@@ -80,7 +80,7 @@ def test_empty_review_has_no_fake_playback_or_insights(screen):
 
 
 def test_review_calibration_picker_compares_cached_ranges_without_settings_fallback(
-    qapp, tmp_path, video,
+    qapp, tmp_path, video, monkeypatch,
 ):
     cfg = Config(data_dir=str(tmp_path), entry_duration=0.1, smoothing=0.0001)
     target = RangeProfile(
@@ -113,7 +113,7 @@ def test_review_calibration_picker_compares_cached_ranges_without_settings_fallb
         widget._coach_data = data
         widget._update_calibration_comparison()
         widget._show_frame(2)
-        assert widget.alerts_text.text() == "BEND YOUR KNEES"
+        assert widget.alerts_text.text() == "Select a calibration profile to see posture alerts."
         widget.reference_combo.setCurrentIndex(widget.reference_combo.findData(str(calibration.resolve())))
         assert widget.alerts_text.text() == "No active posture alert on this frame."
         assert "No approved" in widget.metric_values["shoulder_elev_pct"].text()
@@ -127,6 +127,20 @@ def test_review_calibration_picker_compares_cached_ranges_without_settings_fallb
         widget.reference_combo.setCurrentIndex(widget.reference_combo.findData(str(second.resolve())))
         assert "outside approved range" in widget.alerts_text.text()
         assert "BEND YOUR KNEES" not in widget.alerts_text.text()
+        monkeypatch.setattr(
+            "tango_posture.desktop_qt.screens.review.analyse_review_clip",
+            lambda *args, **kwargs: ReviewAnalysis(data, {"pivots": [], "steps": []}),
+        )
+        widget._start_posture_analysis()
+        deadline = time.monotonic() + 3
+        while widget._analysis_thread is not None and time.monotonic() < deadline:
+            qapp.processEvents()
+            widget._poll_posture_analysis()
+            time.sleep(0.01)
+        assert widget._analysis_thread is None
+        widget._show_frame(2)
+        assert "outside approved range" in widget.alerts_text.text()
+        assert "BEND YOUR KNEES" not in widget.alerts_text.text()
         defaults = Config.model_validate({
             **cfg.model_dump(exclude={"axis_curve"}),
             "calibration_defaults": {
@@ -137,17 +151,22 @@ def test_review_calibration_picker_compares_cached_ranges_without_settings_fallb
         assert "outside approved range" in widget.alerts_text.text()
         widget.reference_combo.setCurrentIndex(0)
         widget._show_frame(2)
-        assert widget.alerts_text.text() == "No active posture alert on this frame."
-        assert "Settings default ranges" in widget.insights_text.text()
-        assert "No approved" in widget.metric_values["shoulder_elev_pct"].text()
+        assert widget.alerts_text.text() == "Select a calibration profile to see posture alerts."
+        assert "without posture coaching" in widget.insights_text.text()
         widget.reference_combo.setCurrentIndex(widget.reference_combo.findData(str(second.resolve())))
         widget.bridge.update_config(cfg)
         widget._coach_data["model_hash"] = "0" * 64
+        rendering = []
+        monkeypatch.setattr(
+            "tango_posture.desktop_qt.screens.review.render_coach_frame_overlay",
+            lambda image, *args, **kwargs: rendering.append(kwargs["lines_only"]) or image,
+        )
         widget._calibration_changed()
         assert "different measurement models" in widget.alerts_text.text()
-        assert widget._display_coach_data() is None
+        assert widget._display_coach_data() is widget._coach_data
+        assert rendering[-1]
         widget.reference_combo.setCurrentIndex(0)
-        assert widget.alerts_text.text() == "BEND YOUR KNEES"
+        assert widget.alerts_text.text() == "Select a calibration profile to see posture alerts."
         widget._release()
         assert widget._compared_coach_data is None
     finally:
@@ -208,15 +227,14 @@ def test_review_approved_pink_axis_uses_old_raw_cache_and_abstains_on_missing_hi
 def test_review_interpolation_settings_refresh_display_without_changing_raw_alerts(
     screen, video, monkeypatch,
 ):
-    observations = []
-    skeletons = []
+    displayed = []
 
-    def render(image, observation, *args, **kwargs):
-        observations.append(observation)
-        skeletons.append(kwargs["skeleton_poses"])
+    def render(image, data, frame_index, cfg, **kwargs):
+        assert kwargs["lines_only"]
+        displayed.append(data["frames"][str(frame_index)])
         return image
 
-    monkeypatch.setattr("tango_posture.references.coach.draw", render)
+    monkeypatch.setattr("tango_posture.desktop_qt.screens.review.render_coach_frame_overlay", render)
     screen.load_archive(video)
     screen._coach_data = {"width": 64, "height": 48, "frames": {
         str(index): {
@@ -229,21 +247,19 @@ def test_review_interpolation_settings_refresh_display_without_changing_raw_aler
     }}
     screen.refresh()
     screen._show_frame(2)
-    assert skeletons[-1][0]["left_hip"].x == pytest.approx(0.6)
-    assert not observations[-1].poses
-    assert screen.alerts_text.text() == "Tracking unavailable"
+    assert displayed[-1]["display_poses"][0]["left_hip"][0] == pytest.approx(0.6)
+    assert screen.alerts_text.text() == "Select a calibration profile to see posture alerts."
     screen.bridge.update_config(screen.bridge.config.model_copy(update={
         "replay_joint_interpolation": "quadratic",
     }))
     screen._show_frame(2)
-    assert skeletons[-1][0]["left_hip"].x == pytest.approx(0.5)
-    assert observations[-1].timestamp == 0.2
-    assert screen.alerts_text.text() == "Tracking unavailable"
+    assert displayed[-1]["display_poses"][0]["left_hip"][0] == pytest.approx(0.5)
+    assert screen.alerts_text.text() == "Select a calibration profile to see posture alerts."
     assert screen._coach_data["frames"]["2"]["measurement_poses"] == [{}]
     screen.bridge.update_config(screen.bridge.config.model_copy(update={"replay_joint_max_gap": 0}))
     screen._show_frame(2)
-    assert not observations[-1].poses
-    assert not skeletons[-1]
+    assert displayed[-1]["measurement_poses"] == [{}]
+    assert "display_poses" not in displayed[-1]
 
 
 @pytest.mark.parametrize("archived", [False, True])
@@ -277,7 +293,12 @@ def test_review_posture_analysis_runs_off_ui_thread_and_syncs_overlay(
 
     def render(image, data, frame_index, cfg, **kwargs):
         observed["overlay_frame"] = frame_index
+        observed["lines_only"] = kwargs["lines_only"]
         image[0, 0] = (0, 0, 255)
+        return image
+
+    def render_movement(image, data, frame_index, fps, **kwargs):
+        observed["movement_options"] = (kwargs["show_pivots"], kwargs["show_steps"])
         return image
 
     monkeypatch.setattr(
@@ -285,6 +306,9 @@ def test_review_posture_analysis_runs_off_ui_thread_and_syncs_overlay(
     )
     monkeypatch.setattr(
         "tango_posture.desktop_qt.screens.review.render_coach_frame_overlay", render
+    )
+    monkeypatch.setattr(
+        "tango_posture.desktop_qt.screens.review.render_movement_overlay", render_movement
     )
     path = video
     if archived:
@@ -311,8 +335,10 @@ def test_review_posture_analysis_runs_off_ui_thread_and_syncs_overlay(
     assert screen.metric_values["shoulder_elev_pct"].text() == "+24.0%"
     assert screen.metric_values["axis_curve_smoothed"].text() == "+12.0%"
     assert screen.metric_values["knee_bend_deg"].text() == "14.5°"
-    assert screen.alerts_text.text() == "BEND YOUR KNEES"
-    assert "Knees: STRAIGHT" in screen.insights_text.text()
+    assert observed["lines_only"]
+    assert observed["movement_options"] == (True, True)
+    assert screen.alerts_text.text() == "Select a calibration profile to see posture alerts."
+    assert "Knees: STRAIGHT" not in screen.insights_text.text()
     assert screen.primary_stage._image.pixelColor(0, 0).red() == 255
     assert screen.splitter.count() == 2
     assert screen.inspector.maximumWidth() == 420
@@ -784,9 +810,9 @@ def test_archive_recordings_variants_and_reports_are_real_and_owned(screen, vide
     append_segment(path, report, video, None, [0.0, 0.1])
     screen.load_archive(path)
     archive = screen._playback.archive
-    overlay_reader = screen._playback.reader
+    raw_reader = screen._playback.reader
     assert archive is not None
-    assert overlay_reader is not None
+    assert raw_reader is not None
     folder = archive.folder
     assert folder.is_dir()
     assert screen.segment_combo.count() == 2
@@ -796,10 +822,9 @@ def test_archive_recordings_variants_and_reports_are_real_and_owned(screen, vide
     ]
     assert "Stored report" in screen.report_view.toPlainText()
     assert "Actual recorded findings." in screen.report_view.toPlainText()
-    screen.stream_combo.setCurrentText("Raw video")
-    assert not overlay_reader.cap.isOpened()
-    raw_reader = screen._playback.reader
-    assert raw_reader is not None
+    assert screen.stream_combo.currentText() == "Raw video"
+    screen.stream_combo.setCurrentText("Overlay video")
+    assert screen.stream_combo.currentText() == "Raw video"
     assert raw_reader.path.name == "video_00.mp4"
     screen.segment_combo.setCurrentIndex(1)
     assert not raw_reader.cap.isOpened()
@@ -903,11 +928,9 @@ def test_bad_overlay_is_not_replaced_with_fake_content_and_raw_can_be_selected(
     overlay.write_bytes(b"broken video")
     append_segment(path, report, video, overlay, [])
     screen.load_archive(path)
-    assert "Replay unavailable:" in screen.status_label.text()
-    assert screen.primary_stage._image is None
-    assert not screen.play_btn.isEnabled()
-    assert screen.duration_sec == 0
-    screen.stream_combo.setCurrentText("Raw video")
+    assert screen.stream_combo.currentText() == "Raw video"
+    screen.stream_combo.setCurrentText("Overlay video")
+    assert screen.stream_combo.currentText() == "Raw video"
     assert screen.play_btn.isEnabled()
     assert screen.duration_sec == pytest.approx(1.2)
     assert screen._playback.reader.path.name == "video_00.mp4"

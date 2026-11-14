@@ -54,6 +54,7 @@ def _compute_family_coverage(
     movement_data: dict[str, Any],
     soundtrack: SoundtrackAnalysisSummary,
     cfg: Config,
+    evaluate_posture: bool = True,
 ) -> dict[str, FamilyCoverage]:
     """Compute separate valid coverage and evidence status for posture, pivots, steps, and soundtrack."""
     rate = fps if math.isfinite(fps) and fps > 0 else 30.0
@@ -94,7 +95,11 @@ def _compute_family_coverage(
         )
     )
     scored_dur = max(0.0, float(clip_duration))
-    if (
+    if not evaluate_posture:
+        posture_alerts = 0
+        top_reason = "Select a calibration profile in Review to compare posture."
+        posture_status = "disabled"
+    elif (
         valid_posture_dur < MIN_EVIDENCE_DURATION_SECONDS
         or (scored_dur > 0 and valid_posture_dur / scored_dur < MIN_EVIDENCE_COVERAGE_RATIO)
     ):

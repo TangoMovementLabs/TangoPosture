@@ -717,15 +717,18 @@ stream.
 ### Dynamic layers and comparison
 
 The **Calibration profile** picker builds derived comparisons from raw cached
-evidence. **No calibration (use Settings)** means configured default ranges when
-enabled, otherwise older Settings insights.
+evidence. **No calibration (visuals only)** renders the skeleton, pivots and
+footprints without posture alerts, even when Settings defaults are enabled.
+Movement-only imports retain raw measurements but do not generate coaching
+alerts. An incompatible calibration reports the error and keeps skeleton
+tracking visible without displaying cached fallback messages.
 
 Dynamic skeletons use same-frame raw poses with optional display-only gap
 filling. Numeric comparison and coverage do not consume those synthetic joints.
 Old display-only caches can render but need reanalysis for approved comparison.
 
 An overlay stream already contains painted pixels; a new selector cannot remove
-them. Use raw/source media for current dynamic calibration comparison.
+them. Review requires raw/source media for dynamic tracking and comparison.
 
 **Open Comparison** owns a second playback instance. It synchronizes by elapsed
 playback time, not semantic movement alignment. The lower-level anchored

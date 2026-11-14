@@ -71,8 +71,9 @@ shorter, thinner, heavier or more experienced.
 | Situation | Where the posture limits come from | What happens to missing metrics |
 | --- | --- | --- |
 | A calibration profile is selected | That profile's approved ranges | Missing or unapproved metrics stay unavailable. There is no fallback to the old posture thresholds. |
-| No calibration is selected, but Settings has enabled **Calibration defaults** | Those enabled minimum/maximum ranges | Disabled or missing default metrics stay unavailable. These defaults replace the old posture-threshold system. |
-| No calibration is selected and no default ranges are enabled | The older Settings thresholds, such as the head-down, shoulder and knee controls | The older descriptive/warning logic is used where observations are available. Formal reference scoring still requires a reference. |
+| Review without a calibration profile | No posture limits are applied | Skeleton and movement remain visible without posture alerts, even when Settings defaults are enabled. |
+| Live Practice without a profile, with **Calibration defaults** enabled | Those enabled minimum/maximum ranges | Disabled or missing default metrics stay unavailable. |
+| Live Practice without a profile or defaults | Older Settings thresholds | The older descriptive/warning logic is used where observations are available. |
 
 **Example:** your selected profile approves only head pitch and the pink torso
 axis. Changing **Settings > Embrace & knees > Closed embrace min knee bend**
@@ -1574,8 +1575,8 @@ view = "side"
 - These are **default ranges**, not a `.tpc` profile and not live-scoring approval.
 
 If a profile is selected, that profile still takes precedence.
-If no profile is selected, the presence of these default ranges replaces the
-older posture thresholds.
+In Live Practice, if no profile is selected, these defaults replace the older
+posture thresholds. Review requires a selected `.tpc` to show posture alerts.
 
 ### Tuning a single example rather than changing everything
 
@@ -1724,7 +1725,7 @@ better-looking or more responsive live experience.
 | Pink line disappears while green torso segments remain | One of four required shoulders/hips is unreliable | Inspect all four raw dots. Improve view or accept UNKNOWN; do not assume the visible side can replace the hidden side. |
 | Pink angle looks wrong for a vertical person | Camera roll, midpoint estimates or image perspective | Level the camera and inspect both shoulder/hip pairs before widening the range. |
 | Head is near zero on the old overlay but outside approved limits | Corrected display angle versus raw `head_pitch` | Inspect raw reference values; do not apply `head_neutral_offset` twice. |
-| Changing head-down/shoulder/knee sliders does nothing | A profile/default range is taking precedence | Edit the relevant approved/default range, or intentionally select no profile and disable all default ranges to use the older mode. |
+| Changing head-down/shoulder/knee sliders does nothing | A profile/default range is taking precedence, or Review has no selected profile | In Review select and edit a profile; in Live Practice use the relevant active range or fallback controls. |
 | Knees have no approved measurement | Not approved, wrong view, or hidden hip/knee/ankle | Check the profile's metric set and raw landmarks. Missing metrics do not fall back to old Settings. |
 | Shoulder value is around `1.0`, not `10%` | Raw clearance versus old elevation percentage | Use normalized clearance limits, not percent values, in the approved row. |
 | Hip direction seems reversed | Wrong original facing direction | Verify facing in unmirrored video; mirror is not the correction. Recreate/reanalyze evidence consistently as needed. |

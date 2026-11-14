@@ -41,11 +41,12 @@ only, not a complete backup of nondefault legacy configuration.
 | Situation | Posture limits |
 | --- | --- |
 | A calibration profile is selected | Its approved minimum/maximum ranges. Missing metrics stay unavailable. |
-| No profile, but at least one Calibration defaults row is enabled | The enabled default ranges. Disabled metrics stay unavailable. |
-| Neither is available | The applicable fallback descriptive-warning controls. |
+| Review without a selected profile | No posture alerts, even if Settings defaults are enabled. Tracking, pivot rings and footprints remain available. |
+| Live Practice without a profile, with Calibration defaults enabled | The enabled default ranges. Disabled metrics stay unavailable. |
+| Live Practice without a profile or defaults | The applicable fallback descriptive-warning controls. |
 
-Fallback controls are still used by current offline coaching; they are not dead
-settings. They do **not** override selected/default approved ranges.
+Fallback controls remain in use in Live Practice and supported legacy analysis.
+They do **not** override selected/default approved ranges.
 Role/embrace recognition, tracking quality and the slow-tango lift cue have
 their own purposes and must not be confused with choosing posture limits.
 
@@ -271,9 +272,9 @@ saved with its reference; changing current Settings alone does not replace it.
 
 ## 5. Head & shoulders
 
-These are **active fallback descriptive controls** for offline coaching when
+These are **active fallback descriptive controls** for live coaching when
 neither a selected profile nor enabled default ranges supplies posture limits.
-They do not define approved native ranges.
+They do not define approved native ranges or trigger uncalibrated Review alerts.
 
 ### Head neutral offset - `head_neutral_offset`
 
@@ -342,7 +343,7 @@ more likely without moving any dot. It does not change raw approved clearance.
 ## 6. Embrace & knees
 
 Role/embrace recognition runs independently of the source of posture limits.
-The last two controls below are fallback knee warnings, not approved bounds.
+The last two controls below are fallback live knee warnings, not approved bounds.
 
 ### Role assign ms - `role_assign_ms`
 
@@ -392,7 +393,7 @@ change the measured knee angle or approve a calibration range.
 **Default:** `8 degrees`; zero or greater.
 
 Minimum projected knee flexion for the fallback straight-knee cue. Despite
-its historical name, the current offline fallback banner is not CLOSED-gated.
+its historical name, older offline fallback scoring was not CLOSED-gated.
 
 **Example:** a measured/smoothed bend of `6` is below `8`, so it can start a
 warning candidate; at a minimum of `5`, it does not. Raising the minimum to `12`
@@ -465,8 +466,8 @@ and does not change the approved raw `hip_offset` measurement.
 
 ## 8. Slow tango
 
-This is an active ankle-height/consecutive-step cue, separate from offline
-footprint placement and pivot detection.
+This is a live/legacy ankle-height/consecutive-step cue, separate from offline
+footprint placement and pivot detection. It does not create uncalibrated Review alerts.
 
 ### Slow tango max BPM - `slow_tango_max_bpm`
 
@@ -512,7 +513,7 @@ beat-analysis or automatic-recording controls.
 **Default:** `120 BPM`; greater than `20` and at most `240`.
 
 Tempo supplied when analysis has no soundtrack BPM. Current Library/Review
-analysis disables soundtrack analysis, so this fallback is important.
+analysis disables soundtrack analysis, but does not show fallback lift alerts.
 It is **not another copy of the slow-tango cutoff**.
 
 **Example:** the defaults supply `120 BPM` against a `115 BPM` slow-tango
@@ -646,9 +647,10 @@ numeric limits, run new video inference or make medical assessments valid.
 ## 12. Calibration defaults
 
 Each row has **Use**, minimum, maximum and applicable view. Units are fixed.
-Initially all rows are disabled. Once any row is enabled, with no selected
-profile only the enabled metrics are available; fallback posture limits do not
-fill the disabled rows.
+Initially all rows are disabled. In Live Practice, once any row is enabled,
+with no selected profile only the enabled metrics are available; fallback
+posture limits do not fill the disabled rows. Review requires a `.tpc` profile
+and does not use these defaults for alerts.
 
 Minimum must not exceed maximum. Endpoints are included. `side` and `front`
 apply their view gate; `all` does not bypass joint quality. Equal bounds are
@@ -894,7 +896,7 @@ replay_joint_max_gap = 0.5
 A bracketed 0.4-second gap can be drawn; a 0.8-second gap is not filled.
 Neither supplies valid missing scoring samples.
 
-### Compare pink-axis tilt without selecting a profile
+### Use a pink-axis default in Live Practice
 
 ```toml
 [calibration_defaults.torso_axis_tilt]
@@ -904,9 +906,9 @@ unit = "degrees"
 view = "all"
 ```
 
-This example enables only that default metric. With no selected profile, the
-other disabled default metrics stay unavailable; fallback posture thresholds
-do not fill them in. Both shoulders and hips must remain reliable.
+This example enables only that default metric for Live Practice. With no selected
+profile, other disabled default metrics stay unavailable. Review requires a
+selected `.tpc` instead. Both shoulders and hips must remain reliable.
 
 ## Further reading and implementation
 

@@ -130,6 +130,10 @@ def test_offline_analysis_dispatches_selected_model_and_records_its_identity(
     assert downloads == [manifest["source_url"]]
     assert result.coach_data["model_hash"] == digest
     assert result.coach_data["model_variant"] == variant
+    report = result.report_path.read_text(encoding="utf-8")
+    assert f"| Pose Model | MediaPipe Pose Landmarker {variant.capitalize()} |" in report
+    assert f"| Pose Model Version | `{manifest['version']}` |" in report
+    assert f"| Pose Model SHA-256 | `{digest}` |" in report
     assert any(f"frames with {variant.capitalize()}" in message for message in progress)
     if variant != "lite":
         assert not (tmp_path / "live_lite.task").exists()
@@ -419,6 +423,24 @@ def test_virtual_clip_range_decoding_and_limits(tmp_path):
     assert video_path.read_bytes() == orig_bytes
 
 
+def test_movement_import_never_builds_fallback_coaching(tmp_path, monkeypatch):
+    video_path = _write_test_video(tmp_path / "clip.avi", duration_seconds=0.5)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Movement import must not build threshold-based coaching")
+
+    monkeypatch.setattr("tango_posture.references.pipeline._build_coach_frame_entry", forbidden)
+    result = analyse_imported_clip(
+        video_path=video_path,
+        cfg=Config(data_dir=str(tmp_path / "data")),
+        selected_out=0.5,
+        estimator_factory=_SyntheticEstimator,
+    )
+    assert result.coach_data["frames"]
+    assert all(entry["measurement_poses"] for entry in result.coach_data["frames"].values())
+    assert not result.coach_data["settings_coaching"]
+
+
 def test_offline_import_movement_and_posture_modes_and_calibration_exclusion(tmp_path):
     video_path = _write_test_video(tmp_path / "clip.avi", fps=15.0, duration_seconds=6.0)
     cfg = Config(
@@ -446,10 +468,20 @@ def test_offline_import_movement_and_posture_modes_and_calibration_exclusion(tmp
     assert res_mov.movement_path.is_file()
     assert res_mov.coverage["pivots"].status == "detected"
     assert res_mov.coverage["steps"].status == "detected"
+    assert res_mov.coverage["posture"].status == "disabled"
+    assert res_mov.coverage["posture"].event_count == 0
+    assert all(
+        "message" not in entry and "alerts" not in entry and "measurement_poses" in entry
+        for entry in res_mov.coach_data["frames"].values()
+    )
     # Exported markdown omits full absolute local path
     md_text = res_mov.report_path.read_text(encoding="utf-8")
     assert str(tmp_path) not in md_text
     assert "https://www.youtube.com/watch?v=dQw4w9WgXcQ" in md_text
+    assert all(text not in md_text for text in (
+        "BAD HEAD ALIGNMENT", "LOWER YOUR SHOULDERS", "BEND YOUR KNEES",
+        "Confirmed Axis Curvature Alerts",
+    ))
 
     # 2. Reference-relative posture review with calibration interval [0.5, 2.5) inside [0.5, 5.5)
     res_posture = analyse_imported_clip(
@@ -500,7 +532,7 @@ def test_poor_footage_reports_not_enough_evidence_without_fabricating_events(tmp
     assert res_cropped.coverage["steps"].event_count == 0
     assert res_cropped.coverage["pivots"].status == "no_events_detected"
 
-    # Multi-person footage -> posture, pivots, and steps all report not_enough_evidence
+    # Multi-person footage -> posture is disabled, pivots and steps lack evidence.
     res_multi = analyse_imported_clip(
         video_path=video_path,
         cfg=cfg,
@@ -510,7 +542,7 @@ def test_poor_footage_reports_not_enough_evidence_without_fabricating_events(tmp
         analysis_mode="movement",
         estimator_factory=lambda: _SyntheticEstimator(multi_person=True),
     )
-    assert res_multi.coverage["posture"].status == "not_enough_evidence"
+    assert res_multi.coverage["posture"].status == "disabled"
     assert res_multi.coverage["pivots"].status == "not_enough_evidence"
     assert res_multi.coverage["steps"].status == "not_enough_evidence"
 
@@ -739,9 +771,10 @@ def test_direct_youtube_download_caching_and_full_open_coach_analysis(tmp_path, 
     assert not np.array_equal(cv2.resize(raw_img, (rendered.shape[1], rendered.shape[0])), rendered)
 
     notes = coach_notes_for_frame(coach_data, first_frame_idx)
-    assert notes is not None and len(notes) >= 4
+    assert notes is not None
     joined = "\n".join(notes)
-    assert "Role:" in joined and "Torso axis:" in joined and "Clip Movement Totals:" in joined
+    assert "Clip Movement Totals:" in joined
+    assert "Role:" not in joined and "Torso axis:" not in joined
 
 
 def test_facebook_reel_download_uses_validated_cache_and_injected_downloader(tmp_path):

@@ -40,7 +40,6 @@ from ...movement import render_floor_guide, render_movement_overlay, validate_mo
 from ...references.coach import (
     coach_notes_for_frame,
     compare_coach_data,
-    compare_default_coach_data,
     interpolate_coach_data,
     render_coach_frame_overlay,
 )
@@ -341,7 +340,7 @@ class ReviewScreen(QWidget):
         selected = self.reference_combo.currentData()
         self.reference_combo.blockSignals(True)
         self.reference_combo.clear()
-        self.reference_combo.addItem("No calibration (use Settings)", None)
+        self.reference_combo.addItem("No calibration (visuals only)", None)
         for reference in self.bridge.list_references():
             if reference.path.suffix.lower() == ".tpc" and reference.path.is_file():
                 self.reference_combo.addItem(reference.name, str(reference.path))
@@ -367,13 +366,12 @@ class ReviewScreen(QWidget):
                 if reference is None:
                     raise ValueError(f"Calibration not found: {path.name}")
                 data = compare_coach_data(data, self.bridge.config, reference)
-            elif self.bridge.config.calibration_defaults:
-                data = compare_default_coach_data(data, self.bridge.config)
             self._compared_coach_data = interpolate_coach_data(
                 data, self.bridge.config,
             )
         except (OSError, ValueError, TypeError, KeyError) as error:
             self._calibration_error = f"Calibration comparison unavailable: {error}"
+            self._compared_coach_data = self._coach_data
             self.analysis_status.setText(self._calibration_error)
             self.bridge.status_message.emit(self._calibration_error)
 
@@ -383,9 +381,7 @@ class ReviewScreen(QWidget):
             self.analysis_status.setText(
                 f"Comparing cached measurements with {self.reference_combo.currentText()}."
                 if self.reference_combo.currentData() is not None else
-                "Using Settings default ranges (no calibration selected)."
-                if self.bridge.config.calibration_defaults else
-                "Using Settings coaching thresholds (no calibration selected)."
+                "No calibration selected; showing tracking and movement without posture alerts."
             )
         self._refresh_overlay()
 
@@ -393,9 +389,7 @@ class ReviewScreen(QWidget):
         return self._compared_coach_data
 
     def _using_range_targets(self) -> bool:
-        return self.reference_combo.currentData() is not None or bool(
-            self.bridge.config.calibration_defaults
-        )
+        return self.reference_combo.currentData() is not None
 
     def load_archive(
         self, path: Path, *, segment_index: int = 0, timestamp: float | None = None
@@ -550,7 +544,7 @@ class ReviewScreen(QWidget):
 
     def _on_stream_changed(self, label: str) -> None:
         self._reset_transport()
-        if self._using_range_targets() and label not in (
+        if label not in (
             "Raw video", "Local video", "Source video",
         ):
             for raw in ("Raw video", "Local video", "Source video"):
@@ -559,7 +553,8 @@ class ReviewScreen(QWidget):
                     return
             self.primary_stage.clear_frame()
             self.analysis_status.setText(
-                "Calibration comparison requires raw/source video; baked warnings cannot be removed."
+                "Tracking and calibration comparison require raw/source video; "
+                "baked warnings cannot be removed."
             )
             return
         if label not in ("Raw video", "Local video", "Source video"):
@@ -788,7 +783,10 @@ class ReviewScreen(QWidget):
                     verbose_skeleton=True,
                     show_vertical_axis=True,
                     show_footer=False,
-                    lines_only=self.lines_only_cb.isChecked(),
+                    lines_only=(
+                        self.lines_only_cb.isChecked() or not self._using_range_targets()
+                        or bool(self._calibration_error)
+                    ),
                 )
             frame = render_movement_overlay(
                 frame,
@@ -817,9 +815,7 @@ class ReviewScreen(QWidget):
         reader = self._playback.reader
         if reader is None:
             return
-        if (
-            self.lines_only_cb.isChecked() or self._using_range_targets()
-        ) and self.stream_combo.currentText() not in (
+        if self.stream_combo.currentText() not in (
             "Raw video", "Local video", "Source video"
         ):
             for label in ("Raw video", "Local video", "Source video"):
@@ -830,12 +826,11 @@ class ReviewScreen(QWidget):
             self.lines_only_cb.setChecked(False)
             self.lines_only_cb.blockSignals(False)
             self.analysis_status.setText(
-                "Calibration/lines-only replay requires a raw/source video; "
+                "Tracking and calibration comparison require a raw/source video; "
                 "baked overlay pixels cannot be removed."
             )
-            if self._using_range_targets():
-                self._reset_transport()
-                self.primary_stage.clear_frame()
+            self._reset_transport()
+            self.primary_stage.clear_frame()
             return
         try:
             self._show_frame(reader.index)
@@ -1002,6 +997,13 @@ class ReviewScreen(QWidget):
 
     def _update_frame_insights(self, frame_index: int) -> None:
         data = self._display_coach_data()
+        if self._calibration_error:
+            for value in self.metric_values.values():
+                value.setText("Not observed")
+            self.alerts_text.setText(self._calibration_error)
+            self.alerts_text.setStyleSheet(f"color: {COLOR_TEXT_MUTED}; font-weight: 600;")
+            self.insights_text.setText("Posture comparison is unavailable.")
+            return
         if data is None:
             for value in self.metric_values.values():
                 value.setText("Not observed")
@@ -1058,6 +1060,12 @@ class ReviewScreen(QWidget):
                     f"{measured_value:.3g} {row['unit']}"
                     if measured_value is not None and row is not None else "No approved / valid measurement"
                 )
+
+        if not self._using_range_targets():
+            self.alerts_text.setText("Select a calibration profile to see posture alerts.")
+            self.alerts_text.setStyleSheet(f"color: {COLOR_TEXT_MUTED}; font-weight: 600;")
+            self.insights_text.setText("Tracking and movement are shown without posture coaching.")
+            return
 
         message = entry.get("message")
         poses = entry.get("measurement_poses", entry.get("poses"))

@@ -9,6 +9,7 @@ from typing import Any
 
 from .config import Config
 from .domain import METRICS, UNITS, Calibration, SessionSummary
+from .models import model_manifest
 from .review import write_metadata
 
 
@@ -127,6 +128,7 @@ def write_markdown_report(
         counter += 1
     latest_path = report_dir / "latest_report.md"
     is_imported = bool(import_context and import_context.get("is_imported_reference"))
+    movement_only = bool(is_imported and import_context and import_context.get("analysis_mode") == "movement")
 
     total_frames = len(frame_log)
     start_t = frame_log[0]["timestamp"] if frame_log else 0.0
@@ -265,6 +267,15 @@ def write_markdown_report(
         if phrases_seen and bpms_seen
         else f"`{cfg.tango_bpm:.1f} BPM` (8 beats/phrase)"
     )
+    model_hash = performance.get("model_hash")
+    model_name = model_version = "Unavailable"
+    if isinstance(model_hash, str) and model_hash:
+        for variant in ("lite", "full", "heavy"):
+            manifest = model_manifest(variant)
+            if manifest["sha256"] == model_hash:
+                model_name = f"MediaPipe Pose Landmarker {variant.capitalize()}"
+                model_version = manifest["version"]
+                break
 
     lines = [
         "# Tango Posture & Body Alignment Report",
@@ -276,6 +287,8 @@ def write_markdown_report(
         "  1. **Body Alignment Analysis**: Quantify head horizontal pitch (ear-to-nose angle relative to horizontal), head-forward offset (ear relative to shoulder/torso), head segment inclination, and trunk vertical inclination.",
         "  2. **Leader / Follower Embrace Identification**: Detect whether the dancer adopts the **Leader** embrace (left arm raised, right arm horizontal around the follower) or **Follower** embrace (right arm raised, left arm horizontal around the leader's shoulder) and when each role occurs.",
         "  3. **Tango 8-Beat Phrase Tracking**: Track the 8-beat Argentine tango musical phrase (`Beat 1..8 -> 1..8`) and map alignment events to both time and musical phrase/beat.",
+        "  4. **Tracking and comparison**: Select a calibration in Review for posture alerts."
+        if movement_only else
         "  4. **Body Performance & Issue Pinpointing (Where in Time)**: Identify every time interval where alignment deviated beyond configured thresholds (such as the head pointing down for longer than the `.env` threshold) or where camera framing obstructed full-body tracking, with exact timestamps so the dancer and teacher can inspect those moments.",
         "  5. **Scope & Disclaimer**: This is a geometric movement observation aid, not a medical assessment or an authority on artistic tango quality.",
         "",
@@ -293,12 +306,17 @@ def write_markdown_report(
         f"| Session ID | `{session_id or 'uncalibrated-observation-run'}` |",
         f"| Observed Timeline | `{_fmt_time(start_t)}` to `{_fmt_time(end_t)}` (`{total_duration:.2f}s`, `{total_frames}` frames) |",
         f"| Selected Side / Facing | `side={cfg.side}`, `facing={cfg.facing}` |",
-        f"| Head-Down Alert Config (`.env`) | Angle `< {cfg.head_down_angle:+.1f} deg` for `>= {cfg.head_down_duration:.1f}s` (neutral offset `{cfg.head_neutral_offset:+.1f} deg`) |",
-        f"| Shoulder Tension Config (`.env`) | Elevation `>= +{cfg.shoulder_raise_threshold:.1f}%` for `>= {cfg.shoulder_tension_duration:.1f}s` |",
-        f"| Axis Curvature Config (`axis_curve`) | Entry `>{cfg.axis_curve_entry * 100.0:+.1f}%` for `>= {cfg.axis_curve_duration:.1f}s`, Clear `<{cfg.axis_curve_clear * 100.0:+.1f}%` for `>= {cfg.axis_curve_clear_duration:.2f}s` |",
-        f"| Closed-Embrace Knee Bend Config (`.env`) | Min knee bend `>= {cfg.closed_embrace_min_knee_bend:.1f} deg` (alert after `{cfg.knee_straight_duration:.1f}s`) |",
+        f"| Pose Model | {model_name} |",
+        f"| Pose Model Version | `{model_version}` |",
+        f"| Pose Model SHA-256 | `{model_hash if isinstance(model_hash, str) and model_hash else 'Unavailable'}` |",
+        *([] if movement_only else [
+            f"| Head-Down Alert Config (`.env`) | Angle `< {cfg.head_down_angle:+.1f} deg` for `>= {cfg.head_down_duration:.1f}s` (neutral offset `{cfg.head_neutral_offset:+.1f} deg`) |",
+            f"| Shoulder Tension Config (`.env`) | Elevation `>= +{cfg.shoulder_raise_threshold:.1f}%` for `>= {cfg.shoulder_tension_duration:.1f}s` |",
+            f"| Axis Curvature Config (`axis_curve`) | Entry `>{cfg.axis_curve_entry * 100.0:+.1f}%` for `>= {cfg.axis_curve_duration:.1f}s`, Clear `<{cfg.axis_curve_clear * 100.0:+.1f}%` for `>= {cfg.axis_curve_clear_duration:.2f}s` |",
+            f"| Closed-Embrace Knee Bend Config (`.env`) | Min knee bend `>= {cfg.closed_embrace_min_knee_bend:.1f} deg` (alert after `{cfg.knee_straight_duration:.1f}s`) |",
+        ]),
         f"| Embrace Type Distribution | `CLOSED`: `{closed_frames}` frames, `OPEN`: `{open_frames}` frames (hysteresis `{cfg.embrace_hysteresis_seconds:.2f}s`) |",
-        f"| Slow-Tango Low-Feet Config (`.env`) | Tempo `<={cfg.slow_tango_max_bpm:.0f} BPM`, max ankle lift `<={cfg.ankle_high_lift_ratio * 100.0:.1f}%`, alert after `{cfg.max_consecutive_high_ankle_steps}` consecutive high steps (peak streak `{max_consec_ankle_steps}`) |",
+        *([] if movement_only else [f"| Slow-Tango Low-Feet Config (`.env`) | Tempo `<={cfg.slow_tango_max_bpm:.0f} BPM`, max ankle lift `<={cfg.ankle_high_lift_ratio * 100.0:.1f}%`, alert after `{cfg.max_consecutive_high_ankle_steps}` consecutive high steps (peak streak `{max_consec_ankle_steps}`) |"]),
         f"| Role Hysteresis Config (`.env`) | Assign after `{cfg.role_assign_ms:.0f} ms`, hold for `{cfg.role_hold_ms:.0f} ms` before returning to `NONE` |",
         f"| Musical 8-Beat Phrase Tracking | {phrase_summary} |",
         f"| Runtime Throughput & Latency | `{fps_str}` (median frame latency `{lat_str}`, dropped frames `{performance.get('dropped_frames', 0)}`) |",
@@ -441,8 +459,10 @@ def write_markdown_report(
                 f"| Median Head Horizontal Angle | `{median(head_angles):+.1f} deg` | `0 deg` = nose level with ear; negative = pointing down |",
                 f"| Minimum (Most Downward) Angle | `{min(head_angles):+.1f} deg` | Lowest downward pitch observed |",
                 f"| Maximum (Most Upward) Angle | `{max(head_angles):+.1f} deg` | Highest pitch observed |",
-                f"| Total Time Pointing Down (`< {cfg.head_down_angle:+.1f} deg`) | `{total_head_down_sec:.2f}s` | Cumulative time below downward angle threshold |",
-                f"| **Confirmed Bad Head Alignment Alerts (`>= {cfg.head_down_duration:.1f}s`)** | **`{len(confirmed_head_down)}`** | Triggered red on-screen `BAD HEAD ALIGNMENT` alert |",
+                *([] if movement_only else [
+                    f"| Total Time Pointing Down (`< {cfg.head_down_angle:+.1f} deg`) | `{total_head_down_sec:.2f}s` | Cumulative time below downward angle threshold |",
+                    f"| **Confirmed Bad Head Alignment Alerts (`>= {cfg.head_down_duration:.1f}s`)** | **`{len(confirmed_head_down)}`** | Triggered red on-screen `BAD HEAD ALIGNMENT` alert |",
+                ]),
             ]
         )
     else:
@@ -463,8 +483,10 @@ def write_markdown_report(
                 f"| Frames with Visible Ear & Shoulder | `{len(shoulder_elevs)} / {total_frames}` | Shoulder elevation coverage |",
                 f"| Median Shoulder Elevation | `{median(shoulder_elevs):+.1f}%` | `0%` = relaxed neutral; positive = shoulders raised toward ears |",
                 f"| Peak Shoulder Elevation | `{max(shoulder_elevs):+.1f}%` | Highest shoulder shrug / tension observed |",
-                f"| Total Time Raised (`>= +{cfg.shoulder_raise_threshold:.1f}%`) | `{total_shoulder_tension_sec:.2f}s` | Cumulative time with elevated shoulders |",
-                f"| **Confirmed Shoulder Tension Alerts (`>= {cfg.shoulder_tension_duration:.1f}s`)** | **`{len(confirmed_shoulder_tension)}`** | Triggered red on-screen `LOWER YOUR SHOULDERS` alert |",
+                *([] if movement_only else [
+                    f"| Total Time Raised (`>= +{cfg.shoulder_raise_threshold:.1f}%`) | `{total_shoulder_tension_sec:.2f}s` | Cumulative time with elevated shoulders |",
+                    f"| **Confirmed Shoulder Tension Alerts (`>= {cfg.shoulder_tension_duration:.1f}s`)** | **`{len(confirmed_shoulder_tension)}`** | Triggered red on-screen `LOWER YOUR SHOULDERS` alert |",
+                ]),
             ]
         )
     else:
@@ -485,8 +507,10 @@ def write_markdown_report(
                 f"| Frames with Visible Ankle, Hip & Head | `{len(axis_ratios)} / {total_frames}` | Full-body axis curvature coverage |",
                 f"| Median Hip / Pelvis Offset | `{median(axis_ratios) * 100.0:+.1f}%` | `0.0%` = hip on reference ankle–back-of-head line; `+` = hip/bump protruding behind line |",
                 f"| Peak Posterior Curvature | `{max(axis_ratios) * 100.0:+.1f}%` | Maximum hip protrusion behind ankle–back-of-head line |",
-                f"| Total Time Above Entry (`>{cfg.axis_curve_entry * 100.0:+.1f}%`) | `{total_axis_above_entry_sec:.2f}s` | Cumulative time exceeding entry threshold |",
-                f"| **Confirmed Axis Curvature Alerts (`>= {cfg.axis_curve_duration:.1f}s` w/ hysteresis `<{cfg.axis_curve_clear * 100.0:+.1f}%`)** | **`{len(confirmed_axis_curve)}`** | Triggered red on-screen `HIP OFFSET` alert; separate from the torso axis |",
+                *([] if movement_only else [
+                    f"| Total Time Above Entry (`>{cfg.axis_curve_entry * 100.0:+.1f}%`) | `{total_axis_above_entry_sec:.2f}s` | Cumulative time exceeding entry threshold |",
+                    f"| **Confirmed Axis Curvature Alerts (`>= {cfg.axis_curve_duration:.1f}s` w/ hysteresis `<{cfg.axis_curve_clear * 100.0:+.1f}%`)** | **`{len(confirmed_axis_curve)}`** | Triggered red on-screen `HIP OFFSET` alert; separate from the torso axis |",
+                ]),
             ]
         )
     else:
@@ -610,7 +634,7 @@ def write_markdown_report(
     )
 
     has_issues = False
-    if confirmed_head_down:
+    if confirmed_head_down and not movement_only:
         has_issues = True
         lines.append(
             f"### 4.1 Confirmed Bad Head Alignment (`< {cfg.head_down_angle:+.1f} deg` for `>= {cfg.head_down_duration:.1f}s` — RED ALERT)"
@@ -632,7 +656,7 @@ def write_markdown_report(
             )
         lines.append("")
 
-    if confirmed_shoulder_tension:
+    if confirmed_shoulder_tension and not movement_only:
         has_issues = True
         lines.append(
             f"### 4.2 Confirmed Shoulder Tension (`>= +{cfg.shoulder_raise_threshold:.1f}%` for `>= {cfg.shoulder_tension_duration:.1f}s` — LOWER YOUR SHOULDERS)"
@@ -658,7 +682,7 @@ def write_markdown_report(
             )
         lines.append("")
 
-    if confirmed_knee_straight:
+    if confirmed_knee_straight and not movement_only:
         has_issues = True
         lines.append(
             f"### 4.2b Confirmed Unbent Knees in Closed Embrace (`< {cfg.closed_embrace_min_knee_bend:.1f} deg` for `>= {cfg.knee_straight_duration:.1f}s` — BEND YOUR KNEES)"
@@ -684,7 +708,7 @@ def write_markdown_report(
             )
         lines.append("")
 
-    if confirmed_axis_curve:
+    if confirmed_axis_curve and not movement_only:
         has_issues = True
         lines.append(
             f"### 4.2c Confirmed Axis Curvature (`>{cfg.axis_curve_entry * 100.0:+.1f}%` for `>= {cfg.axis_curve_duration:.1f}s`, clear `<{cfg.axis_curve_clear * 100.0:+.1f}%` — HIP OFFSET)"
@@ -711,7 +735,7 @@ def write_markdown_report(
             )
         lines.append("")
 
-    if confirmed_ankle_high:
+    if confirmed_ankle_high and not movement_only:
         has_issues = True
         lines.append(
             f"### 4.2d Confirmed High Ankle Lift in Slow Tango (`>={cfg.ankle_high_lift_ratio * 100.0:.1f}%` for `>={cfg.max_consecutive_high_ankle_steps}` consecutive steps at `<={cfg.slow_tango_max_bpm:.0f} BPM`)"
@@ -741,7 +765,7 @@ def write_markdown_report(
             )
         lines.append("")
 
-    if transient_head_down:
+    if transient_head_down and not movement_only:
         has_issues = True
         lines.append(
             f"### 4.2 Brief Head-Down Dips (`< {cfg.head_down_angle:+.1f} deg` for `< {cfg.head_down_duration:.1f}s`)"
@@ -791,6 +815,8 @@ def write_markdown_report(
 
     if not has_issues:
         lines.append(
+            "- Posture alerts require a calibration profile in Review."
+            if movement_only else
             "- No alignment deviations, head-down alerts, or camera framing issues were detected during this run."
         )
 

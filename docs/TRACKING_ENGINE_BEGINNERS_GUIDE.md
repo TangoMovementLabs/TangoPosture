@@ -1649,9 +1649,9 @@ overlay pixels do not become current just because Settings changed.
 
 ### "I raised a limit but the warning did not change"
 
-Check the active limit source. A selected approved profile takes precedence
-over old Settings thresholds; enabled default ranges also replace those old
-limits when no profile is selected.
+Check the active limit source. In Review, posture alerts require a selected
+approved profile. In Live Practice, enabled default ranges also replace older
+Settings thresholds when no profile is selected.
 
 Change the relevant approved/default range rather than unrelated baseline
 controls. Inspect whether a cached result or running worker still uses older

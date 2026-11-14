@@ -42,7 +42,8 @@ _GROUP_HINTS = {
     ),
     "Head & shoulders": (
         "Fallback descriptive warning controls. A selected calibration or enabled Calibration "
-        "defaults supplies approved ranges instead; missing metrics do not fall back here."
+        "defaults supplies approved ranges instead; missing metrics do not fall back here. "
+        "Review alerts require a selected calibration file."
     ),
     "Embrace & knees": (
         "Role/embrace recognition runs independently of calibration. Knee-warning thresholds "
@@ -53,9 +54,8 @@ _GROUP_HINTS = {
         "or enabled Calibration defaults replace these posture limits."
     ),
     "Music": (
-        "Current Library/Review analysis does not detect soundtrack BPM. This fallback tempo "
-        "is the input, not the Slow tango max BPM cutoff. At the defaults, 120 BPM exceeds "
-        "the 115 BPM cutoff, so the slow-tango lift cue is inactive."
+        "This fallback tempo is the input, not the Slow tango max BPM cutoff. Library/Review "
+        "analysis does not detect soundtrack BPM or show fallback lift alerts."
     ),
     "Slow tango": (
         "The BPM ceiling gates the ankle-lift cue, not video playback or footprint detection. "

@@ -186,7 +186,7 @@ defaults** and saves `settings.toml` after confirmation. Existing `.tpc` profile
 also have **Use as Settings defaults** in Library. This replaces the previous
 default ranges, not unrelated settings. Edit or disable individual metrics in
 Settings, then use **Apply & Save settings.toml** to persist your changes.
-With no calibration selected, enabled default ranges replace legacy posture
+In Live Practice with no calibration selected, enabled default ranges replace legacy posture
 thresholds; missing metrics have no fallback. Disable all default ranges to restore
 the legacy thresholds. A selected calibration takes priority, and copying defaults
 does not enable calibrated camera scoring. Load the saved file next time with
@@ -206,11 +206,15 @@ Comparison follows the primary
 playhead's elapsed time; it does not calculate a biomechanical or musical
 alignment. For a raw or local video, click **Analyze posture & movement** to run a
 cancellable background analysis of up to the first two minutes. The resulting
-skeleton overlay, head/shoulder/torso-hip/knee measurements and posture alerts
+skeleton overlay and head/shoulder/torso-hip/knee measurements
 stay synchronized with the current frame. The analysis does not modify the raw
 video and saves results inside the
 selected `.tp` or `.tpr` recording so they return when reopened. Archived baked video
 streams remain unchanged.
+
+Newly generated analysis reports list the pose model, its pinned version and
+SHA-256 fingerprint. If the model cannot be identified, the report says
+**Unavailable** instead of guessing. Existing reports are not rewritten.
 
 Select a `.tpc` in Review's **Calibration profile** picker to compare the
 recording with its approved ranges. In both Live Practice and Review, selecting
@@ -219,8 +223,11 @@ warnings: only metrics with approved ranges can produce calibrated feedback.
 Missing metrics do not fall back to Settings. Review displays the saved units
 and limits; unreliable or incompatible measurements remain unavailable.
 Review comparison does not enable a profile for live camera scoring.
-Choose **No calibration (use Settings)** to use your Settings default ranges, or
-the legacy Settings thresholds if no default ranges are enabled.
+Choose **No calibration (visuals only)** to show the skeleton, pivot rings and
+footprints without posture alerts. Settings default ranges do not generate Review
+alerts. Movement-only reference imports also do not create fallback alerts.
+Previously saved reports and baked videos are not rewritten; their historical
+text or painted overlays may still contain older warnings.
 Live Practice still requires the camera checks and placement confirmation for
 a camera-ready calibration; an unconfirmed selection is not silently discarded.
 
@@ -228,7 +235,7 @@ For closer skeleton tracking, use the raw/source stream: Review draws the
 current frame's raw cached landmarks rather than lagging display-smoothed
 landmarks. Old display-only caches require **Analyze posture & movement** again
 for calibration comparison. Existing baked overlay streams cannot be corrected;
-calibrated playback uses raw/source video.
+Review uses raw/source video, and reports when it is unavailable.
 
 For joints that briefly disappear, **Settings → Replay movement** offers
 **Review joint interpolation** (`linear` by default, or `quadratic`) and

@@ -37,6 +37,7 @@ from ..geometry import (
     knee_bend_alignment,
     pixel,
     shoulder_tension_alignment,
+    torso_axis_alignment,
 )
 from ..metrics import measure
 from ..models import analysis_model_path, model_manifest, prepare_analysis_model, verify
@@ -491,33 +492,53 @@ def analyze_clip(
         consecutive_high_ankle_steps = int(ankle_track["consecutive_high_steps"] or 0)
         bad_ankles = bool(ankle_track["alert"])
 
-        coach_entry, coach_meta = _build_coach_frame_entry(
-            cfg=cfg,
-            frame_obs=frame_obs,
-            display_poses=pose_smoother.update(frame_obs.poses, source_time),
-            source_time=source_time,
-            clip_time=clip_time,
-            head_angle=head_angle,
-            shoulder_elev_pct=shoulder_elev_pct,
-            shoulder_neutral_clearance=sh_neutral,
-            knee_bend_deg=knee_bend_deg,
-            ankle_lift_ratio=ankle_lift_ratio,
-            consecutive_high_ankle_steps=consecutive_high_ankle_steps,
-            bad_ankles=bad_ankles,
-            ankle_high_now=bool(ankle_track.get("high_now")),
-            axis_curve_smoothed=axis_curve_smoothed,
-            axis_curve_state=axis_curve_state,
-            axis_curve_elapsed=float(axis_track.get("elapsed") or 0.0),
-            bad_axis=bad_axis,
-            role=role,
-            embrace_type=embrace_type,
-            upper_body=upper_body,
-            st_state=st_state,
-            quality_reason=quality_reason,
-            timers=timers,
-            session_rows=session_rows,
-            single_pose_ok=len(frame_obs.poses) == 1,
-        )
+        display_poses = pose_smoother.update(frame_obs.poses, source_time)
+        if analysis_mode == "movement":
+            torso = (
+                torso_axis_alignment(
+                    frame_obs.poses[0], frame_obs.width, frame_obs.height, cfg.confidence
+                )
+                if len(frame_obs.poses) == 1 else None
+            )
+            coach_entry = {
+                "timestamp": round(float(source_time), 4),
+                "clip_timestamp": round(float(clip_time), 4),
+                "poses": [_serialise_pose(pose) for pose in display_poses if pose],
+                "head_angle": head_angle,
+                "shoulder_elev_pct": shoulder_elev_pct,
+                "knee_bend_deg": knee_bend_deg,
+                "axis_curve_smoothed": axis_curve_smoothed,
+                "torso_axis_tilt": abs(torso[0]) if torso is not None else None,
+            }
+            coach_meta: dict[str, Any] = {}
+        else:
+            coach_entry, coach_meta = _build_coach_frame_entry(
+                cfg=cfg,
+                frame_obs=frame_obs,
+                display_poses=display_poses,
+                source_time=source_time,
+                clip_time=clip_time,
+                head_angle=head_angle,
+                shoulder_elev_pct=shoulder_elev_pct,
+                shoulder_neutral_clearance=sh_neutral,
+                knee_bend_deg=knee_bend_deg,
+                ankle_lift_ratio=ankle_lift_ratio,
+                consecutive_high_ankle_steps=consecutive_high_ankle_steps,
+                bad_ankles=bad_ankles,
+                ankle_high_now=bool(ankle_track.get("high_now")),
+                axis_curve_smoothed=axis_curve_smoothed,
+                axis_curve_state=axis_curve_state,
+                axis_curve_elapsed=float(axis_track.get("elapsed") or 0.0),
+                bad_axis=bad_axis,
+                role=role,
+                embrace_type=embrace_type,
+                upper_body=upper_body,
+                st_state=st_state,
+                quality_reason=quality_reason,
+                timers=timers,
+                session_rows=session_rows,
+                single_pose_ok=len(frame_obs.poses) == 1,
+            )
         coach_pending[frame_index] = coach_entry
         coach_entry["measurement_poses"] = [_serialise_pose(pose) for pose in frame_obs.poses]
         coach_frame_meta[frame_index] = coach_meta
@@ -573,14 +594,14 @@ def analyze_clip(
 
     for frame_index, entry in coach_pending.items():
         meta = coach_frame_meta[frame_index]
-        entry["lines"] = list(meta["lines"])
-        entry["notes"] = [
-            meta["primary"],
-            *meta["lines"],
-            *_movement_note_lines(
-                movement_data, frame_index, probe.fps, cfg.replay_step_history_seconds
-            ),
-        ]
+        movement_notes = _movement_note_lines(
+            movement_data, frame_index, probe.fps, cfg.replay_step_history_seconds
+        )
+        if analysis_mode == "movement":
+            entry["notes"] = movement_notes
+        else:
+            entry["lines"] = list(meta["lines"])
+            entry["notes"] = [meta["primary"], *meta["lines"], *movement_notes]
     coach_data: dict[str, Any] = {
         "version": 1,
         "model_hash": model_hash,
@@ -594,6 +615,7 @@ def analyze_clip(
         "clip_out": round(clip_out, 4),
         "neutral_offset": neutral_offset,
         "axis_neutral_offset": axis_neutral,
+        "settings_coaching": analysis_mode != "movement",
         "frames": {str(k): v for k, v in coach_pending.items()},
     }
 
@@ -605,6 +627,7 @@ def analyze_clip(
         movement_data=movement_data,
         soundtrack=soundtrack_summary,
         cfg=cfg,
+        evaluate_posture=analysis_mode != "movement",
     )
 
     mean_duration = float(np.mean(infer_times)) if infer_times else 0.0
