@@ -1,10 +1,46 @@
 import csv
 import json
 import sqlite3
+from contextlib import closing
 from dataclasses import asdict
 from pathlib import Path
 
 from .domain import Calibration
+
+DATABASE_TABLES = ("calibrations", "sessions", "events", "observations")
+
+
+def _database_counts(db: sqlite3.Connection) -> dict[str, int]:
+    version = db.execute("PRAGMA user_version").fetchone()[0]
+    if version != 1:
+        raise ValueError(f"Unsupported database schema version {version}; expected 1")
+    return {
+        table: db.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0]
+        for table in DATABASE_TABLES
+    }
+
+
+def database_counts(path: Path) -> dict[str, int]:
+    with (
+        closing(sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True, timeout=1)) as db,
+        db,
+    ):
+        db.execute("BEGIN")
+        return _database_counts(db)
+
+
+def clear_database(path: Path) -> dict[str, int]:
+    """Empty the four session tables atomically, retaining schema and other files."""
+    with closing(sqlite3.connect(f"{path.resolve().as_uri()}?mode=rw", uri=True, timeout=1)) as db:
+        db.execute("PRAGMA foreign_keys=ON")
+        with db:
+            db.execute("BEGIN IMMEDIATE")
+            counts = _database_counts(db)
+            for table in ("events", "observations", "sessions", "calibrations"):
+                db.execute(f'DELETE FROM "{table}"')
+            if any(_database_counts(db).values()):
+                raise RuntimeError("Database cleanup did not empty all four tables")
+        return counts
 
 
 class Storage:

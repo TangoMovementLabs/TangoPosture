@@ -1,311 +1,796 @@
-# TangoPosture: code, architecture and workflows
+# TangoPosture architecture and developer workflows
 
-This is the developer guide to the **implemented Qt application**, not a proposal
-for a replacement architecture. For installation, controls and measurement
-mathematics, see the [user manual](TANGO_POSTURE_GUIDE.md). For acceptance limits,
-see [manual validation](manual_validation.md).
+Canonical repository: [TangoMovementLabs/TangoPosture](https://github.com/TangoMovementLabs/TangoPosture).
 
-Diagrams use Mermaid. GitHub renders the class, state and sequence diagrams;
-VS Code needs a Mermaid-capable Markdown preview. Component and use-case views
-use Mermaid flowcharts because Mermaid has no native UML component/use-case
-syntax.
+This document describes the implemented application: its entry points, module
+ownership, data contracts, background jobs, persistence and extension points.
+It is a map for maintaining the code, not a proposal for a replacement design.
+
+The current Qt shell is **offline-first**. Library imports local video; Review
+analyzes and compares recordings; the calibration editor approves ranges from
+reference evidence. Camera/practice engines still exist, but their presence in
+the source tree does not mean they are reachable from the current desktop
+navigation.
+
+For user-facing instructions, see:
+
+- [General manual](TANGO_POSTURE_GUIDE.md).
+- [Calibration guide](CALIBRATION_BEGINNERS_GUIDE.md).
+- [Settings guide](SETTINGS_BEGINNERS_GUIDE.md).
+- [Tracking-engine guide](TRACKING_ENGINE_BEGINNERS_GUIDE.md).
+
+Some companion guides describe retained camera workflows. Use the reachability
+table below and the actual shell/router as the authority for current desktop
+entry points.
 
 ## Contents
 
-1. [Architecture and dependency boundaries](#1-architecture-and-dependency-boundaries)
-2. [Source map and relocation guide](#2-source-map-and-relocation-guide)
-3. [Domain model and portable files](#3-domain-model-and-portable-files)
-4. [Threads, state and resource ownership](#4-threads-state-and-resource-ownership)
-5. [Use-case catalogue](#5-use-case-catalogue)
-6. [Startup, About, Help and settings](#6-startup-about-help-and-settings)
-7. [Practice, recording, scoring and songs](#7-practice-recording-scoring-and-songs)
-8. [Library import and archive management](#8-library-import-and-archive-management)
-9. [Reference and calibration workflows](#9-reference-and-calibration-workflows)
-10. [Review, comparison and analytics](#10-review-comparison-and-analytics)
-11. [Explicit Ollama interpretation](#11-explicit-ollama-interpretation)
-12. [Maintenance and verification](#12-maintenance-and-verification)
+1. [Runtime scope and entry points](#1-runtime-scope-and-entry-points)
+2. [Components and dependency boundaries](#2-components-and-dependency-boundaries)
+3. [Source ownership map](#3-source-ownership-map)
+4. [Domain records and analysis results](#4-domain-records-and-analysis-results)
+5. [Evidence, coordinates and time](#5-evidence-coordinates-and-time)
+6. [Configuration and model lifecycle](#6-configuration-and-model-lifecycle)
+7. [Library import and packaging](#7-library-import-and-packaging)
+8. [Calibration and comparison policy](#8-calibration-and-comparison-policy)
+9. [Review, playback and reanalysis](#9-review-playback-and-reanalysis)
+10. [Movement and presentation](#10-movement-and-presentation)
+11. [Persistence and archive integrity](#11-persistence-and-archive-integrity)
+12. [Concurrency and resource ownership](#12-concurrency-and-resource-ownership)
+13. [Retained practice and camera services](#13-retained-practice-and-camera-services)
+14. [Analytics and optional report interpretation](#14-analytics-and-optional-report-interpretation)
+15. [Packaging and release boundaries](#15-packaging-and-release-boundaries)
+16. [Making and verifying changes](#16-making-and-verifying-changes)
 
-## 1. Architecture and dependency boundaries
+## 1. Runtime scope and entry points
 
-TangoPosture runs in one local Python process. Qt owns windows and navigation.
-Capture, inference, analysis, persistence and optional HTTP requests are local
-services called by screens or their workers. There is no mandatory server,
-account, cloud inference or Tk implementation.
+### One desktop process, local processing
+
+The main application is a Python process with a PySide6/Qt event loop. It uses
+in-process services, Python threads, Qt signals, queues and local files.
+It does not require an application server, account, mandatory cloud inference,
+browser frontend or Tk fallback.
+
+OpenCV handles video IO and image operations. MediaPipe supplies pose estimates.
+NumPy supports numerical work. Pydantic validates configuration and approved
+range profiles. SQLite supports retained session persistence.
+
+Optional network operations are described separately; local processing does not
+mean every configurable endpoint or import operation is offline.
+
+### Entrypoints
+
+| Entrypoint | Current behaviour | Owner |
+| --- | --- | --- |
+| `tango-posture` | Defaults to the Qt GUI | [cli.py](../src/tango_posture/cli.py) |
+| `tango-posture gui` / `tango-posture qt` | Launches the same Qt application | [desktop_qt/main.py](../src/tango_posture/desktop_qt/main.py) |
+| Packaged desktop executable | Selects its application-data working directory and bundled Lite model, then launches Qt | [desktop.py](../src/tango_posture/desktop.py) |
+| `tango-posture run ...` | Executes the retained capture/practice engine, including supported file/headless modes | [app.py](../src/tango_posture/app.py) |
+| `tango-posture models fetch` | Explicitly installs/verifies the Lite model | [models.py](../src/tango_posture/models.py) |
+| `sessions list`, `sessions export`, `calibrations list` | Local storage commands | [cli.py](../src/tango_posture/cli.py), [storage.py](../src/tango_posture/storage.py) |
+
+The packaged launcher rejects ordinary command-line arguments; its special
+`--smoke-test` path verifies packaged resources and inference. Do not treat
+packaged startup and the console CLI as interchangeable configuration loaders.
+
+### Current desktop reachability
+
+The shell constructs nine stacked workspaces. Eight appear in its rail; the
+References workspace is reached through Home instead.
+
+| Capability | Current desktop access | Retained implementation distinction |
+| --- | --- | --- |
+| Home | Rail | Shows offline-analysis setup and recent practices |
+| Library | Rail; Home > Open Library | Local file import, portable files, promotion, calibration creation |
+| Review | Rail; Library recording; Analytics seek | Playback, dynamic overlays, explicit reanalysis and comparison |
+| Analytics | Rail | Read-only projection of saved archive evidence |
+| AI Coach | Rail; Review report action | Explicit optional report interpretation |
+| Settings | Rail | Shared configuration, including fields for retained services |
+| Help & Guide | Rail | Renders the bundled general manual |
+| Database maintenance | Rail | Explicit, confirmed cleanup of the configured SQLite database only |
+| Calibration Profiles / References | Home > Manage References | Inspect saved profiles, Match Camera Settings, Open Library |
+| Live Practice | No route in the current shell/router | Screen and worker remain in source; CLI capture remains available |
+| Guided camera calibration / Check camera | No current Library/References entry action | Guided dialog, repeat-check logic and approval fields remain implemented |
+| YouTube/Facebook download/import | No current local-import dialog field | URL/download adapters and worker APIs remain implemented |
+| Migrate Legacy data | No current action | Do not reintroduce a migration button from old documentation |
+
+Verify navigation in [shell.py](../src/tango_posture/desktop_qt/shell.py),
+[router.py](../src/tango_posture/desktop_qt/router.py),
+[home.py](../src/tango_posture/desktop_qt/screens/home.py),
+[library.py](../src/tango_posture/desktop_qt/screens/library.py) and
+[references.py](../src/tango_posture/desktop_qt/screens/references.py).
+
+Some retained labels mention practice/camera operations. A label, configuration
+field or importable class is not evidence that a shell route exists.
+
+## 2. Components and dependency boundaries
 
 ```mermaid
 flowchart TB
-    Entry["cli.py / packaged desktop entry"]
-    Shell["desktop_qt/main.py + shell.py<br/>QApplication, splash, rail, router"]
-    Views["desktop_qt/screens/<br/>Qt workspaces + About/Splash"]
-    QtServices["desktop_qt feature packages<br/>practice, calibration, review, library, analytics"]
-    Live["app.py<br/>capture / practice orchestration"]
-    References["references/<br/>import, provenance, analysis, comparison"]
-    Calibration["calibration/<br/>baselines, ranges, evidence, approval statistics"]
-    Engine["pose/, geometry.py, metrics.py, quality.py<br/>movement.py, temporal.py, session.py, beat.py"]
-    Persistence["archive.py, storage.py, review.py, reports.py"]
-    Files[("SQLite + .tp / .tpr / .tpc + exports")]
-    Optional["ollama.py / models.py / references/downloads.py<br/>explicit network operations"]
+    Entry["Console CLI / packaged entry"]
+    Shell["Qt launcher, MainWindow, Router"]
+    Views["Home, Library, Review, Analytics<br/>References, Settings, Coach, Help"]
+    Bridge["ServiceBridge<br/>Config and catalogue access"]
+    Adapters["Qt feature adapters<br/>review analysis, playback, library packaging"]
+    Import["analyse_imported_clip<br/>optional download + report adapter"]
+    Analysis["analyze_clip<br/>shared local clip analysis"]
+    Calibration["calibration/<br/>evidence, measurements, ranges, statistics"]
+    Engine["MediaPipe, geometry, quality<br/>temporal evaluation, movement"]
+    Persistence["Archives, reports, SQLite"]
+    Network["Optional model download<br/>online media adapters / Ollama"]
     Entry --> Shell --> Views
-    Shell --> QtServices
-    Views --> QtServices
-    QtServices --> Live
-    QtServices --> References
-    QtServices --> Calibration
-    Live --> Calibration
-    References --> Calibration
-    Live --> Engine
-    References --> Engine
-    Calibration --> Engine
-    Live --> Persistence
-    References --> Persistence
+    Views --> Bridge
+    Views --> Adapters
+    Views --> Calibration
+    Adapters --> Import --> Analysis
+    Adapters --> Analysis
+    Analysis --> Calibration
+    Analysis --> Engine
+    Import --> Persistence
+    Adapters --> Persistence
     Calibration --> Persistence
-    QtServices --> Persistence
-    Persistence --> Files
-    Views -. "user-requested actions" .-> Optional
+    Bridge --> Persistence
+    Analysis -. "missing selected model" .-> Network
+    Import -. "supported API request" .-> Network
+    Views -. "explicit report interpretation" .-> Network
 ```
 
-The diagram groups runtime collaboration; it is not an exhaustive Python import
-graph. For example, calibration readiness consumes the reference video's probe
-type, while the reference pipeline calls that readiness check.
+The diagram shows collaboration, not an exhaustive Python import graph.
+The Qt packaging adapter currently owns some substantial media orchestration;
+the repository is not a perfectly isolated ports-and-adapters implementation.
 
 ### Boundaries to preserve
 
-- **Views versus services:** screen layout and button handlers live in Qt;
-  pose calculations, calibration statistics, archive formats and download logic
-  do not import Qt.
-- **Calibration versus references:** a reference is replayable evidence.
-  A calibration is an approved interpretation of evidence for a particular view
-  and practice context. A profile does not need its source video to score.
-- **Measurement versus presentation:** raw landmarks supply measurements.
-  Smoothed display landmarks supply overlays. Mirroring changes presentation,
-  not the underlying measurement coordinate system.
-- **Observation versus evaluation:** stored head/shoulder/hip/torso/knee values
-  are not automatically calibrated scores. Approval, camera comparability,
-  confidence, model identity and view checks control evaluation.
-- **Archive versus database:** SQLite supports live sessions and export.
-  Library replay and portable Analytics use the selected archive's evidence;
-  they do not depend on the originating database.
-- **Deterministic feedback versus AI:** `references/coach.py` builds numerical
-  frame insights and overlays. It is not the Ollama client and makes no LLM
-  requests.
+1. **Widgets versus algorithms.** Keep pose geometry, quality checks, range
+   statistics, temporal evaluation and archive contracts out of screen layout
+   code. Workers report results; they do not manipulate widgets.
+2. **Analysis versus delivery.** The shared local analyzer returns structured
+   results. The import adapter writes reports; the Review adapter returns
+   in-memory data. Do not make Review generate temporary reports/databases just
+   to recover results that the analyzer already provides.
+3. **Evidence versus presentation.** Raw poses are measurement input.
+   Coordinate smoothing, mirroring and gap filling are not new observations.
+4. **Reference versus calibration.** A reference is replayable source evidence.
+   A calibration profile is an explicitly approved set of ranges with provenance
+   and applicability. They are different files and lifecycles.
+5. **Observation versus evaluation.** A measured angle is not automatically a
+   posture score. Model identity, quality, selected limits, view and applicable
+   camera approval determine whether evaluation is allowed.
+6. **Archive versus database.** Portable replay and archive Analytics must not
+   require the originating SQLite database.
+7. **Deterministic analysis versus generated commentary.** Frame insights,
+   steps, pivots and approved-range evaluation do not call Ollama.
 
-The [core package](../src/tango_posture/core/) supplies pure desktop state and
-other supporting models. [Contracts](../src/tango_posture/contracts/) define
-typed records for the desktop specification. They are **not** a separate running
-service or a universal RPC layer: the current application still uses
-[domain records](../src/tango_posture/domain.py), direct Python calls, queues,
-Qt signals and job-tagged worker events.
+The [contracts package](../src/tango_posture/contracts/) contains typed command,
+event and query records. It is not a running message broker, HTTP service or
+universal command bus. Current execution also uses direct calls, domain
+dataclasses, dictionaries, Qt signals and job-tagged tuples.
 
-## 2. Source map and relocation guide
+## 3. Source ownership map
 
-All paths below are relative to [the Python package](../src/tango_posture/).
+Paths are relative to [src/tango_posture/](../src/tango_posture/).
 
-```text
-tango_posture/
-  cli.py, desktop.py              CLI and packaged-app entry/configuration
-  app.py                         Shared capture/practice orchestration
-  config.py, domain.py            Validated configuration and shared records
-  calibration/
-    baseline.py                  Neutral-baseline capture and compatibility
-    models.py                    Passage, ApprovedRange, RangeProfile, metric identities
-    archives.py                  Version-2 .tpc profile serialization
-    evidence.py                  Cached raw landmarks and conservative dancer tracking
-    measurements.py              Confidence-qualified range measurements
-    statistics.py                Passage summaries and guided repeat checks
-    readiness.py                 Video/posture-analysis readiness checks
-  references/
-    archives.py                  .tpr creation and recording/excerpt promotion
-    links.py                     YouTube/Facebook URL validation and source clocks
-    downloads.py                 Cancellable yt-dlp adapters and download cache
-    video.py                     Video probe, range validation and virtual decoding
-    pipeline.py                  Reference clip-analysis orchestration
-    coach.py                     Cached posture insights and frame overlay rendering
-    coverage.py                  Measured evidence coverage by metric family
-    soundtrack.py                Optional decoded soundtrack/beat analysis
-    companions.py                Movement/coach JSON persistence and report lookups
-    comparison.py                Content-checked relinking and anchored clip comparison
-    results.py                   ImportedClipResult
-    worker.py                    Cancellable import/download threads
-    constants.py, errors.py       Shared import limits and cancellation exception
-  desktop_qt/
-    main.py, shell.py             Launch, navigation rail and window lifecycle
-    router.py, service_bridge.py  Route payloads, configuration and catalogue access
-    theme.py, navigation_icons.py Shared presentation
-    screens/
-      about.py, splash.py        About dialog and startup splash
-      home.py, practice.py       Landing page and live practice workspace
-      references.py, library.py  Calibration catalogue and portable-file library
-      review.py, analytics.py    Replay/analysis workspaces
-      coach.py, settings.py      Optional report interpretation and configuration
-      help.py                    Rendered/searchable manual
-    calibration/
-      editor.py                  Shared evidence/range approval dialog
-      guided.py                  Guided live-camera capture and repeat checks
-    practice/worker.py           Qt worker, thread and capture-evidence mailbox
-    review/
-      analysis.py                Review-to-reference-analysis adapter
-      playback.py                Owned readers, archives and timestamp mapping
-    library/archives.py          Report packaging
-    analytics/data.py            Read-only persisted-data projection
-    components/                  Reusable controls, video stage, cards and MetricChart
-  pose/                          MediaPipe adapter and named landmarks
-  geometry.py, quality.py         Pure geometry, confidence gates and trackers
-  metrics.py, temporal.py         Measurements and time-qualified feedback
-  movement.py                    Steps, pivots, movement evidence and floor rendering
-  capture.py, beat.py             Video input and audio/beat tracking
-  session.py, storage.py          Session lifecycle, SQLite and exports
-  archive.py                     Shared locked/atomic portable archive operations
-  replay.py, review.py            Video IO, report metadata and saved AI analyses
-  reports.py, overlay.py          Markdown reporting and shared drawing
-  practice.py, display.py         Shared display/control adapters
-  ollama.py                      Optional streaming HTTP client
-  models.py                      Verified model manifest and explicit download
-  tutorial_rendering.py          Shared Markdown/manual rendering
-  core/, contracts/              Pure desktop state and supporting typed records
-```
+| Area | Main owners | Responsibility |
+| --- | --- | --- |
+| Launch | [cli.py](../src/tango_posture/cli.py), [desktop.py](../src/tango_posture/desktop.py), [desktop_qt/main.py](../src/tango_posture/desktop_qt/main.py) | Console/package setup, QApplication, splash |
+| Desktop composition | [shell.py](../src/tango_posture/desktop_qt/shell.py), [router.py](../src/tango_posture/desktop_qt/router.py) | Navigation, workspace construction, route payload delivery |
+| Shared desktop services | [service_bridge.py](../src/tango_posture/desktop_qt/service_bridge.py) | Config notifications, archive/profile catalogues, Settings-default copy |
+| Screens and components | [screens/](../src/tango_posture/desktop_qt/screens/), [components/](../src/tango_posture/desktop_qt/components/) | Widgets, controls, video stages, reusable MetricChart |
+| Configuration and records | [config.py](../src/tango_posture/config.py), [domain.py](../src/tango_posture/domain.py) | Validated Settings, pose/quality/calibration/event records |
+| Local clip analysis | [references/pipeline.py](../src/tango_posture/references/pipeline.py), [results.py](../src/tango_posture/references/results.py) | Shared analyzer, report-producing adapter, typed results/provenance |
+| Source acquisition | [references/links.py](../src/tango_posture/references/links.py), [downloads.py](../src/tango_posture/references/downloads.py), [video.py](../src/tango_posture/references/video.py), [worker.py](../src/tango_posture/references/worker.py) | URL/provenance rules, optional download, probing/decoding, cancellation |
+| Cached frame insights | [references/coach.py](../src/tango_posture/references/coach.py), [coverage.py](../src/tango_posture/references/coverage.py), [companions.py](../src/tango_posture/references/companions.py) | Deterministic posture layers, coverage and report companion IO |
+| Reference media | [references/archives.py](../src/tango_posture/references/archives.py), [comparison.py](../src/tango_posture/references/comparison.py) | Promotion/provenance, lower-level anchored comparison/relinking |
+| Calibration | [calibration/](../src/tango_posture/calibration/) | Models, archives, raw evidence, measurements, readiness and statistics |
+| Calibration UI | [editor.py](../src/tango_posture/desktop_qt/calibration/editor.py), [guided.py](../src/tango_posture/desktop_qt/calibration/guided.py) | Reachable reference editor; retained guided camera dialog |
+| Model execution | [models.py](../src/tango_posture/models.py), [pose/](../src/tango_posture/pose/) | Verified assets, MediaPipe adapter, named points, display interpolation |
+| Measurement/evaluation | [geometry.py](../src/tango_posture/geometry.py), [metrics.py](../src/tango_posture/metrics.py), [quality.py](../src/tango_posture/quality.py), [temporal.py](../src/tango_posture/temporal.py) | Geometry, quality gates, filters and event persistence |
+| Offline movement | [movement.py](../src/tango_posture/movement.py) | Foot placements, pivots, validation, floor/ring/footprint rendering |
+| Review adapters | [review/analysis.py](../src/tango_posture/desktop_qt/review/analysis.py), [review/playback.py](../src/tango_posture/desktop_qt/review/playback.py) | In-memory reanalysis adapter, owned readers/archive/timeline |
+| Library packaging | [library/archives.py](../src/tango_posture/desktop_qt/library/archives.py) | Clip rendering, frame rebasing, portable-file assembly |
+| Saved Analytics | [analytics/data.py](../src/tango_posture/desktop_qt/analytics/data.py) | Read-only saved-data projection |
+| Persistence | [archive.py](../src/tango_posture/archive.py), [storage.py](../src/tango_posture/storage.py), [review.py](../src/tango_posture/review.py), [reports.py](../src/tango_posture/reports.py) | ZIP contracts, SQLite sessions, report metadata/AI companions, Markdown |
+| Capture/practice | [app.py](../src/tango_posture/app.py), [capture.py](../src/tango_posture/capture.py), [practice.py](../src/tango_posture/practice.py), [session.py](../src/tango_posture/session.py) | Retained live/file orchestration, mailbox display, scoring, recording |
+| Camera worker/state | [practice/worker.py](../src/tango_posture/desktop_qt/practice/worker.py), [core/session_state.py](../src/tango_posture/core/session_state.py) | Retained QThread adapter and immutable control-state transitions |
+| Audio | [beat.py](../src/tango_posture/beat.py), [references/soundtrack.py](../src/tango_posture/references/soundtrack.py) | Live music helpers and optional offline soundtrack analysis |
+| Replay/drawing | [replay.py](../src/tango_posture/replay.py), [overlay.py](../src/tango_posture/overlay.py) | Video readers/writers and common overlay primitives |
+| Optional language model | [ollama.py](../src/tango_posture/ollama.py), [screens/coach.py](../src/tango_posture/desktop_qt/screens/coach.py) | HTTP protocol versus UI request lifecycle |
+| Help | [tutorial_rendering.py](../src/tango_posture/tutorial_rendering.py), [screens/help.py](../src/tango_posture/desktop_qt/screens/help.py) | Markdown rendering, search and setting targets |
 
-`__init__.py` files establish real Python packages. Most do not eagerly import
-their submodules. The calibration package exposes the established baseline
-functions through an explicit public API; implementation imports use the
-specific owning modules.
+### Relocated modules
 
-### Old to new locations
+The old monolithic names are not compatibility shims:
 
-| Previous location | Current owner |
+| Old location | Current location |
 | --- | --- |
 | `calibration.py` | [calibration/baseline.py](../src/tango_posture/calibration/baseline.py) |
-| `range_profiles.py` | [calibration/](../src/tango_posture/calibration/): models, archives, evidence, measurements, statistics |
+| `range_profiles.py` | [calibration/](../src/tango_posture/calibration/) |
+| `reference_import.py` | [references/](../src/tango_posture/references/) and [calibration/readiness.py](../src/tango_posture/calibration/readiness.py) |
 | `reference_archives.py` | [references/archives.py](../src/tango_posture/references/archives.py) |
-| `reference_import.py` | [references/](../src/tango_posture/references/) feature modules, plus [calibration/readiness.py](../src/tango_posture/calibration/readiness.py) |
-| `desktop_qt/about.py`, `splash.py` | [screens/about.py](../src/tango_posture/desktop_qt/screens/about.py), [screens/splash.py](../src/tango_posture/desktop_qt/screens/splash.py) |
-| `desktop_qt/calibration_editor.py`, `guided_calibration.py` | [calibration/editor.py](../src/tango_posture/desktop_qt/calibration/editor.py), [calibration/guided.py](../src/tango_posture/desktop_qt/calibration/guided.py) |
-| `desktop_qt/practice_worker.py` | [practice/worker.py](../src/tango_posture/desktop_qt/practice/worker.py) |
-| `desktop_qt/review_analysis.py`, `review_playback.py` | [review/analysis.py](../src/tango_posture/desktop_qt/review/analysis.py), [review/playback.py](../src/tango_posture/desktop_qt/review/playback.py) |
-| `desktop_qt/library_archives.py` | [library/archives.py](../src/tango_posture/desktop_qt/library/archives.py) |
-| `desktop_qt/analytics_data.py` | [analytics/data.py](../src/tango_posture/desktop_qt/analytics/data.py) |
-| `MetricChart` inside the Analytics screen | [components/metric_chart.py](../src/tango_posture/desktop_qt/components/metric_chart.py) |
+| Flat Qt calibration/practice/review/library/analytics helper modules | Corresponding feature packages under [desktop_qt/](../src/tango_posture/desktop_qt/) |
 
-The old monolithic reference/range modules are removed, not retained as import
-shims. External Python integrations must update those module paths. This does
-not change the CLI entry points or serialized archive formats. The roughly
-3,400-line reference importer is now divided by responsibility; the calibration
-editor no longer imports a chart from another workspace screen.
+Import the owning module. If moving code again, update production imports,
+tests and module-qualified monkeypatch targets together. Do not import a chart
+from an unrelated screen when a reusable component already exists.
 
-Large but cohesive orchestrators, such as `Application` and `ReviewScreen`,
-remain intact rather than being split into inheritance mixins solely to reduce
-line counts.
+## 4. Domain records and analysis results
 
-## 3. Domain model and portable files
+### Core records
 
-### UML class view
+| Record | Purpose |
+| --- | --- |
+| `Landmark` | x/y, optional visibility, presence and predicted z |
+| `FrameObservation` | Timestamp, dimensions, image poses and separate world poses |
+| `QualityResult` | Validity plus an explicit reason and optional view width |
+| `MetricObservation` | Timestamped values/quality and view information |
+| `Calibration` | Existing runtime baseline/target envelope and identity |
+| `Passage` | Validated example interval |
+| `ApprovedRange` | Bounds, unit, view, passages, statistics and camera-check flag |
+| `RangeProfile` | Versioned approved metric set, model/capture identity and provenance |
+| `DeviationEvent` | Onset, detection time, peak, end and end reason |
 
-This view shows selected actual records and collaborations, not every field.
+`RangeProfile.calibration()` embeds its serialized profile in
+`Calibration.review["range_profile"]`. This lets the session/storage system
+recognize approved ranges without inventing a second SQLite calibration schema.
 
 ```mermaid
 classDiagram
-    class Landmark {
-        +float x
-        +float y
-        +visibility
-        +presence
-        +z
-    }
     class FrameObservation {
-        +float timestamp
-        +int width
-        +int height
-        +poses
-        +world_poses
+        timestamp
+        width
+        height
+        poses
+        world_poses
     }
-    class MetricObservation {
-        +float timestamp
-        +values
-        +quality
-    }
-    class QualityResult {
-        +bool valid
-        +str reason
-    }
-    class Calibration {
-        +str id
-        +str name
-        +profile
-        +baseline
-        +quality
-        +str model_hash
-        +str metric_version
-        +review
+    class Landmark {
+        x
+        y
+        visibility
+        presence
+        z
     }
     class RangeProfile {
-        +str name
-        +str context
-        +str measurement_version
-        +capture_profile
-        +source
-        +metrics
-        +camera_checks
-        +calibration() Calibration
+        measurement_version
+        model_hash
+        capture_profile
+        source
+        metrics
+        calibration()
     }
     class ApprovedRange {
-        +float lower
-        +float upper
-        +str unit
-        +str view
-        +float valid_duration
-        +bool camera_check_passed
+        lower
+        upper
+        unit
+        view
+        passages
+        camera_check_passed
     }
-    class Passage {
-        +float start
-        +float end
+    class Calibration {
+        profile
+        baseline
+        quality
+        review
     }
-    class Evidence {
-        +frames
-        +str model_hash
-        +capture_profile
-        +source
-        +float max_gap
+    class RunManifest {
+        model_variant
+        model_hash
+        source_sha256
+        selected_in
+        selected_out
     }
-    class Session {
-        +evaluators
-        +rows
-        +pause()
-        +resume()
-        +finish()
+    class ClipAnalysisResult {
+        manifest
+        frame_observations
+        coach_data
+        movement_data
+        coverage
+        performance
     }
-    class PracticeArchive {
-        +path
-        +manifest
-        +folder
-        +report(index)
-        +close()
-    }
-    FrameObservation "1" *-- "0..*" Landmark : poses
-    MetricObservation "1" *-- "*" QualityResult
-    Evidence "1" *-- "*" FrameObservation
+    FrameObservation "1" *-- "*" Landmark : image/world poses
     RangeProfile "1" *-- "1..*" ApprovedRange
-    ApprovedRange "1" *-- "1..*" Passage : examples
-    RangeProfile ..> Calibration : embeds range payload in review
-    Session --> Calibration : accepted target
-    Session ..> MetricObservation : consumes
-    PracticeArchive ..> Evidence : cached analytics supplies
+    RangeProfile ..> Calibration : runtime conversion
+    ClipAnalysisResult "1" *-- "1" RunManifest
+    ClipAnalysisResult "1" o-- "*" FrameObservation
 ```
 
-Definitions live in [domain.py](../src/tango_posture/domain.py),
-[calibration/models.py](../src/tango_posture/calibration/models.py),
-[calibration/evidence.py](../src/tango_posture/calibration/evidence.py),
-[session.py](../src/tango_posture/session.py) and
-[archive.py](../src/tango_posture/archive.py).
+### Three important offline result types
 
-### File contracts
+[references/results.py](../src/tango_posture/references/results.py) separates:
 
-| File | Meaning | Persisted content and compatibility |
+- **RunManifest:** frozen record of model variant/hash, metric identity, capture
+  setup, source hash/name, dimensions, selected interval and execution metadata.
+- **ClipAnalysisResult:** in-memory analysis output, including frame evidence,
+  posture/movement data, coverage, soundtrack summary and optional session
+  results.
+- **ImportedClipResult:** delivery result with report/metadata/companion paths,
+  source information and optional online provenance.
+
+`analyze_clip` is also exported as `analyse_clip`. `analyse_imported_clip` is a
+different adapter, not merely a spelling alias.
+
+Frozen dataclasses prevent field reassignment; their nested dictionaries/lists
+are not recursively immutable. Snapshot configuration and copy mutable payloads
+where an asynchronous consumer needs isolation.
+
+The analyzer performs IO: decoding, hashing, model lookup and possibly model
+download. "In-memory result" means it does not itself require report files or a
+temporary database. It is not a pure mathematical function, and an explicitly
+supplied Storage can receive applicable session writes.
+
+## 5. Evidence, coordinates and time
+
+### Raw and derived pose layers
+
+| Field/layer | Intended use | Invariant |
 | --- | --- | --- |
-| `.tp` | Practice session | Version-1 ZIP manifest; indexed recordings, reports, timestamps and analytics. Multiple recordings can append to the same named practice. |
-| `.tpr` | Reference recording | Version-1 ZIP, kind `reference`, one recording, indexed replay assets/analytics, and `reference.json` with source/excerpt and optional dancer-selection details. |
-| `.tpc`, version 2 | Approved calibration profile | Manifest plus `profile.json`; no recording segments. Contains ranges, units, applicable views/context, coverage, measurement/model identity, provenance and camera checks. |
-| `.tpc`, version 1 | Legacy neutral baseline | Baseline calibration plus replay recording. Remains readable for compatibility. |
+| `measurement_poses` | Raw cached detector evidence | Required for approved calibration/comparison |
+| `poses` | Historical display-smoothed layer | Not a substitute for raw evidence |
+| `display_poses` | Derived Review gap-filled drawing | Must not contribute synthetic scoring coverage |
+| `world_poses` | Model-estimated 3D geometry | Not calibrated room/floor coordinates |
 
-An indexed practice/reference recording can contain:
+The backend retains 19 named landmarks from MediaPipe's 33-point output.
+Image x/y are normalized. Drawing converts them to pixels. Model depth/world
+estimates are distinct from image geometry and are not physical ground truth.
+
+The strict [quality helper](../src/tango_posture/quality.py) requires finite,
+in-image x/y and usable visibility/presence. Older descriptive helpers and
+offline movement have different local policies; there is no universal
+confidence gate governing every line and label.
+
+### Display changes must not rewrite evidence
+
+Review interpolation is bracketed, 2D and display-only:
+
+- Linear by default; optional quadratic with linear fallback.
+- Default maximum gap 3 seconds; zero disables filling.
+- No extrapolation at clip edges.
+- Segment breaks for ambiguous multiperson or invalid/nonincreasing timing.
+- Filled display points do not supply detector confidence or depth evidence.
+
+Live coordinate smoothing is separate. Its output can trail current pixels;
+Review therefore prefers same-frame raw evidence plus its derived interpolation
+instead of reusing a causally delayed display skeleton.
+
+### Time domains
+
+| Time domain | Owner/use |
+| --- | --- |
+| Source presentation time | Video probing and ordered clip decoding |
+| Clip-local time | Selected excerpt and packaged recording |
+| Observation time | Timestamped raw measurements and temporal evaluation |
+| Frame-index/FPS time | Offline movement event basis |
+| Monotonic capture/processing time | Retained live engine and latency measurements |
+| GUI playback time | Reader/timer transport and synchronization |
+
+Do not silently substitute one for another.
+
+The MediaPipe VIDEO adapter uses strictly increasing detector milliseconds:
+`max(previous_ms + 1, round(timestamp * 1000))`. It preserves the original
+observation timestamp separately.
+
+Packaging rebases source frame keys, cuts and movement events into the selected
+clip's frame indices. Stored timestamps also matter for recordings with pauses
+or timing gaps. Review warns and uses an FPS timeline when stored timestamps do
+not match the video frame count; timestamp-dependent navigation must not claim
+precision that the fallback cannot support.
+
+## 6. Configuration and model lifecycle
+
+### Configuration flow
+
+[Config](../src/tango_posture/config.py) validates values with Pydantic,
+rejecting unknown keys and invalid/nonfinite values. Entry/clear ordering,
+calibration durations and default metric units have explicit validation.
+
+Settings builds 11 groups from `SETTING_GROUPS`, plus the generated
+**Calibration defaults** tab. Grouped fields include retained camera/music
+options; exposing them does not create corresponding desktop routes.
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant UI as SettingsScreen
+    participant Config
+    participant Bridge as ServiceBridge
+    participant File as QSaveFile
+    User->>UI: edit values
+    UI->>Config: validate collected values
+    alt invalid
+        Config-->>UI: error
+        UI-->>User: status, keep previous configuration
+    else valid
+        UI->>Bridge: update_config
+        Bridge-->>UI: config_changed
+        opt Apply and Save confirmed
+            UI->>Bridge: save_settings(destination)
+            Bridge->>File: write and commit TOML atomically
+            File-->>UI: success or explicit write failure
+        end
+    end
+```
+
+Important semantics:
+
+- **Apply Settings:** current in-memory configuration only.
+- **Settings TOML:** exports registered editable fields plus Calibration defaults,
+  not the complete internal Config model. Old baseline-only controls and the
+  three legacy per-metric entry/clear pairs are absent from Settings/templates/new
+  exports; older files remain loadable for retained baseline code. Preserve an
+  original legacy file if its nondefault baseline parameters are still needed.
+  Camera device/resolution/mirroring and microphone/automatic-recording controls
+  are also absent from current Settings and new exports. Their backend fields
+  remain for retained-service compatibility. The Music tab's fallback tempo is
+  still used by current offline processing and is distinct from the slow-tango
+  lift ceiling.
+- **Apply & Save settings.toml:** confirms the resolved working-directory path,
+  applies first, then saves. A save error can leave valid new settings applied
+  but unsaved.
+- **Use as Settings defaults:** copies approved bounds/units/views into a
+  replacement default-range set. It saves successfully before publishing the
+  new configuration.
+- **Export TOML:** applies valid edits and writes to the chosen destination.
+- **Import TOML:** validates a chosen file before publishing it.
+- **Reset Defaults:** resets current configuration, not archives/saved files.
+
+The save destination is not derived from `data_dir`. Ordinary startup does not
+implicitly load every file named settings.toml; use CLI `--config` before the
+subcommand or the desktop import action.
+
+Analysis jobs receive configuration snapshots. `config_changed` refreshes
+relevant current UI/comparison layers but does not mutate an in-flight job's
+snapshot or rewrite archived raw evidence.
+
+### Model preparation
+
+[models.py](../src/tango_posture/models.py) and the packaged
+[manifest](../src/tango_posture/model_manifest.json) own supported variants,
+filenames, source URLs and pinned checksums.
+
+Offline `analysis_model` is `lite`, `full` or `heavy`, default Lite.
+The retained live/guided backend uses Lite.
+
+Before offline download, resolution checks known candidates in order:
+
+1. The selected variant's primary destination: configured `model_path` for Lite,
+   or the data-directory model cache for Full/Heavy.
+2. The data-directory model cache.
+3. The configured model file's directory.
+4. The working directory's models folder.
+
+The first existing candidate must verify. A corrupt file is an explicit error,
+not permission to choose another variant or overwrite it silently.
+Valid local files are reused in place; there is no whole-disk discovery.
+
+Missing selected weights download in the analysis job to a temporary file,
+with progress and cooperative cancellation. Verification precedes replacement
+of the destination. Temporary download files are cleaned on exit.
+
+The backend explicitly uses CPU, VIDEO running mode and up to two poses.
+Two-pose detection is not stable person identity or two-person scoring.
+Changing today's selected model does not update old caches; rerun analysis.
+
+## 7. Library import and packaging
+
+The reachable UI is **Library > Import & Analyze Video...**, which opens a
+local-file picker and a title/start/end dialog. The selected interval is limited
+to 120 seconds. Source validation/probing also enforces applicable media limits.
+
+**Import as reference** selects `.tpr`; otherwise the result is a `.tp`.
+The original video is not modified in place.
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant UI as LibraryScreen
+    participant Worker as ReferenceImportWorker
+    participant Import as analyse_imported_clip
+    participant Core as analyze_clip
+    participant Pose as MediaPipe and deterministic engines
+    participant Package as archive_report
+    participant Archive as Archive services
+    User->>UI: choose local video, title and interval
+    UI->>Worker: start with Config snapshot and job ID
+    Worker->>Import: analyze request
+    Import->>Core: validated local clip and delivery context
+    Core->>Core: establish source identity and prepare selected model
+    loop ordered decoded frames
+        Core->>Pose: infer raw frame observation
+        Pose-->>Core: image/world poses
+    end
+    Core->>Core: posture, movement, coverage and RunManifest
+    Core-->>Import: ClipAnalysisResult
+    Import->>Import: write report and companions
+    Import-->>UI: job-tagged ImportedClipResult
+    UI->>Package: background packaging
+    Package->>Package: trim/render streams and rebase evidence
+    Package->>Archive: commit indexed assets and provenance
+    Archive-->>UI: completed portable archive
+    UI->>UI: refresh Library and open Review
+```
+
+### Shared analyzer
+
+`analyze_clip` probes/validates the interval, checks analysis readiness, hashes
+the source, resolves the selected model, and decodes the chosen frames once.
+
+It retains raw observations and reuses them for deterministic posture helpers
+and `analyse_movement_observations`. The shared route passes movement
+`sample_stride=1`; it is not the standalone sampled scanner.
+
+`analysis_mode="movement"` does not require an approved calibration.
+The lower-level posture mode can use a reference or accepted baseline interval.
+Do not confuse that API capability with the current Library dialog's choices.
+
+Soundtrack analysis is optional at the service level. Current Library import
+and Review reanalysis explicitly disable it.
+
+### Delivery and packaging adapters
+
+`analyse_imported_clip` adds optional online acquisition/provenance and report,
+metadata and coaching/movement companions around the shared analyzer.
+It retains storage-related compatibility behaviour; Review deliberately calls
+the in-memory analyzer through its own adapter instead.
+
+`archive_report` reads those companions, renders raw/overlay/floor-lines media,
+and packages indexed evidence. It copies/rebases frame keys and movement data,
+updates clipped-media hashes, and retains original source provenance separately.
+
+Analysis completion and archive commit are separate phases. Cancellation or an
+error must not be presented as a completed Library import before packaging
+finishes.
+
+### Catalogue operations
+
+Library combines case-insensitive name search with `.tp`, `.tpr`, `.tpc` or
+all-types filtering.
+
+- **Rename:** updates the persisted display name, not the physical filename.
+- **Delete:** asks for confirmation, then uses instance `QFile.moveToTrash`
+  under the archive lock. Failure is reported; imported originals are not
+  recursively deleted.
+- **Promote to Reference:** creates a separate `.tpr` from a recording/excerpt,
+  carrying/rebasing available evidence and preserving the source.
+- **Create calibration:** opens the shared editor for a `.tpr`.
+- **Profile details / Use as Settings defaults:** operate on profile-only files.
+
+Promotion is not calibration approval. A replayable reference does not become
+a scoring target merely because its extension changed.
+
+## 8. Calibration and comparison policy
+
+### From evidence to an approved profile
+
+```mermaid
+flowchart LR
+    Reference["Library .tpr"]
+    Cache["Validate cached raw evidence"]
+    Track["Choose dancer and restart anchors"]
+    Examples["Select passages and inspect statistics"]
+    Approve["Approve or skip each metric"]
+    Profile["New version-2 .tpc"]
+    Compare["Compatible offline comparison"]
+    Defaults["Optional Settings defaults"]
+    Reference --> Cache --> Track --> Examples --> Approve --> Profile
+    Profile --> Compare
+    Profile --> Defaults
+```
+
+[CalibrationEditor](../src/tango_posture/desktop_qt/calibration/editor.py)
+opens reference media plus validated raw evidence. Its core services are:
+
+- [evidence.py](../src/tango_posture/calibration/evidence.py): cache identity,
+  dimensions/timing/raw-pose validation and conservative spatial association.
+- [measurements.py](../src/tango_posture/calibration/measurements.py): native
+  metric values with confidence/view rules.
+- [statistics.py](../src/tango_posture/calibration/statistics.py): passage
+  summaries, coverage, distributions and retained guided repeat checks.
+- [archives.py](../src/tango_posture/calibration/archives.py): profile persistence.
+
+The editor does not rerun inference whenever a bound changes. It derives
+statistics from cached raw observations.
+
+Dancer association uses reliable hip centres, a strict nearest-distance limit
+below 0.15, separation from a second candidate above 0.03, and the cached gap
+limit. Loss/ambiguity ends a segment; there is no silent switch to another
+person. Explicit restart anchors require user confirmation of linked identity.
+
+Users select example passages separately from acceptable bounds. The median,
+p10/p90 and middle-80-percent suggestion describe selected evidence, not correct
+tango technique. Angular wrap handling is metric-specific.
+
+Saving rechecks source archive identity, confirmed dancer selection and at
+least one approved metric. It creates a distinctly named profile rather than
+overwriting an existing one.
+
+### Registered range metrics
+
+| Key | Label | Unit |
+| --- | --- | --- |
+| `head_pitch` | Head pitch (ear-to-nose) | degrees |
+| `head_forward` | Head-forward offset | torso_lengths |
+| `head_inclination` | Head inclination | degrees |
+| `shoulder_clearance` | Ear-to-shoulder clearance | normalized_clearance |
+| `hip_offset` | Hip offset from ankle-to-head axis | axis_lengths |
+| `torso_axis_tilt` | Torso axis tilt (pink line) | degrees |
+| `trunk_inclination` | Trunk inclination | degrees |
+| `knee_flexion` | Least-bent reliably visible knee | degrees |
+
+The pink axis measures absolute projected shoulder-midpoint-to-hip-midpoint
+tilt from image vertical. It requires both shoulders and both hips.
+It is distinct from trunk inclination and the older `axis_curve_*` hip-offset
+controls. It is not a spine-curvature or balance measurement.
+
+Approved head pitch uses the raw ear-to-nose angle, shoulder clearance a native
+ratio, and hip offset a raw signed ratio. Do not reuse older neutral-adjusted
+overlay values or warning percentages as their approved-range units.
+
+### Target precedence
+
+| Situation | Evaluation source |
+| --- | --- |
+| Selected approved profile | Its approved metrics/ranges only |
+| No profile, nonempty Calibration defaults | Enabled default ranges only |
+| Neither | Applicable older Settings-based descriptive/threshold behaviour |
+
+Missing, skipped or unapproved metrics do not fall back to older warning
+thresholds when a profile/default-range set is active. Invalid/incompatible
+selected evidence is an error, not permission to silently use Settings.
+
+Unknown measurements remain unknown regardless of how permissive the limits
+are.
+
+### Offline comparison versus retained live approval
+
+Review comparison applies compatible raw evidence, model/measurement identity,
+side/facing/view rules and approved bounds. It does not grant camera approval.
+Compatible video-derived profiles can be compared without being live-scoring
+targets.
+
+The retained live Session only constructs range evaluators for metrics whose
+`camera_check_passed` flag is true. Its guided workflow requires repeatability
+evidence plus explicit approval; copying bounds to Settings does not transfer
+that approval.
+
+The camera dialog/check machinery remains in source, but the current shell
+does not expose it through Library or References. Document a restored entry
+point explicitly if one is added; do not imply that changing a profile flag is
+a supported substitute.
+
+## 9. Review, playback and reanalysis
+
+### Ownership and transport
+
+[ReviewPlayback](../src/tango_posture/desktop_qt/review/playback.py) owns readers,
+the opened archive and extracted media. The Review screen owns transport
+controls, layer selection, current comparison state and job presentation.
+
+The UI selects Library archives with recording segments; profile-only `.tpc`
+files are excluded. Lower-level replay helpers also retain standalone
+video/report capabilities, which do not imply an additional visible file-import
+workflow.
+
+Streams include available raw, overlay and floor-lines variants. Play, pause,
+frame stepping, speed and scrubbing operate on the selected reader/timeline.
+Report timestamp links seek that recording, not an arbitrary matching filename.
+
+### Explicit reanalysis
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant UI as ReviewScreen
+    participant Job as Analysis thread
+    participant Adapter as analyse_review_clip
+    participant Core as analyze_clip
+    participant Archive as store_analytics
+    User->>UI: Analyze posture and movement
+    UI->>Job: snapshot Config, segment, timestamps and acquire archive lease
+    Job->>Job: hash extracted raw video
+    Job->>Adapter: analyze supported clip interval
+    Adapter->>Core: local in-memory analysis, soundtrack disabled
+    Core-->>Adapter: ClipAnalysisResult
+    Adapter-->>Job: ReviewAnalysis with RunManifest
+    Job->>Job: acquire commit lock and check cancellation/current job
+    opt still current and supported archive
+        Job->>Archive: indexed analytics and expected raw-video hash
+        Archive->>Archive: verify archived video and perform locked atomic rewrite
+    end
+    Job-->>UI: job-tagged done, error or cancellation
+    Job->>Job: release archive lease
+    UI->>UI: update comparison/display layers for current frame
+```
+
+The Review adapter calls `analyze_clip` directly; it does not round-trip through
+`analyse_imported_clip`, temporary reports or an import database.
+Current UI analysis uses up to the supported 120-second interval from the
+opened raw clip.
+
+The worker holds an archive lease so navigating away cannot delete extracted
+input while inference still uses it. Cancellation and the active job identifier
+are checked under the commit lock before persistence. `expected_video_sha256`
+prevents committing results against different archived raw media.
+
+Results update the selected recording's indexed analytics. They do not rewrite
+raw video, automatically approve calibration, or rerender every baked overlay
+stream.
+
+### Dynamic layers and comparison
+
+The **Calibration profile** picker builds derived comparisons from raw cached
+evidence. **No calibration (use Settings)** means configured default ranges when
+enabled, otherwise older Settings insights.
+
+Dynamic skeletons use same-frame raw poses with optional display-only gap
+filling. Numeric comparison and coverage do not consume those synthetic joints.
+Old display-only caches can render but need reanalysis for approved comparison.
+
+An overlay stream already contains painted pixels; a new selector cannot remove
+them. Use raw/source media for current dynamic calibration comparison.
+
+**Open Comparison** owns a second playback instance. It synchronizes by elapsed
+playback time, not semantic movement alignment. The lower-level anchored
+comparison API is separate.
+
+Exports write chosen replay/layer output without replacing original archive
+media. Navigating away releases playback resources, cancels analysis and retains
+the path needed to reopen; it is not just hiding an indefinitely active reader.
+
+## 10. Movement and presentation
+
+[movement.py](../src/tango_posture/movement.py) contains both detection and
+drawing helpers. It is a module, not a package or external service.
+
+### Detection
+
+- **Scale/continuity:** estimates projected body scale and detects excessive
+  image/scale jumps.
+- **Steps:** per-foot INITIAL/ANCHORED/MOVING/SETTLING state machines require
+  usable ankle/heel/toe geometry, travel, settling and applicable extension/lift
+  checks.
+- **Pivots:** predicted horizontal hip direction, angular unwrapping,
+  rate/rotation windows and stable projected foot-anchor evidence.
+
+The shared analyzer reuses decoded raw observations. The separate
+`scan_video_movement` API can sample around a target rate with stride rounding;
+its default 15-FPS target does not govern every Qt analysis.
+
+The lower-level movement coordinator has its own single-worker bounded queue.
+It is not the universal job system for the Library and Review screens.
+
+Internal `DETECTOR_CONFIG` values are not desktop Settings fields. Overrides
+alter the detector fingerprint; cache validation expects supported detector
+semantics. Do not add a GUI tuning field without updating call sites,
+provenance and compatibility rules.
+
+### Presentation
+
+Floor grids are decorative image-space geometry, not calibrated floor
+reconstruction. Rings additionally need per-frame hip geometry; an existing
+pivot event can temporarily have no drawable ring.
+
+Footprints use saved placement geometry and fade over media time according to
+`replay_step_history_seconds`. Layer checkboxes change rendering, not stored
+event counts.
+
+Hip-display interpolation within movement uses its own short gap policy,
+separate from Review joint interpolation. General Mirror is not a universal
+replay transformation; inspect the actual renderer arguments.
+
+Step placement is not force/contact sensing. Pivot support labels are projected
+stability heuristics, not measurements of weight bearing.
+
+## 11. Persistence and archive integrity
+
+### Portable file contracts
+
+| Format | Meaning | Important compatibility distinction |
+| --- | --- | --- |
+| `.tp` | Practice archive; version-1 ZIP manifest and indexed segments | Can contain multiple recordings |
+| `.tpr` | Replayable reference; version-1 ZIP, kind reference | Includes source/excerpt provenance in `reference.json` |
+| Version-2 `.tpc` | Approved range profile | `profile.json`, ranges/provenance/checks; no recording segments |
+| Version-1 `.tpc` | Legacy baseline recording | Remains readable; not identical to a profile-only archive |
+
+A recording can have members such as:
 
 ```text
 manifest.json
@@ -315,762 +800,351 @@ lines_00.mp4
 report_00.md
 report_00.metadata.json
 analytics_00.json
+movement_00.v1.json
 ```
 
-Media/analytics members are optional where the original recording did not produce
-them; the manifest is authoritative. Legacy companion/lines filenames are still
-readable. Further recordings use `01`, `02`, etc. Movement data may also have an
-indexed `movement_00.v1.json` companion. Saved Ollama analyses are separate
-report-digest-bound JSON members, not numeric `analytics_00.json` replacements.
+The manifest and available evidence are authoritative. Not every archive has
+every optional stream/companion. Subsequent recordings use indices `01`, `02`,
+and so on. A profile instead stores its profile payload, and a reference adds
+its reference descriptor.
 
-The shared archive layer validates members before temporary extraction, serializes
-writers with per-path reentrant locks, and replaces completed temporary archives
-atomically. On platforms with `fcntl`, it also attempts an advisory file lock;
-this is not a universal cross-process transaction guarantee. Windows replacement
-retries handle transient reader/scanner interference.
+Saved AI interpretations are report-digest-bound companions, not replacements
+for numerical analytics.
 
-Calibration profile archives are written by
-[calibration/archives.py](../src/tango_posture/calibration/archives.py), using the
-same lock/replacement helpers. Existing profile names are rejected rather than
-overwritten. A `RangeProfile` becomes a runtime `Calibration` through
-`Calibration.review["range_profile"]`, preserving the existing SQLite schema.
+### Integrity and lifetime rules
 
-Display-name edits change the manifest, not the physical filename.
-Recording evidence and source hashes remain separate from mutable display names.
+[archive.py](../src/tango_posture/archive.py) owns shared locking, validation,
+extraction and replacement:
 
-## 4. Threads, state and resource ownership
+- Validate archive/member paths before extraction, including traversal,
+  absolute/backslash paths, duplicate names and symlinks.
+- Serialize mutation with per-path reentrant locks.
+- Attempt advisory file locking where `fcntl` is available; this is not a
+  universal distributed/cross-process transaction system.
+- Write completed replacement archives before atomic replacement.
+- Retry applicable Windows replacement interference.
+- Check expected source/member hashes for operations that supply them.
 
-| Owner | Execution and communication | Cleanup / rejection of stale work |
+`PracticeArchive` extracts into an owned temporary directory. `acquire()` adds a
+lease; `close()` releases one. Cleanup happens only when the last lease closes.
+Every worker retaining an extracted input beyond the caller's lifetime must
+release its lease in `finally`.
+
+An atomic archive replacement does not make an entire multi-step import one
+database transaction. Distinguish preparation, report creation, media rendering
+and final archive commit.
+
+### SQLite and reports
+
+[Storage](../src/tango_posture/storage.py) opens `tango.sqlite3` under its supplied
+data directory and manages schema-version-1 calibrations, sessions, observations
+and events. It supports retained practice/session writes and export.
+
+The [Database maintenance screen](../src/tango_posture/desktop_qt/screens/database.py)
+inspects `<config.data_dir>/tango.sqlite3` without creating a missing database.
+It requires an acknowledgement, the exact phrase `DELETE ALL DATA`, and a final
+default-No confirmation. No automatic backup is created. The shell blocks cleanup
+while Library import/packaging/promotion or Review analysis is active, and the
+screen rechecks that guard and the configured target after the confirmation.
+Other app/CLI processes must be stopped by the user.
+
+The maintenance functions in [storage.py](../src/tango_posture/storage.py) require
+schema version 1 and use a `BEGIN IMMEDIATE` transaction with foreign keys enabled.
+They count and delete events and observations before sessions and calibrations,
+verify all four tables are empty, and roll back on failure. The database, schema,
+indexes and schema version remain; no archive, profile, video or report files
+are removed. Inspection uses a read-only connection; cleanup requires an existing
+file. Unsupported schemas, lock conflicts and other errors are reported explicitly.
+
+Portable playback and archive Analytics use selected archive evidence rather
+than requiring that database. Some lower-level Analytics APIs can read a local
+database snapshot; they are not the current workspace's archive-only contract.
+
+Markdown reports, metadata and coaching/movement companions remain separate
+delivery artifacts until packaging. Source hashes, archived clip hashes, report
+digests and mutable display names have different meanings; do not substitute
+one for another.
+
+## 12. Concurrency and resource ownership
+
+| Owner | Execution/communication | Lifetime and stale-work rules |
 | --- | --- | --- |
-| `MainWindow`, screens, dialogs | Qt GUI thread; Router signals and route payloads | Navigating away stops Practice; window close waits for the active practice worker |
-| `PracticeThread` / `QtPracticeWorker` | QThread runs `Application`; `QtPracticeDisplay` exposes frame/control/evidence mailboxes | Worker closes Storage in `finally`; capture loop releases devices, estimator, writers and audio |
-| `ReferenceImportWorker` | Python thread, cancellation event, job-ID-tagged progress/result tuples | UI ignores mismatched job IDs; cancellation is cooperative; close requests cancellation and a bounded join |
-| Library packaging | Python thread, cancellation event and queue polled by Qt timer | Completed archive commits remain separate from staging; errors are displayed |
-| Review analysis | Python thread, cancellation event and job-ID-tagged queue | Archive write verifies raw-video hash; stale UI jobs are ignored |
-| Ollama | Python thread streams chunks through Qt signals with a request token | Cancelled/stale requests are not saved; HTTP timeout bounds blocked IO |
-| `ReviewPlayback` | GUI timer drives local readers and owns extracted archive | Closing/replacing replay closes readers and temporary archive extraction |
+| Qt launcher, shell, screens | GUI event loop, signals and route payloads | Widgets stay on GUI thread |
+| Library analysis | `ReferenceImportWorker`, Python thread, job-tagged events | Cooperative cancel; ignore mismatched job IDs |
+| Library packaging/promotion | Python thread, cancellation event, polled queue | Show completion only after commit; bounded shutdown join |
+| Review reanalysis | Python thread, job ID, event queue, commit lock | Config snapshot, archive lease, cancellation/current-job commit check |
+| Database cleanup | Python thread, result queue and GUI poll timer | Application-modal non-cancellable progress; join on shutdown; SQLite commit or rollback |
+| Review playback/comparison | GUI timers and owned local readers | Close/release on replacement, hide or error |
+| Coach request | Python thread and token-tagged Qt signals | Cancel/stale response is not saved; HTTP timeout bounds blocked IO |
+| Retained practice worker | QThread around `Application` | Opens/closes its own Storage and engine resources |
+| Retained camera capture | Producer thread and one-frame queue | Replace stale queued images rather than accumulating backlog |
+| Retained inference | One executor worker | No unlimited per-exposure inference queue |
+| Retained preview display | Latest-image mailbox plus lossless control/result queues | Dropping an obsolete preview does not drop a save notification |
 
-Workers must not manipulate widgets. Live BGR frames are converted to copied
-`QImage` values for display. Video capture favours fresh camera frames rather
-than an accumulating backlog; file analysis uses ordered decoding. Guided
-calibration explicitly requests raw observation capture.
+### Cancellation is cooperative
 
-### UML state view: desktop preview lifecycle
+Setting an event does not instantly stop a blocked decoder, inference call or
+HTTP read. Workers check at supported boundaries. Shutdown uses the owning
+implementation's cleanup/join policy; a bounded join is not proof every worker
+has already terminated.
 
-[core/session_state.py](../src/tango_posture/core/session_state.py) is immutable:
-invalid commands raise `InvalidTransition` without changing the prior snapshot.
-The Practice screen uses it to drive control availability, while `Application`
-also maintains its own capture/scoring lifecycle.
+Job IDs/request tokens protect UI selection state. They are not substitutes for
+archive hashes or commit locking. Review uses both UI freshness and persistence
+identity checks.
+
+### Startup and presentation ownership
+
+The launcher creates/reuses QApplication and schedules the splash completion
+with a three-second Qt timer. It does not sleep the GUI thread.
+
+The shell owns a reused modeless About dialog and stacked workspaces.
+Help renders the general manual with section navigation/search.
+Image buffers crossing into Qt use copied QImages so the underlying OpenCV
+array cannot be freed while Qt still displays it.
+
+## 13. Retained practice and camera services
+
+This section documents existing engines for maintainers. It does **not** describe
+a current Live Practice rail entry.
+
+### Capture and session orchestration
+
+`Application` coordinates capture, Lite inference, raw measurements, display,
+optional recording/audio, event tracking and storage.
+
+Camera capture favours fresh frames with a one-slot queue. File capture decodes
+sequentially and handles timing fallback/errors explicitly.
+Display smoothing is separate from measurement evidence.
+
+The retained Qt `PracticeScreen` uses immutable
+[session-state transitions](../src/tango_posture/core/session_state.py) to govern
+controls. `Application` and `Session` still own their own runtime lifecycles;
+that state model is not a universal authority over every engine variable.
 
 ```mermaid
 stateDiagram-v2
     [*] --> Idle
-    Idle --> Preparing: choose source / start preview
+    Idle --> Preparing: prepare retained preview
     Preparing --> Preview: ready
-    Preparing --> Error: capture failure
-    Preview --> Error: device / worker failure
-    Error --> Preparing: retry
+    Preparing --> Error: failure
     Error --> Idle: close
-    Preview --> Idle: close after save or abort
+    Preview --> Idle: close and release
     state Preview {
-        state Recording {
+        state Media {
             [*] --> NotRecording
-            NotRecording --> RecordingMedia: Record / song start
-            RecordingMedia --> NotRecording: Save / Abort
+            NotRecording --> Recording: record
+            Recording --> NotRecording: save or abort
         }
         --
         state Scoring {
-            [*] --> ScoringOff
-            ScoringOff --> ScoringActive: compatible accepted target + Start
-            ScoringActive --> ScoringPaused: Pause
-            ScoringPaused --> ScoringActive: Resume
-            ScoringActive --> ScoringOff: Stop
-            ScoringPaused --> ScoringOff: Stop
+            [*] --> Off
+            Off --> Active: accepted compatible target
+            Active --> Paused: pause
+            Paused --> Active: resume
+            Active --> Off: stop
+            Paused --> Off: stop
         }
     }
 ```
 
-Recording and scoring are independent controls: pausing scoring does not pause
-the video. In the shared engine, Stop & Save finalizes the current recording and
-its scoring session; the camera can remain open for another recording.
-Abort concerns the current unsaved content, not already committed segments.
+Recording and scoring are independent. Scoring pause does not pause the video.
+Stop/save finalizes current output; abort concerns unsaved work, not previously
+committed archive recordings.
 
-## 5. Use-case catalogue
+`Session` evaluates approved, camera-checked ranges or legacy baselines as
+appropriate. The timestamp-driven evaluator smooths numbers and requires entry/
+clear persistence. Missing raw evidence becomes UNKNOWN and breaks event
+continuity; increasing `max_gap` does not authorize synthetic observations.
 
-```mermaid
-flowchart LR
-    User["Dancer / teacher"]
-    Startup(["Launch / About / Help"])
-    Settings(["Configure camera, tracking and feedback"])
-    Practice(["Preview / Record / Score / Pause / Save"])
-    Import(["Import local / YouTube / Facebook footage"])
-    Library(["Rename / Trash / promote excerpt"])
-    Calibrate(["Select dancer / examples / approve ranges"])
-    Camera(["Guided camera check / walking drill"])
-    Review(["Replay / layers / steps / pivots / comparison / export"])
-    Analytics(["Load stored charts / events / seek"])
-    Coach(["Request / cancel / save Ollama interpretation"])
-    User --> Startup
-    User --> Settings
-    User --> Practice
-    User --> Import
-    User --> Library
-    User --> Calibrate
-    User --> Camera
-    User --> Review
-    User --> Analytics
-    User --> Coach
-    Camera -. "same approval editor" .-> Calibrate
-    Import -. "creates Library recording" .-> Library
-    Library -. "selected evidence" .-> Calibrate
-    Analytics -. "archive + segment + timestamp" .-> Review
-    Review -. "selected report" .-> Coach
-```
+Older role/embrace/lift trackers have different state-retention policies.
+Do not generalize the generic evaluator's missing-value behaviour to every
+helper.
 
-| Use case | Main UI owner | Service modules / result |
-| --- | --- | --- |
-| Launch and navigate | `main`, `shell`, `router` | Validated Config; one QApplication and stacked workspaces |
-| About / manual | `screens.about`, `screens.help` | Package metadata/logo; `tutorial_rendering` and bundled guide |
-| Apply / reset / import / export settings | `screens.settings`, `service_bridge` | `config`; validated in-memory Config or TOML |
-| Camera/file preview | `screens.practice`, `practice.worker` | `app`, `capture`, `pose`; frames and status |
-| Record / score / pause / save / abort | `screens.practice`, `core.session_state` | `app`, `session`, `temporal`, `storage`, `archive`; `.tp` |
-| Record successive songs | `screens.practice` | `app.update_auto_recording`, `beat`; indexed recordings |
-| Local/online Library import | `screens.library` | `references.worker`, `pipeline`, `downloads`; `.tpr` or `.tp` |
-| Rename / Trash | `screens.library` | `archive`; manifest edit or retained original |
-| Promote recording/excerpt | `screens.library` | `references.archives.promote_reference`; separate `.tpr` |
-| Reference-video calibration | `calibration.editor` | Shared calibration evidence/measurement/statistics services; `.tpc` |
-| Guided capture / camera comparability | `calibration.guided` | Practice worker, repeat checks, reference promotion, shared editor |
-| Inspect / match calibration | `screens.references`, `screens.library` | `service_bridge`, calibration loaders; explicit Config changes |
-| Replay / seek / speed / frame step | `screens.review`, `review.playback` | `archive`, `replay`, `review`; source and archived timestamps |
-| Analyze posture / movement / render floor | `screens.review`, `review.analysis` | Reference pipeline, shared movement/rendering; stored indexed analytics |
-| Compare / export replay | `screens.review` | Second `ReviewPlayback`; `replay.save_overlay_video` |
-| Charts / events / seek to video | `screens.analytics`, `analytics.data` | Archive-only projection and reusable `MetricChart`; Router payload |
-| Interpret / cancel / reopen / export AI response | `screens.coach` | `ollama`, `review`, `archive`; report-digest-bound analysis |
+### Guided camera evidence
 
-## 6. Startup, About, Help and settings
+The retained guided dialog runs the practice worker in temporary storage,
+collects raw observations and records neutral/change/return/repetition holds.
+It shares the reference approval editor rather than implementing a second
+range schema.
 
-### Launch and navigation
+Repeat checks evaluate usable coverage, change relative to within-hold spread,
+direction agreement and return consistency. The dialog supports an additional
+walking drill for that context. These are engineering repeatability checks, not
+validation of technique or anatomy.
 
-`tango-posture`, `tango-posture gui` and `tango-posture qt` all reach the Qt
-launcher. The installed desktop entry also reaches Qt. CLI file-processing,
-model setup, list and export commands remain available independently.
+Current shell removal does not erase the file format's camera-check fields or
+the scoring engine's approval requirements.
 
-```mermaid
-sequenceDiagram
-    actor User
-    participant CLI as cli.py / desktop.py
-    participant Launch as desktop_qt.main
-    participant Window as MainWindow
-    participant Splash as screens.splash
-    participant Router
-    User->>CLI: launch desktop
-    CLI->>Launch: launch_qt(validated Config)
-    Launch->>Launch: create/reuse QApplication; load logo
-    Launch->>Window: construct screens, bridge, navigation
-    Launch->>Splash: show()
-    Launch->>Launch: QTimer.singleShot(3000, finish_startup)
-    Note over Launch,Splash: Qt event loop remains responsive
-    Launch->>Window: show after timer
-    Launch->>Splash: close()
-    User->>Router: select destination
-    Router->>Window: route_changed(route, payload)
-    Window->>Window: switch workspace; refresh; deliver payload
-```
+### Audio and automatic recording
 
-About is a separate modeless dialog, reused by the shell. Help renders the same
-Markdown manual used by the source documentation, with section navigation and
-search; it is not an embedded external website.
+The retained practice engine can use live microphone evidence to start/stop
+song recordings after configured music/silence delays, bounded by the recording
+cap. A synthetic tempo clock is not evidence of audible music.
 
-Logo loading remains in the unchanged-depth launcher/shell and tries packaged
-resources before the source-checkout logo directory. Moving the Splash/About
-widgets does not change resource-relative lookup depth.
+Audio availability/muxing remains platform-dependent. Current offline
+Library/Review calls disable soundtrack analysis, and Qt Review playback is
+video-only. The inactive `replay_audio` and `replay_auto_analyse_movement`
+controls are absent from Settings and new TOML exports. Config accepts those
+keys only for older-file compatibility; neither enables playback audio or
+queues automatic analysis.
 
-### Settings
+## 14. Analytics and optional report interpretation
 
-[SettingsScreen](../src/tango_posture/desktop_qt/screens/settings.py) builds grouped
-editors for the shared configuration. Apply collects all values and validates a
-new `Config` before `ServiceBridge.update_config`. Validation failure leaves the
-old configuration in place and reports the error in the status strip.
+### Portable Analytics
 
-Reset publishes defaults. TOML export first applies valid editor values;
-import validates TOML before replacing bridge configuration. **Apply & Save
-settings.toml** confirms the destination and atomically saves the configuration.
-Calibration approval and Library profile actions can copy exact lower/upper
-limits, native units and applicable views into editable **Calibration defaults**,
-replacing the previous default ranges after confirmation and saving
-`settings.toml`. Unrelated Settings are retained. Write failure leaves the file
-intact and is reported; copying calibration defaults publishes configuration only
-after a successful write. These parameters do not transfer camera-scoring approval.
-Without a selected calibration, nonempty default ranges replace legacy posture
-thresholds in live coaching and cached Review comparison. Clearing every default
-range restores legacy thresholds; selecting a calibration always takes precedence.
-`ServiceBridge.config_changed` synchronizes Settings editors and refreshes Review's
-in-memory comparison/display layers. Workers retain their run-specific configuration;
-no raw archive evidence is rewritten. Load the saved file with `--config settings.toml`
-on subsequent launches, or use TOML import.
+[AnalyticsScreen](../src/tango_posture/desktop_qt/screens/analytics.py) projects
+persisted `.tp` recording data through
+[analytics/data.py](../src/tango_posture/desktop_qt/analytics/data.py).
+It does not rerun pose inference or reopen the originating session database.
 
-**Files → Offline analysis model** persists `analysis_model` (`lite`, `full`, or
-`heavy`; default `lite`). The shared import/Review pipeline resolves this choice
-independently of live `model_path`; live and guided camera inference retain the
-Lite-only checksum gate. [models.py](../src/tango_posture/models.py) verifies each
-variant against its pinned version-1 SHA-256. Missing analysis models download
-in the existing background job, with progress/cancellation and temporary-file
-cleanup before atomic installation. Full/Heavy use `<data_dir>/models/`; Lite
-uses the configured live model path. Corrupt cached files and download failures
-are explicit errors, with no fallback to another variant. The model resolver
-also checks the data-folder cache, the configured model's directory,
-and local `models/` before downloading, returning the first existing candidate.
-That file must pass the selected variant's checksum; invalid weights are reported
-without automatically overwriting them. Valid installed copies are used in place.
-Analysis records its
-actual model hash and selected variant in coaching data; choosing another model
-does not rewrite old evidence until analysis runs again. Calibration model
-compatibility checks remain unchanged.
+Charts split at null observations/long gaps. Duration/coverage semantics come
+from the relevant persisted observations/summaries, not an assumption that
+sample counts equal valid time. Stored frame measurements are not relabelled
+as calibrated scores.
 
-## 7. Practice, recording, scoring and songs
+Chart/event selection routes an archive path, segment index and timestamp to
+Review. If no archived frame supports that time, report the limitation rather
+than seeking a different recording.
 
-The UI owner is [PracticeScreen](../src/tango_posture/desktop_qt/screens/practice.py).
-The execution adapter is [practice/worker.py](../src/tango_posture/desktop_qt/practice/worker.py);
-the shared engine is [Application](../src/tango_posture/app.py).
+### Explicit Ollama interpretation
 
-```mermaid
-sequenceDiagram
-    actor User
-    participant UI as PracticeScreen (GUI)
-    participant Mail as QtPracticeDisplay
-    participant Worker as PracticeThread / QtPracticeWorker
-    participant App as Application
-    participant Pose as Capture / PoseEstimator
-    participant Session
-    participant Store as Storage / archive.py
-    User->>UI: Start Preview(source, optional calibration)
-    UI->>Worker: start(run Config)
-    Worker->>Store: open Storage; load selected target
-    Worker->>App: run(display=Mail)
-    loop captured frames
-        App->>Pose: decode + estimate
-        Pose-->>App: raw FrameObservation
-        App->>App: quality, geometry, movement, beat and display overlay
-        App->>Mail: latest frame, status, recording notifications
-        UI->>Mail: drain on GUI timer
-        opt scoring active
-            App->>Session: process qualified measurements
-            Session->>Store: observations / events
-        end
-    end
-    User->>UI: Record / Start Scoring / Pause / Resume
-    UI->>Mail: validated command / recording state
-    App->>Mail: poll requests
-    User->>UI: Stop & Save
-    UI->>Mail: request save
-    App->>App: close writers; finish recording/session
-    App->>Store: export session; append indexed .tp recording
-    App->>Mail: saved archive + segment notification
-    User->>UI: Close Preview
-    UI->>Mail: request quit
-    App->>Pose: release capture and estimator
-    Worker->>Store: close()
-    Worker-->>UI: finished
-```
-
-### Preview and source selection
-
-When a calibration is selected, posture coaching uses only its approved metric
-ranges, not the Head & shoulders, Embrace & knees or Torso & hip offset Settings
-thresholds. Metrics absent from the profile do not receive default warnings.
-Live scoring retains its explicit camera-check, quality and view gates. A
-camera-ready calibration also requires placement confirmation before preview;
-the UI does not silently discard the selection and use Settings instead.
-Without a calibration, the Settings-based coaching remains available.
-
-Preview accepts a camera or a file as an execution source. This does not bypass
-Library's import/catalogue workflow: **Review's Open/Compare actions choose
-Library archives**, while Practice's source chooses what its capture engine runs.
-Preview alone does not require a scoring-ready calibration.
-
-Loading a calibration adapts side/facing/resolution/capture settings from its
-stored profile. The dancer still confirms the physical setup. Engine
-compatibility checks reject mismatched model/metric identity or capture setup.
-
-### Recording and scoring
-
-Record starts media collection independently of scoring. Start Scoring requires
-an accepted usable target. `Session` chooses the established neutral-baseline
-evaluator or two-sided range evaluator; confidence, view, gap and persistence
-rules remain explicit. Unknown intervals do not count as reassuring posture.
-
-Pause/Resume affects scoring time and events, not recording. Save closes video
-writers, optionally muxes supported microphone audio, finalizes reports and
-appends a numbered recording. Abort is confirmed by the UI and discards current
-unsaved work while preserving previously saved archive members.
-
-Camera EOF/disconnect, worker exceptions, navigation and window-close paths
-release resources and surface completion/failure. Leaving Practice requests a
-safe stop rather than leaving a hidden camera running.
-
-### Automatic song recordings
-
-The checkbox sets the display's auto-recording event.
-`Application.update_auto_recording` requires a live microphone stream and a
-non-calibration run. Continuous detected music must exceed the configured start
-delay; sustained silence must exceed the stop delay. Short gaps do not split
-recordings. Each completed song appends another index, bounded by
-`max_recordings`.
-
-Disabling automation saves an active automatic recording. Tap tempo or a
-synthetic clock is not evidence that a song is playing. Detector accuracy and
-audio mux support remain platform/empirical concerns, not consequences of the
-module reorganization.
-
-## 8. Library import and archive management
-
-### Import local video, YouTube or Facebook Reel
-
-The entry point is [LibraryScreen](../src/tango_posture/desktop_qt/screens/library.py).
-Import-as-reference defaults to `.tpr`; the alternative packages a `.tp`.
-The original media is not edited in place.
-
-```mermaid
-sequenceDiagram
-    actor User
-    participant UI as LibraryScreen
-    participant Worker as references.worker
-    participant Pipeline as references.pipeline
-    participant Download as references.downloads
-    participant Video as references.video
-    participant Engines as Pose / movement / frame insights
-    participant Package as desktop_qt.library.archives
-    participant Archive as archive.py / references.archives
-    User->>UI: choose local file or online URL + clip range
-    UI->>Worker: start(job, copied Config)
-    Worker->>Pipeline: analyse_imported_clip(...)
-    opt online source
-        Pipeline->>Download: validate provenance; cancellable download
-        Download-->>Pipeline: cached local media + source link
-    end
-    Pipeline->>Video: probe / validate range / decode
-    loop selected frames
-        Pipeline->>Engines: estimate, qualify and analyze
-        Worker-->>UI: job-tagged progress
-    end
-    Pipeline-->>Worker: ImportedClipResult + report/companions
-    Worker-->>UI: import_done(job, result)
-    UI->>Package: background archive_report(...)
-    Package->>Package: trim raw; render overlay and floor-lines; reindex evidence
-    Package->>Archive: commit matched indexed assets + analytics
-    opt import as reference
-        Package->>Archive: mark_reference + reference.json
-    end
-    Package-->>UI: archive_done(job, path)
-    UI->>UI: refresh Library; navigate to Review
-```
-
-Source validation lives in [links.py](../src/tango_posture/references/links.py);
-download process/certificate/cancellation details live in
-[downloads.py](../src/tango_posture/references/downloads.py).
-Supported online actions require an explicit request, network access, appropriate
-permission to use the footage and an available yt-dlp tool/module.
-
-The current analysis range limit is 120 seconds and the source-size limit is
-2 GiB. Probe/decode rejects invalid media/ranges before analysis.
-[pipeline.py](../src/tango_posture/references/pipeline.py) coordinates existing
-engines instead of duplicating their algorithms. It saves raw
-`measurement_poses` separately from smoothed overlay `poses`.
-
-Soundtrack decoding and beat analysis have a separate backend module, but Qt
-Library currently invokes analysis with `analyse_soundtrack=False`; the existence
-of that module does not imply a soundtrack-import control in the UI.
-
-Cancel requests set analysis/download and packaging cancellation events. Jobs
-stop at cooperative checkpoints; the UI waits rather than claiming immediate
-termination. Job IDs prevent a late result from replacing a newer selection.
-
-### Rename and delete
-
-Library combines name search with a file-type filter: all types, `.tpr`
-references, `.tpc` calibrations or `.tp` practices. Refresh retains both filters.
-
-- **Rename:** validate a nonempty display name and atomically replace the
-  manifest. Refresh shows the persisted name; the physical file is unchanged.
-- **Delete:** after confirmation, move the selected file to Trash. This is not a
-  recursive purge of practice/reference folders. The Qt instance API returns
-  success directly and provides an error message on failure; a successful move
-  refreshes the filtered list.
-
-### Promote a recording or excerpt
-
-Library gathers the recording and optional start/end times, then calls
-[promote_reference](../src/tango_posture/references/archives.py). The function
-creates a separate `.tpr`, carries provenance, trims/reindexes available media and
-cached evidence, and preserves the source `.tp`/legacy recording. Promoting does
-not approve calibration ranges or make the excerpt automatically valid for live
-scoring.
-
-## 9. Reference and calibration workflows
-
-### Shared workflow and boundaries
-
-```mermaid
-flowchart TD
-    Video["Library .tpr reference<br/>imported or promoted recording"]
-    Camera["Guided camera calibration<br/>explicit start and live framing"]
-    Holds["Head / Shoulders / Hips / Torso / Knees<br/>neutral, change, return, fresh repetition"]
-    CameraReference["Save camera evidence as .tpr"]
-    Editor["Shared CalibrationEditor"]
-    Examples["Select dancer / restart anchors / passages"]
-    Measurements["Cached raw measurements<br/>no repeated pose inference for edits"]
-    Approval["Review video + histogram + chart<br/>approve per-metric bounds"]
-    Profile["New .tpc range profile"]
-    Comparison["Comparison-ready metrics"]
-    Scoring["Live scoring for individually<br/>camera-checked compatible metrics"]
-    Video --> Editor
-    Camera --> Holds --> CameraReference --> Editor
-    Editor --> Examples --> Measurements --> Approval --> Profile
-    Profile --> Comparison
-    Approval -. "guided repeat check + explicit approval" .-> Scoring
-```
-
-### Create a profile from a reference video
-
-[CalibrationEditor](../src/tango_posture/desktop_qt/calibration/editor.py) loads
-the recording through `PracticeArchive`, reads
-[cached evidence](../src/tango_posture/calibration/evidence.py), and uses
-[measurements](../src/tango_posture/calibration/measurements.py) and
-[statistics](../src/tango_posture/calibration/statistics.py).
-
-1. Validate cached dimensions, raw landmark availability, model identity,
-   timestamps and tracking gap limit. Missing/display-only caches produce a
-   message asking for Review reanalysis rather than invented measurements.
-2. Select a numbered dancer. Conservative spatial association ends a track on
-   gaps or ambiguity; it never silently switches to another person.
-3. Add explicit restart anchors if needed and confirm that the linked passages
-   follow the same dancer. Changing dancer evidence clears existing approvals.
-4. Step through Head, Shoulders, Hips, Torso and Knees. Choose example passages
-   independently of acceptable bounds. View median, p10/p90, usable duration,
-   sample count, fraction inside the edited bounds, histogram and timestamp plot.
-   Extrema/plot clicks seek the evidence video.
-5. Approve or skip each metric. The middle 80% is a starting suggestion, not a
-   statement of correct tango technique. Angular samples crossing the wrap
-   boundary are handled consistently.
-6. Save a distinctly named `.tpc`. Save rechecks the source archive hash,
-   confirmed dancer identity and at least one approved metric.
-
-Saving dancer selection separately updates `reference.json`; it does not rewrite
-the raw measurements/video. An unapproved metric remains unavailable for scoring.
-Per-leg support inference, pelvic rotation and validated 3-D spine diagnosis are
-not supplied by this workflow.
-
-The Torso group includes the optional `torso_axis_tilt` metric alongside the
-unchanged `trunk_inclination`. It reuses `torso_axis_alignment` and records the
-absolute projected tilt in degrees, matching the pink overlay's magnitude.
-All four shoulder/hip landmarks must be reliable; raw cached evidence supplies
-approval statistics and later comparisons, never display interpolation.
-Approved bounds persist in `.tpc` profiles and can be copied to Settings defaults.
-Existing profiles remain valid without this additional metric.
-
-### Guided camera calibration and a later camera check
-
-[GuidedCalibration](../src/tango_posture/desktop_qt/calibration/guided.py) uses the
-same practice worker in temporary session storage. The user explicitly starts the
-camera and countdown; instructions are spoken and displayed.
-
-For each wizard group, capture neutral, changed posture, return and a fresh
-repetition. Each hold allows two seconds to settle followed by three seconds of
-capture. Repeat checks operate per metric:
-
-- all four holds must have at least 0.5 seconds and 60% reliable coverage;
-- both observed changes must exceed twice the largest within-hold p90-p10 spread
-  and move in the same direction;
-- return-to-neutral must lie within the implemented noise/change tolerance.
-
-Specific framing guidance and Retry/Skip remain available. A Solo walking context
-adds an eight-second measured walking drill after settling. These are engineering
-repeatability checks, not teacher validation of the target posture.
-
-```mermaid
-sequenceDiagram
-    actor User
-    participant Guided as GuidedCalibration
-    participant Worker as QtPracticeWorker / Application
-    participant Check as calibration.statistics
-    participant Ref as references.archives
-    participant Editor as CalibrationEditor
-    participant Profile as calibration.archives
-    User->>Guided: start camera; begin countdown
-    Guided->>Worker: capture raw observations and recording
-    loop wizard groups
-        Guided->>User: speak/show neutral, change, return, repetition
-        Worker-->>Guided: frames + timestamped raw observations
-        Guided->>Check: repeat_check(samples, four holds)
-        Check-->>Guided: per-metric outcome + reason
-        User->>Guided: retry / skip / continue
-    end
-    opt Solo walking
-        Guided->>Worker: retain walking-drill evidence
-    end
-    Guided->>Worker: request quit; save and release camera
-    Guided->>Ref: promote saved evidence to .tpr
-    Guided->>Editor: open reference + holds + optional existing target
-    User->>Editor: choose examples, approve ranges and camera checks
-    Editor->>Profile: save new .tpc
-```
-
-The same editor opens after video and camera capture. Live-alert enablement is
-per-metric and explicit: the relevant repeat check must pass on camera evidence,
-and the user must approve its camera-check flag. An existing video-derived
-profile can be supplied as the target while camera evidence checks comparability.
-Saving creates another profile rather than overwriting the original.
-
-Video-derived unchecked ranges can be used for compatible-model comparison even
-when the capture setup differs; they are not silently enabled for live scoring.
-Live scoring requires compatible capture/model identity, an approved metric,
-camera approval and a reliable applicable view.
-
-### Inspect or apply a calibration
-
-References is not a navigation-rail entry; Library provides the reference and
-calibration file catalogue. The existing References workspace remains accessible
-through Home's **Manage References** action and lists calibration summaries, exposes details and offers
-Match Camera Settings and New Calibration. Library additionally shows all three
-portable file types and can open a version-2 profile's details or camera check.
-Matching settings is explicit; it cannot establish that the real camera/dancer
-has physically remained in the same place.
-
-## 10. Review, comparison and analytics
-
-### Open, replay and seek
-
-[ReviewScreen](../src/tango_posture/desktop_qt/screens/review.py) selects archives
-through `ServiceBridge.choose_library_archive`. Profiles without recording
-segments are excluded. [ReviewPlayback](../src/tango_posture/desktop_qt/review/playback.py)
-owns the `PracticeArchive`, extracted files and `VideoReader`.
-
-Recording selection populates raw/overlay/available-lines variants. Play, pause,
-frame step, speed and scrub controls operate on that reader. Stored frame
-timestamps preserve pauses and timing gaps for seeking. A timestamp/frame-count
-mismatch reports a warning and uses the video FPS timeline; timestamp-dependent
-report navigation is rejected where it would be misleading.
-
-The lower-level replay adapter retains local-video and legacy-report support for
-service/tests and legacy flows. This does not add a standalone-video import
-picker to the Qt Review workspace.
-
-### Analyze posture and movement
-
-```mermaid
-sequenceDiagram
-    actor User
-    participant UI as ReviewScreen
-    participant Job as Review analysis thread
-    participant Adapter as review.analysis
-    participant Pipeline as references.pipeline
-    participant Archive as archive.store_analytics
-    User->>UI: Analyze posture and movement
-    UI->>Job: snapshot Config, archive, segment, raw video
-    Job->>Job: hash raw video
-    Job->>Adapter: analyse_review_clip(cancel, progress)
-    Adapter->>Pipeline: analyse_imported_clip(...)
-    Pipeline-->>Job: cached frame insights + movement evidence
-    opt not cancelled and selected .tp / .tpr
-        Job->>Archive: store indexed analytics(expected video hash)
-        Archive->>Archive: verify current archived raw hash; atomic rewrite
-    end
-    Job-->>UI: job-tagged done/error/cancelled
-    UI->>UI: render current frame and synchronized insights
-```
-
-Review uses the same deterministic posture/movement pipeline as imports.
-Steps, pivots, projected axes, skeleton, head/shoulder/torso/hip metrics and knee
-angles remain synchronized with the current frame. The floor-only mode renders
-guide/lines/footprints rather than leaving the source video visible underneath.
-Stored raw and overlay variants remain available.
-
-The Insights **Calibration profile** picker compares cached raw measurements
-against the selected `.tpc` approved ranges using the shared measurements and
-timestamp-based evaluator. This is offline comparison, not camera approval;
-unchecked video-derived ranges may be compared without enabling live scoring.
-Only approved metrics are evaluated, with their saved units and bounds.
-Missing raw evidence, incompatible model/side/facing or unreadable profiles
-produce explicit errors, never a fallback to Settings. Tracking/view gaps
-remain unknown. **No calibration (use Settings)** uses configured default ranges
-when present, otherwise the original Settings-based insights.
-
-Dynamic Review skeletons use the current frame's `measurement_poses` rather
-than the causally smoothed display `poses`, avoiding the additional display
-filter delay without shifting timestamps or changing scoring smoothing.
-The display-only [pose interpolator](../src/tango_posture/pose/interpolation.py)
-bridges missing or low-confidence joints between reliable frames. Settings choose
-`replay_joint_interpolation` (`linear` by default, or `quadratic`) and
-`replay_joint_max_gap` (3 seconds by default; zero disables interpolation).
-Linear interpolation uses the actual bracketing timestamps. Quadratic interpolation
-adds a nearby third reliable sample; it uses linear interpolation when no third
-sample exists or the curve would leave the image. No extrapolation is performed
-at clip edges, across ambiguous multi-dancer frames, non-increasing timestamps,
-or beyond the configured gap. Derived `display_poses` are separate from raw
-`measurement_poses`; unknown measurements and missing coverage remain unknown.
-This is Review-only and adds no playback delay; live capture is unchanged.
-Older display-only caches can still render, but must be reanalyzed to supply
-raw calibration-comparison evidence. Calibration comparison requires a raw/source
-stream; baked overlay pixels cannot be removed or retimed.
-
-Reanalysis is limited to the supported analysis duration and updates the matching
-`analytics_XX.json`, not an unrelated recording's data. It does not turn raw
-measurements into approved calibration coverage. Cancel/error status is explicit;
-stale jobs cannot replace the current display.
-
-### Comparison, report links and export
-
-Open Comparison uses another Library recording, with a second owned
-`ReviewPlayback`. It prefers the comparison raw stream and shows/hides a second
-video stage; there is no comparison-stream combobox. Frames are synchronized by
-elapsed playback time using each recording's timeline, not inferred semantic
-alignment. The lower-level anchored comparison API lives in
-[references/comparison.py](../src/tango_posture/references/comparison.py).
-
-Timestamp links in the report seek the matching recording. Report-to-Coach
-navigation passes the selected archive/recording rather than sending a request
-automatically. Video export uses the selected replay/layers and existing local
-video-writing helpers; errors are surfaced and original archive media is not
-replaced.
-
-### Portable Analytics and chart-to-video navigation
-
-The Analytics workspace enumerates `.tp` recordings and calls
-[load_archive_dataset](../src/tango_posture/desktop_qt/analytics/data.py).
-It projects saved observations/events or stored frame measurements without
-re-running inference and without opening the original database.
-
-```mermaid
-sequenceDiagram
-    actor User
-    participant UI as AnalyticsScreen
-    participant Data as analytics.data
-    participant ZIP as Selected .tp
-    participant Chart as MetricChart / event table
-    participant Router
-    participant Review as ReviewScreen / ReviewPlayback
-    User->>UI: choose recording
-    UI->>Data: load_archive_dataset(path, index)
-    Data->>ZIP: read indexed analytics
-    Data-->>UI: SessionData, metrics, summaries, events
-    UI->>Chart: samples split at unknown / long gaps
-    User->>Chart: click time / event
-    Chart->>UI: selected timestamp
-    UI->>Router: archive_path + segment_index + timestamp
-    Router->>Review: load_archive(..., timestamp)
-    Review->>Review: map stored timestamp to frame
-```
-
-Null observations and excessive tracking gaps break chart lines. Valid/unknown
-duration comes from persisted interval accounting, not sample counts; unavailable
-values stay unknown. Frame measurements are labelled as measurements, not posture
-scores. If no archived frame covers the selected time, navigation reports that
-fact rather than guessing another recording.
-
-## 11. Explicit Ollama interpretation
-
-[CoachScreen](../src/tango_posture/desktop_qt/screens/coach.py) loads a saved report
-or an archive recording. Loading a report does not call Ollama.
-[OllamaClient](../src/tango_posture/ollama.py) is the HTTP boundary; it receives
-report text, not video, and model output never executes application actions.
+[CoachScreen](../src/tango_posture/desktop_qt/screens/coach.py) owns selection,
+request state, streaming display, cancellation and exports.
+[OllamaClient](../src/tango_posture/ollama.py) owns HTTP/protocol handling.
 
 ```mermaid
 sequenceDiagram
     actor User
     participant UI as CoachScreen
-    participant Job as Ollama thread
-    participant HTTP as OllamaClient
-    participant Server as Configured Ollama endpoint
-    participant Report as review.py / archive.py
-    User->>UI: select report and model; Analyze
-    UI->>Job: token + cancel event + report digest
-    Job->>HTTP: analyze(report Markdown, on_chunk, cancel)
-    HTTP->>HTTP: validate endpoint and report size
-    HTTP->>Server: explicit streaming /api/chat request
-    loop streamed chunks
-        Server-->>HTTP: text
-        HTTP-->>UI: token-tagged chunk
-    end
-    Job->>Report: re-read report and verify digest
-    alt cancelled or source report changed
-        Job-->>UI: cancelled / stale; do not save
-    else current nonempty response
-        Job->>Report: save_analysis(text, model, endpoint, instruction, complete)
-        Report->>Report: store companion in archive when applicable
-        Job-->>UI: completed / length-limited result
+    participant Job as Request thread
+    participant Client as OllamaClient
+    participant Server as Configured endpoint
+    participant Saved as Report and analysis storage
+    User->>UI: select report and request interpretation
+    UI->>Job: token, cancellation, report digest
+    Job->>Client: report text and request settings
+    Client->>Server: streaming chat request
+    Server-->>UI: token-tagged text chunks
+    Job->>Saved: verify current report digest
+    alt cancelled or stale
+        Job-->>UI: do not save as current analysis
+    else current result
+        Job->>Saved: save digest-bound interpretation
+        Job-->>UI: completion state
     end
 ```
 
-Saved interpretations contain the report SHA-256, model, endpoint, instruction,
-timestamp, text and completion state. Reopening only associates matching-digest
-responses. Export writes the selected analysis explicitly.
+Loading a report does not call an LLM. Requests send report text, not video.
+Generated output does not approve ranges, alter events or execute app actions.
 
-Connection/model checks are also explicit. The endpoint is configurable and can
-be remote, so "local by default" is not a guarantee that every configured server
-is on this machine. Cancellation is cooperative while streaming; a blocked HTTP
-read can remain pending until its timeout.
+Saved interpretations include the report digest, model, endpoint, instruction,
+timestamp, text and completion state. Reopening associates matching-digest
+responses, not merely matching filenames.
 
-Other network boundaries are the explicit Lite model-setup download, the
-first-use download of a selected analysis model when analysis starts, and online
-video import. Downloads retrieve public model/video assets; video analysis remains
-local. Camera/file practice does not automatically fetch a model or call an LLM.
+### Network boundaries
 
-## 12. Maintenance and verification
+| Boundary | Trigger | Data involved |
+| --- | --- | --- |
+| Model setup | CLI fetch or missing selected offline weights during analysis | Pinned public model assets |
+| Online source adapters | Explicit supported API/worker call; not current local-import UI | Validated source URL and downloaded media/provenance |
+| Ollama | Explicit connection/model/interpretation action | Requests and report text sent to configured endpoint |
 
-### Where to put a change
+The default Ollama address is loopback, but users can configure a remote
+server. "Local by default" is not a guarantee about every configured endpoint.
+Online media adapters may need external yt-dlp availability; source support in
+code is not a bundled download UI or a guarantee of upstream availability.
 
-| Change | Start here |
+## 15. Packaging and release boundaries
+
+[pyproject.toml](../pyproject.toml) defines the console entry, dependencies,
+Python support and Hatch wheel resources. The current supported Python range
+is 3.11 (`>=3.11,<3.12`).
+
+The wheel includes the logo and general manual under package resource names.
+The separate architecture/beginner guides are repository documentation; do not
+assume they are automatically embedded in Help.
+
+[TangoPosture.spec](../packaging/TangoPosture.spec) builds the packaged desktop
+with PyInstaller, including MediaPipe assets, the verified Lite model, logo,
+manual, metadata and notices. Tk modules are explicitly excluded.
+
+[The desktop workflow](../.github/workflows/desktop-release.yml) runs checks on
+macOS and Windows. Release/manual-dispatch builds prepare resources, fetch the
+verified Lite model, build macOS arm64/Windows x64 artifacts and run installed
+smoke checks. Publishing waits for checks/builds and attaches installers plus
+checksums. Release tags are checked against the package version.
+
+The packaged smoke path checks Qt construction, resources, checksum and blank
+frame inference. It is not a real-camera/microphone or real-dancer acceptance
+test.
+
+The packaged launcher changes to a per-user application-support directory.
+Relative database/media/model/settings paths therefore resolve differently
+from a source checkout launched at the repository root.
+
+## 16. Making and verifying changes
+
+### Change-location guide
+
+| Requirement | Start with | Preserve |
+| --- | --- | --- |
+| Add/restore desktop workflow | Shell/router and owning screen | Explicit reachability, shutdown and cancellation ownership |
+| Add Settings field | Config, descriptions, grouped UI and actual consumer | Validation, TOML round trip, run snapshots |
+| Change range metric | Calibration models/measurements/statistics and comparison consumers | Native units, version/compatibility, raw evidence rules |
+| Add analysis result | Shared analyzer and result records, then delivery adapters | Review's in-memory path; import reporting remains separate |
+| Change pose model handling | Model manifest/resolver/backend | Pinned variant verification, cache provenance, explicit failure |
+| Change step/pivot logic | Movement detector and validator | Fingerprint/version/timing compatibility and focused examples |
+| Fix visual dropout | Correct renderer/interpolator or raw-quality producer | Synthetic display data must not become measurement evidence |
+| Change archive mutation | Shared archive helpers and owning feature adapter | Locking, atomic replacement, member/hash checks |
+| Change replay timing | Playback and shared replay helpers | Source/clip/frame time distinctions and warnings |
+| Add Analytics chart | Saved-data projection and MetricChart | No hidden inference or invented coverage |
+| Change AI interpretation | Ollama protocol plus Coach lifecycle | Explicit requests, token/digest checks, no action execution |
+
+Avoid creating a second analysis pipeline for a new button. Prefer the shared
+analyzer and a narrow adapter. Conversely, do not claim a retained API is
+reachable until its shell route and lifecycle actually exist.
+
+### Focused verification
+
+Use the smallest existing tests that exercise the changed behaviour:
+
+| Area | Existing tests |
 | --- | --- |
-| Splash/About appearance | [desktop_qt/screens/](../src/tango_posture/desktop_qt/screens/) |
-| Range schema / metric identity | [calibration/models.py](../src/tango_posture/calibration/models.py) |
-| Measurement / reliability rule | [calibration/measurements.py](../src/tango_posture/calibration/measurements.py), shared geometry/quality/metrics |
-| Evidence association / passage statistics | [calibration/evidence.py](../src/tango_posture/calibration/evidence.py), [statistics.py](../src/tango_posture/calibration/statistics.py) |
-| Wizard controls / guidance | [desktop_qt/calibration/](../src/tango_posture/desktop_qt/calibration/) |
-| URL / download / decoding issue | Corresponding [references/](../src/tango_posture/references/) module, not a screen |
-| Reference-analysis coordination | [references/pipeline.py](../src/tango_posture/references/pipeline.py) |
-| Shared archive mutation | [archive.py](../src/tango_posture/archive.py); retain locks, hash checks and atomic replacement |
-| Library packaging | [desktop_qt/library/archives.py](../src/tango_posture/desktop_qt/library/archives.py) |
-| Replay resource/timeline handling | [desktop_qt/review/playback.py](../src/tango_posture/desktop_qt/review/playback.py) |
-| Stored analytics / reusable charts | [desktop_qt/analytics/data.py](../src/tango_posture/desktop_qt/analytics/data.py), [components/metric_chart.py](../src/tango_posture/desktop_qt/components/metric_chart.py) |
-| Ollama protocol / prompt | [ollama.py](../src/tango_posture/ollama.py); lifecycle stays with the Coach workspace |
+| Shared analyzer, import/provenance | [test_reference_import.py](../tests/unit/test_reference_import.py), [test_library.py](../tests/qt/test_library.py), [test_review_playback.py](../tests/qt/test_review_playback.py) |
+| Pose/models/capture | [test_models.py](../tests/unit/test_models.py), [test_capture.py](../tests/unit/test_capture.py), [test_geometry_quality.py](../tests/unit/test_geometry_quality.py) |
+| Ranges/calibration | [test_range_profiles.py](../tests/unit/test_range_profiles.py), [test_temporal_calibration.py](../tests/unit/test_temporal_calibration.py), [test_calibration_editor.py](../tests/qt/test_calibration_editor.py) |
+| Pink axis | [test_torso_axis.py](../tests/unit/test_torso_axis.py) |
+| Movement/interpolation | [test_movement.py](../tests/unit/test_movement.py), [test_pose_interpolation.py](../tests/unit/test_pose_interpolation.py) |
+| Archives and reports | [test_archive.py](../tests/unit/test_archive.py), [test_reference_archives.py](../tests/unit/test_reference_archives.py), [test_review.py](../tests/unit/test_review.py) |
+| Settings/navigation | [test_settings.py](../tests/unit/test_settings.py), [test_shell.py](../tests/qt/test_shell.py) |
+| Analytics/Coach | [test_analytics.py](../tests/qt/test_analytics.py), [test_coach.py](../tests/qt/test_coach.py), [test_ollama.py](../tests/unit/test_ollama.py) |
+| Retained practice/session | [test_practice_worker.py](../tests/qt/test_practice_worker.py), [test_session_state.py](../tests/unit/test_session_state.py), [integration/](../tests/integration/) |
+| Manual rendering/setting targets | [test_tutorial.py](../tests/unit/test_tutorial.py) |
 
-Keep UI imports out of shared services. Import the owning module, not an
-unrelated screen or a removed monolith. When moving a function, update production
-imports, tests and module-qualified monkeypatch targets together. Do not introduce
-another worker pipeline when an existing engine or adapter can supply it.
-
-No dependency or archive-schema change is required by this reorganization.
-Hatch packages the new subpackages; PyInstaller follows their normal imports.
-Existing resource lookups, console entry points and no-Tk exclusions remain.
-The root `/references/` and `/practice/` ignore rules concern user media, not
-similarly named Python source packages.
-
-### Automated checks
-
-From the repository root, run uv commands serially:
+From the repository root, broader existing checks are:
 
 ```bash
-uv run --frozen ruff check .
+uv run --frozen ruff check src tests
 uv run --frozen mypy src
 QT_QPA_PLATFORM=offscreen uv run --frozen pytest -q
 git diff --check
 ```
 
-The reorganized source passes **337 tests**, Ruff and mypy across **96 source
-files**. Existing tests use canonical imports/patch targets without changes to
-their behavioral assertions. Coverage includes URL/download adapters,
-range statistics, archives, live session integration, calibration dialogs,
-playback, Library, Analytics, Coach and desktop entry points.
+These are verification commands, not a claim that every suite was run when
+this document was rewritten. Avoid hard-coded historical test counts or
+packaging-success claims that become stale after the next change.
 
-Additional reorganization checks verified unchanged syntax trees for 133 relocated
-functions/classes/constants apart from imports, all 75 links in this guide,
-byte-for-byte inclusion of every Python source file in the wheel, imports of
-all 95 packaged submodules without Tk, and actual offscreen startup through the
-three-second splash, nine workspaces and About dialog.
+For documentation changes, check local links/heading anchors and relevant
+rendering tests. For runtime changes, test the actual required output and error
+paths, especially cancellation, missing evidence, stale jobs and persistence.
 
-These are software checks, not real-dancer acceptance. Real camera/microphone
-behavior, long sessions, native accessibility/scaling, clean macOS/Windows
-installers, teacher judgement and cross-camera measurement validity still require
-the [manual protocol](manual_validation.md). In particular, repeatability is not
-biomechanical validity, projected metrics are view-dependent, and playback
-comparison is not temporal/technique alignment.
+### Acceptance limits
+
+Automated tests do not establish camera/microphone behaviour on every machine,
+long-session stability, native accessibility, correct installers on every host,
+cross-camera comparability or anatomical validity.
+
+Real footage review should distinguish raw landmark quality, coverage,
+measurement units, selected target policy and display-only estimation.
+Repeatability is not biomechanical validity. Projected posture/movement metrics
+are not medical assessment, force sensing or judgement of artistic tango.

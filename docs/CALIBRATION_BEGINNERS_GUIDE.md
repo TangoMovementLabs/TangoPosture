@@ -139,9 +139,9 @@ and **Settings**. You do not need a References button in the navigation rail.
 | Copy approved ranges into default Settings | Calibration editor | **Use approved ranges as Settings defaults...** |
 | Copy an already saved profile into defaults | **Library**, profile-only `.tpc` row | **Use as Settings defaults** |
 | Edit copied ranges | **Settings > Calibration defaults** | **Use**, minimum, maximum and view for each metric |
-| Change camera, side or facing | **Settings > Camera & view** | The camera/view fields |
+| Change video measurement side or facing | **Settings > Camera & view** | Measurement side and Facing direction |
 | Choose Lite, Full or Heavy for offline analysis | **Settings > Files** | **Offline analysis model** |
-| Change quality and calibration checks | **Settings > Quality & calibration** | Confidence, size, view and older baseline controls |
+| Change evidence quality checks | **Settings > Quality & calibration** | Confidence, segment size and view gates |
 | Change measurement/event timing | **Settings > Tracking** | Smoothing, entry/clear durations and gap limits |
 | Change older head/shoulder warnings | **Settings > Head & shoulders** | Head offset, warning angle/duration and shoulder controls |
 | Change older embrace/knee warnings | **Settings > Embrace & knees** | Role, embrace and knee controls |
@@ -446,22 +446,18 @@ requirements; they are not all controlled by `min_torso` or `min_head`.
 
 ## 6. Live camera calibration, click by click
 
+This section describes retained camera implementations, not a current desktop
+navigation workflow. Camera device/resolution/mirroring controls are no longer
+in Settings; existing legacy configurations remain loadable. For the current
+desktop workflow, import a `.tpr` and use **Create calibration** instead.
+
 ### Part A: get ready
 
-1. Open **Settings > Files** and confirm **Live Practice model file (Lite)**
-   points to the supported Lite weights. The installed desktop app normally
-   bundles Lite. Live Practice does not download a missing model automatically.
-2. Open **Settings > Camera & view** and check camera, requested resolution,
-   measurement side, facing, camera setup name and mirror.
-3. Open **Settings > Quality & calibration**. Start with the built-in quality
-   defaults unless there is a specific reason to change them.
-4. Click **Apply Settings**.
-5. Open **Library > Guided camera calibration...**.
-6. Keep **one dancer** in the calibration image. A partner or another detected
-   person can make the one-person evidence ambiguous.
-
-Alternative: in **Live Practice**, choose **Camera**, close an existing preview,
-enter a **New profile name**, and click **New Calibration**.
+The retained capture entry point must be supplied with its camera configuration
+and verified Lite weights; current Settings exports are not a complete legacy
+camera configuration. Device access and a one-person image are prerequisites.
+The retained wizard's subsequent steps are described below for implementation
+reference, not as instructions to find removed Library or Live Practice actions.
 
 ### Part B: preview and choose the activity
 
@@ -839,16 +835,6 @@ An illustrative approved interval `-0.02 to 0.06` includes slight displacement
 on either side of that target. Raising the maximum to `0.10` allows more
 forward displacement. Raising the minimum can reject values farther backward.
 
-**Older Tracking controls:** `head_forward.entry = 0.08`,
-`head_forward.clear = 0.05`.
-These are forward changes relative to an older stored baseline, not absolute
-approved minimum/maximum values. For a baseline `0.03`, an entry value `0.08`
-requires a forward change greater than `0.08`, meaning a value above roughly
-`0.11` before the persistence test.
-
-Increasing entry makes that older forward-change detector less sensitive.
-Decreasing entry makes it more sensitive. Clear must stay below entry.
-
 ### 9.3 Head inclination: shoulder-to-ear direction relative to torso
 
 **Editor:** Head > **Head inclination**  
@@ -865,13 +851,7 @@ You can therefore have:
 
 Those can be different observations, not a software contradiction.
 
-**Older Tracking controls:** `head_inclination.entry = 10`,
-`head_inclination.clear = 6`, in degrees of change from an older baseline.
-Increasing entry tolerates a larger angular change; decreasing it confirms
-smaller changes after the entry duration.
-
 For approved profiles, use the signed native interval shown by the editor.
-Do not substitute the old absolute-change threshold.
 
 ### Head visibility checklist
 
@@ -1120,19 +1100,9 @@ same thing.
 
 ### Relevant Settings: Tracking
 
-For older baseline-relative scoring:
-
-- `trunk_inclination.entry = 8 degrees`.
-- `trunk_inclination.clear = 5 degrees`.
-
-If the older baseline is `3 degrees`, a value of `12` differs by `9 degrees`.
-That exceeds an entry threshold of eight and can confirm after the persistence
-duration.
-
-Increasing entry to `12` tolerates more change; decreasing to `5` tolerates less.
-These are **changes from a baseline**, not an absolute target interval.
-
-For approved ranges, use the native signed minimum/maximum instead.
+Use the native signed minimum/maximum in the approved profile or Calibration
+defaults. Tracking's measurement smoothing and entry/clear durations affect
+evaluation timing, not those acceptable bounds.
 Head inclination and trunk angles can be handled continuously across an angle
 wrap, so an editor distribution may use an unwrapped interval. Do not force
 every angular range into `0 to 180`; the pink-axis magnitude is a different case.
@@ -1243,13 +1213,9 @@ The listed defaults come from the current `Config`, not from older screenshots.
 
 | Label/key | Default | Meaning and what changing it does |
 | --- | --- | --- |
-| **Camera device index** (`camera`) | `0` | Selects a camera device. `1` is another device, not a better-quality setting. Available indices depend on the computer. |
-| **Image width (pixels)** (`width`) | `640` | Requested live-camera width. Increasing can improve available detail if the device supports it, but can increase processing load. It does not change an imported video's native resolution. |
-| **Image height (pixels)** (`height`) | `480` | Requested live-camera height. Higher adds potential detail/load; lower removes detail. Actual negotiated camera size may differ. |
 | **Measurement side** (`side`) | `left` | Anatomical side preferred by side-dependent measurements. Choose the visible/intended side, not whichever side looks easier in a mirrored screen. |
 | **Facing direction** (`facing`) | `right` | Direction in the original image. Changes signed forward/posterior/trunk conventions. Wrong facing can reverse interpretation. |
-| **Camera setup name** (`capture_profile`) | `default` | Identifies a setup. Rename descriptively after intentional setup changes; renaming does not physically correct the camera. |
-| `mirror` | `false` | Flip display only. Does not change measurement signs, raw coordinates or stored evidence. |
+| **Capture setup name** (`capture_profile`) | `default` | Identifies the capture arrangement in metadata; renaming does not physically correct the camera or rewrite cached evidence. |
 | `allow_all_angles` | `false` | Enable the core all-angle measurement path. It may use midpoints/usable sides during additional views, but does not remove per-profile target-view checks or the pink four-point requirement. |
 
 Changing source, resolution, side, facing or setup after a live check can make a
@@ -1260,7 +1226,7 @@ as a shortcut around a real setup change.
 
 | Label/key | Default | Meaning |
 | --- | --- | --- |
-| **Live Practice model file (Lite)** (`model_path`) | `models/pose_landmarker_lite.task` in the base configuration | Path to the pinned Lite model. Packaged desktop startup can override it with the bundled location. An arbitrary `.task` file is not accepted just because the filename looks right. |
+| **Lite model file** (`model_path`) | `models/pose_landmarker_lite.task` in the base configuration | Path to the pinned Lite model for Lite offline analysis. Packaged startup can override it. An arbitrary `.task` file is not accepted just because the filename looks right. |
 | **Offline analysis model** (`analysis_model`) | `lite` | Lite, Full or Heavy for Library/Review offline analysis. Changing it requires reanalysis for new cached results. |
 | **Data folder** (`data_dir`) | `data` in the base configuration | Where local app data/artifacts are organised. Packaged app paths can differ. Changing it may make profiles appear missing because you are looking in a different data folder. |
 
@@ -1276,20 +1242,14 @@ assuming "Heavy = correct".
 | `min_torso` | `0.12` of image height | Require a larger core torso segment | Permit a smaller core segment | Smaller is not automatically reliable; not a universal setting for every line/helper |
 | `min_head` | `0.04` of image height | Require a larger core shoulder-to-ear segment | Permit a smaller segment | Not an ear-to-nose minimum-angle setting |
 | `max_view_width` | `0.45` | Accept a broader projected ratio as side view | Require a narrower projected ratio for side view | Also changes the side/front dividing gate; not actual shoulder width in centimetres |
-| `view_change_tolerance` | `0.15` | Older baseline checks permit greater difference from captured view-width range | Older checks become stricter about view consistency | Not an acceptable pink/head/trunk angle in degrees |
-| `calibration_duration` | `12 seconds` | Older baseline capture window becomes longer | Window becomes shorter | Does not change guided wizard's fixed two-second settle/three-second capture phases |
-| `calibration_valid_duration` | `9 seconds` | Older baseline acceptance needs more reliable measured time | Needs less reliable time | Must not exceed calibration duration; not the guided repeat-check percentage |
-| `calibration_samples` | `60` | Older baseline acceptance needs more valid observations | Needs fewer | Minimum is two; sample count is not a promise of statistical validation |
-| `offset_mad` | `0.03` | Older head-forward baseline accepts more spread | Demands a steadier baseline | Not an approved maximum head-forward limit |
-| `angle_mad` | `4 degrees` | Older angular baseline accepts more spread | Demands steadier angular evidence | Not an approved pink/trunk angle limit |
-
-**MAD** means median absolute deviation: a robust description of spread around
-the median. Increasing a MAD limit makes an older baseline easier to accept;
-it does not make the movement more correct.
+The six older baseline controls (view-change tolerance, capture duration,
+required valid duration, sample count, offset MAD and angle MAD) were removed
+from Settings and new TOML exports. Older configuration files still load for
+compatibility with retained baseline code; the current reference-range workflow
+does not use those controls.
 
 The shared approval editor uses selected evidence, distributions and explicit
 ranges. The guided repeat check uses the fixed criteria explained in Section 6.
-Do not expect the older baseline controls to change every new wizard behaviour.
 
 Some helpers also have internal pixel guards, such as minimum useful leg-segment
 length or head-line separation. There is no separate GUI setting for every such
@@ -1304,15 +1264,6 @@ guard. Good framing remains necessary even with relaxed quality settings.
 | `entry_duration` | `1.5 seconds` | Higher requires a longer continuous outside-range/change condition; lower confirms sooner. Used by approved-range evaluators. |
 | `clear_duration` | `0.75 seconds` | Higher requires longer recovery inside approved limits or below an old clear boundary; lower clears sooner. |
 | `max_gap` | `0.5 seconds` | Higher permits larger observation intervals before continuity/filter reset checks; lower rejects continuity sooner. Missing raw values still become UNKNOWN. |
-| `head_forward.entry` | `0.08` torso lengths | Higher needs a larger older forward change from baseline; lower needs less. |
-| `head_forward.clear` | `0.05` torso lengths | Higher permits clearing at a larger remaining older forward change; lower requires a smaller change. |
-| `head_inclination.entry` | `10 degrees` | Higher tolerates more older angular change; lower tolerates less. |
-| `head_inclination.clear` | `6 degrees` | Higher clears at a larger remaining change; lower requires closer return. |
-| `trunk_inclination.entry` | `8 degrees` | Higher tolerates more older trunk-angle change; lower tolerates less. |
-| `trunk_inclination.clear` | `5 degrees` | Higher clears at a larger remaining change; lower requires closer return. |
-
-For the three entry/clear pairs, clear must be lower than entry.
-Those six baseline-delta fields do not override approved minimum/maximum ranges.
 
 **Timing example:** a smoothed pink-axis value goes above an approved maximum
 for `0.4 seconds`.
@@ -1349,10 +1300,12 @@ profile identity, repeat checks or camera-scoring permission.
 
 | Label/key | Default | Meaning and effect |
 | --- | --- | --- |
-| `replay_auto_analyse_movement` | `true` | Exposed configuration flag, currently not read by the runtime analysis workflows. Changing it does not enable/disable automatic analysis; use the explicit Analyze action. Not a calibration approval switch. |
 | `replay_step_history_seconds` | `5 seconds` | Increase to retain a longer step-footprint history; decrease for less visual clutter. Allowed range is `0.5 to 30`. |
 | **Review joint interpolation** (`replay_joint_interpolation`) | `linear` | Choose linear or quadratic drawing interpolation. See Section 19. |
 | **Maximum joint gap to fill (seconds; 0 disables)** (`replay_joint_max_gap`) | `3 seconds` | Increase to draw through longer bracketed joint gaps; decrease to limit inferred drawing. `0` disables it. Does not supply scoring evidence. |
+
+The inactive `replay_auto_analyse_movement` control was removed from Settings.
+Use **Analyze posture & movement** explicitly. Older TOML files remain importable.
 
 ### 15.7 A short explanation of invalid combinations
 
@@ -1811,15 +1764,10 @@ and can explain recording or review behaviour.
 
 | Key/label | Default | Effect |
 | --- | --- | --- |
-| `beat_tracking` | `true` | Enable music/beat-related tracking. Turning it off does not approve or recalibrate joints. |
-| **Starting tempo (BPM)** (`tango_bpm`) | `120` | Starting/fallback tempo. Increasing means a faster tempo; decreasing means slower. Can affect tempo-gated heuristics when used as active/fallback BPM. |
-| `beat_analysis_seconds` | `30 seconds` | Increase for a longer beat-analysis window; decrease for a shorter window with less evidence. Not camera-calibration duration. |
-| `auto_record_start_delay` | `1 second` | Increase to start automatic song recording later; decrease to begin sooner. Allowed `0 to 60`. |
-| `auto_record_stop_delay` | `3 seconds` | Increase to wait longer after a song stops; decrease to end sooner. Allowed `0 to 120`. |
-| `max_recordings` | `10` | Maximum recording starts in one coach run. Increase to permit more starts; decrease to reach the cap sooner. Not the number of files retained in Library. Allowed `1 to 1000`. |
+| **Fallback tempo (BPM)** (`tango_bpm`) | `120` | Tempo supplied when analysis has no soundtrack BPM, not the slow-tango ceiling. At the defaults, 120 exceeds the 115 BPM ceiling and the lift cue is inactive. |
 
-Missing microphone access can affect music/automatic recording behaviour.
-It does not make raw shoulder or knee landmarks more accurate.
+The live microphone/automatic-recording controls are absent from current Settings.
+They do not affect raw shoulder or knee landmarks.
 
 ### Review & Ollama
 
@@ -1828,7 +1776,6 @@ landmarks or replace the numeric calibration evaluator.
 
 | Key/label | Default | Effect |
 | --- | --- | --- |
-| `replay_audio` | `false` | Retained configuration field; current Qt Review does not use it and plays video without an audio playback path. Export the stream for external audio playback. No effect on joint calibration. |
 | **Ollama server address** (`ollama_base_url`) | `http://127.0.0.1:11434` | Address of the configured report-interpretation server. A nonlocal server is not the same privacy boundary as a local server. |
 | `ollama_model` | `llama3.2` | The language model for interpretation, not Lite/Full/Heavy pose tracking. |
 | `ollama_timeout` | `120 seconds` | Increase to wait longer for commentary; decrease to fail sooner on slow responses. Maximum `1800`. |

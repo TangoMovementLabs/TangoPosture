@@ -34,6 +34,35 @@ _FLOAT_RANGES = {
     "tango_bpm": (20.0, 240.0),
 }
 
+_GROUP_HINTS = {
+    "Quality & calibration": (
+        "Quality controls determine whether evidence is usable, not whether posture is correct. "
+        "Approve reference ranges using example passages, acceptable limits and per-metric views "
+        "in the calibration editor."
+    ),
+    "Head & shoulders": (
+        "Fallback descriptive warning controls. A selected calibration or enabled Calibration "
+        "defaults supplies approved ranges instead; missing metrics do not fall back here."
+    ),
+    "Embrace & knees": (
+        "Role/embrace recognition runs independently of calibration. Knee-warning thresholds "
+        "are fallbacks, replaced by selected calibration ranges or enabled Calibration defaults."
+    ),
+    "Torso & hip offset": (
+        "Fallback hip-offset controls, not pink torso-line tilt. Selected calibration ranges "
+        "or enabled Calibration defaults replace these posture limits."
+    ),
+    "Music": (
+        "Current Library/Review analysis does not detect soundtrack BPM. This fallback tempo "
+        "is the input, not the Slow tango max BPM cutoff. At the defaults, 120 BPM exceeds "
+        "the 115 BPM cutoff, so the slow-tango lift cue is inactive."
+    ),
+    "Slow tango": (
+        "The BPM ceiling gates the ankle-lift cue, not video playback or footprint detection. "
+        "It is compared with the fallback tempo in Music when no soundtrack BPM is available."
+    ),
+}
+
 
 class SettingsScreen(QScrollArea):
     def __init__(self, bridge: ServiceBridge, router: Router, parent: QWidget | None = None):
@@ -56,7 +85,7 @@ class SettingsScreen(QScrollArea):
         title = QLabel("Application Settings")
         title.setProperty("class", "title")
         subtitle = QLabel(
-            "Configure all practice, review, and Ollama options. Export TOML to save a settings file."
+            "Configure video analysis, reference comparison, review, and Ollama options."
         )
         subtitle.setProperty("class", "subtitle")
         title_box.addWidget(title)
@@ -82,18 +111,15 @@ class SettingsScreen(QScrollArea):
             page = QWidget()
             form = QFormLayout(page)
             form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
-            if group in {"Head & shoulders", "Embrace & knees", "Torso & hip offset"}:
-                hint = QLabel(
-                    "Used only when no calibration is selected. With a calibration, coaching "
-                    "uses its approved ranges; missing metrics do not fall back to these settings."
-                )
+            if group in _GROUP_HINTS:
+                hint = QLabel(_GROUP_HINTS[group])
                 hint.setWordWrap(True)
                 form.addRow(hint)
             if group == "Files":
                 model_hint = QLabel(
-                    "Live Practice always uses Lite. Offline analysis uses the model selected "
-                    "below. Missing analysis models are downloaded once with progress, then "
-                    "cached locally; Full and Heavy take more processing time."
+                    "Offline analysis uses the model selected below. The Lite model file supplies "
+                    "the Lite path; Full and Heavy use their own files. Missing models are downloaded "
+                    "and cached locally; Full and Heavy take more processing time."
                 )
                 model_hint.setWordWrap(True)
                 form.addRow(model_hint)
@@ -194,13 +220,10 @@ class SettingsScreen(QScrollArea):
     @staticmethod
     def _field_label(field: str) -> str:
         labels = {
-            "camera": "Camera device index",
-            "width": "Image width (pixels)",
-            "height": "Image height (pixels)",
             "side": "Measurement side",
             "facing": "Facing direction",
-            "capture_profile": "Camera setup name",
-            "model_path": "Live Practice model file (Lite)",
+            "capture_profile": "Capture setup name",
+            "model_path": "Lite model file",
             "analysis_model": "Offline analysis model",
             "data_dir": "Data folder",
             "confidence": "Minimum landmark confidence",
@@ -209,7 +232,8 @@ class SettingsScreen(QScrollArea):
             "replay_joint_max_gap": "Maximum joint gap to fill (seconds; 0 disables)",
             "head_down_angle": "Head down angle limit (degrees)",
             "shoulder_raise_threshold": "Shoulder tension limit (%)",
-            "tango_bpm": "Starting tempo (BPM)",
+            "slow_tango_max_bpm": "Slow tango max BPM",
+            "tango_bpm": "Fallback tempo (BPM)",
             "ollama_base_url": "Ollama server address",
             "ollama_num_ctx": "Model context size (tokens)",
             "ollama_num_predict": "Maximum response length (tokens)",
@@ -230,39 +254,30 @@ class SettingsScreen(QScrollArea):
             editor.setText(path)
 
     def _set_legacy_widget_aliases(self) -> None:
-        camera = self.field_widgets["camera"]
         side = self.field_widgets["side"]
         facing = self.field_widgets["facing"]
-        mirror = self.field_widgets["mirror"]
         confidence = self.field_widgets["confidence"]
         smoothing = self.field_widgets["smoothing"]
         head_angle = self.field_widgets["head_down_angle"]
         shoulder = self.field_widgets["shoulder_raise_threshold"]
-        beat = self.field_widgets["beat_tracking"]
         bpm = self.field_widgets["tango_bpm"]
         ollama_url = self.field_widgets["ollama_base_url"]
         ollama_model = self.field_widgets["ollama_model"]
-        assert isinstance(camera, QSpinBox)
         assert isinstance(side, QComboBox)
         assert isinstance(facing, QComboBox)
-        assert isinstance(mirror, QCheckBox)
         assert isinstance(confidence, QDoubleSpinBox)
         assert isinstance(smoothing, QDoubleSpinBox)
         assert isinstance(head_angle, QDoubleSpinBox)
         assert isinstance(shoulder, QDoubleSpinBox)
-        assert isinstance(beat, QCheckBox)
         assert isinstance(bpm, QDoubleSpinBox)
         assert isinstance(ollama_url, QLineEdit)
         assert isinstance(ollama_model, QLineEdit)
-        self.cam_spin = camera
         self.side_combo = side
         self.facing_combo = facing
-        self.mirror_cb = mirror
         self.conf_spin = confidence
         self.smooth_spin = smoothing
         self.head_angle_spin = head_angle
         self.shoulder_spin = shoulder
-        self.beat_cb = beat
         self.bpm_spin = bpm
         self.ollama_url = ollama_url
         self.ollama_model = ollama_model

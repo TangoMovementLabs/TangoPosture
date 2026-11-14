@@ -749,21 +749,26 @@ The default time constant is 0.25 seconds. `dt` comes from actual timestamps, so
 
 The first valid observation initialises the filter. A gap longer than 0.5 seconds resets it. Short invalid gaps still break event persistence, even when the filter can retain its previous value for subsequent smoothing.
 
-### Thresholds and hysteresis
+### Approved ranges and event timing
 
-| Metric | Enter threshold | Clear threshold | Direction |
-| --- | --- | --- | --- |
-| Head-forward | `+0.08` torso lengths | Below `+0.05` | Positive delta only |
-| Head inclination | Absolute `10°` | Below absolute `6°` | Either direction |
-| Trunk inclination | Absolute `8°` | Below absolute `5°` | Either direction |
+The selected calibration profile, or enabled Calibration defaults when no
+profile is selected, supplies an acceptable minimum and maximum for each metric.
+An evaluated value is inside when it lies between those bounds, including the
+endpoints. A value outside either end can start a pending deviation.
 
-Entry must remain above threshold continuously for 1.5 seconds. An active deviation clears only after 0.75 seconds continuously below the clear threshold. Between thresholds, an active deviation remains active. Before activation, a return below entry resets the pending timer.
+The outside condition must persist continuously for **Entry duration**, default
+1.5 seconds, before confirmation. An active deviation clears after recovery
+inside the approved interval persists for **Clear duration**, default 0.75 seconds.
+Returning inside before confirmation resets the pending timer.
 
-Different enter and clear thresholds prevent repeated switching when a measurement fluctuates around a single boundary. This is hysteresis.
+For illustration, suppose an already-smoothed pink-axis value first leaves its
+approved interval at source time 10.0 seconds and stays outside. At the first
+qualifying observation at or after 11.5 seconds, an event can confirm. Its onset
+is 10.0; its detection is that later observation. A one-second excursion does
+not qualify at the default entry duration.
 
-For illustration, suppose the **already-smoothed** head-forward delta first exceeds entry at source time 10.0 seconds and stays above it. At the first qualifying observation at or after 11.5 seconds, an event can be confirmed. Its onset is 10.0; its detection is that later observation. A one-second excursion does not qualify.
-
-These defaults are experimental. They are not established tango or clinical cut-offs.
+Bounds are deliberately approved, not universal tango or clinical cut-offs.
+Changing persistence times does not change those bounds.
 
 ### Missing data and gaps
 
@@ -771,7 +776,7 @@ An invalid observation immediately makes the affected metric unknown, resets pen
 
 An inter-frame gap above 0.5 seconds has the same continuity-breaking effect, even if the next detected pose is valid. Otherwise, dropped frames could incorrectly manufacture the appearance of continuous persistence.
 
-Pausing closes active events with `paused` and resets temporal state. Ending closes remaining events with `session_ended`. Successful hysteresis clearing records `cleared`.
+Pausing closes active events with `paused` and resets temporal state. Ending closes remaining events with `session_ended`. Sustained recovery records `cleared`.
 
 ### Duration accounting
 
@@ -804,6 +809,35 @@ A reused reference must match model hash, metric version, side, facing, capture 
 A profile name is an identity label, not an automatic calibration of physical camera geometry. Reusing a profile name does not prove that camera placement stayed unchanged.
 
 ## 16. Storage, exports, and privacy
+
+### Clearing database records
+
+Open **Database maintenance** in the navigation rail to see the configured
+`tango.sqlite3` location and the row counts for **calibrations**, **sessions**,
+**events** and **observations**. **Refresh row counts** updates this snapshot.
+A missing database is not created by this screen.
+
+To empty all four tables:
+
+1. Finish imports, packaging, promotions and Review analysis. Stop any other
+   TangoPosture processes, including CLI sessions.
+2. Verify the displayed database path. This clears every record, not just a
+   selected session or date range.
+3. Tick the acknowledgement and type exactly `DELETE ALL DATA`.
+4. Click **Clear all four tables...**, then **Yes** in the final confirmation.
+   The default is **No**.
+5. Wait for completion. Once started, cleanup cannot be cancelled. The screen
+   reports the deleted row count and refreshes the table counts.
+
+**There is no Undo and no automatic backup.** Deletions run as one transaction:
+if an operation fails, the transaction rolls back and the error is displayed.
+Tables, indexes and the database file are kept so the app can save new data later.
+
+This is **not** a file or Library reset. `.tp` practices, `.tpr` replayable references,
+`.tpc` calibration profiles, videos and reports are untouched. File-based profiles
+and archived history can still appear in Library and archive Analytics afterward.
+Cleanup is unavailable while in-app import/packaging/analysis jobs are active;
+external processes are the user's responsibility.
 
 ### SQLite structure
 
@@ -1050,7 +1084,7 @@ In GUI webcam mode, enabled beat tracking attempts to open a local microphone st
 
 The current microphone implementation uses mono audio at 16 kHz, blocks of 1,024 samples, a Hann window, a real FFT, and positive spectral changes in a 45–450 Hz band. It detects unusually strong changes relative to recent history and nudges the running beat clock. This is an onset/tempo heuristic, not a validated tango musical-structure recogniser. Other sounds and missed onsets can affect it. Microphone startup failure falls back without a raised application error, so the displayed source matters.
 
-The code default is `beat_tracking = true`. To disable microphone beat processing explicitly, use these top-level TOML entries **before** any `[head_forward]` or other table header:
+The code default is `beat_tracking = true`. To disable microphone beat processing explicitly, use these top-level TOML entries **before** any calibration-default or other table header:
 
 ```toml
 side = "left"
@@ -1176,20 +1210,16 @@ Settings are editable in the desktop app and can be imported from or exported to
 
 | Setting | Meaning |
 | --- | --- |
-| `camera` | Camera device index. |
-| `width` | Requested camera image width in pixels. |
-| `height` | Requested camera image height in pixels. |
 | `side` | Anatomical side selected for side-view measurements. |
 | `facing` | Direction faced in the original, unmirrored image. |
 | `capture_profile` | Name identifying the camera and capture setup. |
-| `mirror` | Mirrors the displayed image only. |
 | `allow_all_angles` | Enables the experimental measurement path for additional view angles. |
 
 ### Files
 
 | Setting | Meaning |
 | --- | --- |
-| `model_path` | Location of the Lite model used for Live Practice and Lite analysis. |
+| `model_path` | Location of the pinned Lite model used when offline analysis selects Lite. |
 | `analysis_model` | Offline analysis model: `lite` (default), `full`, or `heavy`. Missing models download when analysis starts; live coaching remains Lite. |
 | `data_dir` | Directory for the local database and practice artifacts. |
 
@@ -1201,12 +1231,6 @@ Settings are editable in the desktop app and can be imported from or exported to
 | `min_torso` | Minimum visible torso length as a fraction of image height. |
 | `min_head` | Minimum visible shoulder-to-ear segment as a fraction of image height. |
 | `max_view_width` | Maximum body-width-to-torso ratio accepted for a side view. |
-| `view_change_tolerance` | Allowed view-width difference from the captured reference. |
-| `calibration_duration` | Total reference capture window in seconds. |
-| `calibration_valid_duration` | Minimum valid measured time required during calibration. |
-| `calibration_samples` | Minimum number of valid observations in a reference. |
-| `offset_mad` | Maximum allowed spread for calibrated head-forward offset. |
-| `angle_mad` | Maximum allowed spread for calibrated angular measurements. |
 
 ### Tracking and reference thresholds
 
@@ -1217,12 +1241,6 @@ Settings are editable in the desktop app and can be imported from or exported to
 | `entry_duration` | Time a threshold must be crossed before confirming a deviation. |
 | `clear_duration` | Time a value must remain below its clear threshold before closing an event. |
 | `max_gap` | Maximum observation gap treated as continuous tracking. |
-| `head_forward.entry` | Forward torso-relative offset that starts a pending event. |
-| `head_forward.clear` | Lower forward offset at which an event can clear. |
-| `head_inclination.entry` | Angular change from reference that starts an event. |
-| `head_inclination.clear` | Lower angular change at which an event can clear. |
-| `trunk_inclination.entry` | Trunk-angle change from reference that starts an event. |
-| `trunk_inclination.clear` | Lower trunk-angle change at which an event can clear. |
 
 ### Head & shoulders
 
@@ -1268,18 +1286,12 @@ Settings are editable in the desktop app and can be imported from or exported to
 
 | Setting | Meaning |
 | --- | --- |
-| `beat_tracking` | Enables microphone-based beat tracking in GUI practice. |
-| `tango_bpm` | Starting tempo estimate for the beat tracker. |
-| `beat_analysis_seconds` | Analysis window used to estimate phrase timing. |
-| `auto_record_start_delay` | Continuous detected music required before automatic recording starts. |
-| `auto_record_stop_delay` | Continuous detected silence required before automatic recording stops. |
-| `max_recordings` | Maximum number of recording starts in one coach run. |
+| `tango_bpm` | Fallback tempo when analysis has no soundtrack BPM; compared with the separate slow-tango ceiling for the ankle-lift cue. |
 
 ### Replay movement
 
 | Setting | Meaning |
 | --- | --- |
-| `replay_auto_analyse_movement` | Exposed configuration flag currently not consumed by the runtime analysis workflows; use the explicit Analyze action. |
 | `replay_step_history_seconds` | Replay media-time window (0.5 to 30 seconds) over which observed step footprints fade out. |
 | `replay_joint_interpolation` | Display-only Review joint gap filling: linear by default, or quadratic with a linear fallback. Raw calibration/scoring evidence is unchanged. |
 | `replay_joint_max_gap` | Maximum bracketed joint gap filled in Review, in seconds; default 3.0, and 0 disables filling. Not the measurement tracking gap limit. |
@@ -1288,7 +1300,6 @@ Settings are editable in the desktop app and can be imported from or exported to
 
 | Setting | Meaning |
 | --- | --- |
-| `replay_audio` | Retained for configuration compatibility; Qt review currently plays video only. Export the stream for external audio playback. |
 | `ollama_base_url` | Address of the local or reachable Ollama server. |
 | `ollama_model` | Model name installed on that Ollama server. |
 | `ollama_timeout` | Maximum wait for a local model request. |

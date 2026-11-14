@@ -1,6 +1,8 @@
 import csv
 import json
 import socket
+import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 import pytest
@@ -8,7 +10,7 @@ from conftest import frame
 
 from tango_posture.metrics import measure
 from tango_posture.session import Session
-from tango_posture.storage import Storage
+from tango_posture.storage import DATABASE_TABLES, Storage, clear_database, database_counts
 
 
 def run_session(root, reference, cfg):
@@ -87,6 +89,94 @@ def test_sample_export(tmp_path, reference, cfg):
     db.save_calibration(reference)
     assert db.calibration(reference.id).id == reference.id
     db.close()
+
+
+def test_clear_database_preserves_schema_files_and_future_sessions(tmp_path, reference, cfg):
+    root = tmp_path / "data with # and ?"
+    db, _, _, out = run_session(root, reference, cfg)
+    try:
+        schema = [tuple(row) for row in db.db.execute("SELECT * FROM sqlite_master")]
+    finally:
+        db.close()
+    path = root / "tango.sqlite3"
+    for suffix in (".tp", ".tpr", ".tpc", ".mp4"):
+        (root / f"retained{suffix}").write_bytes(b"untouched fixture")
+    preserved = {
+        file: file.read_bytes() for file in root.rglob("*")
+        if file.is_file() and file != path
+    }
+    counts = database_counts(path)
+    assert set(counts) == set(DATABASE_TABLES)
+    assert all(value > 0 for value in counts.values())
+
+    assert clear_database(path) == counts
+
+    assert database_counts(path) == dict.fromkeys(DATABASE_TABLES, 0)
+    assert {file: file.read_bytes() for file in preserved} == preserved
+    assert set(root.rglob("*")) == set(preserved) | {path, out}
+    with closing(sqlite3.connect(path)) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert connection.execute("SELECT * FROM sqlite_master").fetchall() == schema
+    db, _, summary, _ = run_session(root, reference, cfg)
+    db.close()
+    assert summary["active_duration"] > 0
+    assert database_counts(path)["sessions"] == 1
+
+
+def test_clear_database_rolls_back_children_when_parent_delete_fails(tmp_path, reference, cfg):
+    db, _, _, _ = run_session(tmp_path, reference, cfg)
+    try:
+        db.db.execute(
+            "CREATE TRIGGER reject_cleanup BEFORE DELETE ON sessions "
+            "BEGIN SELECT RAISE(ABORT, 'fixture prevents deletion'); END"
+        )
+        db.db.commit()
+    finally:
+        db.close()
+    path = tmp_path / "tango.sqlite3"
+    before = database_counts(path)
+
+    with pytest.raises(sqlite3.IntegrityError, match="fixture prevents deletion"):
+        clear_database(path)
+
+    assert database_counts(path) == before
+
+
+@pytest.mark.parametrize("operation", [database_counts, clear_database])
+def test_database_maintenance_never_creates_missing_database(tmp_path, operation):
+    path = tmp_path / "missing-directory" / "tango.sqlite3"
+    with pytest.raises(sqlite3.OperationalError, match="unable to open"):
+        operation(path)
+    assert not path.parent.exists()
+
+
+@pytest.mark.parametrize("operation", [database_counts, clear_database])
+def test_database_maintenance_rejects_unsupported_schema(tmp_path, operation):
+    db = Storage(tmp_path)
+    db.db.execute("PRAGMA user_version=2")
+    db.close()
+    path = tmp_path / "tango.sqlite3"
+    before = path.read_bytes()
+
+    with pytest.raises(ValueError, match="Unsupported database schema version 2"):
+        operation(path)
+
+    assert path.read_bytes() == before
+
+
+def test_clear_database_reports_lock_without_deleting_rows(tmp_path, reference, cfg):
+    db, _, _, _ = run_session(tmp_path, reference, cfg)
+    path = tmp_path / "tango.sqlite3"
+    before = database_counts(path)
+    try:
+        db.db.execute("BEGIN IMMEDIATE")
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            clear_database(path)
+    finally:
+        db.db.rollback()
+        db.close()
+    assert database_counts(path) == before
 
 
 if __name__ == "__main__":

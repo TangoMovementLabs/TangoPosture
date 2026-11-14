@@ -28,6 +28,11 @@ def qapp():
     return app
 
 
+@pytest.fixture(autouse=True)
+def isolated_data_directory(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+
+
 def test_router_navigation():
     router = Router()
     assert router.current == Route.HOME
@@ -80,8 +85,8 @@ def test_packaged_smoke_initializes_qt_and_runs_inference(qapp, tmp_path, monkey
     assert "Checking Qt desktop" in capsys.readouterr().out
 
 
-def test_main_window_instantiation_and_navigation(qapp):
-    cfg = Config()
+def test_main_window_instantiation_and_navigation(qapp, tmp_path):
+    cfg = Config(data_dir=str(tmp_path))
     window = MainWindow(cfg)
     assert window is not None
     assert window.windowTitle() == "TangoPosture Studio"
@@ -109,6 +114,11 @@ def test_main_window_instantiation_and_navigation(qapp):
 
     window.router.navigate(Route.HELP)
     assert window.stack.currentWidget() == window.screens[Route.HELP]
+
+    window.nav_buttons[Route.DATABASE].click()
+    assert window.stack.currentWidget() == window.screens[Route.DATABASE]
+    assert window.nav_buttons[Route.DATABASE].isChecked()
+    assert not (tmp_path / "tango.sqlite3").exists()
 
     window.close()
 
@@ -179,7 +189,7 @@ def test_help_renders_styled_manual_with_hierarchical_contents_and_search(qapp):
 def test_navigation_buttons_have_icons_and_accessible_labels(qapp):
     window = MainWindow(Config())
 
-    assert len(window.nav_buttons) == 7
+    assert len(window.nav_buttons) == 8
     assert Route.REFERENCES not in window.nav_buttons
     for button in window.nav_buttons.values():
         assert not button.icon().isNull()
@@ -258,12 +268,10 @@ def test_settings_screen_update(qapp, tmp_path, monkeypatch):
     window = MainWindow(cfg)
     settings_screen = window.screens[Route.SETTINGS]
 
-    settings_screen.cam_spin.setValue(2)
     settings_screen.bpm_spin.setValue(130.0)
     settings_screen.field_widgets["analysis_model"].setCurrentText("heavy")
     settings_screen._save_settings()
 
-    assert window.bridge.config.camera == 2
     assert window.bridge.config.tango_bpm == 130.0
     assert window.bridge.config.analysis_model == "heavy"
 
@@ -272,28 +280,23 @@ def test_settings_screen_update(qapp, tmp_path, monkeypatch):
     assert window.bridge.config.tango_bpm == 120.0
     assert settings_screen.field_widgets["analysis_model"].currentText() == "lite"
     assert settings_screen.smooth_spin.value() == Config().smoothing
-    assert settings_screen.mirror_cb.isChecked() == Config().mirror
-    settings_screen.field_widgets["calibration_duration"].setValue(15.0)
+    settings_screen.conf_spin.setValue(0.8)
     settings_screen.field_widgets["ollama_num_ctx"].setValue(8192)
-    settings_screen.field_widgets["head_forward.entry"].setValue(0.1)
+    settings_screen.field_widgets["entry_duration"].setValue(2.0)
     assert settings_screen._save_settings()
-    assert window.bridge.config.calibration_duration == 15.0
+    assert window.bridge.config.confidence == 0.8
     assert window.bridge.config.ollama_num_ctx == 8192
-    assert window.bridge.config.head_forward.entry == 0.1
+    assert window.bridge.config.entry_duration == 2.0
 
     source = Config(
         analysis_model="full",
-        camera=3,
         side="right",
         facing="left",
-        mirror=True,
         smoothing=0.8,
         head_down_angle=-20.0,
         shoulder_raise_threshold=17.0,
-        beat_tracking=False,
         tango_bpm=135.0,
-        calibration_duration=15.0,
-        calibration_valid_duration=12.0,
+        confidence=0.85,
         ollama_num_ctx=8192,
         ollama_base_url="http://localhost:11435",
         ollama_model="custom-model",
@@ -305,19 +308,16 @@ def test_settings_screen_update(qapp, tmp_path, monkeypatch):
         lambda *args: (str(settings_path), "TOML (*.toml)"),
     )
     settings_screen._import_toml()
-    assert settings_screen.cam_spin.value() == 3
     assert settings_screen.field_widgets["analysis_model"].currentText() == "full"
     assert settings_screen.side_combo.currentText() == "right"
     assert settings_screen.facing_combo.currentText() == "left"
-    assert settings_screen.mirror_cb.isChecked()
     assert settings_screen.smooth_spin.value() == 0.8
     assert settings_screen.head_angle_spin.value() == -20.0
     assert settings_screen.shoulder_spin.value() == 17.0
-    assert not settings_screen.beat_cb.isChecked()
     assert settings_screen.bpm_spin.value() == 135.0
     assert settings_screen.ollama_url.text() == "http://localhost:11435"
     assert settings_screen.ollama_model.text() == "custom-model"
-    assert settings_screen.field_widgets["calibration_duration"].value() == 15.0
+    assert settings_screen.conf_spin.value() == 0.85
     assert settings_screen.field_widgets["ollama_num_ctx"].value() == 8192
     assert settings_screen.tabs.count() == 12
     window.close()
@@ -333,6 +333,55 @@ def test_settings_screen_exposes_all_shared_setting_fields(qapp):
         field for fields in SETTING_GROUPS.values() for field in fields
     }
     window.close()
+
+
+def test_settings_hide_removed_controls_and_export_only_current_controls(qapp, tmp_path, monkeypatch):
+    import tomllib
+
+    legacy = {
+        "replay_audio": True,
+        "replay_auto_analyse_movement": False,
+        "view_change_tolerance": 0.22,
+        "calibration_duration": 15.0,
+        "calibration_valid_duration": 12.0,
+        "calibration_samples": 80,
+        "offset_mad": 0.04,
+        "angle_mad": 5.0,
+        "head_forward": {"entry": 0.2, "clear": 0.1},
+        "head_inclination": {"entry": 14.0, "clear": 7.0},
+        "trunk_inclination": {"entry": 12.0, "clear": 6.0},
+        "camera": 3,
+        "width": 1280,
+        "height": 720,
+        "mirror": True,
+        "beat_tracking": False,
+        "beat_analysis_seconds": 60.0,
+        "auto_record_start_delay": 2.0,
+        "auto_record_stop_delay": 5.0,
+        "max_recordings": 4,
+    }
+    window = MainWindow(Config(**legacy))
+    screen = window.screens[Route.SETTINGS]
+    target = tmp_path / "exported.toml"
+    monkeypatch.setattr(
+        "tango_posture.desktop_qt.screens.settings.QFileDialog.getSaveFileName",
+        lambda *args: (str(target), "TOML (*.toml)"),
+    )
+    try:
+        legacy_fields = {
+            f"{key}.{name}" if isinstance(value, dict) else key
+            for key, value in legacy.items()
+            for name in (value if isinstance(value, dict) else [None])
+        }
+        assert legacy_fields.isdisjoint(screen.field_widgets)
+        screen.field_widgets["analysis_model"].setCurrentText("heavy")
+        screen._export_toml()
+        exported = tomllib.loads(target.read_text())
+        assert exported["analysis_model"] == "heavy"
+        assert legacy.keys().isdisjoint(exported)
+        assert window.bridge.config.model_dump(include=set(legacy)) == legacy
+    finally:
+        window.close()
 
 
 def test_invalid_settings_are_not_applied(qapp):

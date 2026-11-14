@@ -31,6 +31,7 @@ from .router import Route, Router
 from .screens.about import AboutDialog
 from .screens.analytics import AnalyticsScreen
 from .screens.coach import CoachScreen
+from .screens.database import DatabaseScreen
 from .screens.help import HelpScreen
 from .screens.home import HomeScreen
 from .screens.library import LibraryScreen
@@ -114,6 +115,7 @@ class MainWindow(QMainWindow):
             (Route.COACH, "AI Coach", "coach"),
             (Route.SETTINGS, "Settings", "settings"),
             (Route.HELP, "Help & Guide", "help"),
+            (Route.DATABASE, "Database maintenance", "database"),
         ]
 
         for route, label, icon_name in nav_items:
@@ -150,6 +152,7 @@ class MainWindow(QMainWindow):
             Route.COACH: CoachScreen(self.bridge, self.router),
             Route.SETTINGS: SettingsScreen(self.bridge, self.router),
             Route.HELP: HelpScreen(self.bridge, self.router),
+            Route.DATABASE: DatabaseScreen(self.bridge, self._database_cleanup_blocker),
         }
 
         for route, screen in self.screens.items():
@@ -175,6 +178,16 @@ class MainWindow(QMainWindow):
         # Initial Route
         self.nav_buttons[Route.HOME].setChecked(True)
         self.stack.setCurrentWidget(self.screens[Route.HOME])
+
+    def _database_cleanup_blocker(self) -> str | None:
+        library = self.screens[Route.LIBRARY]
+        review = self.screens[Route.REVIEW]
+        if (
+            isinstance(library, LibraryScreen) and library.has_active_jobs()
+            or isinstance(review, ReviewScreen) and review.has_active_jobs()
+        ):
+            return "Wait for Library imports/packaging and Review analysis to finish before cleanup."
+        return None
 
     def _navigate_shortcut(self, route: Route) -> None:
         focused_widget = QApplication.focusWidget()

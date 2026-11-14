@@ -132,6 +132,14 @@ def _draw_about(painter: QPainter) -> None:
     painter.drawLine(12, 11, 12, 17)
 
 
+def _draw_database(painter: QPainter) -> None:
+    painter.drawEllipse(QRectF(4, 3, 16, 5))
+    painter.drawLine(4, 5, 4, 19)
+    painter.drawLine(20, 5, 20, 19)
+    painter.drawArc(QRectF(4, 10, 16, 5), 180 * 16, 180 * 16)
+    painter.drawArc(QRectF(4, 16, 16, 5), 180 * 16, 180 * 16)
+
+
 _ICON_DRAWERS = {
     "home": _draw_home,
     "practice": _draw_practice,
@@ -143,6 +151,7 @@ _ICON_DRAWERS = {
     "settings": _draw_settings,
     "help": _draw_help,
     "about": _draw_about,
+    "database": _draw_database,
 }
 
 

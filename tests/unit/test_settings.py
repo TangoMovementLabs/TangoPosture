@@ -19,11 +19,23 @@ def test_every_setting_has_a_toml_name_and_editor_group():
         "trunk_inclination",
         "axis_curve",
         "calibration_defaults",
-    }
-    expected |= {
-        f"{metric}.{threshold}"
-        for metric in ("head_forward", "head_inclination", "trunk_inclination")
-        for threshold in ("entry", "clear")
+        "replay_audio",
+        "replay_auto_analyse_movement",
+        "view_change_tolerance",
+        "calibration_duration",
+        "calibration_valid_duration",
+        "calibration_samples",
+        "offset_mad",
+        "angle_mad",
+        "camera",
+        "width",
+        "height",
+        "mirror",
+        "beat_tracking",
+        "beat_analysis_seconds",
+        "auto_record_start_delay",
+        "auto_record_stop_delay",
+        "max_recordings",
     }
     fields = [field for group in SETTING_GROUPS.values() for field in group]
     assert len(fields) == len(set(fields))
@@ -45,24 +57,96 @@ def test_default_toml_has_every_editable_setting():
 
 def test_full_toml_round_trip(tmp_path):
     cfg = Config(
-        camera=2,
-        mirror=True,
         model_path='models/with spaces "quoted".task',
         data_dir="my sessions",
-        head_forward={"entry": 0.2, "clear": 0.1},
         axis_curve_entry=0.1,
-        auto_record_start_delay=2.0,
-        auto_record_stop_delay=5.0,
-        max_recordings=3,
         analysis_model="full",
         replay_joint_interpolation="quadratic",
         replay_joint_max_gap=2.75,
         calibration_defaults={
             "head_pitch": {"lower": -23.125, "upper": 7.5, "unit": "degrees", "view": "all"},
+            "head_forward": {
+                "lower": -0.03, "upper": 0.2, "unit": "torso_lengths", "view": "side",
+            },
             "hip_offset": {"lower": -0.02, "upper": 0.11, "unit": "axis_lengths", "view": "side"},
         },
     )
     assert Config.model_validate(tomllib.loads(export_toml(cfg))) == cfg
+
+
+def test_old_inactive_replay_flags_load_but_are_not_exported(tmp_path):
+    settings = tmp_path / "old-settings.toml"
+    settings.write_text(
+        'replay_audio=true\nreplay_auto_analyse_movement=false\nanalysis_model="full"\n'
+    )
+    cfg = load(settings, {})
+    assert cfg.replay_audio
+    assert not cfg.replay_auto_analyse_movement
+    exported = tomllib.loads(export_toml(cfg))
+    assert "replay_audio" not in exported
+    assert "replay_auto_analyse_movement" not in exported
+    assert Config.model_validate(exported).analysis_model == "full"
+
+
+def test_old_baseline_settings_load_without_returning_to_settings_exports(tmp_path):
+    legacy = {
+        "view_change_tolerance": 0.22,
+        "calibration_duration": 15.0,
+        "calibration_valid_duration": 12.0,
+        "calibration_samples": 80,
+        "offset_mad": 0.04,
+        "angle_mad": 5.0,
+    }
+    settings = tmp_path / "legacy-settings.toml"
+    settings.write_text(
+        "".join(f"{key}={value}\n" for key, value in legacy.items()) + "confidence=0.8\n"
+    )
+    cfg = load(settings, {})
+    assert {key: getattr(cfg, key) for key in legacy} == legacy
+    exported = tomllib.loads(export_toml(cfg))
+    assert legacy.keys().isdisjoint(exported)
+    assert Config.model_validate(exported).confidence == 0.8
+
+
+def test_removed_live_controls_remain_importable_without_being_exported(tmp_path):
+    legacy = {
+        "camera": 3, "width": 1280, "height": 720, "mirror": True,
+        "beat_tracking": False, "beat_analysis_seconds": 60.0,
+        "auto_record_start_delay": 2.0, "auto_record_stop_delay": 5.0, "max_recordings": 4,
+    }
+    settings = tmp_path / "live-settings.toml"
+    settings.write_text(
+        "".join(f"{key}={str(value).lower()}\n" for key, value in legacy.items())
+        + 'analysis_model="full"\n'
+    )
+    cfg = load(settings, {})
+    assert cfg.model_dump(include=set(legacy)) == legacy
+    exported = tomllib.loads(export_toml(cfg))
+    assert legacy.keys().isdisjoint(exported)
+    assert Config.model_validate(exported).analysis_model == "full"
+
+
+@pytest.mark.parametrize("metric,entry,clear", [
+    ("head_forward", 0.2, 0.1),
+    ("head_inclination", 14.0, 7.0),
+    ("trunk_inclination", 12.0, 6.0),
+])
+def test_old_metric_thresholds_load_without_replacing_current_range_settings(
+    tmp_path, metric, entry, clear,
+):
+    settings = tmp_path / "legacy-thresholds.toml"
+    settings.write_text(
+        f"entry_duration=2.0\n[{metric}]\nentry={entry}\nclear={clear}\n"
+        "[calibration_defaults.head_forward]\n"
+        'lower=-0.03\nupper=0.2\nunit="torso_lengths"\nview="side"\n'
+    )
+    cfg = load(settings, {})
+    assert getattr(cfg, metric).model_dump() == {"entry": entry, "clear": clear}
+    exported = tomllib.loads(export_toml(cfg))
+    assert metric not in exported
+    restored = Config.model_validate(exported)
+    assert restored.entry_duration == 2.0
+    assert restored.calibration_defaults == cfg.calibration_defaults
 
 
 @pytest.mark.parametrize("change", [

@@ -87,6 +87,7 @@ class Config(BaseModel):
     axis_curve_duration: float = Field(default=1.5, gt=0)
     axis_curve_clear_duration: float = Field(default=0.75, gt=0)
     axis_neutral_offset: float = Field(default=0.0)
+    # Accept older TOML files; neither replay flag has a runtime consumer.
     replay_audio: bool = False
     replay_auto_analyse_movement: bool = True
     replay_step_history_seconds: float = Field(default=5.0, ge=0.5, le=30.0)
@@ -138,13 +139,9 @@ def parse_bool(value: str) -> bool:
 
 SETTING_GROUPS = {
     "Camera & view": (
-        "camera",
-        "width",
-        "height",
         "side",
         "facing",
         "capture_profile",
-        "mirror",
         "allow_all_angles",
     ),
     "Files": ("model_path", "analysis_model", "data_dir"),
@@ -153,12 +150,6 @@ SETTING_GROUPS = {
         "min_torso",
         "min_head",
         "max_view_width",
-        "view_change_tolerance",
-        "calibration_duration",
-        "calibration_valid_duration",
-        "calibration_samples",
-        "offset_mad",
-        "angle_mad",
     ),
     "Tracking": (
         "smoothing",
@@ -166,12 +157,6 @@ SETTING_GROUPS = {
         "entry_duration",
         "clear_duration",
         "max_gap",
-        "head_forward.entry",
-        "head_forward.clear",
-        "head_inclination.entry",
-        "head_inclination.clear",
-        "trunk_inclination.entry",
-        "trunk_inclination.clear",
     ),
     "Head & shoulders": (
         "head_neutral_offset",
@@ -202,21 +187,14 @@ SETTING_GROUPS = {
         "max_consecutive_high_ankle_steps",
     ),
     "Music": (
-        "beat_tracking",
         "tango_bpm",
-        "beat_analysis_seconds",
-        "auto_record_start_delay",
-        "auto_record_stop_delay",
-        "max_recordings",
     ),
     "Replay movement": (
-        "replay_auto_analyse_movement",
         "replay_step_history_seconds",
         "replay_joint_interpolation",
         "replay_joint_max_gap",
     ),
     "Review & Ollama": (
-        "replay_audio",
         "ollama_base_url",
         "ollama_model",
         "ollama_timeout",
@@ -247,15 +225,11 @@ for _fields in SETTING_GROUPS.values():
         SETTING_MAP[_field] = (_field, _setting_parser(_field))
 
 SETTING_DESCRIPTIONS: dict[str, str] = {
-    "camera": "Camera device index.",
-    "width": "Requested camera image width in pixels.",
-    "height": "Requested camera image height in pixels.",
     "side": "Anatomical side selected for side-view measurements.",
     "facing": "Direction faced in the original, unmirrored image.",
     "capture_profile": "Name identifying the camera and capture setup.",
-    "mirror": "Mirrors the displayed image only.",
     "allow_all_angles": "Enables the experimental measurement path for additional view angles.",
-    "model_path": "Location of the Lite model used for Live Practice and Lite analysis.",
+    "model_path": "Location of the pinned Lite model used when offline analysis selects Lite.",
     "analysis_model": (
         "Offline analysis model: lite (default), full, or heavy. "
         "Missing models download when analysis starts; live coaching remains Lite."
@@ -265,23 +239,11 @@ SETTING_DESCRIPTIONS: dict[str, str] = {
     "min_torso": "Minimum visible torso length as a fraction of image height.",
     "min_head": "Minimum visible shoulder-to-ear segment as a fraction of image height.",
     "max_view_width": "Maximum body-width-to-torso ratio accepted for a side view.",
-    "view_change_tolerance": "Allowed view-width difference from the captured reference.",
-    "calibration_duration": "Total reference capture window in seconds.",
-    "calibration_valid_duration": "Minimum valid measured time required during calibration.",
-    "calibration_samples": "Minimum number of valid observations in a reference.",
-    "offset_mad": "Maximum allowed spread for calibrated head-forward offset.",
-    "angle_mad": "Maximum allowed spread for calibrated angular measurements.",
     "smoothing": "Time constant for smoothing measurements over time.",
     "overlay_smoothing": "Smoothing time constant for rendered landmark lines and segments.",
     "entry_duration": "Time a threshold must be crossed before confirming a deviation.",
     "clear_duration": "Time a value must remain below its clear threshold before closing an event.",
     "max_gap": "Maximum observation gap treated as continuous tracking.",
-    "head_forward.entry": "Forward torso-relative offset that starts a pending event.",
-    "head_forward.clear": "Lower forward offset at which an event can clear.",
-    "head_inclination.entry": "Angular change from reference that starts an event.",
-    "head_inclination.clear": "Lower angular change at which an event can clear.",
-    "trunk_inclination.entry": "Trunk-angle change from reference that starts an event.",
-    "trunk_inclination.clear": "Lower trunk-angle change at which an event can clear.",
     "head_neutral_offset": "Offset used by the separate ear-to-nose horizontal-angle cue.",
     "head_down_duration": "Duration required before showing the head-angle warning.",
     "head_down_angle": "Ear-to-nose image-angle boundary for that warning.",
@@ -302,15 +264,9 @@ SETTING_DESCRIPTIONS: dict[str, str] = {
     "slow_tango_max_bpm": "Tempo ceiling for the slow-tango ankle-lift cue.",
     "ankle_high_lift_ratio": "Ankle lift threshold relative to estimated leg length.",
     "max_consecutive_high_ankle_steps": "Consecutive high-lift steps required to trigger the cue.",
-    "beat_tracking": "Enables microphone-based beat tracking in GUI practice.",
-    "tango_bpm": "Starting tempo estimate for the beat tracker.",
-    "beat_analysis_seconds": "Analysis window used to estimate phrase timing.",
-    "auto_record_start_delay": "Continuous detected music required before automatic recording starts.",
-    "auto_record_stop_delay": "Continuous detected silence required before automatic recording stops.",
-    "max_recordings": "Maximum number of recording starts in one coach run.",
-    "replay_auto_analyse_movement": (
-        "Exposed configuration flag currently not consumed by the runtime analysis workflows; "
-        "use the explicit Analyze action."
+    "tango_bpm": (
+        "Fallback tempo when analysis has no soundtrack BPM. "
+        "Compared with the separate slow-tango ceiling for the ankle-lift cue."
     ),
     "replay_step_history_seconds": (
         "Replay media-time window (0.5 to 30 seconds) over which observed step footprints fade out."
@@ -322,10 +278,6 @@ SETTING_DESCRIPTIONS: dict[str, str] = {
     "replay_joint_max_gap": (
         "Maximum bracketed joint gap filled in Review, in seconds; default 3.0, and 0 disables filling. "
         "Not the measurement tracking gap limit."
-    ),
-    "replay_audio": (
-        "Retained for configuration compatibility; Qt review currently plays video only. "
-        "Export the stream for external audio playback."
     ),
     "ollama_base_url": "Address of the local or reachable Ollama server.",
     "ollama_model": "Model name installed on that Ollama server.",
@@ -359,7 +311,8 @@ def setting_value(cfg: Config, field: str):
 
 
 def export_toml(cfg: Config) -> str:
-    data = cfg.model_dump(exclude={"axis_curve"})
+    fields = {field.split(".")[0] for field in SETTING_MAP} | {"calibration_defaults"}
+    data = cfg.model_dump(include=fields)
     lines: list[str] = []
 
     def table(values: dict, path: tuple[str, ...] = ()) -> None:

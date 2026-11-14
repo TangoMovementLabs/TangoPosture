@@ -411,10 +411,12 @@ Therefore:
 
 **Settings > Quality & calibration** includes:
 
-- `min_torso` and `min_head`: minimum usable projected body/head size.
+- `min_torso` and `min_head`: minimum usable torso and shoulder-to-ear segment sizes.
 - `max_view_width`: a side-view width gate.
-- `view_change_tolerance`: tolerance for view changes in applicable calibration
-  comparisons.
+
+The older view-change tolerance and baseline duration/sample/MAD controls are
+no longer exposed in Settings or new exports. Their internal configuration
+fields remain loadable for older baseline workflows, not reference-range approval.
 
 **Settings > Camera & view** includes `side`, `facing` and `allow_all_angles`.
 
@@ -784,9 +786,9 @@ With limits 0 to 8:
 An outside value starts pending. Persistence uses `entry_duration`.
 An inside value starts clearing. Persistence uses `clear_duration`.
 
-With older baseline thresholds, the evaluator uses separate entry and lower
-clear thresholds. Head-forward is directional; applicable angular comparisons
-use wrapped magnitude. These are not identical to approved interval semantics.
+Set the native bounds in the selected profile or Calibration defaults.
+The old per-metric baseline entry/clear pairs are no longer Settings controls;
+do not confuse them with the current persistence durations.
 
 ### Timing settings
 
@@ -972,8 +974,10 @@ Do not use the generic evaluator's rules to infer this helper's behaviour.
 
 ### Music and Ollama are separate engines
 
-**Settings > Music** controls beat tracking, tempo and recording gates.
-It does not move the skeleton or change the pose model.
+**Settings > Music** contains the fallback tempo used when analysis has no
+soundtrack BPM. The slow-tango ceiling is a separate cutoff, not a duplicate.
+The removed microphone/automatic-recording controls remain internal to retained
+services. None of these moves the skeleton or changes the pose model.
 
 **Settings > Review & Ollama** controls optional report text interpretation.
 Ollama is not MediaPipe and does not supply pose landmarks, approve ranges or
@@ -1237,9 +1241,9 @@ observer-independent description. Facing and viewpoint matter.
 Where the movement renderer is explicitly given a mirror option, it reflects
 the arrow once without rewriting the stored event direction.
 
-Current Qt Review does not pass the general mirror setting into this renderer,
-so **Settings > Camera & view > Mirror** is not a universal replay-direction
-switch.
+Current Qt Review does not pass a general mirror setting into this renderer.
+The live-only mirror control was removed from Settings; it was not a replay-
+direction switch.
 
 ## 17. All internal movement parameters
 
@@ -1692,17 +1696,17 @@ Do not rename arbitrary files or bypass verification.
 
 ### "I enabled automatic movement analysis but nothing happens"
 
-`replay_auto_analyse_movement` is a retained Settings field currently not
-consumed by the Qt runtime analysis path.
+`replay_auto_analyse_movement` has no runtime consumer and was removed from
+Settings and new TOML exports. Older TOML files containing it still load.
 
 Use the explicit **Analyze posture & movement** or Library import/analysis
 action. Repeated toggling will not queue work.
 
 ### "Replay audio remains silent"
 
-`replay_audio` is also retained but currently not used by Qt Review playback,
-which is video-only. Export/play the video externally when you need an
-audio-capable player.
+`replay_audio` was also removed from Settings and new TOML exports; older files
+still load. Qt Review playback is video-only. Export/play the video externally
+when you need an audio-capable player.
 
 Neither replay flag is a tracking-quality parameter.
 

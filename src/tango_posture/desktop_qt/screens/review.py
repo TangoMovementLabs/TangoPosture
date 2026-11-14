@@ -334,6 +334,9 @@ class ReviewScreen(QWidget):
         self.refresh()
         self.bridge.config_changed.connect(lambda _cfg: self.refresh())
 
+    def has_active_jobs(self) -> bool:
+        return self._analysis_thread is not None and self._analysis_thread.is_alive()
+
     def refresh(self) -> None:
         selected = self.reference_combo.currentData()
         self.reference_combo.blockSignals(True)

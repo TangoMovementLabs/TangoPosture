@@ -163,6 +163,12 @@ class LibraryScreen(QWidget):
 
         self.refresh()
 
+    def has_active_jobs(self) -> bool:
+        return (
+            self._import_job_id is not None or self._import_worker.is_running()
+            or (self._package_thread is not None and self._package_thread.is_alive())
+        )
+
     def refresh(self) -> None:
         self.practices = self.bridge.list_library_archives()
         self._filter_table(self.search_input.text())

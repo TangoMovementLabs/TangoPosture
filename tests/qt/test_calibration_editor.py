@@ -103,8 +103,9 @@ def test_calibration_defaults_require_confirmation_and_round_trip_through_settin
         monkeypatch.setattr(QMessageBox, "question", lambda *args: QMessageBox.StandardButton.Yes)
         editor.defaults_button.click()
         saved = Config.model_validate(tomllib.loads(destination.read_text()))
-        assert saved == bridge.config
-        assert saved.camera == 2 and saved.tango_bpm == 135
+        assert export_toml(saved) == export_toml(bridge.config)
+        assert "camera" not in tomllib.loads(destination.read_text())
+        assert bridge.config.camera == 2 and saved.tango_bpm == 135
         assert set(saved.calibration_defaults) == {"head_pitch"}
         approved = editor.approved["head_pitch"]
         target = saved.calibration_defaults["head_pitch"]
@@ -124,7 +125,7 @@ def test_calibration_defaults_require_confirmation_and_round_trip_through_settin
         assert saved.calibration_defaults["head_pitch"].upper == 12.5
         assert saved.replay_joint_interpolation == "quadratic"
         assert saved.replay_joint_max_gap == 1.25
-        assert saved.camera == 2 and saved.tango_bpm == 135
+        assert bridge.config.camera == 2 and saved.tango_bpm == 135
     finally:
         editor.reject()
         settings.close()

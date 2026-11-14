@@ -15,6 +15,7 @@ class Route(StrEnum):
     ANALYTICS = "analytics"
     COACH = "coach"
     SETTINGS = "settings"
+    DATABASE = "database"
     HELP = "help"
 
 

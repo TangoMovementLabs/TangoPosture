@@ -1,22 +1,22 @@
-# TangoPosture Settings: every parameter explained for beginners
+# TangoPosture Settings: practical examples for beginners
 
-**A tab-by-tab guide to what each setting does, how to adjust it, and what changes.**
+This guide follows the current desktop Settings screen: **48 editable settings
+and eight Calibration defaults rows**. Each parameter is explained once, with a
+worked example. Examples illustrate software behaviour, not medical limits or
+universal tango technique.
 
-Open **Settings** in the desktop navigation. This guide follows the current
-tab order and covers all 71 registered settings fields plus the eight
-**Calibration defaults** rows.
+The guide covers **Library video import, reference calibration, Review and
+optional Ollama commentary**. Unavailable live-camera, microphone and automatic
+recording controls, removed baseline controls and their adjustment recipes are
+not part of this guide or current Settings exports.
 
-The default values below are the application's built-in configuration defaults.
-An imported settings file, packaged startup configuration, or selected reference
-can supply different effective values. Read your visible settings and status
-messages instead of assuming that an older screenshot shows today's defaults.
-
-Examples demonstrate software behaviour. They are not medical limits,
-validated tango standards, or prescriptions for different body types.
+Older configuration files remain loadable for backend compatibility. New
+Settings exports contain the current editable controls and Calibration defaults
+only, not a complete backup of nondefault legacy configuration.
 
 ## Contents
 
-- [Before changing anything](#before-changing-anything)
+- [Before adjusting settings](#before-adjusting-settings)
 - [1. Camera & view](#1-camera--view)
 - [2. Files](#2-files)
 - [3. Quality & calibration](#3-quality--calibration)
@@ -29,1189 +29,872 @@ validated tango standards, or prescriptions for different body types.
 - [10. Replay movement](#10-replay-movement)
 - [11. Review & Ollama](#11-review--ollama)
 - [12. Calibration defaults](#12-calibration-defaults)
-- [Apply, save, export, import and reset](#apply-save-export-import-and-reset)
-- [Practical adjustment recipes](#practical-adjustment-recipes)
-- [Invalid values and misleading adjustments](#invalid-values-and-misleading-adjustments)
-- [Quick checklist and further reading](#quick-checklist-and-further-reading)
+- [Reference-video knees and shoulders: the actual calculations](#reference-video-knees-and-shoulders-the-actual-calculations)
+- [Applying, saving and reanalyzing](#applying-saving-and-reanalyzing)
+- [Practical video-analysis recipes](#practical-video-analysis-recipes)
+- [Further reading and implementation](#further-reading-and-implementation)
 
-## Before changing anything
+## Before adjusting settings
 
-### The most important rule: which limits are active?
+### Which posture limits are active?
 
-| Current situation | Limits used for posture comparison |
+| Situation | Posture limits |
 | --- | --- |
-| A calibration profile is selected | Its approved ranges. Missing/unapproved metrics do not fall back to older posture settings. |
-| No profile is selected, but at least one Calibration defaults row is enabled | The enabled default ranges. Disabled metrics remain unavailable, and older posture thresholds are replaced. |
-| No profile is selected and no default ranges are enabled | Older Settings-based descriptive/warning controls where observations are available. Formal reference scoring still requires a reference. |
+| A calibration profile is selected | Its approved minimum/maximum ranges. Missing metrics stay unavailable. |
+| No profile, but at least one Calibration defaults row is enabled | The enabled default ranges. Disabled metrics stay unavailable. |
+| Neither is available | The applicable fallback descriptive-warning controls. |
 
-For example, changing **Head down angle limit** does not override a selected
-approved `head_pitch` range. Change the approved/default range instead.
+Fallback controls are still used by current offline coaching; they are not dead
+settings. They do **not** override selected/default approved ranges.
+Role/embrace recognition, tracking quality and the slow-tango lift cue have
+their own purposes and must not be confused with choosing posture limits.
 
-Camera, quality, smoothing and general event timing are separate from the source
-of the posture limits. They still matter when using approved ranges.
+### How to use the examples
 
-### How to make a controlled change
+1. Inspect the dots and the correct dancer first.
+2. Change one parameter and click **Apply Settings**.
+3. Reanalyze when changing the model or cached processing results.
+4. Compare the same video passage before and after.
+5. Save explicitly once satisfied.
 
-1. Export your current Settings if you want a backup.
-2. Identify the actual problem: incorrect dots, missing evidence, noisy numbers,
-   delayed alerts, wrong limits, or missing recordings are different problems.
-3. Change one setting.
-4. Click **Apply Settings** and read the result.
-5. Restart a live preview when changing its camera/model/processing setup:
-   a running worker has its own configuration.
-6. Reanalyze video when changing the analysis model or settings whose results
-   are already stored in an analysis cache.
-7. Compare the same passage before and after.
-8. Save the successful configuration explicitly.
+An unavailable measurement means insufficient usable evidence, not bad
+posture. Wider ranges cannot fix a misplaced joint. Interpolated drawing is
+not recovered measurement evidence.
 
-Widening limits cannot repair a hip dot on clothing. Increasing interpolation
-cannot produce reliable measurements of a hidden hip.
-
-### Understand the units
-
-- **Pixels:** image dimensions or distances, not centimetres.
-- **Seconds:** durations and smoothing time constants.
-- **Milliseconds:** 1000 milliseconds equal one second.
-- **Degrees:** angles. Negative values can be meaningful.
-- **Ratios:** distances divided by a body/image reference length.
-- **Percentages:** use `10` for ten percent only in a percentage field; a ratio
-  of ten percent is `0.10`.
-- **BPM:** beats per minute.
-- **Tokens:** language-model text units, not camera frames.
-
-There is no built-in height, weight or body-build preset that derives validated
-posture limits. Improve framing and use individual reference evidence.
+**Units:** a ratio of `0.06` means six percent; a percentage field uses `6`
+for six percent. Degrees, seconds, pixels and language-model tokens are
+different units. None of these settings is a height/weight/body-build preset.
 
 ## 1. Camera & view
 
-### Camera device index - `camera`
-
-**Default:** `0`.
-
-Selects which camera the computer opens. It is a device number, not quality.
-
-- Try another available index if the wrong camera opens.
-- Increasing from `0` to `1` does not improve tracking: it selects another device.
-- A nonexistent or unavailable device produces a camera error.
-- Check operating-system camera permission if none opens.
-
-Close the preview before changing cameras. A checked reference may specify its
-own camera source; the practice worker loads that reference's capture settings.
-
-### Image width (pixels) - `width`
-
-**Default:** `640`; must be positive.
-
-Requests the live-camera image width.
-
-- Increase, for example to `1280`, for more potential detail if supported.
-- Decrease for less image data and potentially lower processing load.
-- More pixels do not guarantee better landmark estimates or faster inference.
-- The camera can negotiate a different actual size.
-
-This does not resize an imported video's original resolution. Changing the
-actual capture geometry can require a new/checkable live reference.
-
-### Image height (pixels) - `height`
-
-**Default:** `480`; must be positive.
-
-Requests live-camera height, with the same detail/load trade-off as width.
-
-Use a resolution the device supports, such as `640 x 480` or `1280 x 720`.
-Increasing height does not replace moving the camera when the feet are cropped.
-Check the resulting image rather than assuming the request was honoured.
+Despite the retained tab name, this tab now contains video measurement/view
+controls, not live-camera device, resolution or mirroring controls.
 
 ### Measurement side - `side`
 
-**Default:** `left`; choices: `left`, `right`.
+**Default:** `left`; choices `left`, `right`.
 
-The dancer's anatomical side preferred by side-dependent measurements.
+The anatomical side preferred by side-dependent geometry. This is the dancer's
+left/right, not the screen's. Some helpers can use another usable side.
 
-- Choose the side that is appropriate and reliably visible.
-- This is not the screen's left/right side.
-- Changing it can change which ear/shoulder/hip chain is used.
-- Some helpers can use the other usable side; the pink axis still requires
-  both shoulders and both hips.
-
-Keep side consistent between reference evidence and comparison footage.
+**Example:** if the dancer's right ear/shoulder/hip chain is the reliably visible
+one, choose `right` before producing reference evidence and matching analysis.
+An existing reference editor restores its cached capture settings; changing this
+dropdown does not relabel an already cached reference.
 
 ### Facing direction - `facing`
 
-**Default:** `right`; choices: `left`, `right`.
+**Default:** `right`; choices `left`, `right`.
 
-Direction faced in the original, unmirrored camera image. It defines forward/
-posterior directions for some signed measurements.
+Direction faced in the original image, used to interpret signed forward/
+posterior measurements. It is not a request to flip the video.
 
-Wrong facing can reverse interpretation of head-forward or hip-offset values.
-Correct this by inspecting the original view, not by toggling Mirror.
-Existing evidence may need consistent reanalysis/recalibration.
+**Example:** a dancer facing screen-left should use `left`. Leaving `right`
+can reverse the interpretation of a signed offset. Reanalyze matching evidence
+after correcting the setup rather than compensating with wider posture limits.
 
-### Camera setup name - `capture_profile`
+### Capture setup name - `capture_profile`
 
 **Default:** `default`.
 
-A descriptive identifier for the arrangement, such as `room-a-left-side`.
-It is not a camera adjustment or an automatically detected pose.
+An identifier stored with capture metadata. It describes the setup; it does not
+change the camera or landmarks.
 
-Use distinct names for genuinely different setups. Changing the name affects
-reference compatibility; it does not fix perspective, roll or bad landmarks.
-Keep the physical setup unchanged after its camera check.
-
-### Mirror - `mirror`
-
-**Default:** disabled (`false`).
-
-Mirrors the live displayed image when that display path applies it.
-Saved measurement coordinates retain the original orientation.
-
-- Enable if a mirror-style preview is easier to follow.
-- Disable to view the camera's original orientation.
-- Do not change facing/side merely to compensate for screen mirroring.
-
-Do not assume every replay/export path uses this live-display switch.
-Mirroring is a drawing transformation, not recalibration.
+**Example:** use `studio-side-a` for new evidence from one arrangement and
+`studio-front-b` for another. These names help distinguish saved setups.
+Renaming the setting does not rotate existing footage or update cached metadata.
 
 ### Allow all angles - `allow_all_angles`
 
-**Default:** disabled (`false`).
+**Default:** disabled.
 
-Enables the core all-angle measurement path. It can use shoulder/hip midpoints
-or usable alternative sides during additional views.
+Selects the more permissive core measurement path, which can use shoulder/hip
+midpoints or usable alternative sides. It does not invent hidden joints.
+Approved metrics still enforce their own `side`, `front` or `all` view.
 
-- Enable deliberately for the corresponding measurement workflow.
-- Disable for the stricter selected side-view path.
-- Enabling does not invent hidden joints or validate all camera perspectives.
-- Approved/default ranges still apply their own `side`, `front` or `all` view.
-
-It is not an automatic switch that makes every 360-degree movement measurable.
+**Example:** enabling it can let core geometry survive a usable front-facing
+passage that the strict side-view path rejects. A metric approved only for
+`side` will still be unavailable outside its approved view.
 
 ## 2. Files
 
-### Live Practice model file (Lite) - `model_path`
+### Lite model file - `model_path`
 
-**Base default:** `models/pose_landmarker_lite.task`.
-Packaged startup normally supplies its bundled Lite location.
+**Base default:** `models/pose_landmarker_lite.task`; packaged paths can differ.
 
-Use **Browse...** to select the exact supported Lite model if necessary.
-The app verifies the file's checksum.
+Location of the pinned Lite model. The selected file must pass checksum
+verification. This does not turn a Lite model into Full or Heavy.
 
-- Changing the path changes which file is loaded, not a sensitivity value.
-- An arbitrary `.task` file or renamed Full/Heavy file is not accepted as Lite.
-- Live Practice uses Lite and does not automatically download a missing model.
-
-For supported offline variants, use the next selector.
+**Example:** with Offline analysis model set to `lite`, select an existing,
+verified Lite `.task` file with **Browse...** to reuse it. Renaming a Heavy file
+to the Lite filename fails verification. Missing offline models are downloaded
+when no local candidate file exists. A corrupt cached candidate raises a
+verification error rather than silently triggering another download.
 
 ### Offline analysis model - `analysis_model`
 
-**Default:** `lite`; choices: `lite`, `full`, `heavy`.
+**Default:** `lite`; choices `lite`, `full`, `heavy`.
 
-Controls offline analysis through **Library** and
-**Review > Analyze posture & movement**.
+Selects the MediaPipe variant used by new Library/Review analysis. Existing
+local assets are verified and reused; missing assets download and are cached.
 
-- Lite is the default and matches the live model.
-- Full/Heavy are alternatives with greater processing cost.
-- None guarantees visibility through occlusion or better results for every dancer.
-- Existing local supported weights are verified and reused before downloading.
-- Missing offline weights download with progress and are cached.
-
-Changing this selector does not rewrite old results: reanalyze the recording.
-Calibration/model identities must match. **Live Practice > Source: Video file**
-still uses the Lite practice worker, not this selectable offline pipeline.
+**Example:** switch from `lite` to `full`, then explicitly reanalyze a recording.
+Compare its dots and processing time on the same passage. Merely changing the
+selector leaves saved results unchanged. Calibration and comparison evidence
+must have compatible model identities.
 
 ### Data folder - `data_dir`
 
-**Base default:** `data`; packaged app locations can differ.
+**Base default:** `data`.
 
-Use **Browse...** to select where local data and archives are organised.
+Base location for app data and practice artifacts. Packaged startup can supply
+a different path. This is not the destination of every Save/Export action.
 
-Changing folders can make the Library appear empty because it is looking in a
-different place. It does not mean the old files were deleted.
-
-This does not control the destination of the **settings.toml** save button,
-which uses the process's current working directory. Read the displayed path.
+**Example:** changing from `data` to `sessions-b` can show an empty Library
+because it now searches another location. It does not delete the old archives.
+The **Apply & Save settings.toml** destination remains the working directory.
 
 ## 3. Quality & calibration
 
-Some controls here belong to the older baseline capture system. The current
-guided wizard uses fixed holds and its own repeat checks; see the notices below.
+These settings determine whether evidence is usable, not whether posture is
+correct. The approved posture limits are configured separately.
 
 ### Minimum landmark confidence - `confidence`
 
-**Default:** `0.70`; allowed `0 to 1`.
+**Default:** `0.70`; allowed `0` to `1`.
 
-Sets acceptance for strict landmark quality checks, including visibility and
-presence.
+Strict app-side checks require finite coordinates, in-image positions, and
+sufficient visibility and presence. Some descriptive/movement helpers have
+their own thresholds.
 
-- Increase to accept fewer uncertain observations: more missing dots/metrics
-  can result.
-- Decrease to accept more observations: more noise or wrong positions can result.
-- Try framing/lighting improvements before lowering it.
-- A value of `0.70` does not mean "70% accurate".
-
-This is an app-side filter, not a model-training control or the MediaPipe
-detector's configurable minimum-detection-confidence option. Some older helpers
-and the separate movement detector use other thresholds.
+**Example:** a point with visibility `0.65` and presence `0.95` fails a `0.70`
+strict gate but passes a `0.60` gate if the other checks pass. Lowering the
+setting admits weaker evidence; it does not make the dot more accurate.
 
 ### Min torso - `min_torso`
 
 **Default:** `0.12`; positive fraction of image height.
 
-Core shoulder-to-hip geometry must be large enough.
-At image height `480`, `0.12` is about `57.6 pixels`.
+Minimum projected shoulder-to-hip length for core geometry. This does not
+control every helper independently.
 
-- Increase to require a larger core torso segment.
-- Decrease to permit smaller segments, with less image detail.
-- Improve framing first; reducing this does not restore pixels.
-
-It does not govern every descriptive helper or offline movement scale check.
+**Example:** in a 480-pixel-high video, the minimum is `57.6` pixels. A
+50-pixel torso fails this check. Reducing the setting to `0.10` changes the
+minimum to 48 pixels, but improving framing is preferable to admitting tiny,
+uncertain body segments.
 
 ### Min head - `min_head`
 
 **Default:** `0.04`; positive fraction of image height.
 
-Minimum core shoulder-to-ear segment size.
-At height `480`, `0.04` is about `19.2 pixels`.
+Minimum core shoulder-to-ear segment, **not the whole head**. It qualifies
+head-forward/head-inclination evidence; the ear-to-nose pitch helper has
+separate guards.
 
-- Increase to demand more visible segment size.
-- Decrease to accept smaller segments.
-- This is not a minimum nose angle or a head-height-in-centimetres control.
-
-The ear-to-nose helper has separate internal geometry guards.
+**Example:** at 480 pixels high, the minimum is `19.2` pixels. A 17-pixel
+segment is unavailable for those core head metrics. A value of `0.03` lowers
+the minimum to `14.4` pixels. Failure does not automatically invalidate every
+other metric or the whole calibration.
 
 ### Max view width - `max_view_width`
 
-**Default:** `0.45`; must be positive.
+**Default:** `0.45`; positive ratio.
 
-Maximum projected width-to-torso ratio treated as an acceptable side view.
-It also separates side/front gates for approved ranges.
+Separates the projected side/front view policies. Side requires a usable ratio
+at or below the boundary; front requires one above it. `all` skips this split,
+not landmark-quality checks.
 
-- Increase to accept a broader projected ratio as side-on.
-- Decrease to demand a narrower ratio.
-- This is not shoulder width in centimetres or a body-weight setting.
-
-If trustworthy side-on evidence repeatedly measures `0.48`, testing `0.50`
-may change its classification. First verify the view and dot placement.
-The same change also affects front-view range checks: retest both.
-
-### View change tolerance - `view_change_tolerance`
-
-**Default:** `0.15`; positive ratio allowance.
-
-Used by older baseline view-width comparisons.
-
-- Increase to permit more variation from the captured view-width range.
-- Decrease to insist on closer view consistency.
-- It is not an allowable head/trunk tilt in degrees.
-
-It does not replace a new profile's per-metric applicable-view requirement.
-
-### Calibration duration - `calibration_duration`
-
-**Default:** `12 seconds`; positive.
-
-Older baseline capture window.
-
-- Increase for a longer old capture window.
-- Decrease for a shorter old capture window.
-- Must be at least the required valid duration.
-
-This does **not** extend the new guided wizard's two-second settle and
-three-second capture phases.
-
-### Calibration valid duration - `calibration_valid_duration`
-
-**Default:** `9 seconds`; positive and no greater than calibration duration.
-
-Minimum continuous usable time required by older baseline acceptance.
-
-- Increase to demand more reliable old baseline evidence.
-- Decrease to accept less evidence.
-- Not the new guided repeat check's coverage percentage.
-
-Setting `15` while calibration duration remains `12` is invalid.
-
-### Calibration samples - `calibration_samples`
-
-**Default:** `60`; integer, at least `2`.
-
-Minimum valid observations for older baseline acceptance.
-
-- Increase to demand more samples.
-- Decrease to demand fewer.
-- More samples do not guarantee that the chosen posture is desirable.
-
-The guided wizard's repeatability acceptance is not controlled by this count.
-
-### Offset mad - `offset_mad`
-
-**Default:** `0.03`; positive.
-
-Maximum allowed spread around the older head-forward baseline median.
-MAD means median absolute deviation.
-
-- Increase to accept a noisier/more variable old baseline.
-- Decrease to demand steadier evidence.
-- Not an acceptable maximum head-forward posture value.
-
-Do not raise it simply to accept a badly detected ear dot.
-
-### Angle mad - `angle_mad`
-
-**Default:** `4 degrees`; positive.
-
-Maximum spread for older angular baseline measurements.
-
-- Increase to accept more angular variation during old capture.
-- Decrease to require steadier angular evidence.
-- Not a pink-axis or trunk-alignment target angle.
-
-The new approval editor uses chosen passages and explicit acceptable bounds.
+**Example:** a usable ratio of `0.48` fails a side-approved metric at `0.45`
+but can pass that view gate at `0.50`. The same change can make it fail a
+front-approved metric. Check the actual viewpoint before changing this boundary.
 
 ## 4. Tracking
 
-There are three distinct questions:
-
-1. How much should a measured number be smoothed?
-2. How long should an excursion last before confirmation?
-3. What limits should it be compared with?
-
-Changing one does not automatically change the others.
+These controls smooth numbers and time events. Set acceptable posture ranges
+in the selected calibration or Calibration defaults, not in this tab.
 
 ### Measurement smoothing (seconds) - `smoothing`
 
-**Default:** `0.25 seconds`; must be positive.
+**Default:** `0.25`; positive time constant.
 
-Time constant for evaluated measurements.
+Makes evaluated values respond gradually. Higher values smooth more but follow
+changes more slowly.
 
-- Increase, e.g. `0.40`, for calmer numbers but more gradual response.
-- Decrease, e.g. `0.15`, for faster response with more visible noise.
-- It is not a fixed video delay.
-- It cannot be set to zero through valid configuration.
-
-Approved-range events use this smoothing. It does not change raw cached joint
-evidence or teach the pose model new anatomy.
+**Example:** after a sudden change, over `0.1` seconds a `0.25`-second filter
+moves about 33% toward the new value; a `0.50`-second filter moves about 18%.
+This is not a fixed video delay and does not change raw cached landmarks.
 
 ### Overlay smoothing - `overlay_smoothing`
 
-**Default:** `0.20 seconds`; zero or greater.
+**Default:** `0.20`; zero or greater.
 
-Used by live pose drawing and some older derived/display-related measurements.
+Current offline processing uses this for some descriptive head/shoulder/knee
+values. It is not the control for Review's same-frame skeleton or interpolation.
+Some descriptive filters use Measurement smoothing when this is zero.
 
-- Increase for smoother but more trailing live lines.
-- Decrease for less trailing and more jitter.
-- Zero disables the pose-coordinate smoother.
-
-Zero does not remove every other filter. Some older knee/shoulder paths use
-`smoothing` as a fallback when this is zero.
-Review uses same-frame raw skeleton evidence plus optional display interpolation;
-do not assume this slider changes every Review skeleton.
+**Example:** changing `0.20` to `0.10` makes applicable descriptive values
+follow a change faster, with more possible jitter. Setting zero does not remove
+every filter. Reanalyze to regenerate stored descriptive results.
 
 ### Entry duration - `entry_duration`
 
 **Default:** `1.5 seconds`; positive.
 
-How long an evaluated excursion must persist to confirm a range/baseline event.
+Time a continuous evaluated excursion must persist before confirming an event.
+It does not change the acceptable range.
 
-- Increase to ignore more brief excursions and confirm later.
-- Decrease to confirm sooner, potentially counting more brief noise.
-- Does not move the video or skeleton sooner.
-
-A `0.4-second` outside-range excursion does not confirm at `1.5`, but can at
-`0.3`, if continuity and measurements qualify.
+**Example:** a `0.4`-second excursion outside approved bounds does not confirm
+at `1.5`, but can at `0.3` if valid observations remain continuous. Raising
+the duration to `2.0` ignores more brief excursions and confirms later.
 
 ### Clear duration - `clear_duration`
 
 **Default:** `0.75 seconds`; positive.
 
-How long recovery must persist before the evaluator clears an event.
+Time recovery must persist before an active event clears.
 
-- Increase for more stable but later clearing.
-- Decrease for faster clearing, potentially more on/off changes.
-
-Approved ranges require recovery inside the interval.
-Older baseline scoring instead uses its lower clear threshold.
+**Example:** returning inside an approved interval for `0.4` seconds is not
+enough at `0.75`; returning for `0.8` seconds can clear it when observations
+qualify. At `0.25`, the same event can clear sooner.
 
 ### Max gap - `max_gap`
 
 **Default:** `0.5 seconds`; positive.
 
-Observation-gap/continuity guard for several measurement/tracking paths.
+Continuity/reset limit for applicable tracking and evaluation paths. Missing
+raw measurements still become UNKNOWN.
 
-- Increase to tolerate larger intervals before some resets.
-- Decrease to reset continuity sooner.
-- Missing raw values still become UNKNOWN; a bigger gap limit does not invent them.
-
-It is **not** the Review joint-interpolation maximum gap.
-
-### Head forward / entry - `head_forward.entry`
-
-**Default:** `0.08 torso lengths`; positive.
-
-Older forward-change threshold relative to a stored baseline.
-
-- Increase to tolerate a larger forward change before an old event.
-- Decrease for more sensitivity.
-- Baseline `0.03` plus entry `0.08` means a forward value above roughly `0.11`
-  before timing confirmation.
-
-Not an absolute approved `head_forward` maximum.
-
-### Head forward / clear - `head_forward.clear`
-
-**Default:** `0.05 torso lengths`; nonnegative and below entry.
-
-Older remaining forward change at which clearing can begin.
-
-- Increase to clear while farther from the baseline.
-- Decrease to require closer recovery.
-
-Do not set it equal to or greater than entry.
-
-### Head inclination / entry - `head_inclination.entry`
-
-**Default:** `10 degrees`; positive.
-
-Older magnitude of angular change from the head-inclination baseline.
-
-- Increase to tolerate a larger change.
-- Decrease to detect smaller sustained changes.
-
-Head inclination is torso-relative shoulder-to-ear direction, not the
-ear-to-nose horizontal head-pitch metric.
-
-### Head inclination / clear - `head_inclination.clear`
-
-**Default:** `6 degrees`; nonnegative and below entry.
-
-- Increase to allow earlier clearing farther from the old baseline.
-- Decrease to require a closer return.
-
-Does not override an approved head-inclination minimum/maximum interval.
-
-### Trunk inclination / entry - `trunk_inclination.entry`
-
-**Default:** `8 degrees`; positive.
-
-Older magnitude of trunk-angle change from its baseline.
-
-- Increase to tolerate larger angular changes.
-- Decrease to detect smaller changes.
-
-This is not the pink-axis magnitude limit.
-
-### Trunk inclination / clear - `trunk_inclination.clear`
-
-**Default:** `5 degrees`; nonnegative and below entry.
-
-- Increase to allow clearing at a larger remaining old trunk change.
-- Decrease to require closer recovery.
-
-The three older entry/clear pairs do not override new approved/default ranges.
+**Example:** a `0.7`-second observation gap exceeds `0.5`, so the applicable
+filter/event continuity resets. Increasing to `0.8` permits that timestamp gap
+but does not fill missing joints. The calibration editor uses the gap policy
+saved with its reference; changing current Settings alone does not replace it.
 
 ## 5. Head & shoulders
 
-These older warning controls are used only in the older Settings-based mode,
-not as substitutes for a selected approved range/default-range set.
+These are **active fallback descriptive controls** for offline coaching when
+neither a selected profile nor enabled default ranges supplies posture limits.
+They do not define approved native ranges.
 
 ### Head neutral offset - `head_neutral_offset`
 
 **Default:** `-12 degrees`.
 
-Subtracted from raw ear-to-nose pitch in the older horizontal head cue.
+Subtracted from raw ear-to-nose pitch for the corrected fallback cue.
 
-At raw pitch `-12`:
-
-- Offset `-12` gives corrected `0`.
-- Increase the offset to `-8`: corrected angle becomes `-4`.
-- Decrease the offset to `-16`: corrected angle becomes `+4`.
-
-This shifts a cue; it does not level the camera.
-Approved `head_pitch` uses the raw angle, without this subtraction.
+**Example:** raw pitch `-12` minus offset `-12` gives corrected zero.
+Changing the offset to `-8` gives `-4`; changing it to `-16` gives `+4`.
+Approved `head_pitch` instead compares the raw angle without this subtraction.
 
 ### Head down duration - `head_down_duration`
 
 **Default:** `3 seconds`; positive.
 
-Duration required for the older downward-head warning.
+Persistence required for the fallback downward-head warning.
 
-- Increase to require longer persistence.
-- Decrease to warn sooner.
-- Does not change the warning angle or general approved-range entry duration.
+**Example:** corrected pitch below its limit for two seconds does not confirm
+this warning at `3`. Setting the duration to `1` makes a qualifying two-second
+passage long enough. Approved-range events use Tracking's Entry duration.
 
 ### Head down angle limit (degrees) - `head_down_angle`
 
-**Default:** `-15 degrees`; must stay negative.
+**Default:** `-15 degrees`; must remain negative.
 
-Boundary for the older corrected ear-to-nose cue.
+Boundary for corrected fallback ear-to-nose pitch.
 
-- Change to `-10`: warn after a smaller downward excursion.
-- Change to `-20`: allow more downward excursion before this boundary.
-- More negative is not "higher sensitivity": watch the sign.
-
-With an approved head-pitch profile, change its native limits instead.
+**Example:** corrected pitch `-12` does not cross a `-15` limit, but does cross
+`-10`. Changing to `-20` tolerates more downward pitch. The duration must also
+qualify before a warning; this setting does not move a selected profile's bounds.
 
 ### Shoulder tension duration - `shoulder_tension_duration`
 
 **Default:** `1 second`; positive.
 
-Duration before the older sustained shoulder banner.
+Persistence before the fallback shoulder-elevation banner. The name does not
+mean that muscle tension is measured.
 
-- Increase to avoid more brief banners.
-- Decrease to confirm sooner.
-
-It does not change measured ear-to-shoulder clearance.
+**Example:** a `0.6`-second qualifying elevation does not confirm at `1`,
+but can at `0.5`. Increasing to `2` ignores more brief changes. Raw clearance
+and approved clearance bounds are unchanged.
 
 ### Shoulder tension limit (%) - `shoulder_raise_threshold`
 
 **Default:** `10%`; positive.
 
-Older computed shoulder-elevation percentage above its effective clearance
-baseline.
+Boundary for computed fallback elevation relative to effective neutral
+clearance. This is a percentage, not the approved clearance ratio.
 
-- Increase to `15`: require a larger computed elevation percentage.
-- Decrease to `6`: warn at a smaller computed elevation.
-
-The approved shoulder metric is a raw clearance ratio, not this percentage.
-This is also not a left/right shoulder-level comparison or muscle-tension sensor.
+**Example:** computed elevation `12%` exceeds a `10%` limit, but not `15%`.
+Lowering the limit to `6%` admits more warning candidates. Persistence and
+recovery rules still apply.
 
 ### Shoulder neutral clearance - `shoulder_neutral_clearance`
 
 **Default:** `1.05`; positive.
 
-Fallback baseline for the older elevation percentage:
+Starting fallback baseline for `100 * (baseline - raw clearance) / baseline`.
+The helper clamps its effective baseline to at least `0.20`; offline processing
+can also adapt it from qualifying observations.
 
-`100 * (neutral clearance - raw clearance) / neutral clearance`.
-
-At raw clearance `0.95`:
-
-- Baseline `1.00` gives `5%`.
-- Baseline `1.10` gives approximately `13.6%`.
-
-Increasing the baseline increases computed elevation at fixed raw clearance;
-decreasing reduces it. The effective old baseline can also adapt from observed
-clearances or come from a saved older calibration.
-
-Do not adjust this to compensate for an incorrectly placed shoulder dot.
+**Example:** at raw clearance `0.95`, a baseline of `1.00` gives `5%` elevation,
+while `1.10` gives about `13.6%`. Raising the baseline can therefore make warning
+more likely without moving any dot. It does not change raw approved clearance.
 
 ## 6. Embrace & knees
 
-Role/embrace labels are heuristics based on observed arm geometry.
-They are not identity recognition or measurement of partner pressure.
+Role/embrace recognition runs independently of the source of posture limits.
+The last two controls below are fallback knee warnings, not approved bounds.
 
 ### Role assign ms - `role_assign_ms`
 
 **Default:** `300 milliseconds`; zero or greater.
 
-Time an observed arm pattern must persist before a role is assigned.
+Required persistence of a matching arm pattern before assigning its role label.
+It is not person-identity tracking.
 
-- Increase for slower, more stable assignment.
-- Decrease for faster assignment with more possible label changes.
-- `300 ms` equals `0.3 seconds`.
-
-This does not control person identity tracking.
+**Example:** a pattern visible for `0.2` seconds is too brief at `300 ms`,
+but can qualify at `100 ms` once the update timestamps permit assignment.
+Increasing to `600 ms` makes assignment slower and more resistant to brief noise.
 
 ### Role hold ms - `role_hold_ms`
 
 **Default:** `5000 milliseconds`; zero or greater.
 
-How long a confirmed role can remain after the expected pattern stops appearing.
+How long a confirmed role label can remain after the matching pattern disappears.
 
-- Increase to preserve the label through longer turns/occlusions.
-- Decrease to release it sooner.
-
-The retained label is not new evidence that the arm pattern stayed visible.
+**Example:** after a turn hides the pattern for two seconds, a `5000 ms` hold
+can retain the previous label; a `1000 ms` hold releases it sooner. A retained
+label is history, not fresh evidence that the arms remain in that position.
 
 ### Embrace closed threshold - `embrace_closed_threshold`
 
-**Default:** `0.72`; greater than zero and no greater than one.
+**Default:** `0.72`; greater than zero and at most one.
 
-Boundary on a heuristic openness score.
+Boundary on a heuristic openness score, not physical partner distance.
+The recognizer also applies smoothing, a switching band and persistence.
 
-- Increase: a fixed score is more likely to be classified CLOSED.
-- Decrease: a fixed score is more likely to be OPEN.
-
-It is not physical distance in metres. Wrong arm dots can change the score;
-fix the evidence before changing the boundary.
+**Example:** an initial smoothed score of `0.70` falls on the CLOSED side of
+`0.72`, but the OPEN side of `0.65`. Raising the threshold makes CLOSED more
+likely for a fixed score. State changes still depend on the recognizer's timing.
 
 ### Embrace hysteresis seconds - `embrace_hysteresis_seconds`
 
 **Default:** `1 second`; zero or greater.
 
-Required persistence for a candidate OPEN/CLOSED switch, alongside internal
-smoothing and a small hysteresis band.
+Persistence before switching between OPEN and CLOSED once the switching
+conditions qualify.
 
-- Increase to switch more slowly/stably.
-- Decrease to switch sooner.
-
-There is no independent GUI slider for the internal score band.
+**Example:** a candidate lasting `0.4` seconds is too brief at `1.0`, but can
+switch at `0.3`. A longer duration gives steadier but later labels; it does not
+change the measured knee angle or approve a calibration range.
 
 ### Closed embrace min knee bend - `closed_embrace_min_knee_bend`
 
 **Default:** `8 degrees`; zero or greater.
 
-Minimum projected knee flexion for the older straight-knee cue.
+Minimum projected knee flexion for the fallback straight-knee cue. Despite
+its historical name, the current offline fallback banner is not CLOSED-gated.
 
-- Increase to `12`: more flexion is required to be above the old boundary.
-- Decrease to `5`: a straighter-looking leg is allowed.
-
-The older banner is gated by CLOSED embrace. An approved `knee_flexion` range
-is a separate minimum/maximum comparison, not automatically that embrace-only
-rule. Do not force bending to satisfy an arbitrary example.
+**Example:** a measured/smoothed bend of `6` is below `8`, so it can start a
+warning candidate; at a minimum of `5`, it does not. Raising the minimum to `12`
+requires more bend. Do not bend to satisfy an arbitrary software example.
 
 ### Knee straight duration - `knee_straight_duration`
 
 **Default:** `1 second`; positive.
 
-Required persistence for the older straight-knee banner.
+Persistence required for the fallback straight-knee banner.
 
-- Increase to delay/avoid more brief banners.
-- Decrease to confirm sooner.
-
-Does not change the projected angle or an approved range's general timing.
+**Example:** a qualifying straight-looking interval of `0.7` seconds does not
+confirm at `1.0`, but can at `0.5`. A selected/default approved knee range uses
+Tracking's event timing instead.
 
 ## 7. Torso & hip offset
 
-These settings describe the older ankle-to-head-line **hip-offset** warning.
-They are not the pink shoulder-midpoint-to-hip-midpoint angle controls.
+These active fallback controls concern hip displacement from the ankle-to-head
+line. **They are not pink torso-line tilt settings.**
 
 ### Axis curve entry - `axis_curve_entry`
 
 **Default:** `0.06`; positive ratio.
 
-Older positive posterior hip-deviation entry threshold.
+Posterior corrected hip-offset boundary for starting a fallback event candidate.
 
-- Increase to require more deviation.
-- Decrease to detect smaller deviation.
-- `0.06` is six percent of the estimated ankle-to-head axis length, not six degrees.
-
-Approved `hip_offset` instead uses raw signed minimum/maximum limits.
+**Example:** corrected deviation `0.07` exceeds `0.06`, but not `0.08`.
+Raising entry tolerates more displacement; lowering it detects smaller changes.
+The ratio is not degrees. Approved `hip_offset` uses its native bounds instead.
 
 ### Axis curve clear - `axis_curve_clear`
 
-**Default:** `0.035`; zero or greater, and below entry.
+**Default:** `0.035`; nonnegative and below entry.
 
-Smoothed old hip deviation must fall below this before clearing can begin.
+Recovery boundary for the active fallback hip-offset event.
 
-- Increase to clear at a larger remaining deviation.
-- Decrease to require a smaller remaining deviation.
-
-Keep it below entry to preserve hysteresis.
+**Example:** smoothed corrected deviation `0.03` is below `0.035`, allowing
+clearing to begin. At a clear threshold of `0.02`, it must recover farther.
+Keep clear below entry; the two thresholds have different jobs.
 
 ### Axis curve duration - `axis_curve_duration`
 
 **Default:** `1.5 seconds`; positive.
 
-- Increase to require longer sustained old hip deviation.
-- Decrease to confirm sooner.
+Persistence above the fallback hip-offset entry threshold before confirmation.
 
-It is not the duration for every approved metric; those use general Tracking
-entry duration.
+**Example:** a one-second qualifying excursion does not confirm at `1.5`,
+but can at `0.5`. It does not alter the hip-offset ratio or the timing of
+approved-range metrics.
 
 ### Axis curve clear duration - `axis_curve_clear_duration`
 
 **Default:** `0.75 seconds`; positive.
 
-- Increase for longer recovery before the old warning clears.
-- Decrease for faster clearing.
+Persistence of recovery before the fallback hip-offset event clears.
 
-Does not alter the numeric entry/clear boundaries.
+**Example:** `0.5` seconds below the recovery threshold is insufficient at
+`0.75`, but can clear at `0.3`. Increasing this setting keeps the event active
+through more brief recoveries without moving either threshold.
 
 ### Axis neutral offset - `axis_neutral_offset`
 
 **Default:** `0.0`.
 
-Subtracted from raw offset for the older corrected deviation.
-At raw `0.05`:
+Neutral value subtracted from raw hip offset for fallback corrected deviation.
 
-- Neutral `0.00`: corrected `0.05`.
-- Increase neutral to `0.02`: corrected `0.03`.
-- Decrease neutral to `-0.01`: corrected `0.06`.
-
-Approved raw `hip_offset` does not subtract this field.
-It is not a pelvic-rotation or camera-levelling control.
-
-The older TOML `axis_curve` threshold object is a compatibility alias, not a
-second independent GUI metric. Prefer the visible entry/clear controls.
+**Example:** raw `0.05` minus neutral `0.02` gives corrected `0.03`.
+Neutral `-0.01` instead gives `0.06`. This shifts the fallback cue, not the hip,
+and does not change the approved raw `hip_offset` measurement.
 
 ## 8. Slow tango
 
-These controls govern an older ankle-height/consecutive-step heuristic.
-They do not configure the separate offline footprint placement detector.
+This is an active ankle-height/consecutive-step cue, separate from offline
+footprint placement and pivot detection.
 
-### Slow tango max bpm - `slow_tango_max_bpm`
+### Slow tango max BPM - `slow_tango_max_bpm`
 
-**Default:** `115 BPM`; positive and no greater than `240`.
+**Default:** `115 BPM`; positive and at most `240`.
 
-Maximum known tempo for the slow-tango lift heuristic.
+This setting exists **once** in the app. It is the maximum tempo at which the
+slow-tango lift cue can operate, not the current/fallback tempo itself.
 
-- Increase to let it operate at faster known tempos.
-- Decrease to restrict it to slower known tempos.
-
-The tracker can also treat unknown tempo as active. Its caller may supply a
-fallback tempo. Verify beat tracking rather than assuming music is perfectly
-classified.
+**Example:** with a supplied tempo of `110 BPM`, a `115` cutoff allows the cue
+to operate if ankle evidence and high-step conditions qualify. At `120 BPM`,
+that cutoff disables the cue. Raising the cutoff to `125` admits `120 BPM`.
+This does not change playback speed or the separate footprint detector.
 
 ### Ankle high lift ratio - `ankle_high_lift_ratio`
 
-**Default:** `0.06`; greater than zero and no greater than one.
+**Default:** `0.06`; greater than zero and at most one.
 
-Normalized vertical ankle separation considered high.
+Vertical ankle separation considered high relative to estimated leg length.
+Internal step-start/end boundaries are also derived from this value.
 
-- Increase to tolerate larger separation.
-- Decrease to classify smaller separation as high.
-
-For estimated leg length `300 pixels`, `0.06` corresponds to `18 pixels` in this
-projected ratio. This is not certified floor clearance in centimetres.
-
-Internal start/end separation boundaries are derived from this setting, so it
-can influence segmentation as well as the high threshold.
+**Example:** with a 300-pixel estimated leg length, `0.06` corresponds to an
+18-pixel threshold, while `0.08` corresponds to 24 pixels. A 21-pixel separation
+is above the first but below the second. This is projected separation, not
+certified floor clearance in centimetres.
 
 ### Max consecutive high ankle steps - `max_consecutive_high_ankle_steps`
 
 **Default:** `2`; integer at least one.
 
-- Increase to allow more consecutive high steps before alerting.
-- Decrease to alert after fewer.
+Consecutive qualifying high steps needed for the lift alert.
 
-A qualifying low step can reset the consecutive count.
-This is not a count of all offline footprints, and hidden feet can make the
-measurement unavailable.
+**Example:** at `2`, the alert can appear during the second qualifying high
+step; at `3`, it waits for another. A qualifying low step can reset the streak.
+The BPM gate must also permit the cue, and hidden feet can make it unavailable.
 
 ## 9. Music
 
-These affect music tracking and automatic recording, not landmark placement.
+This tab now contains only the fallback tempo. It does not expose microphone,
+beat-analysis or automatic-recording controls.
 
-### Beat tracking - `beat_tracking`
+### Fallback tempo (BPM) - `tango_bpm`
 
-**Default:** enabled (`true`).
+**Default:** `120 BPM`; greater than `20` and at most `240`.
 
-- Enable music/beat tracking where the input workflow supports it.
-- Disable if you do not need it.
-- Automatic song recording depends on usable music detection, not just this
-  checkbox alone.
+Tempo supplied when analysis has no soundtrack BPM. Current Library/Review
+analysis disables soundtrack analysis, so this fallback is important.
+It is **not another copy of the slow-tango cutoff**.
 
-Microphone access is relevant to live-camera music detection.
-
-### Starting tempo (BPM) - `tango_bpm`
-
-**Default:** `120`; greater than `20` and no greater than `240`.
-
-Starting/fallback tempo.
-
-- Increase for a faster starting tempo.
-- Decrease for slower.
-- Actual detected tempo can replace the initial/fallback value.
-
-It can affect tempo-gated heuristics when used as their active tempo. It does
-not make the camera run at more frames per second.
-
-### Beat analysis seconds - `beat_analysis_seconds`
-
-**Default:** `30 seconds`; positive.
-
-Beat/phrase analysis window.
-
-- Increase for a longer window and more time before an analysis is complete.
-- Decrease for a shorter window with less evidence.
-
-Not the camera-calibration window or an alert-duration parameter.
-
-### Auto record start delay - `auto_record_start_delay`
-
-**Default:** `1 second`; allowed `0 to 60`.
-
-Continuous detected music required before an automatic recording begins.
-
-- Increase to avoid reacting to short music-like bursts.
-- Decrease to start sooner.
-
-Requires the automatic song-recording option and appropriate source/music
-conditions. It does not start every manual recording.
-
-### Auto record stop delay - `auto_record_stop_delay`
-
-**Default:** `3 seconds`; allowed `0 to 120`.
-
-Continuous detected silence required before stopping an automatic recording.
-
-- Increase to keep recording across longer pauses.
-- Decrease to stop sooner, possibly splitting a song at short quiet passages.
-
-Not a delay before closing an arbitrary live preview.
-
-### Max recordings - `max_recordings`
-
-**Default:** `10`; integer `1 to 1000`.
-
-Maximum recording starts in one coach run.
-
-- Increase to permit more starts.
-- Decrease to hit the cap sooner.
-
-It does not delete old recordings or set the total number of archives retained
-in Library.
+**Example:** the defaults supply `120 BPM` against a `115 BPM` slow-tango
+cutoff, so that lift cue is inactive. Setting the fallback to `105 BPM` makes
+the BPM gate pass; an alert still needs qualifying high steps. Enter a tempo
+appropriate to the clip rather than lowering it just to force an alert.
 
 ## 10. Replay movement
 
-### Replay auto analyse movement - `replay_auto_analyse_movement`
-
-**Default:** enabled (`true`).
-
-An exposed configuration flag that the current runtime analysis workflows do
-not consume.
-
-Changing it currently does not turn automatic analysis on or off.
-Use the explicit **Analyze posture & movement** action. Do not troubleshoot
-missing results by repeatedly toggling an inactive flag.
-
 ### Replay step history seconds - `replay_step_history_seconds`
 
-**Default:** `5 seconds`; allowed `0.5 to 30`.
+**Default:** `5 seconds`; allowed `0.5` to `30`.
 
-How long observed step footprints remain visible as they fade in replay.
+Media-time window over which observed step footprints fade out.
 
-- Increase for a longer visible trail.
-- Decrease for less clutter.
-
-Does not create, delete or re-detect step events. Scrubbing changes which stored
-events are visible at that media time.
+**Example:** increasing to `10` shows a longer trail during playback or
+scrubbing; reducing to `2` leaves fewer recent footprints visible. It does
+not create/delete steps or change their stored timestamps.
 
 ### Review joint interpolation - `replay_joint_interpolation`
 
-**Default:** `linear`; choices: `linear`, `quadratic`.
+**Default:** `linear`; choices `linear`, `quadratic`.
 
-How Review fills qualifying gaps between reliable joint positions for drawing.
+Display-only filling of bracketed gaps between reliable joint observations.
+Quadratic attempts a curve using another sample and falls back to linear
+when unsuitable.
 
-- Linear draws a straight path between the surrounding observations.
-- Quadratic attempts a curved path using a third nearby sample.
-- Quadratic falls back to linear when unsuitable.
-
-Neither recovers the actual hidden movement with certainty.
-Both are display-only, not calibration/scoring evidence.
+**Example:** for a joint seen before and after a short gap, `linear` moves it
+along the direct path between those observations. `quadratic` can curve that
+path. Neither guarantees the actual hidden motion or supplies scoring evidence.
 
 ### Maximum joint gap to fill (seconds; 0 disables) - `replay_joint_max_gap`
 
 **Default:** `3 seconds`; zero or greater.
 
-Maximum separation between qualifying surrounding samples for Review gap filling.
+Maximum separation of bracketing usable observations for drawing interpolation.
+It is different from Tracking's continuity limit.
 
-- Increase to draw through longer bracketed gaps, with more uncertainty.
-- Decrease to fill fewer/shorter gaps.
-- Set `0` to disable filling.
-
-No indefinite extrapolation at clip edges. This is not the general `max_gap`
-tracking/measurement control, and it does not predict live hidden joints.
+**Example:** endpoints separated by `0.4` seconds can be filled at `0.5`,
+but not at `0.2`. Setting zero disables filling. Increasing to `3` bridges
+longer, more uncertain intervals; there is no indefinite edge extrapolation.
 
 ## 11. Review & Ollama
 
-Ollama is optional text interpretation of reports. It is not the pose tracker.
-Changing its settings does not move skeleton dots or change numeric approvals.
-
-### Replay audio - `replay_audio`
-
-**Default:** disabled (`false`).
-
-Retained configuration field, currently not used by Qt Review's playback path.
-Changing it does not enable in-app audio playback.
-Export the video stream for playback in an external audio-capable player.
+Ollama is optional report commentary, not the pose tracker or calibration
+evaluator. Report text is sent to the configured server. A nonlocal server
+has a different privacy boundary from a local one.
 
 ### Ollama server address - `ollama_base_url`
 
 **Default:** `http://127.0.0.1:11434`.
 
-The report-interpretation server address.
+Address of the Ollama service, not a pose-model download location.
 
-- Keep a local address to use your local server.
-- A different host means a different server, potentially remote.
-- This is not a pose-model download location.
-
-Report text is sent to the configured server for interpretation. Consider that
-privacy boundary before using a nonlocal server.
+**Example:** use the default for a server on the same machine at port 11434.
+If you deliberately run it locally at port 11435, use
+`http://127.0.0.1:11435`. Changing the address does not start the server.
 
 ### Ollama model - `ollama_model`
 
 **Default:** `llama3.2`; nonempty text.
 
-Language model used on that server.
+Language model requested from Ollama. This does not select MediaPipe.
 
-Choose an installed/available model supported by the server.
-A larger language model can need more memory and time; it is not necessarily
-better commentary for your report.
-This does not select MediaPipe Lite/Full/Heavy.
+**Example:** choose an installed model name such as `llama3.2`. A name that
+is unavailable on that server produces a request error; changing it to a
+larger language model does not improve joint coordinates.
 
 ### Ollama timeout - `ollama_timeout`
 
-**Default:** `120 seconds`; positive, maximum `1800`.
+**Default:** `120 seconds`; positive and at most `1800`.
 
-- Increase to wait longer for a slow server/model.
-- Decrease to fail sooner.
+Maximum wait for a model request.
 
-A larger timeout does not make the server faster or restore a disconnected
-server.
+**Example:** a request taking 150 seconds can time out at `120`; a `180`
+timeout permits waiting longer. This does not make generation faster.
+Reducing to `30` fails sooner when the service is slow.
 
 ### Response variation - `ollama_temperature`
 
-**Default:** `0.2`; allowed `0 to 2`.
+**Default:** `0.2`; allowed `0` to `2`.
 
-- Increase for potentially more variable generated wording.
-- Decrease for less variation.
+Requested variation in generated language.
 
-Not a landmark confidence score. A low temperature does not guarantee factual
-or medically valid interpretation.
+**Example:** changing from `0.2` to `0.8` can produce more variable wording
+for the same report. Setting zero requests less variation, not guaranteed
+accuracy or deterministic behaviour on every server.
 
 ### Model context size (tokens) - `ollama_num_ctx`
 
-**Default:** `16384`; integer `1024 to 131072`.
+**Default:** `16384`; integer `1024` to `131072`.
 
-Requested language-model context capacity.
+Requested language-model context capacity. Tokens are text units, not frames.
 
-- Increase to allow more possible text context, with greater resource cost.
-- Decrease to reduce capacity/resource demand.
-
-Actual server/model capabilities still matter. This is not video duration or
-the number of tracked frames.
+**Example:** reducing to `8192` requests less context capacity and can reduce
+resource demand, but leaves less room for the prompt/report. Increasing to
+`32768` requests more capacity if the server/model supports it.
 
 ### Maximum response length (tokens) - `ollama_num_predict`
 
-**Default:** `2048`; integer `128 to 16384`.
+**Default:** `2048`; integer `128` to `16384`.
 
-- Increase for potentially longer responses.
-- Decrease for shorter responses and less generation work.
+Maximum requested generated response length, not an exact output length.
 
-This is a maximum request, not a guarantee that a response will contain exactly
-that many tokens.
+**Example:** setting `512` asks for a shorter generation budget than `2048`.
+A model may still stop before either maximum. Increasing it permits a longer
+answer and potentially more generation time.
 
 ### Maximum report length (characters) - `ollama_max_report_chars`
 
 **Default:** `40000`; at least `1000`.
 
-Text budget from the report supplied for interpretation.
+Budget for report text included for commentary, not the amount of raw video
+analyzed.
 
-- Increase to supply more report text.
-- Decrease to supply less, potentially omitting useful detail.
-
-It does not analyze more raw video frames. A small report budget and a very
-large context window are different controls.
+**Example:** a 30000-character report fits a `40000` budget. At `10000`,
+the supplied report content is limited and can omit useful context. Increasing
+context tokens is not the same as increasing this character budget.
 
 ### Analysis focus - `ollama_instruction`
 
 **Default:** explain supported observations and suggest three focused practice
 exercises.
 
-Additional instruction for commentary.
+Additional instruction accompanying the report.
 
-An example is: "Summarize observable changes and clearly identify unavailable
-measurements."
-
-Changing it affects requested text, not numeric scores, camera quality or which
-joints are implemented. Do not use commentary as a medical assessment.
+**Example:** enter "Summarize observable changes and identify unavailable
+measurements." This requests different commentary; it does not change
+numeric limits, run new video inference or make medical assessments valid.
 
 ## 12. Calibration defaults
 
-This tab follows the other Settings tabs. Its configuration container is
-`calibration_defaults`.
+Each row has **Use**, minimum, maximum and applicable view. Units are fixed.
+Initially all rows are disabled. Once any row is enabled, with no selected
+profile only the enabled metrics are available; fallback posture limits do not
+fill the disabled rows.
 
-Initially all eight ranges are disabled. Each row has **Use**, minimum, maximum
-and view. Units are fixed by the metric.
-
-| Control | How to adjust | Impact |
-| --- | --- | --- |
-| Use | Enable only a deliberately reviewed range | If at least one is enabled and no profile is selected, enabled ranges replace older posture thresholds. Missing/disabled metrics stay unavailable. |
-| Minimum | Lower to permit smaller native values; raise to exclude more small values | Narrows/widens one end of the interval |
-| Maximum | Raise to permit larger native values; lower to exclude more large values | Narrows/widens the other end |
-| View | Choose side, front or all deliberately | Applies its comparability gate; all does not invent hidden joints or validate different cameras |
-
-Minimum must not exceed maximum. Equal bounds can be valid configuration but
-extremely sensitive to small variation.
+Minimum must not exceed maximum. Endpoints are included. `side` and `front`
+apply their view gate; `all` does not bypass joint quality. Equal bounds are
+valid configuration but can be impractically sensitive to small variation.
 
 ### Head pitch (ear-to-nose) - `head_pitch`
 
 **Unit:** degrees; raw ear-to-nose image angle.
 
-An invented interval `-20 to -5` includes raw `-12`.
-
-- Lower minimum to `-25`: permit more negative raw pitch.
-- Raise maximum to `0`: permit higher raw pitch.
-
-The old head neutral offset is not subtracted. Do not copy zeroed overlay
-angles as if they were raw reference values.
+**Example:** enable a deliberately chosen interval `-20` to `-5`: raw `-12`
+is inside, raw `-25` is outside. Lowering the minimum to `-30` admits `-25`.
+The fallback neutral offset is not subtracted from these values.
 
 ### Head-forward offset - `head_forward`
 
-**Unit:** torso lengths; forward component of ear displacement relative to torso.
+**Unit:** torso lengths; signed torso-relative forward ear displacement.
 
-Invented interval `-0.02 to 0.06`.
-
-- Raise maximum to `0.10`: allow more forward displacement.
-- Lower minimum: allow more displacement in the opposite direction.
-
-Not centimetres and not the older change-from-baseline entry threshold.
+**Example:** with a range `-0.02` to `0.06`, a value of `0.08` is outside.
+Raising the maximum to `0.10` admits it. This changes an approved native
+interval, not a change-from-baseline threshold.
 
 ### Head inclination - `head_inclination`
 
-**Unit:** degrees; shoulder-to-ear direction relative to torso.
+**Unit:** degrees; shoulder-to-ear orientation relative to the torso.
 
-- Widen the signed interval to include more native angular variation.
-- Narrow it to reject more variation.
-
-Not the same as horizontal ear-to-nose pitch or head lateral roll.
+**Example:** a chosen interval `-5` to `10` accepts `7` but rejects `12`.
+Raising the maximum to `15` admits `12`. This is not horizontal ear-to-nose
+pitch or lateral head roll.
 
 ### Ear-to-shoulder clearance - `shoulder_clearance`
 
-**Unit:** normalized clearance.
+**Unit:** normalized clearance; smaller generally means shoulder nearer ear.
 
-Invented interval `0.95 to 1.15`.
-
-- Lower minimum: allow smaller clearance.
-- Raise maximum: allow larger clearance.
-
-Smaller clearance generally corresponds to shoulder nearer ear.
-This is neither the old elevation percentage nor equal left/right shoulder level.
+**Example:** a range `0.85` to `1.15` rejects `0.80`. Lowering the minimum
+to `0.75` admits that smaller clearance. These values are not elevation
+percentages or a left/right shoulder-height comparison.
 
 ### Hip offset from ankle-to-head axis - `hip_offset`
 
-**Unit:** axis lengths; signed raw offset from the projected ankle-to-head line.
+**Unit:** axis lengths; signed raw projected hip offset.
 
-Invented interval `-0.02 to 0.04`.
-
-- Raise maximum: allow more posterior-side raw offset.
-- Lower minimum: allow more offset in the other direction.
-
-The old axis neutral subtraction is not applied. This is not pelvic rotation.
+**Example:** a range `-0.02` to `0.04` rejects `0.05`. Raising the maximum
+to `0.06` admits it. The fallback neutral offset is not subtracted here.
+This is not pelvic rotation or an actual balance measurement.
 
 ### Torso axis tilt (pink line) - `torso_axis_tilt`
 
-**Unit:** degrees; absolute shoulder-midpoint-to-hip-midpoint tilt from image
-vertical. Requires both shoulders and both hips.
+**Unit:** degrees; absolute midpoint-torso tilt from image vertical.
 
-Invented interval `0 to 8`.
-
-- Raise maximum to `10`: allow greater tilt magnitude.
-- Lower maximum to `4`: a `4.5` observation is outside.
-- Raise minimum to `2`: a vertical `0` observation is outside too.
-
-Either tilt direction has the same magnitude. Keep the camera level.
-The `axis_curve_*` controls do not set this range.
+**Example:** a range `0` to `8` accepts a tilt magnitude of `6` and rejects
+`10`. Raising the maximum to `12` admits `10`; raising the minimum to `2`
+would also reject upright zero. Both shoulders and hips must be reliable.
 
 ### Trunk inclination - `trunk_inclination`
 
-**Unit:** degrees; signed core shoulder-to-hip orientation.
+**Unit:** degrees; signed core torso orientation.
 
-- Widen the native interval to accept more orientation variation.
-- Narrow it to accept less.
-
-Different landmark/quality/sign rules from the pink axis. Do not swap their
-limits just because both use degrees.
+**Example:** a range `-4` to `6` rejects `-7`. Lowering the minimum to `-8`
+admits it. The landmark/sign rules differ from the pink-axis magnitude;
+do not copy one metric's limits into the other.
 
 ### Least-bent reliably visible knee - `knee_flexion`
 
-**Unit:** degrees; `180 - projected hip-knee-ankle interior angle`.
+**Unit:** degrees; zero is straight in the projected geometry.
 
-Invented interval `5 to 25`.
+**Example:** with an interval `5` to `25`, a bend of `12` is inside and `3`
+is outside. Raising the minimum to `15` also rejects `12`; raising the maximum
+permits more bend. These examples are not instructions to force a knee angle.
 
-- Lower minimum: allow a straighter projected leg.
-- Raise minimum: require more projected flexion.
-- Raise maximum: allow more flexion.
+Use **Use as Settings defaults** in Library or the calibration editor to copy
+a profile's approved bounds/units/views. It replaces the default set and asks
+before saving. It does not copy full evidence or grant camera-scoring approval.
 
-The helper generally reports the least-bent usable leg, not independent
-weight-bearing-leg limits. The projected angle is not a medical diagnosis.
+## Reference-video knees and shoulders: the actual calculations
 
-### Copying from a profile
+### Importing a reference is not approving its posture
 
-Use **Use as Settings defaults** in Library or the approval editor.
-The operation replaces the default-range set with that profile's approved
-metrics and saves all current Settings after overwrite confirmation.
+1. **Library > Import video**, importing as a reference, creates a replayable
+   `.tpr` containing video and cached model evidence.
+2. **Create calibration** opens that reference's approval editor.
+3. Select the correct dancer, metric, applicable view and example passages.
+4. Inspect the evidence, edit acceptable bounds, **Approve metric** and save
+   the `.tpc`.
 
-It preserves limits, units and views. It does not copy the full evidence or
-grant live-camera scoring approval.
-Selected profiles still take precedence over these defaults.
+The editor uses raw cached `measurement_poses`, not smoothed descriptive
+percentages or interpolated display dots. A display-only cache must be
+reanalyzed before it can supply verified raw calibration evidence.
 
-## Apply, save, export, import and reset
+The editor restores the reference's cached capture settings. Changing today's
+measurement side does not rewrite the saved reference. The selected inference
+model also does not replace existing cached landmarks until reanalysis.
 
-### Apply Settings
+### Knee geometry
 
-Validates edits and updates the current app configuration. It does not write a
-settings file. Read any error message.
+For each usable leg, form pixel-space vectors from knee to hip and knee to ankle:
 
-### Apply & Save settings.toml
-
-Confirms overwrite, applies valid edits, and attempts a file save.
-The file path is the current working directory's `settings.toml`, not necessarily
-Data folder. Inspect the confirmation destination.
-
-If applying succeeds but the file write fails, the app can have new values that
-are not saved. Check the status message.
-
-### Export TOML...
-
-Applies valid edits and writes a configuration at your chosen destination.
-Use it for a backup or a clearly located settings file.
-
-### Import TOML...
-
-Loads a chosen file into the app.
-It does not automatically rewrite another file.
-The ordinary loader reads a file only when supplied/configured; naming a file
-`settings.toml` does not guarantee automatic loading after restart.
-
-### Reset Defaults
-
-Restores built-in current configuration, including disabled default ranges.
-It does not automatically overwrite saved files or delete Library archives.
-
-Stop an active preview before relying on a reset for that running worker.
-
-## Practical adjustment recipes
-
-These are invented experiments, not universal presets.
-
-### A. Live skeleton trails too much
-
-First check camera/processing latency and the actual dots.
-Then try a smaller overlay time constant:
-
-```toml
-overlay_smoothing = 0.08
-smoothing = 0.25
+```text
+u = hip - knee
+v = ankle - knee
+interior angle = degrees(acos(clamp(dot(u, v) / (length(u) * length(v)), -1, 1)))
+knee flexion = max(0, 180 - interior angle)
 ```
 
-This reduces live coordinate smoothing while leaving the general evaluator
-time constant unchanged. It may make drawing noisier. Restart the preview.
-It does not select a faster model or alter camera hardware latency.
+Coordinates use the actual video's width and height, not removed camera-size
+controls. An interior angle of 170 degrees gives 10 degrees of projected flexion;
+180 gives zero.
 
-### B. Measured numbers are noisy but drawing looks acceptable
+Normally the least-bent usable knee wins: 20 degrees on one side and 6 on the
+other gives 6, not their average. This does not identify a weight-bearing leg.
+If both legs qualify but the other leg's minimum visibility is below 0.60 and
+the preferred side is at least 0.15 more visible, the preferred side is used.
+The configurable strict confidence mask normally removes such a weak leg first.
 
-```toml
-smoothing = 0.40
-overlay_smoothing = 0.20
+Required hip/knee/ankle points must pass the approval confidence/presence mask.
+The helper also has a fixed visibility floor of 0.35 and requires both leg
+segments to be at least 10 pixels. If neither leg qualifies, the sample is
+missing, not zero degrees. The unsigned image angle is not a 3D diagnosis of
+joint locking or hyperextension.
+
+### Shoulder geometry
+
+For each usable ear/shoulder pair:
+
+```text
+vertical gap = (shoulder.y - ear.y) * image height
+raw clearance C = smallest usable vertical gap / reference scale S
 ```
 
-This makes evaluated numbers respond more gradually.
-It does not repair incorrectly located joints. Inspect whether genuine brief
-changes you care about are now hidden by smoothing.
+Image y increases downward. A shoulder rising toward its ear reduces the gap.
+The smallest usable gap selects the more elevated-looking side, not an average
+and not the difference between the two shoulder heights.
 
-### C. Brief changes produce too many confirmed events
+The reference scale is chosen as follows:
+
+1. For each usable ear/hip pair with vertical separation greater than 20 pixels,
+   calculate `0.26 * vertical ear-to-hip separation`. Prefer the largest candidate.
+2. Without such a candidate, take the largest available fallback:
+   - `0.68 * two-dimensional nose-to-paired-ear pixel distance`;
+   - `0.65 * horizontal distance between ears`;
+   - `0.28 * horizontal distance between shoulders`.
+3. If the selected scale is smaller than 8 pixels, the result is unavailable.
+
+These constants are not Settings parameters. The helper requires visibility
+of at least 0.50; approval first applies the configurable confidence/presence
+mask and image-boundary checks.
+
+At ear-to-hip separation 200 pixels, S is `0.26 * 200 = 52` pixels.
+A selected shoulder/ear gap of 52 pixels gives C = 1.0; a gap of 41.6 gives 0.8.
+Normalization reduces simple camera-distance effects, but anatomy, head
+motion, perspective and model errors still matter.
+
+### Why fallback analysis can show a percentage instead
+
+Fallback shoulder coaching converts clearance C to:
+
+```text
+B = max(0.20, effective neutral clearance)
+elevation percent = 100 * (B - C) / B
+```
+
+B = 1.05 and C = 0.90 gives approximately 14.3%. C = B gives zero;
+C greater than B can give a negative percentage. This does not measure muscle
+contraction.
+
+Current Library movement import starts from configured neutral clearance.
+It collects up to 600 raw clearances between 0.65 and 1.50. After at least 15
+qualifying samples, the baseline is the greater of its starting value and those
+samples' 75th percentile. A fixed raw gap can therefore acquire a different
+descriptive percentage as that baseline develops.
+
+For the fallback shoulder warning, recovery uses
+`max(4, 0.65 * shoulder_raise_threshold)` percent: 6.5% at the default.
+The fallback knee recovery boundary is its configured minimum plus 2.5 degrees:
+10.5 degrees at the default.
+
+Applicable descriptive knee/shoulder filters use Overlay smoothing when nonzero,
+otherwise Measurement smoothing, with a minimum time constant of 0.0001 seconds.
+A gap above Max gap resets those filters. These raw descriptive helpers use their
+own visibility floors; a displayed descriptive number does not prove that the
+stricter approval checks passed.
+
+**Approved knee/shoulder ranges do not use that adaptive percentage or
+descriptive smoothing as their raw calibration samples.** After approval,
+range evaluation applies general measurement smoothing and event timing.
+
+### From raw examples to approved bounds
+
+The editor summarizes the selected dancer's eligible samples within the chosen
+passages. Lost identity, missing landmarks and wrong views do not become zeros.
+Side/front eligibility uses the per-metric view and Max view width; `all` skips
+that split, not missing evidence.
+
+**Suggest middle 80% of examples** proposes the 10th and 90th percentiles,
+not the observed extremes or a universal technique standard. At least two
+usable samples and a positive reliable time interval are needed. Reliable
+duration excludes invalid intervals and uses the gap policy saved with the
+reference.
+
+Inspect low/high examples and explicitly approve the acceptable minimum and
+maximum. Standing and walking distributions can differ. These measurements
+remain two-dimensional projections, not force, partner pressure or medical
+assessments.
+
+## Applying, saving and reanalyzing
+
+| Action | What it does | Practical example |
+| --- | --- | --- |
+| Apply Settings | Validates and publishes current in-memory edits, without writing a file. | Change Entry duration, Apply, then rebuild the relevant comparison. |
+| Apply & Save settings.toml | Confirms overwrite, applies valid edits and saves in the process working directory. | Read the displayed destination; it is not automatically Data folder. |
+| Export TOML... | Applies valid edits and writes current editable settings to your chosen file. | Export a named video-analysis preset. Removed legacy-only values are omitted. |
+| Import TOML... | Validates and loads a chosen configuration. | Load that preset, inspect visible values, then reanalyze where required. |
+| Reset Defaults | Restores built-in configuration and disables default ranges. | Reset experimental edits without deleting Library archives or saved files. |
+
+If applying succeeds but saving fails, the new values can be active but unsaved.
+Read errors rather than assuming success. A file named `settings.toml` is not
+automatically loaded merely because it exists; startup must be configured to
+load it or it must be imported.
+
+Changing the inference model requires new analysis for new landmarks.
+Changing cached descriptive processing also requires regeneration.
+Approved-range Review comparisons can be rebuilt from raw cached evidence
+without downloading/running a different pose model.
+
+## Practical video-analysis recipes
+
+### Brief excursions should not confirm events
 
 ```toml
 entry_duration = 2.0
 clear_duration = 0.75
 ```
 
-This requires longer persistence before range events confirm.
-It leaves acceptable limits unchanged and does not fix tracking quality.
+A one-second qualifying outside-range interval will not confirm at this entry
+duration. Bounds and raw joints are unchanged.
 
-### D. Review drawing should fill only short gaps
+### Fill only short drawing gaps
 
 ```toml
 replay_joint_interpolation = "linear"
 replay_joint_max_gap = 0.5
 ```
 
-This reduces display inference compared with the three-second default.
-It does not supply missing scoring evidence. Use zero instead to disable it.
+A bracketed 0.4-second gap can be drawn; a 0.8-second gap is not filled.
+Neither supplies valid missing scoring samples.
 
-### E. A default pink-axis comparison without selecting a profile
+### Compare pink-axis tilt without selecting a profile
 
 ```toml
 [calibration_defaults.torso_axis_tilt]
@@ -1221,46 +904,23 @@ unit = "degrees"
 view = "all"
 ```
 
-This invented example enables only the pink-axis default range.
-With no selected profile, the other default metrics remain unavailable and old
-posture thresholds do not fill them in. It is not camera-scoring permission.
-Both shoulder/hip pairs must still be reliably observed.
+This example enables only that default metric. With no selected profile, the
+other disabled default metrics stay unavailable; fallback posture thresholds
+do not fill them in. Both shoulders and hips must remain reliable.
 
-## Invalid values and misleading adjustments
+## Further reading and implementation
 
-| Problem | What to do |
-| --- | --- |
-| Confidence outside `0 to 1` | Use an allowed value; do not interpret a number above one as extra accuracy. |
-| Clear equal to/greater than entry | Lower clear or raise entry while preserving the intended hysteresis. |
-| Minimum greater than maximum | Correct the order. Negative signed values are allowed where meaningful. |
-| Required old calibration time exceeds capture duration | Reduce required time or increase the old window. |
-| Head-down limit is zero/positive | Use a negative old limit; approved raw ranges are a separate system. |
-| Entering a percent as a ratio | Convert carefully: six percent is `0.06`, not `6`. |
-| Changing an inactive replay flag | Use the actual analysis/export action, not repeated toggling. |
-| Adding internal pivot/step detector keys to settings TOML | They are not exposed Settings fields; unknown keys are rejected. |
-| Different pose model in calibration and recording | Recreate matching evidence; do not bypass compatibility by copying limits. |
-| Saving but not loading after restart | Import/configure the saved file and verify current values. |
-
-## Quick checklist and further reading
-
-- [ ] I know whether a profile, default ranges or older thresholds are active.
-- [ ] I understand the unit and sign of the value I am editing.
-- [ ] I fixed framing/dot placement before changing limits.
-- [ ] I changed one parameter at a time.
-- [ ] I applied the edit and read the result.
-- [ ] I restarted/reanalyzed where necessary.
-- [ ] I saved to a known location and know how to reload it.
-- [ ] I did not interpret UNKNOWN or a smooth skeleton as reliable evidence.
-
-Companion guides:
-
-- [Detailed calibration guide](CALIBRATION_BEGINNERS_GUIDE.md).
+- [Calibration guide](CALIBRATION_BEGINNERS_GUIDE.md).
 - [Tracking-engine guide](TRACKING_ENGINE_BEGINNERS_GUIDE.md).
 - [General manual](TANGO_POSTURE_GUIDE.md).
-
-Implementation references:
-
-- [Settings defaults, constraints and groups](../src/tango_posture/config.py).
-- [Qt tabs, labels and Apply/Save behaviour](../src/tango_posture/desktop_qt/screens/settings.py).
-- [Default-range copying and save destination](../src/tango_posture/desktop_qt/service_bridge.py).
-- [Metric names and native units](../src/tango_posture/calibration/models.py).
+- [Architecture](ARCHITECTURE.md).
+- [Editable groups, defaults and export](../src/tango_posture/config.py).
+- [Qt Settings controls](../src/tango_posture/desktop_qt/screens/settings.py).
+- [Model selection/cache resolution](../src/tango_posture/models.py).
+- [Geometry and ankle-lift tempo gate](../src/tango_posture/geometry.py).
+- [Approval measurements](../src/tango_posture/calibration/measurements.py).
+- [Raw reference evidence](../src/tango_posture/calibration/evidence.py).
+- [Passage statistics](../src/tango_posture/calibration/statistics.py).
+- [Approval editor](../src/tango_posture/desktop_qt/calibration/editor.py).
+- [Offline pipeline and fallback tempo](../src/tango_posture/references/pipeline.py).
+- [Fallback coaching](../src/tango_posture/references/coach.py).
