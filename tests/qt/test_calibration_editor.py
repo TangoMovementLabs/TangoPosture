@@ -5,18 +5,24 @@ import cv2
 import numpy as np
 import pytest
 from conftest import frame
+from PySide6.QtCore import QPoint, Qt
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QMessageBox, QPushButton
 
-from tango_posture.archive import append_segment, read_analytics, read_manifest
+from tango_posture.archive import append_segment, read_analytics, read_manifest, store_analytics
 from tango_posture.calibration.archives import read_range_profile
 from tango_posture.calibration.baseline import profile
+from tango_posture.calibration.measurements import measure_ranges
+from tango_posture.calibration.models import METRIC_DETAILS, ApprovedRange, Passage
 from tango_posture.config import Config, export_toml
 from tango_posture.desktop_qt.calibration.editor import CalibrationEditor
 from tango_posture.desktop_qt.calibration.guided import GuidedCalibration
+from tango_posture.desktop_qt.calibration.preview import COLORS, render_approved_feedback
 from tango_posture.desktop_qt.router import Router
 from tango_posture.desktop_qt.screens.library import LibraryScreen
 from tango_posture.desktop_qt.screens.settings import SettingsScreen
 from tango_posture.desktop_qt.service_bridge import ServiceBridge
+from tango_posture.domain import Landmark
 from tango_posture.models import MANIFEST
 from tango_posture.references.archives import promote_reference
 
@@ -77,6 +83,348 @@ def test_shared_editor_reuses_cache_and_saves_independent_profiles(qapp, tmp_pat
     assert saved[0].metrics["head_pitch"].lower == -100
     assert len(saved[0].metrics["head_pitch"].passages) == 2
     assert not saved[0].metrics["head_pitch"].camera_check_passed
+
+
+def test_editor_uses_cached_review_layers_and_interpolation(qapp, cached_reference, monkeypatch):
+    analytics = read_analytics(cached_reference, 0)
+    entries = analytics["frames"]
+    coach = {
+        "width": 640, "height": 480,
+        "frames": {
+            str(index): {
+                "timestamp": index / 10,
+                "measurement_poses": [] if index == 2 else entry["poses"],
+                "message": "BEND YOUR KNEES",
+            }
+            for index, entry in enumerate(entries)
+        },
+    }
+    movement = {"steps": [{"frame": 1}], "pivots": [{"start_frame": 1, "end_frame": 5}]}
+    store_analytics(cached_reference, 0, {"coach_data": coach, "movement_data": movement})
+    before = cached_reference.read_bytes()
+    seen = {}
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Calibration must not rerun inference")
+
+    def skeleton(image, data, index, cfg, **kwargs):
+        seen["entry"] = data["frames"][str(index)]
+        seen["interpolation"] = cfg.replay_joint_interpolation
+        seen["lines_only"] = kwargs["lines_only"]
+        return image
+
+    def movement_overlay(image, data, index, fps, **kwargs):
+        seen["movement"] = data
+        seen["movement_options"] = kwargs
+        return image
+
+    monkeypatch.setattr("tango_posture.references.pipeline.MediaPipeEstimator", forbidden)
+    monkeypatch.setattr(
+        "tango_posture.desktop_qt.calibration.editor.render_coach_frame_overlay", skeleton
+    )
+    monkeypatch.setattr(
+        "tango_posture.desktop_qt.calibration.editor.render_movement_overlay", movement_overlay
+    )
+    editor = CalibrationEditor(cached_reference, Config(
+        replay_joint_interpolation="quadratic", replay_step_history_seconds=2.5,
+    ))
+    try:
+        editor._seek_frame(2)
+        assert seen["entry"]["measurement_poses"] == []
+        assert seen["entry"]["display_poses"]
+        assert seen["interpolation"] == "quadratic"
+        assert seen["lines_only"]
+        assert seen["movement"] == movement
+        assert seen["movement_options"]["show_pivots"]
+        assert seen["movement_options"]["show_steps"]
+        assert seen["movement_options"]["step_history_seconds"] == 2.5
+        assert seen["movement_options"]["frame_timestamp"] == pytest.approx(0.2)
+        assert not editor.evidence.frames[2].poses
+        assert cached_reference.read_bytes() == before
+    finally:
+        editor.reject()
+
+
+def test_approved_feedback_tracks_all_metrics_and_draft_lifecycle(qapp, cached_reference, monkeypatch):
+    seen = []
+
+    def render(image, observation, cfg, targets, rows):
+        seen.append((set(targets), {row["metric"]: row["state"] for row in rows}))
+        return render_approved_feedback(image, observation, cfg, targets, rows)
+
+    monkeypatch.setattr("tango_posture.desktop_qt.calibration.editor.render_approved_feedback", render)
+    editor = CalibrationEditor(cached_reference, Config(
+        smoothing=0.0001, entry_duration=0.2, clear_duration=0.2,
+    ))
+    try:
+        assert not seen
+        assert editor._approved_coach_data is None
+        value = editor._samples["head_pitch"][0][1]
+        assert value is not None
+        editor.lower_spin.setValue(-100)
+        editor.upper_spin.setValue(value - 5)
+        editor._approve()
+        assert seen[-1] == ({"head_pitch"}, {"head_pitch": "PENDING"})
+        editor.scrubber.setValue(3)
+        assert seen[-1][1]["head_pitch"] == "DEVIATION"
+        assert editor.chart.states[0.0] == "PENDING"
+        assert editor.chart.states[0.3] == "DEVIATION"
+        editor.scrubber.setValue(0)
+        assert seen[-1][1]["head_pitch"] == "PENDING"
+
+        editor.step_combo.setCurrentText("Shoulders")
+        editor.lower_spin.setValue(-100)
+        editor.upper_spin.setValue(100)
+        editor._approve()
+        assert seen[-1][0] == {"head_pitch", "shoulder_clearance"}
+        assert seen[-1][1]["shoulder_clearance"] == "WITHIN_REFERENCE"
+
+        editor.step_combo.setCurrentText("Head")
+        original = editor.approved["head_pitch"].upper
+        editor.upper_spin.setValue(100)
+        assert not editor.chart.states
+        editor.scrubber.setValue(3)
+        assert editor.approved["head_pitch"].upper == original
+        assert seen[-1][1]["head_pitch"] == "DEVIATION"
+        editor._approve()
+        assert seen[-1][1]["head_pitch"] == "WITHIN_REFERENCE"
+        editor._skip()
+        assert seen[-1][0] == {"shoulder_clearance"}
+        editor._restart_track()
+        assert not editor.approved
+        assert editor._approved_coach_data is None
+    finally:
+        editor.reject()
+
+
+def test_approved_feedback_stops_when_dancer_tracking_is_lost(qapp, cached_reference, monkeypatch):
+    analytics = read_analytics(cached_reference, 0)
+    entries = analytics["frames"]
+    entries[2]["poses"] = []
+    store_analytics(cached_reference, 0, {"frames": entries})
+    seen = []
+
+    def render(image, observation, cfg, targets, rows):
+        seen.append((observation, rows))
+        return render_approved_feedback(image, observation, cfg, targets, rows)
+
+    monkeypatch.setattr("tango_posture.desktop_qt.calibration.editor.render_approved_feedback", render)
+    editor = CalibrationEditor(cached_reference, Config(entry_duration=0.1))
+    try:
+        editor._approve()
+        editor.scrubber.setValue(2)
+        assert not seen[-1][0].poses
+        assert seen[-1][1][0]["state"] == "UNKNOWN"
+        editor.scrubber.setValue(3)
+        assert not seen[-1][0].poses
+        assert seen[-1][1][0]["state"] == "UNKNOWN"
+    finally:
+        editor.reject()
+
+
+def test_approved_feedback_times_both_limits_and_recovery(qapp, cached_reference):
+    entries = read_analytics(cached_reference, 0)["frames"]
+    for index, entry in enumerate(entries):
+        y = 100 if index < 4 else 90 if index < 8 else 70 if index < 12 else 90
+        entry["poses"][0]["nose"][1] = y / 480 + 0.0000123
+    store_analytics(cached_reference, 0, {"frames": entries})
+    editor = CalibrationEditor(cached_reference, Config(
+        smoothing=0.0001, entry_duration=0.2, clear_duration=0.2,
+    ))
+    try:
+        editor.lower_spin.setValue(25)
+        editor.upper_spin.setValue(45)
+        editor._approve()
+        compared = editor._approved_coach_data
+        assert compared is not None
+        rows = [compared["frames"][str(index)]["calibration_rows"][0] for index in range(15)]
+        assert rows[0]["raw"] == pytest.approx(editor._samples["head_pitch"][0][1], abs=1e-10)
+        assert [rows[i]["state"] for i in (0, 2, 4, 6, 8, 10, 12, 14)] == [
+            "PENDING", "DEVIATION", "DEVIATION", "WITHIN_REFERENCE",
+            "PENDING", "DEVIATION", "DEVIATION", "WITHIN_REFERENCE",
+        ]
+    finally:
+        editor.reject()
+
+
+@pytest.mark.parametrize("key", list(METRIC_DETAILS))
+def test_approved_metric_geometry_and_unknown_abstention(key, monkeypatch):
+    observation = frame()
+    pose = observation.poses[0]
+    pose["left_knee"] = Landmark(315 / 640, 380 / 480, 0.99, 0.99)
+    pose["right_knee"] = Landmark(330 / 640, 380 / 480, 0.99, 0.99)
+    cfg = Config()
+    value = measure_ranges(observation, cfg).values[key]
+    assert value is not None
+    target = ApprovedRange(
+        lower=-100, upper=100, unit=METRIC_DETAILS[key][2], view="side",
+        passages=[Passage(start=0, end=1)], median=0, p10=0, p90=0,
+        valid_duration=1, selected_duration=1, samples=2, inside_fraction=1,
+    )
+    drawn = []
+    original_line = cv2.line
+
+    def record_line(image, start, end, color, *args):
+        drawn.append((start, end, color))
+        return original_line(image, start, end, color, *args)
+
+    monkeypatch.setattr(cv2, "line", record_line)
+    image = np.zeros((480, 640, 3), dtype=np.uint8)
+    row = {"metric": key, "state": "DEVIATION", "raw": value, "smoothed": value}
+    render_approved_feedback(image, observation, cfg, {key: target}, [row])
+    assert any(color == COLORS["DEVIATION"] for _, _, color in drawn)
+    if key == "head_pitch":
+        assert any(start[1] == end[1] and color == (255, 220, 0)
+                   for start, end, color in drawn)
+    drawn.clear()
+    row["state"] = "UNKNOWN"
+    render_approved_feedback(image, observation, cfg, {key: target}, [row])
+    assert not drawn
+
+
+def test_approved_assessments_fit_small_video_and_show_every_metric(monkeypatch):
+    observation = frame()
+    target = ApprovedRange(
+        lower=-100, upper=100, unit="degrees", view="side",
+        passages=[Passage(start=0, end=1)], median=0, p10=0, p90=0,
+        valid_duration=1, selected_duration=1, samples=2, inside_fraction=1,
+    )
+    targets = {key: target.model_copy(update={"unit": details[2]})
+               for key, details in METRIC_DETAILS.items()}
+    rows = [{"metric": key, "state": "UNKNOWN", "smoothed": None} for key in targets]
+    labels = []
+    original_text = cv2.putText
+
+    def record_text(image, text, origin, font, scale, color, thickness, line_type):
+        labels.append((text, origin, cv2.getTextSize(text, font, scale, thickness)[0]))
+        return original_text(image, text, origin, font, scale, color, thickness, line_type)
+
+    monkeypatch.setattr(cv2, "putText", record_text)
+    render_approved_feedback(np.zeros((120, 240, 3), dtype=np.uint8),
+                             observation, Config(), targets, rows)
+    assert len(labels) == len(METRIC_DETAILS)
+    assert all("[UNKNOWN]" in text and x + size[0] < 240 and y < 120
+               for text, (x, y), size in labels)
+
+
+def test_editor_chart_shows_limits_and_example_intervals(qapp, cached_reference):
+    editor = CalibrationEditor(cached_reference, Config())
+    try:
+        editor.resize(1180, 800)
+        editor.show()
+        editor.passages_input.setText("0-1; 2-3")
+        editor.lower_spin.setValue(-100)
+        editor.upper_spin.setValue(100)
+        editor._update_stats()
+        qapp.processEvents()
+        assert editor.chart.bounds == (-100, 100)
+        assert editor.chart.intervals == [(0, 1), (2, 3)]
+        image = editor.chart.grab().toImage()
+        amber_pixels = sum(
+            1 for y in range(image.height()) for x in range(image.width())
+            if (color := image.pixelColor(x, y)).red() > 180
+            and color.green() > 120 and color.blue() < 130
+        )
+        assert amber_pixels > 20
+        width = image.width() - 82
+        inside_x = round(62 + 0.5 / editor.chart.time_end * width)
+        outside_x = round(62 + 1.5 / editor.chart.time_end * width)
+        assert image.pixelColor(inside_x, 30) != image.pixelColor(outside_x, 30)
+        editor._approve()
+        editor.metric_combo.setCurrentIndex(1)
+        editor.metric_combo.setCurrentIndex(0)
+        assert editor.chart.bounds == (-100, 100)
+        assert editor.chart.intervals == [(0, 1), (2, 3)]
+    finally:
+        editor.reject()
+
+
+def test_calibration_chart_playhead_tracks_playback_and_seeking(qapp, tmp_path, cached_reference):
+    excerpt = tmp_path / "references" / "ExcerptForPlayhead.tpr"
+    promote_reference(
+        tmp_path / "practice.tp", excerpt, "Excerpt", start_frame=5, end_frame=25,
+    )
+    editor = CalibrationEditor(excerpt, Config())
+    try:
+        editor.show()
+        qapp.processEvents()
+        assert editor.chart.origin_timestamp == pytest.approx(0.5)
+        assert editor.chart.playhead_timestamp == pytest.approx(0.5)
+        editor.play_button.click()
+        assert editor.play_timer.isActive()
+        editor._advance_frame()
+        assert editor.chart.playhead_timestamp == pytest.approx(0.6)
+        editor.play_button.click()
+        editor.scrubber.setValue(12)
+        assert editor.chart.playhead_timestamp == pytest.approx(1.7)
+        editor.scrubber.setValue(3)
+        assert editor.chart.playhead_timestamp == pytest.approx(0.8)
+        editor.metric_combo.setCurrentIndex(1)
+        assert editor.chart.playhead_timestamp == pytest.approx(0.8)
+        qapp.processEvents()
+        image = editor.chart.grab().toImage()
+        x = round(62 + (0.8 - 0.5) / editor.chart.time_end * (image.width() - 82))
+        assert any(
+            (color := image.pixelColor(px, 40)).red() > 200
+            and color.green() < 150 and color.blue() > 160
+            for px in range(x - 2, x + 3)
+        )
+        target_x = round(62 + 0.5 * (editor.chart.width() - 82))
+        QTest.mouseClick(editor.chart, Qt.MouseButton.LeftButton, pos=QPoint(target_x, 40))
+        assert editor.scrubber.value() in (9, 10)
+        assert editor.chart.playhead_timestamp == pytest.approx(
+            editor.evidence.frames[editor.scrubber.value()].timestamp
+        )
+    finally:
+        editor.reject()
+
+
+def test_pivot_context_is_saved_without_changing_approved_ranges(qapp, tmp_path, cached_reference):
+    editor = CalibrationEditor(cached_reference, Config(data_dir=str(tmp_path)))
+    try:
+        editor._approve()
+        approved = editor.approved["head_pitch"].model_dump()
+        editor.context_combo.setCurrentText("Pivot")
+        editor._save()
+        profile = read_range_profile(editor.saved_path)
+        assert profile.context == "Pivot"
+        assert profile.metrics["head_pitch"].model_dump() == approved
+    finally:
+        editor.reject()
+
+
+def test_guided_pivot_context_does_not_start_walking_drill(qapp, tmp_path):
+    dialog = GuidedCalibration(ServiceBridge(Config(data_dir=str(tmp_path))))
+    try:
+        dialog.context.setCurrentText("Pivot")
+        assert dialog.context.currentText() == "Pivot"
+        dialog._step = 4
+        dialog._next()
+        assert not dialog._walking
+        assert dialog._review_requested
+    finally:
+        dialog.reject()
+
+
+def test_editor_draws_cached_movement_without_running_analysis(qapp, cached_reference):
+    movement = {
+        "width": 640, "height": 480,
+        "steps": [{"frame": 0, "time": 0.0, "hx": 170, "hy": 420,
+                   "tx": 200, "ty": 370, "side": "left"}],
+        "pivots": [{"start_frame": 0, "end_frame": 5, "direction": "clockwise"}],
+        "hip_frames": [{"frame": 0, "lx": 250, "ly": 250,
+                        "rx": 390, "ry": 250, "scale": 100}],
+    }
+    store_analytics(cached_reference, 0, {"movement_data": movement})
+    editor = CalibrationEditor(cached_reference, Config())
+    try:
+        editor._seek_frame(0)
+        with_movement = editor.stage._image.copy()
+        editor._movement_data = None
+        editor._seek_frame(0)
+        assert editor.stage._image != with_movement
+    finally:
+        editor.reject()
 
 
 def test_calibration_defaults_require_confirmation_and_round_trip_through_settings(

@@ -42,6 +42,7 @@ from ...references.coach import (
     compare_coach_data,
     interpolate_coach_data,
     render_coach_frame_overlay,
+    render_coach_torso_axis,
 )
 from ...references.companions import load_report_coach_data, load_report_movement_data
 from ...references.constants import MAX_IMPORT_RANGE_SECONDS
@@ -246,16 +247,26 @@ class ReviewScreen(QWidget):
         self.reference_combo.currentIndexChanged.connect(self._calibration_changed)
         it_layout.addWidget(self.reference_combo)
         self.show_coach_cb = QCheckBox("Skeleton / posture overlay")
+        self.show_torso_axis_cb = QCheckBox("Torso axis angle (pink line)")
+        self.show_torso_axis_cb.setToolTip(
+            "Show the shoulder-to-hip midpoint line and its angle from image vertical. "
+            "This is a measurement, not an alert."
+        )
         self.show_pivots_cb = QCheckBox("Pivot rings")
         self.show_steps_cb = QCheckBox("Step footprints")
         self.lines_only_cb = QCheckBox("Lines only on floor")
         for checkbox in (self.show_coach_cb, self.show_pivots_cb, self.show_steps_cb):
             checkbox.setChecked(True)
         for checkbox in (
-            self.show_coach_cb, self.show_pivots_cb, self.show_steps_cb, self.lines_only_cb
+            self.show_coach_cb, self.show_torso_axis_cb, self.show_pivots_cb,
+            self.show_steps_cb, self.lines_only_cb,
         ):
             checkbox.toggled.connect(self._refresh_overlay)
             it_layout.addWidget(checkbox)
+        self.axis_status = QLabel()
+        self.axis_status.setWordWrap(True)
+        self.axis_status.setStyleSheet(f"color: {COLOR_TEXT_MUTED}; font-size: 11px;")
+        it_layout.addWidget(self.axis_status)
 
         self.metric_values: dict[str, QLabel] = {}
         for key, title in (
@@ -781,13 +792,29 @@ class ReviewScreen(QWidget):
                     reader.index,
                     self.bridge.config,
                     verbose_skeleton=True,
-                    show_vertical_axis=True,
+                    show_vertical_axis=False,
                     show_footer=False,
                     lines_only=(
                         self.lines_only_cb.isChecked() or not self._using_range_targets()
                         or bool(self._calibration_error)
                     ),
                 )
+            self.axis_status.clear()
+            if self.show_torso_axis_cb.isChecked():
+                frames = coach_data.get("frames") if coach_data is not None else None
+                entry = frames.get(str(reader.index)) if isinstance(frames, dict) else None
+                if coach_data is None or not isinstance(entry, dict) or "measurement_poses" not in entry:
+                    self.axis_status.setText(
+                        "Raw axis landmarks are unavailable. Analyze the source video again."
+                    )
+                else:
+                    try:
+                        frame = render_coach_torso_axis(
+                            frame, coach_data, reader.index, self.bridge.config,
+                            show_labels=not self.lines_only_cb.isChecked(),
+                        )
+                    except (TypeError, ValueError) as error:
+                        self.axis_status.setText(f"Axis unavailable: {error}")
             frame = render_movement_overlay(
                 frame,
                 self._movement_data,

@@ -224,6 +224,63 @@ def test_review_approved_pink_axis_uses_old_raw_cache_and_abstains_on_missing_hi
         widget.close()
 
 
+def test_review_axis_toggle_uses_raw_landmarks_without_coaching(screen, video, monkeypatch):
+    screen.load_archive(video)
+    pose = {
+        "left_shoulder": [0.55, 0.2, 0, 0.99, 0.99],
+        "right_shoulder": [0.75, 0.2, 0, 0.99, 0.99],
+        "left_hip": [0.35, 0.8, 0, 0.99, 0.99],
+        "right_hip": [0.55, 0.8, 0, 0.99, 0.99],
+    }
+    missing_hip = {key: point for key, point in pose.items() if key != "right_hip"}
+    screen._coach_data = {"width": 64, "height": 48, "frames": {
+        "0": {"timestamp": 0.0, "measurement_poses": [pose]},
+        "1": {"timestamp": 0.1, "measurement_poses": [missing_hip], "display_poses": [pose]},
+        "2": {"timestamp": 0.2, "poses": [pose]},
+    }}
+    screen._update_calibration_comparison()
+    screen.show_coach_cb.setChecked(False)
+    screen.show_pivots_cb.setChecked(False)
+    screen.show_steps_cb.setChecked(False)
+    screen._show_frame(0)
+    original = screen.primary_stage._image.copy()
+    assert not screen.show_torso_axis_cb.isChecked()
+
+    text = []
+    put_text = cv2.putText
+
+    def record_text(image, label, *args, **kwargs):
+        text.append(label)
+        return put_text(image, label, *args, **kwargs)
+
+    monkeypatch.setattr(cv2, "putText", record_text)
+    screen.show_torso_axis_cb.setChecked(True)
+    assert screen.primary_stage._image != original
+    assert any(label.startswith("Torso axis:") and "deg" in label for label in text)
+    assert screen.alerts_text.text() == "Select a calibration profile to see posture alerts."
+    screen.show_torso_axis_cb.setChecked(False)
+    assert screen.primary_stage._image == original
+
+    screen.scrubber.setValue(1)
+    without_axis = screen.primary_stage._image.copy()
+    text.clear()
+    screen.show_torso_axis_cb.setChecked(True)
+    assert screen.primary_stage._image == without_axis
+    assert not text
+
+    screen.show_torso_axis_cb.setChecked(False)
+    screen.scrubber.setValue(2)
+    without_axis = screen.primary_stage._image.copy()
+    screen.show_torso_axis_cb.setChecked(True)
+    assert screen.primary_stage._image == without_axis
+    assert "Analyze the source video again" in screen.axis_status.text()
+
+    screen.scrubber.setValue(0)
+    text.clear()
+    screen.lines_only_cb.setChecked(True)
+    assert not text
+
+
 def test_review_interpolation_settings_refresh_display_without_changing_raw_alerts(
     screen, video, monkeypatch,
 ):

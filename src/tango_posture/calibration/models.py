@@ -31,6 +31,8 @@ METRIC_DETAILS = {
 
 STEPS = ("Head", "Shoulders", "Hips", "Torso", "Knees")
 
+PRACTICE_CONTEXTS = ("Neutral posture", "Solo walking", "Close embrace", "Pivot")
+
 
 CYCLIC_METRICS = {"head_inclination", "trunk_inclination"}
 

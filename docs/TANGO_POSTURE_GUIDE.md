@@ -1164,6 +1164,7 @@ stream of a single dancer filmed from a fixed, approximately level camera:
 
 - **Controls**:
   - **Analyze posture & movement**: Runs (or re-runs) the offline pose pass on the selected recording. **Cancel analysis** stops a running job; cancelling a re-run preserves the previous valid result.
+  - **Torso axis angle (pink line)**: Optionally shows the shoulder-midpoint to hip-midpoint line and its angle from image vertical, independently of the skeleton. Both shoulders and hips must be reliably observed; interpolation does not supply missing measurement landmarks. This visual cue alone does not produce an alert.
   - **Pivot rings**: Draws a perspective ellipse ring centered on the hip midpoint and aligned with the projected hip line only during an observed pivot interval, with a tangent directional arrow indicating **clockwise** or **anticlockwise** top-down rotation.
   - **Step footprints**: Draws left and right heel-to-toe footprint markers at their observed floor positions. Each marker fades in over a short ramp (`min(0.15s, 0.15 × T)`) and fades linearly to zero at `T = replay_step_history_seconds` (default `5.0s`) of replay media time. Pausing playback pauses the fade.
   - Select **Raw video** for dynamic layers; baked overlay pixels cannot be removed by toggling layers. **Lines only on floor** switches to a raw stream when available.

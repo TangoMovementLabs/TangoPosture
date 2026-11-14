@@ -586,8 +586,10 @@ opens reference media plus validated raw evidence. Its core services are:
   summaries, coverage, distributions and retained guided repeat checks.
 - [archives.py](../src/tango_posture/calibration/archives.py): profile persistence.
 
-The editor does not rerun inference whenever a bound changes. It derives
-statistics from cached raw observations.
+The editor does not rerun inference. It derives statistics from cached raw
+observations and uses Review's skeleton interpolation and cached movement
+renderers for preview. Interpolation does not alter range evidence. If movement
+data is absent, the editor requests analysis in Review.
 
 Dancer association uses reliable hip centres, a strict nearest-distance limit
 below 0.15, separation from a second candidate above 0.03, and the cached gap
@@ -596,7 +598,8 @@ person. Explicit restart anchors require user confirmation of linked identity.
 
 Users select example passages separately from acceptable bounds. The median,
 p10/p90 and middle-80-percent suggestion describe selected evidence, not correct
-tango technique. Angular wrap handling is metric-specific.
+tango technique. The chart shades selected passages and draws both editable
+limits across its full timeline. Angular wrap handling is metric-specific.
 
 Saving rechecks source archive identity, confirmed dancer selection and at
 least one approved metric. It creates a distinctly named profile rather than

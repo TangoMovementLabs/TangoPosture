@@ -137,6 +137,7 @@ and **Settings**. You do not need a References button in the navigation rail.
 | Draw the skeleton during practice | **Live Practice** | **Skeleton (V)** |
 | Show the pink torso axis during practice | **Live Practice** | **Vertical axis (Y)** |
 | Show synchronized skeleton/posture in Review | **Review**, frame-insights panel | **Skeleton / posture overlay** |
+| Show the pink torso axis and angle in Review | **Review**, frame-insights panel | **Torso axis angle (pink line)** |
 | Copy approved ranges into default Settings | Calibration editor | **Use approved ranges as Settings defaults...** |
 | Copy an already saved profile into defaults | **Library**, profile-only `.tpc` row | **Use as Settings defaults** |
 | Edit copied ranges | **Settings > Calibration defaults** | **Use**, minimum, maximum and view for each metric |
@@ -462,16 +463,18 @@ reference, not as instructions to find removed Library or Live Practice actions.
 
 ### Part B: preview and choose the activity
 
-1. Select **Neutral posture**, **Solo walking** or **Close embrace** in the
+1. Select **Neutral posture**, **Solo walking**, **Close embrace** or **Pivot** in the
    wizard's context selector.
 2. Click **Start camera preview**.
 3. Look at the estimated dots and check framing.
 4. Click **Begin guided checks**.
 5. The wizard gives a three-second countdown.
 
-The context name describes the purpose of your profile. Choosing **Close
-embrace** is not a measurement of partner pressure and does not make a
-two-person calibration supported.
+The context name is saved as a description of the activity the profile is
+intended for; it does not change the measurement rules, approved ranges or
+automatically detect the activity. Choosing **Close embrace** is not a
+measurement of partner pressure and does not make a two-person calibration
+supported. **Pivot** is a label, not an automatic pivot-capture drill.
 
 ### Part C: the four holds in each step
 
@@ -714,6 +717,20 @@ Pick passages appropriate to the intended target:
 
 You can choose different passages for different metrics.
 
+The chart shades these passages and draws the edited acceptable minimum and
+maximum as dashed horizontal lines across the whole timeline. The scale expands
+to include both limits, even when they lie outside the observed values.
+The pink vertical cursor follows video playback and seeking. Click the chart
+to seek the video to a corresponding time.
+
+The preview loads the reference's cached raw landmarks and movement analysis;
+it does not rerun the pose model. Like Review, it uses the current Review joint
+interpolation and footprint-history settings and displays cached pivot rings
+and footprints. Dancer numbers remain available for identity selection.
+Interpolation affects drawing only: approved ranges use raw measurements.
+If movement analysis was not saved, the editor says so; analyze the reference
+in Review to add it. Older display-only landmark caches also require reanalysis.
+
 ### 8.4 Inspect the evidence, including the extremes
 
 Use **Show low example** and **Show high example**.
@@ -756,6 +773,23 @@ make the reference more accurate.
 
 After changing an already approved metric's limits, examples or view, click
 **Approve metric** again so the saved approval reflects those edits.
+
+All approved metrics are shown together on the video, even while you edit
+another metric. Their lines and assessment labels are green for **IN RANGE**,
+orange for **PENDING**, red for **ALERT**, and grey for **UNKNOWN**. No
+posture alert or metric geometry is added for an unapproved metric. If the
+selected dancer is lost or the necessary landmarks are unreliable, the metric
+is unknown rather than an alert.
+
+The chart plots raw measurements and shows the edited minimum and maximum
+lines. For a metric whose displayed limits and view match its approval, the
+curve colors show the same smoothed, timed states used by Review. A short
+excursion may remain pending; an alert can remain red briefly while recovery
+is confirmed. Consequently the curve can lie inside a limit while still red,
+or outside while still green or orange. Editing limits or view does not change
+the video feedback until you approve again. The vertical cursor follows playback
+and seeking; seeking backward shows the previously calculated state at that
+time.
 
 Skipping a metric is better than approving a number you cannot observe reliably.
 
@@ -981,6 +1015,16 @@ to invent the other hip.
 
 An interpolated skeleton can look complete while this raw measurement remains
 UNKNOWN.
+
+In **Review**, turn on **Torso axis angle (pink line)** to see this line, its
+vertical guide and its current angle independently of the skeleton checkbox.
+It is off initially. It uses cached raw landmarks, so a missing or unreliable
+shoulder or hip hides the axis even if the displayed skeleton is interpolated.
+It is a visual measurement, not an alert: alerts still require an approved
+calibration. Older caches without raw landmarks need video reanalysis.
+**Lines only on floor** hides the angle label while leaving the
+axis lines visible. Dynamic controls require a raw/source video, not a baked
+overlay.
 
 ### Approving the pink axis
 

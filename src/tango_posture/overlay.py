@@ -30,8 +30,9 @@ def screen_point(x: float, y: float, width: int, height: int, mirror: bool) -> t
     )
 
 
-def _draw_torso_axis(
-    image: Any, pose: dict[str, Landmark], mirror: bool, confidence: float
+def draw_torso_axis(
+    image: Any, pose: dict[str, Landmark], mirror: bool, confidence: float, *,
+    show_labels: bool = True,
 ) -> None:
     height, width = image.shape[:2]
     axis = torso_axis_alignment(pose, width, height, confidence)
@@ -62,6 +63,8 @@ def _draw_torso_axis(
         cv2.circle(image, point, 5, torso_color, -1, cv2.LINE_AA)
     # Magnitude stays the same when the display is mirrored; it is not a judgement
     # that leaning is wrong, nor an estimate of forward/backward lean in 3D.
+    if not show_labels:
+        return
     labels = (
         (f"Torso axis: {abs(angle):.1f} deg", torso_color),
         ("Vertical (level camera)", vertical_color),
@@ -327,7 +330,7 @@ def draw(
                     cv2.LINE_AA,
                 )
         if show_vertical_axis:
-            _draw_torso_axis(image, pose, mirror, confidence)
+            draw_torso_axis(image, pose, mirror, confidence)
         ankle_info = ankle_lift_alignment(pose, observation.width, observation.height)
         if settings_coaching and ankle_info is not None:
             raw_ankle_lift, lifted_lm, grounded_lm = ankle_info

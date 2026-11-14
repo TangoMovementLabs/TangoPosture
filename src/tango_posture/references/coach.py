@@ -26,7 +26,7 @@ from ..domain import (
 from ..geometry import (
     torso_axis_alignment,
 )
-from ..overlay import MESSAGES, draw, screen_point
+from ..overlay import MESSAGES, draw, draw_torso_axis, screen_point
 from ..pose.constants import CONNECTIONS
 from ..pose.interpolation import interpolate_poses
 from ..quality import reliable
@@ -86,7 +86,8 @@ def _coach_observation(
                 raise ValueError("Invalid cached measurement landmark. Analyze posture again.")
             if isinstance(coords, list | tuple) and len(coords) >= 3:
                 pose[str(name)] = Landmark(
-                    x=float(coords[0]), y=float(coords[1]), z=float(coords[2]),
+                    x=float(coords[0]), y=float(coords[1]),
+                    z=float(coords[2]) if coords[2] is not None else None,
                     visibility=float(coords[3]) if len(coords) >= 4 and coords[3] is not None else None,
                     presence=float(coords[4]) if len(coords) >= 5 and coords[4] is not None else None,
                 )
@@ -127,6 +128,13 @@ def compare_default_coach_data(data: dict[str, Any], cfg: Config) -> dict[str, A
     return _compare_targets(data, cfg, cfg.calibration_defaults, "Settings default ranges", {
         "calibration_name": "Settings default ranges",
     })
+
+
+def compare_approved_coach_data(
+    data: dict[str, Any], cfg: Config, targets: Mapping[str, ApprovedRange],
+) -> dict[str, Any]:
+    """Evaluate in-progress approved ranges against cached raw landmarks."""
+    return _compare_targets(data, cfg, targets, "Approved calibration", {})
 
 
 def _compare_targets(
@@ -193,6 +201,24 @@ def interpolate_coach_data(data: dict[str, Any], cfg: Config) -> dict[str, Any]:
             for index, observation in zip(indices, interpolated, strict=True)
         },
     }
+
+
+def render_coach_torso_axis(
+    image: np.ndarray, coach_data: dict[str, Any], frame_index: int, cfg: Config, *,
+    show_labels: bool = True,
+) -> np.ndarray:
+    """Draw the axis from raw cached landmarks, independent of posture coaching."""
+    frames = coach_data.get("frames")
+    entry = frames.get(str(frame_index)) if isinstance(frames, dict) else None
+    if not isinstance(entry, dict):
+        return image
+    width = int(coach_data.get("width") or image.shape[1])
+    height = int(coach_data.get("height") or image.shape[0])
+    observation = _coach_observation(entry, width, height, require_measurements=True)
+    canvas = image.copy()
+    for pose in observation.poses:
+        draw_torso_axis(canvas, pose, False, cfg.confidence, show_labels=show_labels)
+    return canvas
 
 
 def render_coach_frame_overlay(

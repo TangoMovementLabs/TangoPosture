@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
 
 from ...calibration.archives import read_range_profile
 from ...calibration.measurements import metric_samples
-from ...calibration.models import METRIC_DETAILS, STEPS, Passage
+from ...calibration.models import METRIC_DETAILS, PRACTICE_CONTEXTS, STEPS, Passage
 from ...calibration.statistics import repeat_check
 from ...domain import FrameObservation
 from ...references.archives import promote_reference, reference_directory
@@ -91,7 +91,11 @@ class GuidedCalibration(QDialog):
         layout.addWidget(self.stage, 1)
         row = QHBoxLayout()
         self.context = QComboBox()
-        self.context.addItems(["Neutral posture", "Solo walking", "Close embrace"])
+        self.context.addItems(PRACTICE_CONTEXTS)
+        self.context.setToolTip(
+            "Labels the profile. Solo walking adds a walking capture; Pivot does not "
+            "automatically capture or detect pivots."
+        )
         if self.base_profile:
             self.context.setEditable(True)
             self.context.setCurrentText(self.base_profile.context)
