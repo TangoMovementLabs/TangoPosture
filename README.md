@@ -16,6 +16,15 @@ for the source layout, module responsibilities, use cases, UML and sequence diag
 
 **Experimental movement observation, not medical assessment or a judgement of artistic tango quality.** See the [Tango Posture Coach Manual](docs/TANGO_POSTURE_GUIDE.md) for one guide to practice, references, reports, configuration, examples, and limitations. Open **Help & Guide** in the desktop navigation rail for the same guide with search and section navigation.
 
+New to calibration? Read the [detailed beginner's calibration guide](docs/CALIBRATION_BEGINNERS_GUIDE.md)
+for live-camera and video workflows, every retained landmark, Settings explanations,
+and practical framing/tuning examples for different heights and builds.
+
+The [beginner's Settings guide](docs/SETTINGS_BEGINNERS_GUIDE.md) explains every
+parameter by tab, including adjustment effects and saving/reloading.
+The [tracking-engine guide](docs/TRACKING_ENGINE_BEGINNERS_GUIDE.md) explains
+models, evidence quality, smoothing, interpolation, steps, pivots and limitations.
+
 ---
 
 ## Key Features Added

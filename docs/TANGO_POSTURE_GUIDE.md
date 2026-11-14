@@ -1279,8 +1279,10 @@ Settings are editable in the desktop app and can be imported from or exported to
 
 | Setting | Meaning |
 | --- | --- |
-| `replay_auto_analyse_movement` | Automatically queues offline movement analysis after each saved practice recording. |
+| `replay_auto_analyse_movement` | Exposed configuration flag currently not consumed by the runtime analysis workflows; use the explicit Analyze action. |
 | `replay_step_history_seconds` | Replay media-time window (0.5 to 30 seconds) over which observed step footprints fade out. |
+| `replay_joint_interpolation` | Display-only Review joint gap filling: linear by default, or quadratic with a linear fallback. Raw calibration/scoring evidence is unchanged. |
+| `replay_joint_max_gap` | Maximum bracketed joint gap filled in Review, in seconds; default 3.0, and 0 disables filling. Not the measurement tracking gap limit. |
 
 ### Review & Ollama
 
