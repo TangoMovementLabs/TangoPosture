@@ -34,7 +34,6 @@ from .screens.coach import CoachScreen
 from .screens.help import HelpScreen
 from .screens.home import HomeScreen
 from .screens.library import LibraryScreen
-from .screens.practice import PracticeScreen
 from .screens.references import ReferencesScreen
 from .screens.review import ReviewScreen
 from .screens.settings import SettingsScreen
@@ -50,7 +49,6 @@ class MainWindow(QMainWindow):
         self.cfg = cfg
         self.bridge = ServiceBridge(cfg, self)
         self.router = Router(self)
-        self._close_when_practice_stops = False
         self.about_dialog: AboutDialog | None = None
 
         self.setWindowTitle("TangoPosture Studio")
@@ -110,7 +108,6 @@ class MainWindow(QMainWindow):
 
         nav_items = [
             (Route.HOME, "Home", "home"),
-            (Route.PRACTICE, "Live Practice", "practice"),
             (Route.LIBRARY, "Library", "library"),
             (Route.REVIEW, "Review", "review"),
             (Route.ANALYTICS, "Analytics", "analytics"),
@@ -146,7 +143,6 @@ class MainWindow(QMainWindow):
         self.stack = QStackedWidget()
         self.screens: dict[Route, QWidget] = {
             Route.HOME: HomeScreen(self.bridge, self.router),
-            Route.PRACTICE: PracticeScreen(self.bridge, self.router),
             Route.REFERENCES: ReferencesScreen(self.bridge, self.router),
             Route.LIBRARY: LibraryScreen(self.bridge, self.router),
             Route.REVIEW: ReviewScreen(self.bridge, self.router),
@@ -169,9 +165,6 @@ class MainWindow(QMainWindow):
         # Wire Signals
         self.router.route_changed.connect(self._on_route_changed)
         self.bridge.status_message.connect(self.status_strip.set_status)
-        practice_screen = self.screens[Route.PRACTICE]
-        if isinstance(practice_screen, PracticeScreen):
-            practice_screen.stopped.connect(self._finish_close_if_ready)
 
         # Setup Shortcuts (Ctrl+1 to Ctrl+8 / Cmd+1 to Cmd+8)
         for idx, (route, _, _) in enumerate(nav_items, start=1):
@@ -209,34 +202,14 @@ class MainWindow(QMainWindow):
         return None
 
     def _on_route_changed(self, route: Route, payload: object) -> None:
-        practice_screen = self.screens[Route.PRACTICE]
-        if (
-            self.stack.currentWidget() is practice_screen
-            and route is not Route.PRACTICE
-            and isinstance(practice_screen, PracticeScreen)
-        ):
-            practice_screen.stop_for_navigation()
-
         if route in self.nav_buttons:
             self.nav_buttons[route].setChecked(True)
 
         screen = self.screens.get(route)
         if screen:
             self.stack.setCurrentWidget(screen)
-            if (
-                route is Route.PRACTICE
-                and payload == "calibrate"
-                and isinstance(screen, PracticeScreen)
-            ):
-                screen.begin_calibration()
             if hasattr(screen, "refresh"):
                 screen.refresh()
-            if (
-                route is Route.LIBRARY
-                and isinstance(screen, LibraryScreen)
-                and payload == "import-url"
-            ):
-                screen.import_online_video()
             if route is Route.REVIEW and isinstance(screen, ReviewScreen):
                 if isinstance(payload, Path):
                     screen.load_archive(payload)
@@ -260,18 +233,4 @@ class MainWindow(QMainWindow):
                 screen.load_report(payload)
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        practice_screen = self.screens[Route.PRACTICE]
-        if (
-            isinstance(practice_screen, PracticeScreen)
-            and practice_screen.worker_running
-        ):
-            self._close_when_practice_stops = True
-            practice_screen.stop_for_navigation()
-            event.ignore()
-            return
         super().closeEvent(event)
-
-    def _finish_close_if_ready(self) -> None:
-        if self._close_when_practice_stops:
-            self._close_when_practice_stops = False
-            self.close()

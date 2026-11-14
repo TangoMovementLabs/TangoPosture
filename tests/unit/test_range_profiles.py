@@ -11,7 +11,13 @@ from tango_posture.archive import read_calibration_archive, read_manifest, renam
 from tango_posture.calibration.archives import read_range_profile, save_range_profile
 from tango_posture.calibration.baseline import compatible, profile
 from tango_posture.calibration.evidence import Evidence, dancer_frames
-from tango_posture.calibration.measurements import measure_profile, measure_ranges, metric_samples
+from tango_posture.calibration.measurements import (
+    measure_profile,
+    measure_ranges,
+    measure_targets,
+    metric_samples,
+    view_eligible,
+)
 from tango_posture.calibration.models import METRIC_DETAILS, ApprovedRange, Passage, RangeProfile
 from tango_posture.calibration.statistics import repeat_check, summarize_examples
 from tango_posture.config import Config
@@ -283,3 +289,28 @@ def test_only_camera_checked_ranges_score_and_export_without_source(tmp_path):
         assert result["units"] == {"head_pitch": "degrees"}
         assert (storage.export(session.id, tmp_path / "export") / "summary.json").is_file()
     assert not Path("unavailable.tpr").exists()
+
+
+def test_front_view_calibration_and_evaluation_share_view_eligibility_gate():
+    sample = frame(0.0)
+    cfg = Config()
+    # Synthetic side-ish frame has view_width 0.0625 <= cfg.max_view_width (0.45)
+    assert not view_eligible("front", 0.0625, cfg.max_view_width)
+    assert view_eligible("side", 0.0625, cfg.max_view_width)
+    assert view_eligible("all", 0.0625, cfg.max_view_width)
+
+    front_samples = metric_samples([sample], cfg, view="front")
+    assert front_samples["head_pitch"] == [(0.0, None)]
+
+    target = ApprovedRange(
+        lower=-90, upper=90, unit="degrees", view="front",
+        passages=[Passage(start=0, end=1)], median=0, p10=-10, p90=10,
+        valid_duration=1, selected_duration=1, samples=10, inside_fraction=1,
+    )
+    evaluated = measure_targets(sample, cfg, {"head_pitch": target})
+    assert evaluated.values["head_pitch"] is None
+    assert not evaluated.quality["head_pitch"].valid
+    assert "approved camera view" in evaluated.quality["head_pitch"].reason
+
+    all_samples = metric_samples([sample], cfg, view="all")
+    assert all_samples["head_pitch"][0][1] is not None

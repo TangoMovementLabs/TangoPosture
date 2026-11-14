@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import queue
 import time
+from collections import deque
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -65,7 +66,7 @@ class GuidedCalibration(QDialog):
         self._temporary = TemporaryDirectory(prefix="tango-guided-calibration-")
         self._display = QtPracticeDisplay(capture_evidence=True)
         self._thread: PracticeThread | None = None
-        self._frames: list[FrameObservation] = []
+        self._frames: deque[FrameObservation] = deque(maxlen=3600)
         self._holds: dict[str, list[Passage]] = {}
         self._step = 0
         self._phase = -1

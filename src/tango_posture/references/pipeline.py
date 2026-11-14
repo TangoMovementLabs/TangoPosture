@@ -53,110 +53,37 @@ from .coverage import _compute_family_coverage
 from .downloads import download_facebook_reel, download_youtube_video, imports_directory
 from .errors import ImportCancelledError
 from .links import YouTubeClockAlignment, parse_facebook_reel_url, parse_youtube_url
-from .results import ImportedClipResult
+from .results import ClipAnalysisResult, ImportedClipResult, RunManifest
 from .soundtrack import analyse_video_soundtrack
-from .video import iter_virtual_clip_frames, probe_import_video, validate_clip_range
+from .video import VideoProbeInfo, iter_virtual_clip_frames, probe_import_video, validate_clip_range
 
 
-def analyse_imported_clip(
+def analyze_clip(
     *,
     video_path: Path | str,
     cfg: Config,
-    report_dir: Path | None = None,
-    storage: Storage | None = None,
     selected_in: float = 0.0,
     selected_out: float | None = None,
     title: str = "",
-    youtube_url: str | None = None,
-    youtube_alignment: YouTubeClockAlignment | None = None,
-    facebook_url: str | None = None,
     analysis_mode: str = "movement",
     reference: Calibration | None = None,
     calibration_interval: tuple[float, float] | None = None,
     analyse_soundtrack: bool = False,
+    storage: Storage | None = None,
     estimator_factory: Callable[[], PoseEstimator] | None = None,
     progress_callback: Callable[[int, int, str], None] | None = None,
     cancel_check: Callable[[], bool] | None = None,
-    youtube_downloader: Callable[[str, Path], Path] | None = None,
-    facebook_downloader: Callable[[str, Path], Path] | None = None,
-) -> ImportedClipResult:
-    """Import and analyse a selected range `[selected_in, selected_out)` of a local video file.
-
-    When `video_path` is blank and `youtube_url` is valid, the video is first downloaded into
-    `imports_directory(cfg.data_dir)` (reusing a cached copy) and analysed; a downloaded video is
-    the exact same edit as YouTube, so a confirmed 1:1 clock alignment is stored automatically.
-
-    - Leaves the user's video file untouched on disk.
-    - Supports `analysis_mode="movement"` (no calibration required) and
-      `analysis_mode="posture"` (using `reference` or `calibration_interval`).
-    - Optionally decodes and analyses the video soundtrack (`analyse_soundtrack=True`).
-    - Writes a Markdown report, companion `.metadata.json`, and `.movement.v1.json`.
-    """
-    yt_link = parse_youtube_url(youtube_url) if youtube_url and youtube_url.strip() else None
-    facebook_link = (
-        parse_facebook_reel_url(facebook_url)
-        if facebook_url and facebook_url.strip()
-        else None
-    )
-    if yt_link is not None and facebook_link is not None:
-        raise ValueError("Import from only one video URL at a time")
-    downloaded_from_youtube = False
-    downloaded_from_facebook = False
+    probe: VideoProbeInfo | None = None,
+    source_sha256: str | None = None,
+) -> ClipAnalysisResult:
+    """Analyze a local video clip in memory without writing reports or temporary databases."""
     if not video_path or not str(video_path).strip():
-        if yt_link is None and facebook_link is None:
-            raise ValueError("Choose a local video file or enter a YouTube or Facebook Reel URL")
-        if yt_link is not None:
-            downloaded_path, _ = download_youtube_video(
-                yt_link.canonical_url,
-                imports_directory(cfg.data_dir),
-                progress_callback=progress_callback,
-                cancel_check=cancel_check,
-                downloader=youtube_downloader,
-            )
-            downloaded_from_youtube = True
-        else:
-            assert facebook_link is not None
-            downloaded_path, _ = download_facebook_reel(
-                facebook_link.canonical_url,
-                imports_directory(cfg.data_dir),
-                progress_callback=progress_callback,
-                cancel_check=cancel_check,
-                downloader=facebook_downloader,
-            )
-            downloaded_from_facebook = True
-        video_path = downloaded_path
+        raise ValueError("Choose a local video file to analyze")
 
-    probe = probe_import_video(Path(video_path))
-    if (
-        yt_link is not None
-        and not downloaded_from_youtube
-        and probe.path.name == f"youtube_{yt_link.video_id}.mp4"
-        and probe.path.parent.resolve() == imports_directory(cfg.data_dir).resolve()
-    ):
-        downloaded_from_youtube = True
-    if (
-        facebook_link is not None
-        and not downloaded_from_facebook
-        and probe.path.name == f"facebook_reel_{facebook_link.reel_id}.mp4"
-        and probe.path.parent.resolve() == imports_directory(cfg.data_dir).resolve()
-    ):
-        downloaded_from_facebook = True
-    effective_in = float(selected_in)
-    if downloaded_from_youtube and yt_link is not None and yt_link.anchor_seconds is not None:
-        if effective_in == 0.0 and 0.0 < yt_link.anchor_seconds < probe.duration_seconds:
-            effective_in = float(yt_link.anchor_seconds)
-        elif (
-            effective_in >= probe.duration_seconds
-            and abs(effective_in - float(yt_link.anchor_seconds)) < 1e-6
-        ):
-            effective_in = 0.0
-    if selected_out is not None:
-        raw_out = float(selected_out)
-    elif downloaded_from_youtube or downloaded_from_facebook:
-        raw_out = min(probe.duration_seconds, effective_in + MAX_IMPORT_RANGE_SECONDS)
-    else:
-        raw_out = probe.duration_seconds
-    clip_in, clip_out = validate_clip_range(probe, effective_in, raw_out)
+    if probe is None:
+        probe = probe_import_video(Path(video_path))
+    raw_out = float(selected_out) if selected_out is not None else probe.duration_seconds
+    clip_in, clip_out = validate_clip_range(probe, float(selected_in), raw_out)
     clip_duration = clip_out - clip_in
 
     model_path = analysis_model_path(cfg)
@@ -186,27 +113,12 @@ def analyse_imported_clip(
     if not readiness.ready:
         raise ValueError(readiness.reason or readiness.summary)
 
-    if progress_callback is not None:
-        progress_callback(0, 100, "Computing file identity…")
-    source_sha = file_sha256(probe.path)
-
-    validated_alignment: YouTubeClockAlignment | None = None
-    if yt_link is not None and downloaded_from_youtube:
-        # TangoPosture fetched this exact file from YouTube, so the clocks are 1:1.
-        validated_alignment = YouTubeClockAlignment(
-            local_source_seconds=clip_in,
-            youtube_seconds=clip_in,
-            confirmed_same_edit=True,
-            source_sha256=source_sha,
-            youtube_video_id=yt_link.video_id,
-        )
-    elif yt_link is not None and youtube_alignment is not None and youtube_alignment.is_valid_for(
-        source_sha256=source_sha,
-        youtube_video_id=yt_link.video_id,
-        clip_in=clip_in,
-        clip_out=clip_out,
-    ):
-        validated_alignment = youtube_alignment
+    if source_sha256 is None:
+        if progress_callback is not None:
+            progress_callback(0, 100, "Computing file identity…")
+        source_sha = file_sha256(probe.path)
+    else:
+        source_sha = source_sha256
 
     if estimator_factory is None:
         download_progress = None
@@ -359,24 +271,10 @@ def analyse_imported_clip(
         max_gap=cfg.max_gap,
     )
 
-    target_dir = (
-        report_dir
-        if report_dir is not None
-        else Path("reports")
-        if cfg.data_dir == "data"
-        else Path(cfg.data_dir) / "reports"
-    )
-    target_dir.mkdir(parents=True, exist_ok=True)
-    db_path = (
-        Path(cfg.data_dir) / "tango_posture.db"
-        if storage is not None or cfg.data_dir != "data"
-        else target_dir / "import_sessions.sqlite3"
-    )
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    store = storage or Storage(db_path)
     session: Session | None = None
     if active_reference is not None:
-        store.save_calibration(active_reference)
+        if storage is not None:
+            storage.save_calibration(active_reference)
         scored_start = (
             cal_window[1]
             if cal_window is not None and cal_window[0] <= clip_in + 1e-3
@@ -385,7 +283,7 @@ def analyse_imported_clip(
         session = Session(
             active_reference,
             cfg,
-            store,
+            storage,
             scored_start,
             f"import:{probe.path.name}",
             {"model_hash": model_hash, "metric_version": METRIC_VERSION},
@@ -427,6 +325,8 @@ def analyse_imported_clip(
     coach_frame_meta: dict[int, dict[str, Any]] = {}
 
     for frame_index, source_time, clip_time, frame_obs in decoded_frames:
+        if cancel_check is not None and cancel_check():
+            raise ImportCancelledError("Reference video analysis was cancelled")
         in_cal = bool(
             cal_window is not None and cal_window[0] - 1e-6 <= source_time < cal_window[1] - 1e-6
         )
@@ -648,6 +548,9 @@ def analyse_imported_clip(
             }
         )
 
+    if cancel_check is not None and cancel_check():
+        raise ImportCancelledError("Reference video analysis was cancelled")
+
     total_source_frames = max(probe.frame_count, decoded_frames[-1][0] + 1)
     movement_observations = [
         (frame_index, obs) for frame_index, _, _, obs in decoded_frames
@@ -664,6 +567,9 @@ def analyse_imported_clip(
         segment_index=-1,
         source_member=probe.path.name,
     )
+
+    if cancel_check is not None and cancel_check():
+        raise ImportCancelledError("Reference video analysis was cancelled")
 
     for frame_index, entry in coach_pending.items():
         meta = coach_frame_meta[frame_index]
@@ -702,11 +608,12 @@ def analyse_imported_clip(
     )
 
     mean_duration = float(np.mean(infer_times)) if infer_times else 0.0
+    processed_fps = 1.0 / mean_duration if mean_duration > 0 else None
     performance = {
         "model_hash": model_hash,
         "model_variant": cfg.analysis_model,
         "resolution": [probe.width, probe.height],
-        "processed_fps": 1.0 / mean_duration if mean_duration > 0 else None,
+        "processed_fps": processed_fps,
         "dropped_frames": 0,
         "timestamp_fallback": False,
     }
@@ -721,6 +628,219 @@ def analyse_imported_clip(
     scored_frame_log = [
         row for row in frame_log if not row.get("in_calibration_window", False)
     ] or frame_log
+
+    manifest = RunManifest(
+        model_variant=cfg.analysis_model,
+        model_hash=model_hash,
+        metric_version=METRIC_VERSION,
+        capture_profile=cap_profile,
+        source_sha256=source_sha,
+        source_filename=probe.path.name,
+        width=probe.width,
+        height=probe.height,
+        fps=probe.fps,
+        selected_in=clip_in,
+        selected_out=clip_out,
+        clip_duration=clip_duration,
+        analysis_mode=analysis_mode,
+        processed_fps=processed_fps,
+    )
+
+    return ClipAnalysisResult(
+        manifest=manifest,
+        video_path=probe.path,
+        title=clean_title,
+        source_sha256=source_sha,
+        selected_in=clip_in,
+        selected_out=clip_out,
+        clip_duration=clip_duration,
+        analysis_mode=analysis_mode,
+        readiness=readiness,
+        reference=active_reference,
+        calibration_window=cal_window,
+        coach_data=coach_data,
+        movement_data=movement_data,
+        soundtrack=soundtrack_summary,
+        coverage=coverage,
+        frame_log=frame_log,
+        scored_frame_log=scored_frame_log,
+        frame_observations=decoded_frames,
+        performance=performance,
+        session_id=session.id if session is not None else None,
+        session_summary=session_summary,
+        session_events=session_events,
+    )
+
+
+analyse_clip = analyze_clip
+
+
+def analyse_imported_clip(
+    *,
+    video_path: Path | str,
+    cfg: Config,
+    report_dir: Path | None = None,
+    storage: Storage | None = None,
+    selected_in: float = 0.0,
+    selected_out: float | None = None,
+    title: str = "",
+    youtube_url: str | None = None,
+    youtube_alignment: YouTubeClockAlignment | None = None,
+    facebook_url: str | None = None,
+    analysis_mode: str = "movement",
+    reference: Calibration | None = None,
+    calibration_interval: tuple[float, float] | None = None,
+    analyse_soundtrack: bool = False,
+    estimator_factory: Callable[[], PoseEstimator] | None = None,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+    youtube_downloader: Callable[[str, Path], Path] | None = None,
+    facebook_downloader: Callable[[str, Path], Path] | None = None,
+) -> ImportedClipResult:
+    """Import and analyse a selected range `[selected_in, selected_out)` of a local video file.
+
+    When `video_path` is blank and `youtube_url` is valid, the video is first downloaded into
+    `imports_directory(cfg.data_dir)` (reusing a cached copy) and analysed; a downloaded video is
+    the exact same edit as YouTube, so a confirmed 1:1 clock alignment is stored automatically.
+
+    - Leaves the user's video file untouched on disk.
+    - Supports `analysis_mode="movement"` (no calibration required) and
+      `analysis_mode="posture"` (using `reference` or `calibration_interval`).
+    - Optionally decodes and analyses the video soundtrack (`analyse_soundtrack=True`).
+    - Writes a Markdown report, companion `.metadata.json`, and `.movement.v1.json`.
+    """
+    yt_link = parse_youtube_url(youtube_url) if youtube_url and youtube_url.strip() else None
+    facebook_link = (
+        parse_facebook_reel_url(facebook_url)
+        if facebook_url and facebook_url.strip()
+        else None
+    )
+    if yt_link is not None and facebook_link is not None:
+        raise ValueError("Import from only one video URL at a time")
+    downloaded_from_youtube = False
+    downloaded_from_facebook = False
+    if not video_path or not str(video_path).strip():
+        if yt_link is None and facebook_link is None:
+            raise ValueError("Choose a local video file or enter a YouTube or Facebook Reel URL")
+        if yt_link is not None:
+            downloaded_path, _ = download_youtube_video(
+                yt_link.canonical_url,
+                imports_directory(cfg.data_dir),
+                progress_callback=progress_callback,
+                cancel_check=cancel_check,
+                downloader=youtube_downloader,
+            )
+            downloaded_from_youtube = True
+        else:
+            assert facebook_link is not None
+            downloaded_path, _ = download_facebook_reel(
+                facebook_link.canonical_url,
+                imports_directory(cfg.data_dir),
+                progress_callback=progress_callback,
+                cancel_check=cancel_check,
+                downloader=facebook_downloader,
+            )
+            downloaded_from_facebook = True
+        video_path = downloaded_path
+
+    probe = probe_import_video(Path(video_path))
+    if (
+        yt_link is not None
+        and not downloaded_from_youtube
+        and probe.path.name == f"youtube_{yt_link.video_id}.mp4"
+        and probe.path.parent.resolve() == imports_directory(cfg.data_dir).resolve()
+    ):
+        downloaded_from_youtube = True
+    if (
+        facebook_link is not None
+        and not downloaded_from_facebook
+        and probe.path.name == f"facebook_reel_{facebook_link.reel_id}.mp4"
+        and probe.path.parent.resolve() == imports_directory(cfg.data_dir).resolve()
+    ):
+        downloaded_from_facebook = True
+    effective_in = float(selected_in)
+    if downloaded_from_youtube and yt_link is not None and yt_link.anchor_seconds is not None:
+        if effective_in == 0.0 and 0.0 < yt_link.anchor_seconds < probe.duration_seconds:
+            effective_in = float(yt_link.anchor_seconds)
+        elif (
+            effective_in >= probe.duration_seconds
+            and abs(effective_in - float(yt_link.anchor_seconds)) < 1e-6
+        ):
+            effective_in = 0.0
+    if selected_out is not None:
+        raw_out = float(selected_out)
+    elif downloaded_from_youtube or downloaded_from_facebook:
+        raw_out = min(probe.duration_seconds, effective_in + MAX_IMPORT_RANGE_SECONDS)
+    else:
+        raw_out = probe.duration_seconds
+
+    target_dir = (
+        report_dir
+        if report_dir is not None
+        else Path("reports")
+        if cfg.data_dir == "data"
+        else Path(cfg.data_dir) / "reports"
+    )
+    target_dir.mkdir(parents=True, exist_ok=True)
+    db_path = (
+        Path(cfg.data_dir) / "tango_posture.db"
+        if storage is not None or cfg.data_dir != "data"
+        else target_dir / "import_sessions.sqlite3"
+    )
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    store = storage or Storage(db_path)
+
+    clip_result = analyze_clip(
+        video_path=probe.path,
+        cfg=cfg,
+        selected_in=effective_in,
+        selected_out=raw_out,
+        title=title,
+        analysis_mode=analysis_mode,
+        reference=reference,
+        calibration_interval=calibration_interval,
+        analyse_soundtrack=analyse_soundtrack,
+        storage=store,
+        estimator_factory=estimator_factory,
+        progress_callback=progress_callback,
+        cancel_check=cancel_check,
+        probe=probe,
+    )
+
+    clip_in = clip_result.selected_in
+    clip_out = clip_result.selected_out
+    clip_duration = clip_result.clip_duration
+    source_sha = clip_result.source_sha256
+    readiness = clip_result.readiness
+    active_reference = clip_result.reference
+    movement_data = clip_result.movement_data
+    coach_data = clip_result.coach_data
+    coverage = clip_result.coverage
+    soundtrack_summary = clip_result.soundtrack
+    frame_log = clip_result.frame_log
+    scored_frame_log = clip_result.scored_frame_log
+    performance = clip_result.performance
+    clean_title = clip_result.title
+    cap_profile = clip_result.manifest.capture_profile
+    session_summary = clip_result.session_summary
+    session_events = clip_result.session_events
+
+    validated_alignment: YouTubeClockAlignment | None = None
+    if yt_link is not None and downloaded_from_youtube:
+        validated_alignment = YouTubeClockAlignment(
+            local_source_seconds=clip_in,
+            youtube_seconds=clip_in,
+            confirmed_same_edit=True,
+            source_sha256=source_sha,
+            youtube_video_id=yt_link.video_id,
+        )
+    elif yt_link is not None and youtube_alignment is not None and youtube_alignment.is_valid_for(
+        source_sha256=source_sha,
+        youtube_video_id=yt_link.video_id,
+        clip_in=clip_in,
+        clip_out=clip_out,
+    ):
+        validated_alignment = youtube_alignment
 
     if progress_callback is not None:
         progress_callback(92, 100, "Writing report & companion metadata…")
@@ -754,7 +874,7 @@ def analyse_imported_clip(
         frame_log=scored_frame_log,
         performance=performance,
         reference=active_reference,
-        session_id=session.id if session is not None else None,
+        session_id=clip_result.session_id,
         session_summary=session_summary,
         session_events=session_events,
         recorded_video=probe.path,

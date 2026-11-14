@@ -2,6 +2,7 @@ from dataclasses import asdict
 from uuid import uuid4
 
 from .calibration.baseline import utc_now
+from .calibration.measurements import view_eligible
 from .calibration.models import profile_from_calibration
 from .config import Config
 from .domain import METRICS, Calibration, MetricObservation, QualityResult
@@ -15,7 +16,7 @@ class Session:
         self,
         ref: Calibration,
         cfg: Config,
-        storage: Storage,
+        storage: Storage | None,
         timestamp: float,
         source: str,
         versions: dict,
@@ -42,8 +43,9 @@ class Session:
         self.pause_start: float | None = None
         self.pause_duration = 0.0
         self.finished = False
-        storage.save_calibration(ref)
-        storage.start(self.id, ref.id, utc_now(), source, cfg.model_dump(), versions)
+        if storage is not None:
+            storage.save_calibration(ref)
+            storage.start(self.id, ref.id, utc_now(), source, cfg.model_dump(), versions)
 
     def update(self, observation: MetricObservation) -> list[dict]:
         if self.start is None:
@@ -54,10 +56,7 @@ class Session:
             if self.profile is not None:
                 view = self.profile.metrics[metric].view
                 width = observation.view_width
-                if view != "all" and (
-                    width is None or (view == "side" and width > self.cfg.max_view_width)
-                    or (view == "front" and width <= self.cfg.max_view_width)
-                ):
+                if not view_eligible(view, width, self.cfg.max_view_width):
                     quality = QualityResult(False, "Camera view is not comparable to the approved range")
             row = {
                 "timestamp": observation.timestamp,
@@ -70,13 +69,14 @@ class Session:
             }
             rows.append(row)
         self.rows.extend(rows)
-        self.buffer.extend(rows)
-        if len(self.buffer) >= 180:
-            self.flush()
+        if self.storage is not None:
+            self.buffer.extend(rows)
+            if len(self.buffer) >= 180:
+                self.flush()
         return rows
 
     def flush(self) -> None:
-        if self.buffer:
+        if self.buffer and self.storage is not None:
             self.storage.observations(self.id, self.buffer)
             self.buffer.clear()
 
@@ -124,6 +124,7 @@ class Session:
             "experimental engineering defaults; not technique standards"
         )
         self.flush()
-        self.storage.finish(self.id, utc_now(), status, summary, events)
+        if self.storage is not None:
+            self.storage.finish(self.id, utc_now(), status, summary, events)
         self.finished = True
         return summary

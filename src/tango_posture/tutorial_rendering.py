@@ -8,6 +8,8 @@ from typing import Any
 
 import markdown
 
+from .config import SETTING_DESCRIPTIONS, SETTING_MAP
+
 STYLE = """
 body { background: #f2f5f9; color: #26364a; font-family: Helvetica, Arial, sans-serif;
        font-size: 15px; line-height: 1.6; margin: 0; }
@@ -63,6 +65,21 @@ def render_tutorial(
         end = content.find("<h2 ", start + 1)
         end = len(content) if end < 0 else end
         section = re.sub(r"<tr>\s*<td><code>([a-z][a-z0-9_.]*)</code>", anchor, content[start:end])
+        missing_rows: list[str] = []
+        for field in SETTING_MAP:
+            if field not in settings:
+                target = "setting-" + field.replace(".", "-").replace("_", "-")
+                settings[field] = target
+                desc = html.escape(SETTING_DESCRIPTIONS.get(field, "Configuration setting."))
+                missing_rows.append(
+                    f'<tr id="{target}"><td><code>{html.escape(field)}</code></td>'
+                    f"<td>{desc}</td></tr>"
+                )
+        if missing_rows:
+            section += (
+                "<table><thead><tr><th>Setting</th><th>Meaning</th></tr></thead>"
+                f"<tbody>{''.join(missing_rows)}</tbody></table>"
+            )
         content = content[:start] + section + content[end:]
     page = (
         '<!DOCTYPE html><html><head><meta charset="utf-8" />'

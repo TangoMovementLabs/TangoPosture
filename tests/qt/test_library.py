@@ -294,54 +294,12 @@ def test_unexpected_import_event_recovers_controls(qapp, tmp_path):
     screen.close()
 
 
-@pytest.mark.parametrize(
-    "url,field",
-    [
-        ("https://www.youtube.com/watch?v=dQw4w9WgXcQ", "youtube_url"),
-        ("https://www.facebook.com/reel/123456789012345", "facebook_url"),
-    ],
-)
-def test_online_import_uses_shared_download_analysis_worker(
-    qapp, tmp_path, monkeypatch, url, field
-):
+def test_library_has_no_online_download_or_live_calibration_buttons(qapp, tmp_path):
     screen = LibraryScreen(ServiceBridge(Config(data_dir=str(tmp_path))), Router())
-    started = []
-    monkeypatch.setattr(
-        screen._import_worker, "start",
-        lambda **kwargs: started.append(kwargs) or "url-job",
-    )
-    screen._start_online_import(url, 10.0, 30.0, "Study clip")
-    assert started[0][field]
-    assert started[0]["video_path"] == ""
-    assert started[0]["selected_in"] == 10.0
-    assert started[0]["selected_out"] == 30.0
-    assert not screen.url_import_btn.isEnabled()
-    assert screen.cancel_import_btn.isEnabled()
-    screen._handle_import_event(("import_error", "url-job", "Download unavailable"))
-    assert "Download unavailable" in screen.import_status.text()
-    assert screen.url_import_btn.isEnabled()
+    labels = {button.text() for button in screen.findChildren(QPushButton)}
+    assert "Import YouTube / Facebook…" not in labels
+    assert "Guided camera calibration…" not in labels
+    assert not hasattr(screen, "url_import_btn")
+    assert not hasattr(screen, "calibration_btn")
     screen.close()
 
-
-def test_invalid_online_import_does_not_start_worker(qapp, tmp_path, monkeypatch):
-    screen = LibraryScreen(ServiceBridge(Config(data_dir=str(tmp_path))), Router())
-    started = []
-    monkeypatch.setattr(screen._import_worker, "start", lambda **kwargs: started.append(kwargs))
-    screen._start_online_import("https://example.com/video", 0, 20, "")
-    assert not started
-    assert "valid HTTPS" in screen.import_status.text()
-    screen._start_online_import("https://youtu.be/dQw4w9WgXcQ", 0, 121, "")
-    assert not started
-    assert "120 seconds" in screen.import_status.text()
-    screen.close()
-
-
-def test_online_import_auto_end_uses_downloaded_duration(qapp, tmp_path, monkeypatch):
-    screen = LibraryScreen(ServiceBridge(Config(data_dir=str(tmp_path))), Router())
-    started = []
-    monkeypatch.setattr(
-        screen._import_worker, "start", lambda **kwargs: started.append(kwargs) or "job"
-    )
-    screen._start_online_import("https://youtu.be/dQw4w9WgXcQ", 0.0, None, "")
-    assert started[0]["selected_out"] is None
-    screen.close()

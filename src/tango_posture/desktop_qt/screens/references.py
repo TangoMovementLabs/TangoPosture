@@ -53,10 +53,10 @@ class ReferencesScreen(QWidget):
         refresh_btn = QPushButton("Refresh")
         refresh_btn.clicked.connect(self.refresh)
 
-        cal_btn = QPushButton("New Calibration")
+        cal_btn = QPushButton("Open Library")
         cal_btn.setProperty("class", "primary")
         cal_btn.clicked.connect(
-            lambda: self.router.navigate(Route.PRACTICE, "calibrate")
+            lambda: self.router.navigate(Route.LIBRARY)
         )
 
         header.addWidget(refresh_btn)

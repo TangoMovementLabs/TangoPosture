@@ -299,8 +299,12 @@ class CalibrationEditor(QDialog):
                 self.evidence.capture_profile, self.evidence.source, self.evidence.max_gap,
             )
             frames.extend(dancer_frames(evidence, dancer, self.cfg.confidence))
-        cfg = self.cfg.model_copy(update={"allow_all_angles": self.view_combo.currentText() != "side"})
-        self._samples = metric_samples(frames, cfg)
+        selected_view = self.view_combo.currentText()
+        view_mode = (
+            selected_view if selected_view in ("side", "front", "all") else "side"
+        )
+        cfg = self.cfg.model_copy(update={"allow_all_angles": view_mode != "side"})
+        self._samples = metric_samples(frames, cfg, view=view_mode)  # type: ignore[arg-type]
         if self.metric_combo.currentData():
             self._update_stats(suggest=True)
 

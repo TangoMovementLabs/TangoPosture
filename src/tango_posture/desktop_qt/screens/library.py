@@ -6,7 +6,6 @@ from pathlib import Path
 from queue import Empty, Queue
 from threading import Event, Thread
 from typing import Any
-from urllib.parse import urlsplit
 
 import cv2
 from PySide6.QtCore import QFile, QObject, QTimer, Signal
@@ -39,7 +38,6 @@ from ...archive import PracticeArchive, _archive_lock, rename_archive
 from ...calibration.archives import read_range_profile
 from ...references.archives import promote_reference, reference_directory, reference_path
 from ...references.constants import MAX_IMPORT_RANGE_SECONDS
-from ...references.links import parse_facebook_reel_url, parse_youtube_url
 from ...references.results import ImportedClipResult
 from ...references.video import probe_import_video
 from ...references.worker import ReferenceImportWorker
@@ -97,14 +95,11 @@ class LibraryScreen(QWidget):
 
         self.import_btn = QPushButton("Import & Analyze Video…")
         self.import_btn.clicked.connect(self._analyze_import_video)
-        self.url_import_btn = QPushButton("Import YouTube / Facebook…")
-        self.url_import_btn.clicked.connect(self.import_online_video)
         self.open_btn = QPushButton("Import Local Video…")
         self.open_btn.clicked.connect(self._import_video)
         self.refresh_btn = QPushButton("Refresh")
         self.refresh_btn.clicked.connect(self.refresh)
         header.addWidget(self.import_btn)
-        header.addWidget(self.url_import_btn)
         self.open_btn.hide()
         header.addWidget(self.refresh_btn)
         layout.addLayout(header)
@@ -118,19 +113,16 @@ class LibraryScreen(QWidget):
         search_row.addWidget(QLabel("File type:"))
         self.type_filter = QComboBox()
         self.type_filter.addItem("All types", "")
-        self.type_filter.addItem("References (.tpr)", ".tpr")
-        self.type_filter.addItem("Calibrations (.tpc)", ".tpc")
-        self.type_filter.addItem("Practices (.tp)", ".tp")
+        self.type_filter.addItem("References", ".tpr")
+        self.type_filter.addItem("Calibrations", ".tpc")
+        self.type_filter.addItem("Practices", ".tp")
         self.type_filter.currentIndexChanged.connect(
             lambda _: self._filter_table(self.search_input.text())
         )
         search_row.addWidget(self.type_filter)
-        self.import_reference_cb = QCheckBox("Import as reference (.tpr)")
+        self.import_reference_cb = QCheckBox("Import as reference")
         self.import_reference_cb.setChecked(True)
         search_row.addWidget(self.import_reference_cb)
-        self.calibration_btn = QPushButton("Guided camera calibration…")
-        self.calibration_btn.clicked.connect(lambda: self._camera_calibration())
-        search_row.addWidget(self.calibration_btn)
         layout.addLayout(search_row)
 
         # Table
@@ -218,9 +210,6 @@ class LibraryScreen(QWidget):
                 promote_btn.clicked.connect(lambda _, path=p["path"]: self._promote(path))
                 actions_layout.addWidget(promote_btn)
             elif profile_only:
-                check_btn = QPushButton("Check camera")
-                check_btn.clicked.connect(lambda _, path=p["path"]: self._camera_calibration(path))
-                actions_layout.addWidget(check_btn)
                 defaults_btn = QPushButton("Use as Settings defaults")
                 defaults_btn.clicked.connect(lambda _, path=p["path"]: self._use_defaults(path))
                 actions_layout.addWidget(defaults_btn)
@@ -258,16 +247,6 @@ class LibraryScreen(QWidget):
             )
         except (OSError, ValueError, KeyError) as error:
             self.import_status.setText(f"Cannot read profile: {error}")
-
-    def _camera_calibration(self, path: Path | None = None) -> None:
-        from ..calibration.guided import GuidedCalibration
-
-        try:
-            dialog = GuidedCalibration(self.bridge, self, profile_path=path)
-            dialog.exec()
-            self.refresh()
-        except (OSError, ValueError, TypeError, RuntimeError) as error:
-            self.import_status.setText(f"Cannot open camera calibration: {error}")
 
     def _promote(self, path: Path) -> None:
         try:
@@ -467,7 +446,6 @@ class LibraryScreen(QWidget):
 
     def _start_import(
         self, path: Path | str, selected_in: float, selected_out: float | None, title: str,
-        *, youtube_url: str | None = None, facebook_url: str | None = None,
     ) -> None:
         self._package_cancel.clear()
         self._import_cfg = self.bridge.config.model_copy(deep=True)
@@ -482,91 +460,16 @@ class LibraryScreen(QWidget):
                 title=title,
                 analysis_mode="movement",
                 analyse_soundtrack=False,
-                youtube_url=youtube_url,
-                facebook_url=facebook_url,
             )
         except (OSError, RuntimeError, ValueError) as error:
             self.import_status.setText(f"Could not start import: {error}")
             self._finish_import()
             return
         self._set_import_busy(True)
-        self.import_status.setText(
-            "Downloading and analyzing video…" if youtube_url or facebook_url
-            else "Analyzing local video…"
-        )
+        self.import_status.setText("Analyzing local video…")
         self.import_progress.setRange(0, 0)
         self.import_progress.show()
         self.cancel_import_btn.setEnabled(True)
-
-    def import_online_video(self) -> None:
-        dialog = QDialog(self)
-        dialog.setWindowTitle("Import YouTube video or Facebook Reel")
-        form = QFormLayout(dialog)
-        url_input = QLineEdit()
-        url_input.setPlaceholderText("HTTPS YouTube or Facebook Reel URL")
-        title_input = QLineEdit()
-        start_input = QDoubleSpinBox()
-        end_input = QDoubleSpinBox()
-        for field in (start_input, end_input):
-            field.setDecimals(2)
-            field.setRange(0.0, 86400.0)
-        end_input.setValue(MAX_IMPORT_RANGE_SECONDS)
-        automatic_end = QCheckBox("Use available duration (up to 120 seconds from start)")
-        automatic_end.setChecked(True)
-        end_input.setEnabled(False)
-        automatic_end.toggled.connect(lambda checked: end_input.setEnabled(not checked))
-        form.addRow("Video URL:", url_input)
-        form.addRow("Title (optional):", title_input)
-        form.addRow("Clip start (seconds):", start_input)
-        form.addRow("Clip end (seconds):", end_input)
-        form.addRow(automatic_end)
-        note = QLabel(
-            "Downloads require network access and yt-dlp. Import only videos you have "
-            "permission to use. Maximum analysis range: 120 seconds."
-        )
-        note.setWordWrap(True)
-        form.addRow(note)
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-        )
-        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Download & Analyze")
-        buttons.accepted.connect(dialog.accept)
-        buttons.rejected.connect(dialog.reject)
-        form.addRow(buttons)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
-            return
-        self._start_online_import(
-            url_input.text(), start_input.value(),
-            None if automatic_end.isChecked() else end_input.value(), title_input.text()
-        )
-
-    def _start_online_import(
-        self, url: str, selected_in: float, selected_out: float | None, title: str
-    ) -> None:
-        youtube = None
-        facebook = None
-        try:
-            host = (urlsplit(url.strip()).hostname or "").lower()
-            if host in ("facebook.com", "www.facebook.com", "m.facebook.com", "web.facebook.com"):
-                facebook = parse_facebook_reel_url(url.strip())
-            else:
-                youtube = parse_youtube_url(url.strip())
-        except ValueError as error:
-            self.import_status.setText(
-                f"Enter a valid HTTPS YouTube video or Facebook Reel URL: {error}"
-            )
-            return
-        if youtube is None and facebook is None:
-            self.import_status.setText("Enter a valid HTTPS YouTube video or Facebook Reel URL.")
-            return
-        if selected_out is not None and not 0 < selected_out - selected_in <= MAX_IMPORT_RANGE_SECONDS:
-            self.import_status.setText("Choose a clip range longer than zero and at most 120 seconds.")
-            return
-        self._start_import(
-            "", selected_in, selected_out, title.strip(),
-            youtube_url=youtube.canonical_url if youtube is not None else None,
-            facebook_url=facebook.canonical_url if facebook is not None else None,
-        )
 
     def _cancel_import(self) -> None:
         if self._import_job_id is None:
@@ -646,8 +549,6 @@ class LibraryScreen(QWidget):
     def _set_import_busy(self, busy: bool) -> None:
         self.table.setEnabled(not busy)
         self.import_btn.setEnabled(not busy)
-        self.url_import_btn.setEnabled(not busy)
         self.open_btn.setEnabled(not busy)
         self.refresh_btn.setEnabled(not busy)
         self.import_reference_cb.setEnabled(not busy)
-        self.calibration_btn.setEnabled(not busy)

@@ -93,6 +93,7 @@ class ReviewScreen(QWidget):
         self._analysis_events: queue.SimpleQueue[tuple[int, str, object]] = queue.SimpleQueue()
         self._analysis_cancel: Event | None = None
         self._analysis_thread: Thread | None = None
+        self._analysis_commit_lock = threading.Lock()
         self._analysis_job_id = 0
         self._active_analysis_job: int | None = None
         self.destroyed.connect(self._playback.close)
@@ -770,6 +771,7 @@ class ReviewScreen(QWidget):
         dynamic_stream = self.stream_combo.currentText() in (
             "Raw video", "Local video", "Source video"
         )
+        self.current_time_sec = self._playback.timestamp_for_frame(reader.index)
         if dynamic_stream:
             if self.lines_only_cb.isChecked():
                 frame = render_floor_guide(frame)
@@ -790,6 +792,7 @@ class ReviewScreen(QWidget):
                 self._movement_data,
                 reader.index,
                 reader.fps,
+                frame_timestamp=self.current_time_sec,
                 show_pivots=self.show_pivots_cb.isChecked(),
                 show_steps=self.show_steps_cb.isChecked(),
                 step_history_seconds=self.bridge.config.replay_step_history_seconds,
@@ -801,7 +804,6 @@ class ReviewScreen(QWidget):
         if image.isNull():
             raise ValueError("Cannot display decoded video frame")
         self.primary_stage.set_frame(image)
-        self.current_time_sec = self._playback.timestamp_for_frame(reader.index)
         self._sync_comparison_frame()
         self.scrubber.blockSignals(True)
         self.scrubber.setValue(reader.index)
@@ -883,6 +885,12 @@ class ReviewScreen(QWidget):
             frame / reader.fps for frame in range(reader.count)
         ]
 
+        archive_lease = (
+            self._playback.archive.acquire()
+            if self._playback.archive is not None
+            else None
+        )
+
         def report_progress(current: int, total: int, message: str) -> None:
             self._analysis_events.put((job_id, "progress", (current, total, message)))
 
@@ -896,26 +904,38 @@ class ReviewScreen(QWidget):
                     progress_callback=report_progress,
                     cancel_check=cancel_event.is_set,
                 )
-                if (
-                    not cancel_event.is_set() and archive_path is not None
-                    and archive_path.suffix.lower() in (".tp", ".tpr") and segment_index is not None
-                ):
-                    store_analytics(
-                        archive_path, segment_index,
-                        {"coach_data": coach_data.coach_data,
-                         "movement_data": coach_data.movement_data, "max_gap": cfg.max_gap,
-                         "model_hash": coach_data.coach_data.get("model_hash"),
-                         "capture_profile": coach_data.coach_data.get("capture_profile"),
-                         "frame_timestamps": timestamps},
-                        expected_video_sha256=video_sha256,
-                    )
-                event = "cancelled" if cancel_event.is_set() else "done"
-                self._analysis_events.put((job_id, event, coach_data))
+                with self._analysis_commit_lock:
+                    cancelled = cancel_event.is_set() or self._active_analysis_job != job_id
+                    if (
+                        not cancelled
+                        and archive_path is not None
+                        and archive_path.suffix.lower() in (".tp", ".tpr")
+                        and segment_index is not None
+                    ):
+                        store_analytics(
+                            archive_path, segment_index,
+                            {"coach_data": coach_data.coach_data,
+                             "movement_data": coach_data.movement_data, "max_gap": cfg.max_gap,
+                             "model_hash": coach_data.coach_data.get("model_hash"),
+                             "capture_profile": coach_data.coach_data.get("capture_profile"),
+                             "frame_timestamps": timestamps},
+                            expected_video_sha256=video_sha256,
+                        )
+                    event = "cancelled" if cancelled else "done"
+                    self._analysis_events.put((job_id, event, coach_data))
             except Exception as error:  # noqa: BLE001 - surface background analysis errors in the UI
-                event = "cancelled" if cancel_event.is_set() else "error"
-                self._analysis_events.put(
-                    (job_id, event, f"{type(error).__name__}: {error}")
-                )
+                with self._analysis_commit_lock:
+                    event = (
+                        "cancelled"
+                        if cancel_event.is_set() or self._active_analysis_job != job_id
+                        else "error"
+                    )
+                    self._analysis_events.put(
+                        (job_id, event, f"{type(error).__name__}: {error}")
+                    )
+            finally:
+                if archive_lease is not None:
+                    archive_lease.close()
 
         self._analysis_thread = Thread(
             target=work,
@@ -925,10 +945,11 @@ class ReviewScreen(QWidget):
         self._analysis_thread.start()
 
     def _cancel_posture_analysis(self) -> None:
-        cancel_event = self._analysis_cancel
-        if cancel_event is None or cancel_event.is_set():
-            return
-        cancel_event.set()
+        with self._analysis_commit_lock:
+            cancel_event = self._analysis_cancel
+            if cancel_event is None or cancel_event.is_set():
+                return
+            cancel_event.set()
         self.analysis_status.setText("Canceling posture analysis…")
         self.cancel_analysis_btn.setEnabled(False)
 

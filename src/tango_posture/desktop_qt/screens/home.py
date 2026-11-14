@@ -47,25 +47,25 @@ class HomeScreen(QScrollArea):
         cards_grid = QGridLayout()
         cards_grid.setSpacing(16)
 
-        # 1. Quick Start Practice Card
+        # 1. Offline Video Library Card
         practice_card = QFrame()
         practice_card.setProperty("class", "card")
         p_layout = QVBoxLayout(practice_card)
         p_layout.setContentsMargins(20, 18, 20, 18)
         p_layout.setSpacing(12)
 
-        p_title = QLabel("Live Practice")
+        p_title = QLabel("Video Analysis & Library")
         p_title.setStyleSheet("font-size: 15px; font-weight: bold;")
         cfg = self.bridge.config
         self.setup_summary = QLabel(
-            f"Camera {cfg.camera} · {cfg.width}×{cfg.height} · {cfg.side} side · {cfg.facing} facing"
+            f"Model {cfg.analysis_model} · {cfg.side} side · {cfg.facing} facing"
         )
         self.setup_summary.setStyleSheet(f"color: {COLOR_TEXT_MUTED}; font-size: 12px;")
 
-        start_btn = QPushButton("Start Practice")
+        start_btn = QPushButton("Open Library")
         start_btn.setProperty("class", "primary")
         start_btn.setFixedHeight(36)
-        start_btn.clicked.connect(lambda: self.router.navigate(Route.PRACTICE))
+        start_btn.clicked.connect(lambda: self.router.navigate(Route.LIBRARY))
 
         p_layout.addWidget(p_title)
         p_layout.addWidget(self.setup_summary)
@@ -119,7 +119,7 @@ class HomeScreen(QScrollArea):
     def refresh(self) -> None:
         cfg = self.bridge.config
         self.setup_summary.setText(
-            f"Camera {cfg.camera} · {cfg.width}×{cfg.height} · {cfg.side} side · {cfg.facing} facing"
+            f"Model {cfg.analysis_model} · {cfg.side} side · {cfg.facing} facing"
         )
         refs = self.bridge.list_references()
         if refs:

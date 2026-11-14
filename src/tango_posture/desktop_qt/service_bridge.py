@@ -47,6 +47,8 @@ class ServiceBridge(QObject):
         self.cfg = cfg
         self._active_session: SessionState = SessionState()
         self._running_worker = None
+        self._reference_cache: dict[tuple[Path, int, int], ReferenceSummary] = {}
+        self._manifest_cache: dict[tuple[Path, int, int], dict[str, Any]] = {}
 
     @property
     def config(self) -> Config:
@@ -133,14 +135,21 @@ class ServiceBridge(QObject):
         if folder.is_dir():
             for path in sorted([*folder.glob("calibration_*.json"), *folder.glob("*.tpc")], reverse=True):
                 try:
+                    resolved = path.resolve()
+                    stat_result = resolved.stat()
+                    cache_key = (resolved, stat_result.st_mtime_ns, stat_result.st_size)
+                    cached = self._reference_cache.get(cache_key)
+                    if cached is not None:
+                        results[cached.id] = cached
+                        continue
                     ref = load_calibration_file(str(path), folder)
                     if ref:
                         prof = getattr(ref, "profile", {})
                         ranges = profile_from_calibration(ref)
-                        results[ref.id] = ReferenceSummary(
+                        summary = ReferenceSummary(
                             id=ref.id,
                             name=getattr(ref, "name", path.stem),
-                            path=path.resolve(),
+                            path=resolved,
                             side=prof.get("side", "left"),
                             facing=prof.get("facing", "right"),
                             camera=str(prof.get("camera", 0)),
@@ -149,21 +158,36 @@ class ServiceBridge(QObject):
                                 value.camera_check_passed for value in ranges.metrics.values()
                             ),
                         )
+                        self._reference_cache[cache_key] = summary
+                        results[ref.id] = summary
                 except (OSError, ValueError, KeyError):
                     continue
 
         return list(results.values())
 
+    def _read_cached_manifest(self, archive_path: Path) -> dict[str, Any]:
+        from ..archive import read_manifest
+
+        resolved = archive_path.resolve()
+        stat_result = resolved.stat()
+        cache_key = (resolved, stat_result.st_mtime_ns, stat_result.st_size)
+        cached = self._manifest_cache.get(cache_key)
+        if cached is not None:
+            return cached
+        manifest = read_manifest(archive_path)
+        self._manifest_cache[cache_key] = manifest
+        return manifest
+
     def list_practices(self) -> list[dict[str, Any]]:
         """List practice archives (.tp) using their persisted display names."""
-        from ..archive import practice_directory, read_manifest
+        from ..archive import practice_directory
 
         folder = practice_directory(self.cfg.data_dir)
         items = []
         if folder.is_dir():
             for archive_path in sorted(folder.glob("*.tp"), key=lambda p: p.stat().st_mtime_ns, reverse=True):
                 try:
-                    manifest = read_manifest(archive_path)
+                    manifest = self._read_cached_manifest(archive_path)
                     segments = manifest.get("segments", [])
                     items.append({
                         "name": manifest.get("name", archive_path.stem),
@@ -178,7 +202,7 @@ class ServiceBridge(QObject):
         return items
 
     def list_library_archives(self) -> list[dict[str, Any]]:
-        from ..archive import calibration_directory, read_manifest
+        from ..archive import calibration_directory
         from ..references.archives import reference_directory
 
         items = self.list_practices()
@@ -188,7 +212,7 @@ class ServiceBridge(QObject):
         ):
             for path in sorted(folder.glob(suffix)):
                 try:
-                    manifest = read_manifest(path)
+                    manifest = self._read_cached_manifest(path)
                     items.append({
                         "name": manifest.get("name", path.stem),
                         "path": path.resolve(),

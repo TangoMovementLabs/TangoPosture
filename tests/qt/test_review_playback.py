@@ -323,23 +323,29 @@ def test_review_posture_analysis_runs_off_ui_thread_and_syncs_overlay(
         assert screen._movement_data == {"pivots": [], "steps": []}
 
 
-def test_review_analysis_uses_temporary_storage_and_shared_analyzer(
+def test_review_analysis_uses_in_memory_clip_analyzer_without_temp_db_or_report(
     video, tmp_path, monkeypatch
 ):
     observed = {}
     coach_data = {"frames": {}}
+    manifest = SimpleNamespace(model_variant="lite", model_hash="abc")
 
-    def analyze_imported_clip(**kwargs):
+    def fake_analyze_clip(**kwargs):
         observed.update(kwargs)
-        return SimpleNamespace(coach_data=coach_data, movement_data={"steps": [{"frame": 1}]})
+        return SimpleNamespace(
+            coach_data=coach_data,
+            movement_data={"steps": [{"frame": 1}]},
+            manifest=manifest,
+        )
 
     monkeypatch.setattr(
-        'tango_posture.desktop_qt.review.analysis.analyse_imported_clip',
-        analyze_imported_clip,
+        "tango_posture.desktop_qt.review.analysis.analyze_clip",
+        fake_analyze_clip,
     )
+    data_dir = tmp_path / "data"
     result = analyse_review_clip(
         video,
-        Config(data_dir=str(tmp_path)),
+        Config(data_dir=str(data_dir)),
         selected_out=1.0,
         progress_callback=lambda *_: None,
         cancel_check=lambda: False,
@@ -347,12 +353,55 @@ def test_review_analysis_uses_temporary_storage_and_shared_analyzer(
 
     assert result.coach_data is coach_data
     assert result.movement_data == {"steps": [{"frame": 1}]}
+    assert result.manifest is manifest
     assert observed["video_path"] == video
     assert observed["selected_in"] == 0.0
     assert observed["selected_out"] == 1.0
     assert observed["analysis_mode"] == "movement"
     assert observed["analyse_soundtrack"] is False
-    assert not observed["report_dir"].exists()
+    assert "report_dir" not in observed
+    assert "storage" not in observed
+    assert not data_dir.exists()
+
+
+def test_review_navigation_preserves_leased_video_and_blocks_cancelled_commit(
+    screen, video, tmp_path, monkeypatch, qapp
+):
+    archive_path, _ = make_archive(tmp_path, video)
+    started = threading.Event()
+    proceed = threading.Event()
+    worker_saw_readable_file = []
+
+    def analyze(path, cfg, *, selected_out, progress_callback, cancel_check):
+        started.set()
+        proceed.wait(timeout=3.0)
+        worker_saw_readable_file.append(path.is_file() and path.read_bytes() == video.read_bytes())
+        return ReviewAnalysis({"frames": {"0": {"head_angle": 1.0}}}, {"pivots": [], "steps": []})
+
+    monkeypatch.setattr(
+        "tango_posture.desktop_qt.screens.review.analyse_review_clip", analyze
+    )
+    screen.load_archive(archive_path)
+    original_extract_folder = screen._playback.archive.folder
+    screen._start_posture_analysis()
+    thread = screen._analysis_thread
+    assert thread is not None
+
+    deadline = time.monotonic() + 3
+    while not started.is_set() and time.monotonic() < deadline:
+        qapp.processEvents()
+        time.sleep(0.01)
+    assert started.is_set()
+
+    # Simulate navigation away / release closing the playback archive while worker is still running
+    screen._release()
+    assert original_extract_folder.exists()
+    proceed.set()
+    thread.join(timeout=3.0)
+
+    assert not original_extract_folder.exists()
+    assert worker_saw_readable_file == [True]
+    assert read_analytics(archive_path, 0) is None
 
 
 def test_review_draws_steps_and_pivots_and_can_toggle_them(screen, video):

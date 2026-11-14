@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping, Sequence
+from typing import Literal
 
 from ..config import Config, RangeDefault
 from ..domain import (
@@ -58,6 +59,23 @@ def measure_ranges(frame: FrameObservation, cfg: Config) -> MetricObservation:
     return MetricObservation(frame.timestamp, values, quality, core.view_width)
 
 
+def view_eligible(
+    view: Literal["side", "front", "all"],
+    view_width: float | None,
+    max_view_width: float,
+) -> bool:
+    """Return whether a frame's measured view_width satisfies the target view policy."""
+    if view == "all":
+        return True
+    if view_width is None or not math.isfinite(view_width):
+        return False
+    if view == "side":
+        return view_width <= max_view_width
+    if view == "front":
+        return view_width > max_view_width
+    return False
+
+
 def measure_profile(frame: FrameObservation, cfg: Config, profile: RangeProfile) -> MetricObservation:
     """Use the same per-view measurement path in approval and subsequent scoring."""
     return measure_targets(frame, cfg, profile.metrics)
@@ -79,24 +97,33 @@ def measure_targets(
             center = (target.lower + target.upper) / 2
             result.values[key] = center + wrapped(value - center)
         width = observation.view_width
-        if target.view != "all" and (
-            width is None or (target.view == "side" and width > cfg.max_view_width)
-            or (target.view == "front" and width <= cfg.max_view_width)
-        ):
+        if not view_eligible(target.view, width, cfg.max_view_width):
             result.values[key] = None
             result.quality[key] = QualityResult(False, "Return to this metric's approved camera view")
     return result
 
 
 def metric_samples(
-    frames: Sequence[FrameObservation], cfg: Config,
+    frames: Sequence[FrameObservation],
+    cfg: Config,
+    *,
+    view: Literal["side", "front", "all"] | None = None,
 ) -> dict[str, list[tuple[float, float | None]]]:
+    effective_view: Literal["side", "front", "all"] = (
+        view if view is not None else ("all" if cfg.allow_all_angles else "side")
+    )
+    eval_cfg = cfg.model_copy(update={"allow_all_angles": effective_view != "side"})
     result: dict[str, list[tuple[float, float | None]]] = {key: [] for key in METRIC_DETAILS}
     previous: dict[str, float] = {}
     for frame in frames:
-        observation = measure_ranges(frame, cfg)
+        observation = measure_ranges(frame, eval_cfg)
+        eligible = view_eligible(effective_view, observation.view_width, eval_cfg.max_view_width)
         for key, series in result.items():
-            value = observation.values[key] if observation.quality[key].valid else None
+            value = (
+                observation.values[key]
+                if eligible and observation.quality[key].valid
+                else None
+            )
             if value is not None and key in CYCLIC_METRICS:
                 if key in previous:
                     value = previous[key] + wrapped(value - previous[key])

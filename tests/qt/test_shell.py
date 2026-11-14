@@ -35,15 +35,15 @@ def test_router_navigation():
     visited = []
     router.route_changed.connect(lambda r, p: visited.append(r))
 
-    router.navigate(Route.PRACTICE)
-    assert router.current == Route.PRACTICE
-    assert visited == [Route.PRACTICE]
+    router.navigate(Route.LIBRARY)
+    assert router.current == Route.LIBRARY
+    assert visited == [Route.LIBRARY]
 
     router.navigate(Route.REVIEW)
     assert router.current == Route.REVIEW
 
     assert router.go_back()
-    assert router.current == Route.PRACTICE
+    assert router.current == Route.LIBRARY
 
     assert router.go_back()
     assert router.current == Route.HOME
@@ -93,9 +93,9 @@ def test_main_window_instantiation_and_navigation(qapp):
         assert route in window.screens
 
     # Verify switching route updates current screen
-    window.router.navigate(Route.PRACTICE)
-    assert window.stack.currentWidget() == window.screens[Route.PRACTICE]
-    assert window.nav_buttons[Route.PRACTICE].isChecked()
+    window.router.navigate(Route.REVIEW)
+    assert window.stack.currentWidget() == window.screens[Route.REVIEW]
+    assert window.nav_buttons[Route.REVIEW].isChecked()
 
     window.router.navigate(Route.REFERENCES)
     assert window.stack.currentWidget() == window.screens[Route.REFERENCES]
@@ -179,7 +179,7 @@ def test_help_renders_styled_manual_with_hierarchical_contents_and_search(qapp):
 def test_navigation_buttons_have_icons_and_accessible_labels(qapp):
     window = MainWindow(Config())
 
-    assert len(window.nav_buttons) == 8
+    assert len(window.nav_buttons) == 7
     assert Route.REFERENCES not in window.nav_buttons
     for button in window.nav_buttons.values():
         assert not button.icon().isNull()

@@ -246,6 +246,97 @@ for _fields in SETTING_GROUPS.values():
     for _field in _fields:
         SETTING_MAP[_field] = (_field, _setting_parser(_field))
 
+SETTING_DESCRIPTIONS: dict[str, str] = {
+    "camera": "Camera device index.",
+    "width": "Requested camera image width in pixels.",
+    "height": "Requested camera image height in pixels.",
+    "side": "Anatomical side selected for side-view measurements.",
+    "facing": "Direction faced in the original, unmirrored image.",
+    "capture_profile": "Name identifying the camera and capture setup.",
+    "mirror": "Mirrors the displayed image only.",
+    "allow_all_angles": "Enables the experimental measurement path for additional view angles.",
+    "model_path": "Location of the Lite model used for Live Practice and Lite analysis.",
+    "analysis_model": (
+        "Offline analysis model: lite (default), full, or heavy. "
+        "Missing models download when analysis starts; live coaching remains Lite."
+    ),
+    "data_dir": "Directory for the local database and practice artifacts.",
+    "confidence": "Minimum landmark confidence used by quality checks.",
+    "min_torso": "Minimum visible torso length as a fraction of image height.",
+    "min_head": "Minimum visible shoulder-to-ear segment as a fraction of image height.",
+    "max_view_width": "Maximum body-width-to-torso ratio accepted for a side view.",
+    "view_change_tolerance": "Allowed view-width difference from the captured reference.",
+    "calibration_duration": "Total reference capture window in seconds.",
+    "calibration_valid_duration": "Minimum valid measured time required during calibration.",
+    "calibration_samples": "Minimum number of valid observations in a reference.",
+    "offset_mad": "Maximum allowed spread for calibrated head-forward offset.",
+    "angle_mad": "Maximum allowed spread for calibrated angular measurements.",
+    "smoothing": "Time constant for smoothing measurements over time.",
+    "overlay_smoothing": "Smoothing time constant for rendered landmark lines and segments.",
+    "entry_duration": "Time a threshold must be crossed before confirming a deviation.",
+    "clear_duration": "Time a value must remain below its clear threshold before closing an event.",
+    "max_gap": "Maximum observation gap treated as continuous tracking.",
+    "head_forward.entry": "Forward torso-relative offset that starts a pending event.",
+    "head_forward.clear": "Lower forward offset at which an event can clear.",
+    "head_inclination.entry": "Angular change from reference that starts an event.",
+    "head_inclination.clear": "Lower angular change at which an event can clear.",
+    "trunk_inclination.entry": "Trunk-angle change from reference that starts an event.",
+    "trunk_inclination.clear": "Lower trunk-angle change at which an event can clear.",
+    "head_neutral_offset": "Offset used by the separate ear-to-nose horizontal-angle cue.",
+    "head_down_duration": "Duration required before showing the head-angle warning.",
+    "head_down_angle": "Ear-to-nose image-angle boundary for that warning.",
+    "shoulder_tension_duration": "Duration required before showing the shoulder cue.",
+    "shoulder_raise_threshold": "Shoulder-elevation threshold above the relaxed baseline.",
+    "shoulder_neutral_clearance": "Fallback clearance used when no captured shoulder baseline is available.",
+    "role_assign_ms": "Time an arm pattern must persist before assigning a role label.",
+    "role_hold_ms": "Time to retain a role label after the pattern disappears.",
+    "embrace_closed_threshold": "Boundary for the heuristic open/closed embrace label.",
+    "embrace_hysteresis_seconds": "Hysteresis duration used to stabilize embrace classification.",
+    "closed_embrace_min_knee_bend": "Minimum knee flexion used by the straight-knee cue in closed embrace.",
+    "knee_straight_duration": "Duration required before showing the knee cue.",
+    "axis_curve_entry": "Posterior hip offset that starts a pending axis event.",
+    "axis_curve_clear": "Lower offset at which a confirmed axis event can clear.",
+    "axis_curve_duration": "Time above the entry threshold required to confirm an axis event.",
+    "axis_curve_clear_duration": "Time below the clear threshold required to close an axis event.",
+    "axis_neutral_offset": "Fallback neutral offset when no captured reference is available.",
+    "slow_tango_max_bpm": "Tempo ceiling for the slow-tango ankle-lift cue.",
+    "ankle_high_lift_ratio": "Ankle lift threshold relative to estimated leg length.",
+    "max_consecutive_high_ankle_steps": "Consecutive high-lift steps required to trigger the cue.",
+    "beat_tracking": "Enables microphone-based beat tracking in GUI practice.",
+    "tango_bpm": "Starting tempo estimate for the beat tracker.",
+    "beat_analysis_seconds": "Analysis window used to estimate phrase timing.",
+    "auto_record_start_delay": "Continuous detected music required before automatic recording starts.",
+    "auto_record_stop_delay": "Continuous detected silence required before automatic recording stops.",
+    "max_recordings": "Maximum number of recording starts in one coach run.",
+    "replay_auto_analyse_movement": (
+        "Exposed configuration flag currently not consumed by the runtime analysis workflows; "
+        "use the explicit Analyze action."
+    ),
+    "replay_step_history_seconds": (
+        "Replay media-time window (0.5 to 30 seconds) over which observed step footprints fade out."
+    ),
+    "replay_joint_interpolation": (
+        "Display-only Review joint gap filling: linear by default, or quadratic with a linear fallback. "
+        "Raw calibration/scoring evidence is unchanged."
+    ),
+    "replay_joint_max_gap": (
+        "Maximum bracketed joint gap filled in Review, in seconds; default 3.0, and 0 disables filling. "
+        "Not the measurement tracking gap limit."
+    ),
+    "replay_audio": (
+        "Retained for configuration compatibility; Qt review currently plays video only. "
+        "Export the stream for external audio playback."
+    ),
+    "ollama_base_url": "Address of the local or reachable Ollama server.",
+    "ollama_model": "Model name installed on that Ollama server.",
+    "ollama_timeout": "Maximum wait for a local model request.",
+    "ollama_temperature": "Controls response variation.",
+    "ollama_num_ctx": "Requested model context capacity in tokens.",
+    "ollama_num_predict": "Maximum generated response length in tokens.",
+    "ollama_max_report_chars": "Maximum report text sent for local analysis.",
+    "ollama_instruction": "Additional instruction accompanying a report.",
+}
+
 
 def set_setting(data: dict, key: str, value: str) -> None:
     field, parse = SETTING_MAP[key]

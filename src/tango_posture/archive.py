@@ -1,5 +1,7 @@
 """Portable practice archives and temporary, validated replay extraction."""
 
+from __future__ import annotations
+
 import hashlib
 import json
 import math
@@ -547,6 +549,8 @@ class PracticeArchive:
         self.path = path.expanduser().resolve()
         self.temporary = TemporaryDirectory(prefix="tango-replay-")
         self.folder = Path(self.temporary.name)
+        self._leases = 1
+        self._lease_lock = threading.Lock()
         try:
             with _archive_lock(self.path), ZipFile(self.path) as archive:
                 self.manifest = read_manifest(self.path)
@@ -573,8 +577,21 @@ class PracticeArchive:
             self.close()
             raise
 
+    def acquire(self) -> PracticeArchive:
+        with self._lease_lock:
+            if self._leases <= 0:
+                raise RuntimeError("PracticeArchive is already closed")
+            self._leases += 1
+        return self
+
     def report(self, index: int) -> Path:
         return self.folder / self.manifest["segments"][index]["report"]
 
     def close(self) -> None:
-        self.temporary.cleanup()
+        with self._lease_lock:
+            if self._leases <= 0:
+                return
+            self._leases -= 1
+            should_cleanup = self._leases == 0
+        if should_cleanup:
+            self.temporary.cleanup()
