@@ -369,7 +369,7 @@ def test_settings_screen_update(qapp, tmp_path, monkeypatch):
     assert settings_screen.ollama_model.text() == "custom-model"
     assert settings_screen.conf_spin.value() == 0.85
     assert settings_screen.field_widgets["ollama_num_ctx"].value() == 8192
-    assert settings_screen.tabs.count() == 12
+    assert settings_screen.tabs.count() == 13
     window.close()
 
 

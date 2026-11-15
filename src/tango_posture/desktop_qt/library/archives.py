@@ -21,6 +21,7 @@ from ...archive import (
 )
 from ...config import Config
 from ...movement import render_floor_guide, render_movement_overlay
+from ...pose.recovery import rebase_pose_recovery
 from ...references.coach import render_coach_frame_overlay
 from ...references.companions import load_report_coach_data, load_report_movement_data
 from ...references.errors import ImportCancelledError
@@ -68,7 +69,14 @@ def archive_report(
         target_size = (target_width, round(height * target_width / width))
         image = render_floor_guide(image) if floor else image
         if coach is not None:
-            image = render_coach_frame_overlay(image, coach, index, cfg, lines_only=floor)
+            image = render_coach_frame_overlay(
+                image,
+                coach,
+                index,
+                cfg,
+                lines_only=floor,
+                show_estimates=cfg.replay_show_recovered_joints,
+            )
         if (image.shape[1], image.shape[0]) != target_size:
             image = cv2.resize(image, target_size, interpolation=cv2.INTER_LINEAR)
         return render_movement_overlay(
@@ -105,6 +113,17 @@ def archive_report(
                 if start <= int(key) <= end
             }
             indexed_coach["source_sha256"] = file_sha256(raw)
+            if indexed_coach.get("pose_recovery") is not None:
+                rebased = rebase_pose_recovery(
+                    indexed_coach["pose_recovery"],
+                    start,
+                    end + 1,
+                    new_source_sha256=indexed_coach["source_sha256"],
+                )
+                if rebased is None:
+                    indexed_coach.pop("pose_recovery", None)
+                else:
+                    indexed_coach["pose_recovery"] = rebased
         indexed_movement = copy.deepcopy(movement)
         if indexed_movement is not None:
             indexed_movement.update(

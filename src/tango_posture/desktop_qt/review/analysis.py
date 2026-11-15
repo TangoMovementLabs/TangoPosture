@@ -33,6 +33,7 @@ def analyse_review_clip(
     selected_out: float,
     progress_callback: Callable[[int, int, str], None],
     cancel_check: Callable[[], bool],
+    recover_tracking: bool | None = None,
 ) -> ReviewAnalysis:
     """Analyze a local clip in memory without persisting a temporary report or database."""
     result = analyze_clip(
@@ -44,6 +45,7 @@ def analyse_review_clip(
         analyse_soundtrack=False,
         progress_callback=progress_callback,
         cancel_check=cancel_check,
+        recover_tracking=recover_tracking,
     )
     if result.coach_data is None:
         raise ValueError("Posture analysis completed without frame-level coaching data")
@@ -102,7 +104,14 @@ def render_review_overlays(
             raise ImportCancelledError("Posture analysis canceled")
         if floor:
             image = render_floor_guide(image)
-        image = render_coach_frame_overlay(image, analysis.coach_data, index, cfg, lines_only=True)
+        image = render_coach_frame_overlay(
+            image,
+            analysis.coach_data,
+            index,
+            cfg,
+            lines_only=True,
+            show_estimates=cfg.replay_show_recovered_joints,
+        )
         return render_movement_overlay(
             image, analysis.movement_data, index, fps, show_pivots=True, show_steps=True,
             step_history_seconds=cfg.replay_step_history_seconds,

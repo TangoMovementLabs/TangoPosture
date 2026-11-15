@@ -24,10 +24,11 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ...archive import read_manifest
+from ...archive import read_analytics, read_manifest
 from ...calibration.baseline import load_calibration_file
 from ...calibration.models import METRIC_DETAILS, RangeProfile
 from ...domain import Calibration
+from ...replay import time_label
 from ..analytics.data import (
     FRAME_METRICS,
     ComparisonResult,
@@ -147,6 +148,16 @@ class AnalyticsScreen(QWidget):
         self.state_label = QLabel()
         self.state_label.setWordWrap(True)
         layout.addWidget(self.state_label)
+        self.tracking_recovery_label = QLabel()
+        self.tracking_recovery_label.setWordWrap(True)
+        self.tracking_recovery_label.setTextFormat(Qt.TextFormat.RichText)
+        self.tracking_recovery_label.setOpenExternalLinks(False)
+        self.tracking_recovery_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextBrowserInteraction
+        )
+        self.tracking_recovery_label.linkActivated.connect(self._on_recovery_link)
+        self.tracking_recovery_label.setVisible(False)
+        layout.addWidget(self.tracking_recovery_label)
         alignment_note = QLabel(
             "Time alignment unavailable; no offset or scale has been calculated."
         )
@@ -200,6 +211,8 @@ class AnalyticsScreen(QWidget):
         self._current_source = None
         self._comparison = None
         self.state_label.setText(message)
+        self.tracking_recovery_label.clear()
+        self.tracking_recovery_label.setVisible(False)
         self.export_charts_btn.setEnabled(False)
         for metric in self.charts:
             self.charts[metric].set_data(None)
@@ -438,6 +451,7 @@ class AnalyticsScreen(QWidget):
             f"Active duration: {_seconds(dataset.active_duration)} · {cal_summary}. "
             f"{note}{extra_note}"
         )
+        self._update_tracking_recovery_summary(path, index)
 
         calibration_selected = (
             self.calibration_combo.currentData() is not None and not cal_error
@@ -775,6 +789,69 @@ class AnalyticsScreen(QWidget):
 
         self.bridge.status_message.emit(f"Exported {len(active)} charts to {destination.name}")
         return destination
+
+    def _update_tracking_recovery_summary(self, path: Path, index: int) -> None:
+        try:
+            analytics = read_analytics(path, index)
+        except (OSError, ValueError, TypeError, BadZipFile):
+            analytics = None
+        if not isinstance(analytics, dict):
+            self.tracking_recovery_label.clear()
+            self.tracking_recovery_label.setVisible(False)
+            return
+        coach = analytics.get("coach_data")
+        recovery = (
+            coach.get("pose_recovery")
+            if isinstance(coach, dict) and isinstance(coach.get("pose_recovery"), dict)
+            else analytics.get("pose_recovery")
+        )
+        if not isinstance(recovery, dict):
+            self.tracking_recovery_label.clear()
+            self.tracking_recovery_label.setVisible(False)
+            return
+        summary = recovery.get("summary") if isinstance(recovery.get("summary"), dict) else {}
+        detected = int(summary.get("windows_detected", len(recovery.get("windows") or [])) or 0)
+        recovered_win = int(summary.get("windows_recovered", 0) or 0)
+        unresolved = int(summary.get("windows_unresolved", 0) or 0)
+        skipped_budget = int(summary.get("windows_skipped_budget", 0) or 0)
+        recovered_frames = int(summary.get("recovered_frames", 0) or 0)
+        recovered_joints = int(summary.get("recovered_joints", 0) or 0)
+        interp_joints = int(summary.get("interpolated_joints", 0) or 0)
+        links: list[str] = []
+        for win in (recovery.get("windows") or [])[:5]:
+            if not isinstance(win, dict):
+                continue
+            gst = win.get("gap_start_time")
+            get = win.get("gap_end_time")
+            if isinstance(gst, int | float) and isinstance(get, int | float):
+                label = f"{time_label(float(gst))}–{time_label(float(get))}"
+                links.append(f'<a href="seek:{float(gst):.6f}">{label}</a>')
+        links_html = f" · Windows: {', '.join(links)}" if links else ""
+        budget_part = f", {skipped_budget} skipped by budget" if skipped_budget else ""
+        self.tracking_recovery_label.setText(
+            f"<b>Tracking recovery</b> (display only; measured coverage unchanged): "
+            f"{detected} gap window(s) ({recovered_win} recovered, {unresolved} unresolved{budget_part}) · "
+            f"{recovered_frames} frame(s), {recovered_joints} joint estimate(s) ({interp_joints} interpolated)"
+            f"{links_html}"
+        )
+        self.tracking_recovery_label.setVisible(True)
+
+    def _on_recovery_link(self, url: str) -> None:
+        if not url.startswith("seek:"):
+            return
+        try:
+            timestamp = float(url[5:])
+        except ValueError:
+            return
+        if self.recordings:
+            timestamps = self.recordings[0][2]
+            if (
+                timestamps
+                and not (timestamps[0] <= timestamp <= timestamps[-1])
+                and 0.0 <= timestamp <= (timestamps[-1] - timestamps[0])
+            ):
+                timestamp = timestamps[0] + timestamp
+        self._seek_to_recording(timestamp)
 
     def _seek_to_recording(self, timestamp: float) -> None:
         match = next(

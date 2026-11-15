@@ -163,3 +163,92 @@ def interpolate_poses(
                     if origins_out is not None:
                         origins_out[index][name] = "interpolated"
     return result
+
+
+def interpolate_tracked_dancer_poses(
+    samples: Sequence[Any],
+    *,
+    max_gap_s: float,
+    confidence: float,
+    break_flags: Sequence[bool] | None = None,
+    timestamps: Sequence[float] | None = None,
+    frame_indices: Sequence[int] | None = None,
+    sample_factory: Any = None,
+) -> list[Any]:
+    """Per-track linear 2D display interpolation bounded by valid same-track anchors.
+
+    Populates ``sample.display_pose`` and ``sample.interpolated_display = True`` on
+    bracketed missing frames within ``max_gap_s`` without mutating ``raw_pose``,
+    ``torso_eligible``, ``hip_eligible``, or ``quality_status``. Never crosses
+    identity breaks or shot cuts supplied via ``break_flags``.
+    """
+    result = list(samples)
+    if max_gap_s <= 0.0 or len(result) < 3:
+        return result
+
+    segments: list[list[int]] = [[]]
+    for idx, sample in enumerate(result):
+        broken = bool(break_flags[idx]) if break_flags is not None and idx < len(break_flags) else False
+        if broken:
+            segments.append([])
+        if sample is not None and segments[-1]:
+            prev_valid_t = next(
+                (result[p].timestamp for p in reversed(segments[-1]) if result[p] is not None),
+                None,
+            )
+            if prev_valid_t is not None and sample.timestamp <= prev_valid_t:
+                segments.append([])
+        segments[-1].append(idx)
+
+    for seg in segments:
+        valid_indices = [
+            i for i in seg
+            if result[i] is not None and result[i].raw_pose is not None and result[i].hip_eligible
+        ]
+        if len(valid_indices) < 2:
+            continue
+        names = {
+            name
+            for i in valid_indices
+            for name in (result[i].raw_pose or {})
+        }
+        for name in names:
+            joint_valid = [
+                i for i in valid_indices
+                if reliable((result[i].raw_pose or {}).get(name), confidence)
+            ]
+            for left, right in pairwise(joint_valid):
+                if right == left + 1:
+                    continue
+                t0 = float(result[left].timestamp)
+                t1 = float(result[right].timestamp)
+                dt = t1 - t0
+                if dt <= 0.0 or dt > max_gap_s + 1e-9:
+                    continue
+                p0 = result[left].raw_pose[name]
+                p1 = result[right].raw_pose[name]
+                for idx in range(left + 1, right):
+                    slot = result[idx]
+                    if slot is None:
+                        if sample_factory is None or timestamps is None or frame_indices is None:
+                            continue
+                        slot = sample_factory(float(timestamps[idx]), int(frame_indices[idx]))
+                    existing = slot.display_pose if slot.display_pose is not None else {}
+                    if reliable(existing.get(name), confidence):
+                        continue
+                    slot_t = float(slot.timestamp)
+                    alpha = (slot_t - t0) / dt
+                    interp_lm = Landmark(
+                        x=float(p0.x + alpha * (p1.x - p0.x)),
+                        y=float(p0.y + alpha * (p1.y - p0.y)),
+                        visibility=1.0,
+                        presence=1.0,
+                    )
+                    new_display = dict(existing)
+                    new_display[name] = interp_lm
+                    result[idx] = replace(
+                        slot,
+                        display_pose=new_display,
+                        interpolated_display=True,
+                    )
+    return result

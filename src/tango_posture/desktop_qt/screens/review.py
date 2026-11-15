@@ -21,7 +21,11 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
+    QDoubleSpinBox,
     QFileDialog,
+    QFormLayout,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -48,6 +52,7 @@ from ...calibration.measurements import measure_ranges
 from ...calibration.models import METRIC_DETAILS, ApprovedRange, profile_from_calibration
 from ...calibration.normalization import HoldSourceIdentity, resolve_raw_media_sha256
 from ...movement import render_floor_guide, render_movement_overlay, validate_movement_analysis
+from ...pose.recovery import recover_clip_tracking_range
 from ...references.coach import (
     _coach_observation,
     compare_coach_data,
@@ -57,7 +62,11 @@ from ...references.coach import (
     render_coach_head_posture,
     render_coach_torso_axis,
 )
-from ...references.companions import load_report_coach_data, load_report_movement_data
+from ...references.companions import (
+    load_report_coach_data,
+    load_report_movement_data,
+    save_coach_companion,
+)
 from ...references.constants import MAX_IMPORT_RANGE_SECONDS
 from ...replay import VideoReader, time_label
 from ...reports import latest_analysis_model_section
@@ -190,6 +199,8 @@ class ReviewScreen(QWidget):
         self._analysis_commit_lock = threading.Lock()
         self._analysis_job_id = 0
         self._active_analysis_job: int | None = None
+        self._last_cfg_recovery_auto = bool(self.bridge.config.replay_recovery_auto)
+        self._last_cfg_show_recovered = bool(self.bridge.config.replay_show_recovered_joints)
         self.destroyed.connect(self._playback.close)
 
         layout = QHBoxLayout(self)
@@ -347,6 +358,19 @@ class ReviewScreen(QWidget):
         self.cancel_analysis_btn.setToolTip("Stop the running analysis; the archive stays unchanged.")
         self.cancel_analysis_btn.clicked.connect(self._cancel_posture_analysis)
         it_layout.addWidget(self.analytics_btn)
+        self.recover_gaps_cb = QCheckBox("Recover short tracking gaps")
+        self.recover_gaps_cb.setChecked(bool(self.bridge.config.replay_recovery_auto))
+        self.recover_gaps_cb.setToolTip(
+            "When analyzing, run display-only backward pose recovery on short lower-limb dropouts."
+        )
+        it_layout.addWidget(self.recover_gaps_cb)
+        self.recover_tracking_btn = QPushButton("Recover tracking…")
+        self.recover_tracking_btn.setEnabled(False)
+        self.recover_tracking_btn.setToolTip(
+            "Run display-only backward lower-limb tracking recovery on a chosen gap or pivot."
+        )
+        self.recover_tracking_btn.clicked.connect(self._open_targeted_recovery_dialog)
+        it_layout.addWidget(self.recover_tracking_btn)
         it_layout.addWidget(self.cancel_analysis_btn)
         self.analysis_status = _caption_label(
             "Analyze a raw video to add synchronized posture insights. Analysis runs in the background."
@@ -454,6 +478,36 @@ class ReviewScreen(QWidget):
         self.axis_status = _caption_label("")
         self.axis_status.setVisible(False)
         it_layout.addWidget(self.axis_status)
+        it_layout.addSpacing(4)
+        it_layout.addWidget(_section_label("Tracking evidence"))
+        evidence_row = QHBoxLayout()
+        evidence_row.setSpacing(10)
+        self.show_estimates_cb = QCheckBox("Show estimates")
+        self.show_estimates_cb.setChecked(bool(self.bridge.config.replay_show_recovered_joints))
+        self.show_estimates_cb.setToolTip(
+            "Show display-only backward-pass and pivot-interpolated lower-limb joint estimates."
+        )
+        self.show_estimates_cb.toggled.connect(self._on_tracking_display_toggled)
+        self.forward_only_cb = QCheckBox("Forward only")
+        self.forward_only_cb.setChecked(False)
+        self.forward_only_cb.setToolTip(
+            "Show strictly forward pose observations and hide all recovered and interpolated joints."
+        )
+        self.forward_only_cb.toggled.connect(self._on_tracking_display_toggled)
+        evidence_row.addWidget(self.show_estimates_cb)
+        evidence_row.addWidget(self.forward_only_cb)
+        evidence_row.addStretch()
+        it_layout.addLayout(evidence_row)
+        self.tracking_legend_label = _caption_label(
+            "Solid: forward · Dashed: backward pass · Dotted: interpolated"
+        )
+        it_layout.addWidget(self.tracking_legend_label)
+        self.tracking_evidence_status = _caption_label("Open a recording to inspect tracking evidence.")
+        it_layout.addWidget(self.tracking_evidence_status)
+        self.show_on_raw_btn = QPushButton("Show on raw video")
+        self.show_on_raw_btn.setVisible(False)
+        self.show_on_raw_btn.clicked.connect(self._switch_to_raw_video)
+        it_layout.addWidget(self.show_on_raw_btn)
         it_layout.addSpacing(6)
 
         # Frame status and metrics
@@ -567,6 +621,16 @@ class ReviewScreen(QWidget):
         return self._analysis_thread is not None and self._analysis_thread.is_alive()
 
     def refresh(self) -> None:
+        cfg_recovery_auto = bool(self.bridge.config.replay_recovery_auto)
+        if cfg_recovery_auto != self._last_cfg_recovery_auto:
+            self._last_cfg_recovery_auto = cfg_recovery_auto
+            self.recover_gaps_cb.setChecked(cfg_recovery_auto)
+        cfg_show_recovered = bool(self.bridge.config.replay_show_recovered_joints)
+        if cfg_show_recovered != self._last_cfg_show_recovered:
+            self._last_cfg_show_recovered = cfg_show_recovered
+            self.show_estimates_cb.blockSignals(True)
+            self.show_estimates_cb.setChecked(cfg_show_recovered)
+            self.show_estimates_cb.blockSignals(False)
         selected = self.reference_combo.currentData()
         sort_mode = self.reference_sort_combo.currentData()
         references = [
@@ -1294,6 +1358,8 @@ class ReviewScreen(QWidget):
                     or not self._using_range_targets()
                     or bool(self._calibration_error)
                 ),
+                show_estimates=self.show_estimates_cb.isChecked(),
+                forward_only=self.forward_only_cb.isChecked(),
             )
 
         status_messages: list[str] = []
@@ -1383,6 +1449,102 @@ class ReviewScreen(QWidget):
         except REPLAY_ERRORS as error:
             self._playback_error(error)
 
+    def _on_tracking_display_toggled(self) -> None:
+        reader = self._playback.reader
+        self._update_tracking_evidence_ui(reader.index if reader is not None else None)
+        self._refresh_overlay()
+
+    def _switch_to_raw_video(self) -> None:
+        for raw in ("Raw video", "Local video", "Source video"):
+            if raw in self._playback.variants:
+                self._on_stream_changed(raw)
+                return
+        self.tracking_evidence_status.setText("Raw video needed for tracking recovery.")
+
+    def _update_tracking_evidence_ui(self, frame_index: int | None = None) -> None:
+        reader = self._playback.reader
+        has_raw = self._analysis_video_path() is not None
+        if reader is not None and not self._is_dynamic_stream():
+            self.show_estimates_cb.setEnabled(False)
+            self.forward_only_cb.setEnabled(False)
+            if has_raw:
+                self.show_on_raw_btn.setVisible(True)
+                self.show_on_raw_btn.setEnabled(True)
+                self.tracking_evidence_status.setText(
+                    "Viewing baked overlay stream. Click 'Show on raw video' to toggle live tracking evidence."
+                )
+            else:
+                self.show_on_raw_btn.setVisible(False)
+                self.tracking_evidence_status.setText("Raw video needed for tracking recovery.")
+            return
+
+        self.show_on_raw_btn.setVisible(False)
+        self.show_estimates_cb.setEnabled(True)
+        self.forward_only_cb.setEnabled(True)
+        if reader is not None and not has_raw:
+            self.tracking_evidence_status.setText("Raw video needed for tracking recovery.")
+            return
+
+        data = self._display_coach_data() or self._coach_data
+        if data is None:
+            self.tracking_evidence_status.setText(
+                "Analyze a recording or open an analyzed archive to inspect tracking evidence."
+            )
+            return
+        if self.forward_only_cb.isChecked():
+            self.tracking_evidence_status.setText(
+                "Forward only: showing raw forward pose observations."
+            )
+            return
+
+        frames = data.get("frames")
+        idx = frame_index if frame_index is not None else (reader.index if reader is not None else 0)
+        entry = frames.get(str(idx)) if isinstance(frames, dict) else None
+        if isinstance(entry, Mapping):
+            summary = str(entry.get("display_status_summary") or "").strip()
+            origins = (
+                entry.get("display_joint_origins")
+                if isinstance(entry.get("display_joint_origins"), Mapping)
+                else {}
+            )
+            diagnostics = (
+                entry.get("display_diagnostics")
+                if isinstance(entry.get("display_diagnostics"), Mapping)
+                else {}
+            )
+            if not self.show_estimates_cb.isChecked():
+                if summary:
+                    self.tracking_evidence_status.setText(f"Estimates hidden · {summary}")
+                else:
+                    self.tracking_evidence_status.setText(
+                        "Estimates hidden (showing forward observations only)."
+                    )
+                return
+            if summary:
+                self.tracking_evidence_status.setText(summary)
+                return
+            rec_origins = {v for v in origins.values() if v in ("backward", "interpolated")}
+            if "backward" in rec_origins and "interpolated" in rec_origins:
+                self.tracking_evidence_status.setText(
+                    "Recovered for display (backward pass + interpolation)."
+                )
+            elif "backward" in rec_origins:
+                self.tracking_evidence_status.setText("Recovered for display (backward pass).")
+            elif "interpolated" in rec_origins:
+                self.tracking_evidence_status.setText("Recovered for display (interpolated).")
+            elif diagnostics:
+                reason = str(next(iter(diagnostics.values())))
+                self.tracking_evidence_status.setText(f"Forward tracking ({reason}).")
+            else:
+                self.tracking_evidence_status.setText("Forward tracking.")
+            return
+
+        recovery_meta = data.get("pose_recovery")
+        if isinstance(recovery_meta, Mapping) and recovery_meta.get("status_message"):
+            self.tracking_evidence_status.setText(str(recovery_meta["status_message"]))
+        else:
+            self.tracking_evidence_status.setText("No pose data on this frame.")
+
     def _analysis_video_path(self) -> Path | None:
         for label in ("Raw video", "Local video", "Source video"):
             path = self._playback.variants.get(label)
@@ -1393,11 +1555,26 @@ class ReviewScreen(QWidget):
     def _update_analysis_controls(self) -> None:
         thread = self._analysis_thread
         running = thread is not None and thread.is_alive()
-        self.analytics_btn.setEnabled(self._analysis_video_path() is not None and not running)
+        has_raw = self._analysis_video_path() is not None
+        self.analytics_btn.setEnabled(has_raw and not running)
+        self.recover_gaps_cb.setEnabled(has_raw and not running)
+        self.recover_tracking_btn.setEnabled(has_raw and self._coach_data is not None and not running)
+        if self._playback.reader is not None and not has_raw:
+            self.recover_tracking_btn.setToolTip("Raw video needed for tracking recovery.")
+            self.recover_gaps_cb.setToolTip("Raw video needed for tracking recovery.")
+        else:
+            self.recover_tracking_btn.setToolTip(
+                "Run display-only backward lower-limb tracking recovery on a chosen gap or pivot."
+            )
+            self.recover_gaps_cb.setToolTip(
+                "When analyzing, run display-only backward pose recovery on short lower-limb dropouts."
+            )
         self.cancel_analysis_btn.setEnabled(
             self._analysis_cancel is not None and not self._analysis_cancel.is_set()
         )
         self.cancel_analysis_btn.setVisible(running or self.cancel_analysis_btn.isEnabled())
+        reader = self._playback.reader
+        self._update_tracking_evidence_ui(reader.index if reader is not None else None)
 
     def _start_posture_analysis(self) -> None:
         if self._analysis_thread is not None:
@@ -1434,6 +1611,7 @@ class ReviewScreen(QWidget):
         archive_path = self.current_archive_path
         segment_index = self._playback.selected_segment_index
 
+        recover_tracking = self.recover_gaps_cb.isChecked()
         archive_lease = (
             self._playback.archive.acquire()
             if self._playback.archive is not None
@@ -1452,6 +1630,7 @@ class ReviewScreen(QWidget):
                     selected_out=selected_out,
                     progress_callback=report_progress,
                     cancel_check=cancel_event.is_set,
+                    recover_tracking=recover_tracking,
                 )
                 if (
                     not cancel_event.is_set()
@@ -1544,6 +1723,248 @@ class ReviewScreen(QWidget):
         )
         self._analysis_thread.start()
 
+    def _open_targeted_recovery_dialog(self) -> None:
+        reader = self._playback.reader
+        video_path = self._analysis_video_path()
+        if reader is None or video_path is None:
+            self.analysis_status.setText("Raw video needed for tracking recovery.")
+            return
+        if self._coach_data is None:
+            self.analysis_status.setText("Analyze the video before running targeted tracking recovery.")
+            return
+        duration = max(0.1, float(self.duration_sec or reader.duration or 0.1))
+        playhead = min(max(0.0, float(self.current_time_sec)), duration)
+        default_start = max(0.0, playhead - 1.0)
+        default_end = min(duration, default_start + 2.0)
+        default_start = max(0.0, default_end - 2.0)
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Recover lower-limb tracking")
+        form = QFormLayout(dialog)
+        preset_combo = QComboBox()
+        preset_combo.addItem(
+            f"Playhead window ({time_label(default_start)}–{time_label(default_end)})",
+            (default_start, default_end),
+        )
+        preselect_idx = 0
+
+        frames_map = self._coach_data.get("frames") if isinstance(self._coach_data, Mapping) else {}
+        first_source_ts = None
+        if isinstance(frames_map, Mapping) and frames_map:
+            first_key = min(frames_map, key=lambda k: int(k) if str(k).isdigit() else 0)
+            first_entry = frames_map.get(first_key)
+            if isinstance(first_entry, Mapping) and isinstance(first_entry.get("timestamp"), int | float):
+                first_source_ts = float(first_entry["timestamp"])
+
+        def _to_clip_time(ts_val: float) -> float:
+            if first_source_ts is not None and ts_val > duration + 1e-3:
+                return max(0.0, min(duration, ts_val - first_source_ts))
+            return max(0.0, min(duration, ts_val))
+
+        pivots = (
+            self._movement_data.get("pivots")
+            if isinstance(self._movement_data, Mapping)
+            else None
+        ) or []
+        for p_idx, piv in enumerate(pivots, start=1):
+            if not isinstance(piv, Mapping):
+                continue
+            ps = _to_clip_time(float(piv.get("start_time", 0.0)))
+            pe = _to_clip_time(float(piv.get("end_time", ps + 0.5)))
+            if pe <= ps:
+                pe = min(duration, ps + 0.25)
+            preset_combo.addItem(
+                f"Pivot #{p_idx}: {piv.get('direction', '')} ({time_label(ps)}–{time_label(pe)})",
+                (ps, pe),
+            )
+            if ps - 0.1 <= playhead <= pe + 0.1 and preselect_idx == 0:
+                preselect_idx = preset_combo.count() - 1
+
+        existing_rec = self._coach_data.get("pose_recovery") if isinstance(self._coach_data, Mapping) else None
+        for win in (existing_rec.get("windows") if isinstance(existing_rec, Mapping) else None) or []:
+            if not isinstance(win, Mapping):
+                continue
+            ws = _to_clip_time(float(win.get("gap_start_time", 0.0)))
+            we = _to_clip_time(float(win.get("gap_end_time", ws + 0.2)))
+            if we <= ws:
+                we = min(duration, ws + 0.25)
+            tag = "budget-skipped" if win.get("budget_skipped") else (win.get("skip_reason") or "gap")
+            preset_combo.addItem(
+                f"Flagged {tag} ({time_label(ws)}–{time_label(we)})",
+                (ws, we),
+            )
+            if ws - 0.1 <= playhead <= we + 0.1 and preselect_idx == 0:
+                preselect_idx = preset_combo.count() - 1
+
+        start_spin = QDoubleSpinBox()
+        end_spin = QDoubleSpinBox()
+        for spin in (start_spin, end_spin):
+            spin.setDecimals(2)
+            spin.setSingleStep(0.1)
+            spin.setRange(0.0, duration)
+
+        def _apply_preset(index: int) -> None:
+            data = preset_combo.itemData(index)
+            if isinstance(data, tuple) and len(data) == 2:
+                start_spin.setValue(float(data[0]))
+                end_spin.setValue(float(data[1]))
+
+        preset_combo.currentIndexChanged.connect(_apply_preset)
+        preset_combo.setCurrentIndex(preselect_idx)
+        _apply_preset(preselect_idx)
+
+        form.addRow("Target window:", preset_combo)
+        form.addRow("Start (clip s):", start_spin)
+        form.addRow("End (clip s):", end_spin)
+        form.addRow(
+            QLabel("Display-only backward recovery; measured posture, steps, and pivots stay unchanged.")
+        )
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Ok
+        )
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("Recover")
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.run_targeted_recovery(start_spin.value(), end_spin.value())
+
+    def run_targeted_recovery(
+        self,
+        start_time: float,
+        end_time: float,
+        *,
+        estimator_factory: Callable[[], Any] | None = None,
+    ) -> bool:
+        """Run display-only targeted recovery on [start_time, end_time] and persist."""
+        if self._analysis_thread is not None:
+            self._poll_posture_analysis()
+        video_path = self._analysis_video_path()
+        if self._playback.reader is None or video_path is None:
+            self.analysis_status.setText("Raw video needed for tracking recovery.")
+            return False
+        if self._coach_data is None:
+            self.analysis_status.setText("Analyze the recording before running targeted recovery.")
+            return False
+        if self._analysis_thread is not None and self._analysis_thread.is_alive():
+            return False
+
+        t0 = float(min(start_time, end_time))
+        t1 = float(max(start_time, end_time))
+        if t1 <= t0:
+            t1 = t0 + 0.25
+
+        self._analysis_job_id += 1
+        job_id = self._analysis_job_id
+        cancel_event = threading.Event()
+        self._analysis_cancel = cancel_event
+        self._active_analysis_job = job_id
+        self.analysis_status.setText("Recovering tracking in selected window…")
+        self.cancel_analysis_btn.setEnabled(True)
+        self.cancel_analysis_btn.setVisible(True)
+        self.analytics_btn.setEnabled(False)
+        self.recover_gaps_cb.setEnabled(False)
+        self.recover_tracking_btn.setEnabled(False)
+        self._analysis_timer.start()
+
+        cfg = self.bridge.config.model_copy(deep=True)
+        coach_snapshot = dict(self._coach_data)
+        movement_snapshot = dict(self._movement_data) if isinstance(self._movement_data, Mapping) else None
+        archive_path = self.current_archive_path
+        segment_index = self._playback.selected_segment_index
+        report = self._playback._report
+        companion_path: Path | None = None
+        if report is not None and (archive_path is None or archive_path.suffix.lower() == ".md"):
+            cand = (
+                report.path.parent / report.coach_overlay_file
+                if report.coach_overlay_file
+                else report.path.parent / f"{report.path.stem}.coach.v1.json"
+            )
+            if cand.is_file():
+                companion_path = cand
+        archive_lease = (
+            self._playback.archive.acquire()
+            if self._playback.archive is not None
+            else None
+        )
+
+        def report_progress(current: int, total: int, message: str) -> None:
+            self._analysis_events.put((job_id, "progress", (current, total, message)))
+
+        def work() -> None:
+            try:
+                video_sha256 = file_sha256(video_path)
+                merged_recovery = recover_clip_tracking_range(
+                    video_path=video_path,
+                    coach_data=coach_snapshot,
+                    cfg=cfg,
+                    start_time=t0,
+                    end_time=t1,
+                    movement_data=movement_snapshot,
+                    estimator_factory=estimator_factory,
+                    cancel_check=cancel_event.is_set,
+                    progress_callback=report_progress,
+                )
+                updated_coach = {**coach_snapshot, "pose_recovery": merged_recovery}
+                updated_coach = interpolate_coach_data(
+                    updated_coach,
+                    cfg,
+                    pose_recovery=merged_recovery,
+                    movement_data=movement_snapshot,
+                )
+                if (
+                    not cancel_event.is_set()
+                    and archive_path is not None
+                    and archive_path.suffix.lower() in (".tp", ".tpr")
+                    and segment_index is not None
+                ):
+                    if file_sha256(video_path) != video_sha256:
+                        raise ValueError("Source video changed during recovery; archive was not changed")
+                    with self._analysis_commit_lock:
+                        cancelled = cancel_event.is_set() or self._active_analysis_job != job_id
+                        if not cancelled:
+                            store_analytics(
+                                archive_path,
+                                segment_index,
+                                {"coach_data": updated_coach},
+                                expected_video_sha256=video_sha256,
+                            )
+                        event = "cancelled" if cancelled else "recovery_done"
+                        self._analysis_events.put((job_id, event, (updated_coach, merged_recovery)))
+                    return
+                if not cancel_event.is_set() and companion_path is not None:
+                    with self._analysis_commit_lock:
+                        cancelled = cancel_event.is_set() or self._active_analysis_job != job_id
+                        if not cancelled:
+                            save_coach_companion(companion_path, updated_coach)
+                        event = "cancelled" if cancelled else "recovery_done"
+                        self._analysis_events.put((job_id, event, (updated_coach, merged_recovery)))
+                    return
+                with self._analysis_commit_lock:
+                    cancelled = cancel_event.is_set() or self._active_analysis_job != job_id
+                    event = "cancelled" if cancelled else "recovery_done"
+                    self._analysis_events.put((job_id, event, (updated_coach, merged_recovery)))
+            except Exception as error:  # noqa: BLE001 - surface background recovery errors in the UI
+                with self._analysis_commit_lock:
+                    event = (
+                        "cancelled"
+                        if cancel_event.is_set() or self._active_analysis_job != job_id
+                        else "error"
+                    )
+                    self._analysis_events.put((job_id, event, f"{type(error).__name__}: {error}"))
+            finally:
+                if archive_lease is not None:
+                    archive_lease.close()
+
+        self._analysis_thread = Thread(
+            target=work,
+            name="qt-review-targeted-recovery",
+            daemon=True,
+        )
+        self._analysis_thread.start()
+        return True
+
     def _cancel_posture_analysis(self) -> None:
         with self._analysis_commit_lock:
             cancel_event = self._analysis_cancel
@@ -1609,6 +2030,31 @@ class ReviewScreen(QWidget):
                 reader = self._playback.reader
                 if reader is not None:
                     self._show_frame(reader.index)
+            elif event == "recovery_done" and isinstance(payload, tuple) and len(payload) == 2:
+                updated_coach, merged_recovery = payload
+                self._coach_data = updated_coach
+                try:
+                    if self._playback.archive is not None:
+                        path = self._playback.archive.path
+                        index = self._playback.selected_segment_index or 0
+                        frame = self._playback.reader.index if self._playback.reader else 0
+                        self._analysis_cancel = None
+                        self._active_analysis_job = None
+                        self.load_archive(path, segment_index=index)
+                        if self._playback.reader is not None:
+                            self._show_frame(min(frame, self._playback.reader.count - 1))
+                    else:
+                        self._update_calibration_comparison()
+                        if self._playback.reader is not None:
+                            self._show_frame(self._playback.reader.index)
+                except (OSError, ValueError, UnicodeError, KeyError, BadZipFile) as error:
+                    self.bridge.status_message.emit(f"Could not refresh archive after recovery: {error}")
+                msg = (
+                    str(merged_recovery.get("status_message") or "").strip()
+                    if isinstance(merged_recovery, Mapping)
+                    else ""
+                )
+                self.analysis_status.setText(msg or "Targeted tracking recovery updated.")
             elif event == "cancelled":
                 self.analysis_status.setText("Posture analysis canceled.")
             elif event == "error":
@@ -1884,6 +2330,7 @@ class ReviewScreen(QWidget):
         alert_text, alert_tone = snapshot["alert"]
         self._set_alert(alert_text, alert_tone)
         self.insights_text.setText(snapshot["details"])
+        self._update_tracking_evidence_ui(frame_index)
         self._publish_review_context(frame_index)
 
     def _update_time_label(self) -> None:

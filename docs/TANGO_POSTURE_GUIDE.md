@@ -1560,6 +1560,27 @@ Additional instruction accompanying the report.
 measurements." This requests different commentary; it does not change
 numeric limits, run new video inference or make medical assessments valid.
 
+### Measurement normalization (Review)
+
+**Location:** **Settings -> Review & Ollama -> Measurement normalization** (also reachable via **Measurement normalization settings…** in **Review**).
+
+Measurement normalization adds an optional, per-metric additive offset (`reference_scale_raw = observed_raw + offset`, wrapped modulo `360°` onto `[-180°, 180°)` for cyclic metrics `head_inclination` and `trunk_inclination`) before `Evaluator` temporal smoothing during offline **Review** comparisons. Approved `.tpc` bounds remain untouched on the reference scale, and source media, cached landmarks, and saved Markdown reports are never modified.
+
+**Important — neutral baseline vs. posture habits:** Use measurement normalization **only** to remove a verified camera-angle, lens, clothing, or teacher-vs-student anatomical baseline difference observed during aligned neutral holds. Never normalize away genuine student posture habits (such as habitual forward head or dropped chin). Each pair is explicitly scoped to one calibration profile (`.tpc`) and one practice/reference recording (`Apply this adjustment in Review`), while unconfigured comparisons continue to show `Original calibration scale · no adjustment applied`.
+
+**Worked example (Matched holds & Review):**
+Suppose a student compares a practice clip against an approved **Head pitch** range of `1.0°` to `5.0°`:
+1. Select a separate neutral **Fit hold** on both recordings: reference Fit hold median is `3.0°` and practice Fit hold median is `7.0°`, yielding signed offset `−4.0°`.
+2. Select a non-overlapping neutral **Check hold** on both recordings: reference Check hold median is `3.2°` and practice Check hold median is `7.4°`. Applying `−4.0°` gives corrected check `7.4° + (−4.0°) = 3.4°`, an error of `0.2°` (within the default `1.0°` maximum verification error -> `Verified on check hold`).
+3. In the Settings preview row, entering raw `8.0°` (or clicking **Use current Review frame**) maps to `4.00°` inside `1.0..5.0°`, whereas raw `11.0°` maps to `7.00°` outside `1.0..5.0°`.
+4. In **Review**, frame `8.0°` feeds `4.0°` into the temporal `Evaluator` (shown as `Raw 8.0° · Adjustment −4.0° · Reference scale 4.0°` and `Used for assessment (smoothed)`), producing `WITHIN_REFERENCE`.
+
+**Safety gates & recheck (`Needs recheck`):**
+- Matched holds require separate, non-overlapping Fit and Check windows meeting **Minimum valid frames** (`8`), **Minimum hold coverage** (`0.60`), and **Maximum verification error** (`1.0`).
+- Applicability binds to profile bounds digest, measurement settings fingerprint, raw media SHA-256, and landmark frame fingerprints: renaming an archive file preserves normalization automatically, whereas reanalyzing landmarks, editing profile bounds, or changing measurement settings triggers `Needs recheck` (leaving original calibration scale in Review until rechecked).
+- **Adjustment unavailable:** If an offset would shift a bounded or unsigned metric outside its physical domain (such as `knee_flexion < 0°`, `knee_flexion > 180°`, or `shoulder_clearance < 0`), Review marks the frame `Unavailable · Not applied` and evaluates the unadjusted observation instead.
+- Saved Markdown reports and **AI Coach** always reflect the original unadjusted analysis scale and display a notice banner when viewed alongside normalized Review comparisons.
+
 ### Calibration defaults rows
 
 Each row in `[calibration_defaults]` has **Use**, minimum, maximum and applicable view (`side`, `front`, `all`).

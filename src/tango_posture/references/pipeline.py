@@ -652,6 +652,57 @@ def analyze_clip(
         "frames": {str(k): v for k, v in coach_pending.items()},
     }
 
+    should_recover = cfg.replay_recovery_auto if recover_tracking is None else bool(recover_tracking)
+    pose_recovery: dict[str, Any] | None = None
+    if should_recover:
+        try:
+            pose_recovery = run_clip_tracking_recovery(
+                video_path=probe.path,
+                coach_data=coach_data,
+                cfg=cfg,
+                movement_data=movement_data,
+                model_path=model_path if model_path.is_file() else None,
+                estimator_factory=estimator_factory,
+                progress_callback=progress_callback,
+                cancel_check=cancel_check,
+            )
+            coach_data["pose_recovery"] = pose_recovery
+            coach_data = interpolate_coach_data(
+                coach_data,
+                cfg,
+                pose_recovery=pose_recovery,
+                movement_data=movement_data,
+            )
+        except ImportCancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - fallback preserves forward tracking and base analytics
+            logger.warning("Tracking recovery failed; keeping forward tracking: %s", exc)
+            pose_recovery = {
+                "schema_version": 1,
+                "status": "failed",
+                "status_message": f"Tracking recovery failed ({exc}); keeping forward tracking.",
+                "source_sha256": source_sha,
+                "model_name": cfg.analysis_model,
+                "model_sha256": model_hash,
+                "source_width": probe.width,
+                "source_height": probe.height,
+                "video_fps": round(float(probe.fps), 4),
+                "frame_count": len(decoded_frames),
+                "summary": {
+                    "windows_detected": 0,
+                    "windows_attempted": 0,
+                    "windows_recovered": 0,
+                    "windows_unresolved": 0,
+                    "windows_skipped_budget": 0,
+                    "recovered_frames": 0,
+                    "recovered_joints": 0,
+                    "interpolated_joints": 0,
+                },
+                "windows": [],
+                "frames": {},
+            }
+            coach_data["pose_recovery"] = pose_recovery
+
     coverage = _compute_family_coverage(
         clip_duration=clip_duration,
         total_frames=len(decoded_frames),
@@ -725,6 +776,7 @@ def analyze_clip(
         session_id=session.id if session is not None else None,
         session_summary=session_summary,
         session_events=session_events,
+        pose_recovery=pose_recovery,
     )
 
 
@@ -752,6 +804,7 @@ def analyse_imported_clip(
     cancel_check: Callable[[], bool] | None = None,
     youtube_downloader: Callable[[str, Path], Path] | None = None,
     facebook_downloader: Callable[[str, Path], Path] | None = None,
+    recover_tracking: bool | None = None,
 ) -> ImportedClipResult:
     """Import and analyse a selected range `[selected_in, selected_out)` of a local video file.
 
@@ -861,6 +914,7 @@ def analyse_imported_clip(
         progress_callback=progress_callback,
         cancel_check=cancel_check,
         probe=probe,
+        recover_tracking=recover_tracking,
     )
 
     clip_in = clip_result.selected_in
@@ -1007,4 +1061,5 @@ def analyse_imported_clip(
         facebook_reel=facebook_link,
         coach_path=companion_coach_path,
         coach_data=coach_data,
+        pose_recovery=clip_result.pose_recovery,
     )

@@ -18,6 +18,7 @@ from ..archive import (
     read_analytics,
     read_manifest,
 )
+from ..pose.recovery import rebase_pose_recovery
 from ..replay import VideoReader, save_overlay_video
 from .errors import ImportCancelledError
 
@@ -107,6 +108,28 @@ def promote_reference(
                         if int(key) >= start_frame and (end_frame is None or int(key) < end_frame)
                     }
                     coach["source_sha256"] = file_sha256(media["video"])
+                    if coach.get("pose_recovery") is not None:
+                        rebased = rebase_pose_recovery(
+                            coach["pose_recovery"],
+                            start_frame,
+                            end_frame,
+                            new_source_sha256=coach["source_sha256"],
+                        )
+                        if rebased is None:
+                            coach.pop("pose_recovery", None)
+                        else:
+                            coach["pose_recovery"] = rebased
+                if analytics.get("pose_recovery") is not None:
+                    rebased_top = rebase_pose_recovery(
+                        analytics["pose_recovery"],
+                        start_frame,
+                        end_frame,
+                        new_source_sha256=coach.get("source_sha256") if coach else None,
+                    )
+                    if rebased_top is None:
+                        analytics.pop("pose_recovery", None)
+                    else:
+                        analytics["pose_recovery"] = rebased_top
                 if excerpt:
                     analytics.pop("session", None)
                     analytics["movement_data"] = None

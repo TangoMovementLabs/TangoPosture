@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import shutil
 import stat
@@ -24,6 +25,8 @@ else:  # pragma: no cover
     fcntl = None  # type: ignore[assignment]
 
 from .domain import Calibration
+
+logger = logging.getLogger(__name__)
 
 _locks: dict[Path, threading.RLock] = {}
 _locks_guard = threading.Lock()
@@ -164,6 +167,56 @@ def _validate_analytics(data: Any, index: int) -> dict[str, Any]:
             or (timestamps and int(key) >= len(timestamps))
         ):
             raise ValueError("Invalid archived coach frame index")
+    from .pose.recovery import validate_pose_recovery_payload
+
+    coach = data.get("coach_data")
+    valid_indices = {int(k) for k in coach_frames} if coach_frames else None
+    ts_list = [float(t) for t in timestamps] if timestamps else None
+    frame_count = len(timestamps) if timestamps else None
+    if isinstance(coach, dict) and coach.get("pose_recovery") is not None:
+        try:
+            dancer_sel = (
+                coach.get("dancer_selection")
+                if isinstance(coach.get("dancer_selection"), dict)
+                else None
+            )
+            validate_pose_recovery_payload(
+                coach["pose_recovery"],
+                frame_count=frame_count,
+                valid_frame_indices=valid_indices,
+                timestamps=ts_list,
+                source_sha256=coach.get("source_sha256"),
+                model_sha256=coach.get("model_hash"),
+                source_width=coach.get("width"),
+                source_height=coach.get("height"),
+                dancer_selection=dancer_sel,
+            )
+        except (ValueError, TypeError) as exc:
+            logger.warning("Ignoring invalid or stale pose_recovery in archived analytics %s: %s", name, exc)
+            coach = dict(coach)
+            coach.pop("pose_recovery", None)
+            data = {**data, "coach_data": coach}
+    if data.get("pose_recovery") is not None:
+        try:
+            coach_meta = data.get("coach_data") if isinstance(data.get("coach_data"), dict) else {}
+            validate_pose_recovery_payload(
+                data["pose_recovery"],
+                frame_count=frame_count,
+                valid_frame_indices=valid_indices,
+                timestamps=ts_list,
+                source_sha256=coach_meta.get("source_sha256"),
+                model_sha256=coach_meta.get("model_hash") or data.get("model_hash"),
+                source_width=coach_meta.get("width"),
+                source_height=coach_meta.get("height"),
+                dancer_selection=(
+                    coach_meta.get("dancer_selection")
+                    if isinstance(coach_meta.get("dancer_selection"), dict)
+                    else None
+                ),
+            )
+        except (ValueError, TypeError) as exc:
+            logger.warning("Ignoring invalid or stale top-level pose_recovery in %s: %s", name, exc)
+            data = {k: v for k, v in data.items() if k != "pose_recovery"}
     return data
 
 

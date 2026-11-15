@@ -661,6 +661,13 @@ class LibraryScreen(QWidget):
         form.addRow("Title:", title_input)
         form.addRow("Clip start (seconds):", start_input)
         form.addRow("Clip end (seconds):", end_input)
+        recover_gaps_cb = QCheckBox("Recover short tracking gaps")
+        recover_gaps_cb.setObjectName("recoverGapsCheckBox")
+        recover_gaps_cb.setChecked(bool(self.bridge.config.replay_recovery_auto))
+        recover_gaps_cb.setToolTip(
+            "Run display-only backward pose recovery on short lower-limb dropouts during import."
+        )
+        form.addRow(recover_gaps_cb)
         form.addRow(
             QLabel(
                 f"Movement review · maximum clip length {MAX_IMPORT_RANGE_SECONDS:.0f} seconds. "
@@ -692,10 +699,17 @@ class LibraryScreen(QWidget):
             selected_in,
             selected_out,
             title_input.text().strip() or probe.path.stem,
+            recover_tracking=recover_gaps_cb.isChecked(),
         )
 
     def _start_import(
-        self, path: Path | str, selected_in: float, selected_out: float | None, title: str,
+        self,
+        path: Path | str,
+        selected_in: float,
+        selected_out: float | None,
+        title: str,
+        *,
+        recover_tracking: bool | None = None,
     ) -> None:
         self._package_cancel.clear()
         self._import_cfg = self.bridge.config.model_copy(deep=True)
@@ -710,6 +724,11 @@ class LibraryScreen(QWidget):
                 title=title,
                 analysis_mode="movement",
                 analyse_soundtrack=False,
+                recover_tracking=(
+                    bool(self._import_cfg.replay_recovery_auto)
+                    if recover_tracking is None
+                    else bool(recover_tracking)
+                ),
             )
         except (OSError, RuntimeError, ValueError) as error:
             self.import_status.setText(f"Could not start import: {error}")

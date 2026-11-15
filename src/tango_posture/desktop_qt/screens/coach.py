@@ -138,6 +138,14 @@ class CoachScreen(QWidget):
         )
         self.status_label.setWordWrap(True)
         result_layout.addWidget(self.status_label)
+        self.normalization_notice_lbl = QLabel(
+            "Notice: AI Coach analyzes this saved Markdown report from the original unadjusted analysis scale. "
+            "Normalized adjustments shown in Review do not alter saved report files."
+        )
+        self.normalization_notice_lbl.setWordWrap(True)
+        self.normalization_notice_lbl.setStyleSheet(f"color: {COLOR_COPPER}; font-size: 12px;")
+        self.normalization_notice_lbl.setVisible(False)
+        result_layout.addWidget(self.normalization_notice_lbl)
         self.progress = QProgressBar()
         self.progress.setRange(0, 1)
         self.progress.setValue(0)
@@ -177,14 +185,21 @@ class CoachScreen(QWidget):
             return
         archive: PracticeArchive | None = None
         segment_index: int | None = None
+        normalized_review = False
         try:
             if isinstance(source, dict):
-                path = source.get("archive_path")
-                index = source.get("segment_index")
-                if not isinstance(path, Path) or not isinstance(index, int):
-                    raise TypeError("Invalid archive report selection.")
-                archive = PracticeArchive(path)
-                segment_index = index
+                normalized_review = bool(source.get("normalized_review"))
+                if "report_path" in source and isinstance(source.get("report_path"), Path):
+                    path = source["report_path"]
+                    if path.suffix.lower() != ".md":
+                        raise ValueError("Choose a Markdown report or a .tp/.tpc archive.")
+                else:
+                    path = source.get("archive_path")
+                    index = source.get("segment_index")
+                    if not isinstance(path, Path) or not isinstance(index, int):
+                        raise TypeError("Invalid archive report selection.")
+                    archive = PracticeArchive(path)
+                    segment_index = index
             elif isinstance(source, Path):
                 path = source
                 if path.suffix.lower() in (".tp", ".tpc", ".tpr"):
@@ -242,6 +257,7 @@ class CoachScreen(QWidget):
         self.status_label.setText(
             "Report loaded. Ollama will receive this report only after you click Analyze."
         )
+        self.normalization_notice_lbl.setVisible(normalized_review)
         self.analyze_btn.setEnabled(True)
         self.export_btn.setEnabled(False)
         self._refresh_saved_analyses()
