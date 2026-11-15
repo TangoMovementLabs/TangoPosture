@@ -123,7 +123,7 @@ def test_review_calibration_picker_compares_cached_ranges_without_settings_fallb
         assert widget.alerts_text.text() == "Select a calibration profile to see posture alerts."
         widget.reference_combo.setCurrentIndex(widget.reference_combo.findData(str(calibration.resolve())))
         assert widget.alerts_text.text() == "No active posture alert on this frame."
-        assert "No approved" in widget.metric_values["shoulder_elev_pct"].text()
+        assert widget.metric_values["shoulder_elev_pct"].text() == "Not in profile"
         assert "Head only" in widget.insights_text.text()
         assert "normalized_clearance" not in widget.insights_text.text()
         target.metrics["head_pitch"].lower = -180
@@ -219,12 +219,13 @@ def test_review_approved_pink_axis_uses_old_raw_cache_and_abstains_on_missing_hi
             widget.reference_combo.findData(str(calibration.resolve())),
         )
         widget._show_frame(2)
-        assert "24.1 degrees" in widget.metric_values["torso_axis_tilt"].text()
+        assert widget.metric_values["torso_axis_tilt"].text() == "24.1°"
+        assert widget.metric_ranges["torso_axis_tilt"].text() == "Approved 0.0° to 5.0°"
         assert "Torso axis tilt (pink line)" in widget.alerts_text.text()
         assert "outside approved range" in widget.alerts_text.text()
-        assert "No approved" in widget.metric_values["head_angle"].text()
+        assert widget.metric_values["head_angle"].text() == "Not in profile"
         widget._show_frame(3)
-        assert "No approved / valid measurement" in widget.metric_values["torso_axis_tilt"].text()
+        assert widget.metric_values["torso_axis_tilt"].text() == "Not measured"
         assert "tracking/view" in widget.alerts_text.text()
         assert "right_hip" not in data["frames"]["3"]["measurement_poses"][0]
     finally:
@@ -891,6 +892,7 @@ def test_review_posture_analysis_can_be_cancelled(screen, video, monkeypatch, qa
         qapp.processEvents()
         time.sleep(0.01)
     assert started.is_set()
+    assert not screen.cancel_analysis_btn.isHidden()
     screen._cancel_posture_analysis()
 
     deadline = time.monotonic() + 3
@@ -902,6 +904,7 @@ def test_review_posture_analysis_can_be_cancelled(screen, video, monkeypatch, qa
     assert screen._analysis_thread is None
     assert screen.analysis_status.text() == "Posture analysis canceled."
     assert all(value.text() == "Not observed" for value in screen.metric_values.values())
+    assert screen.cancel_analysis_btn.isHidden()
 
 
 def test_local_video_decodes_seeks_and_plays_to_real_end(screen, video):
@@ -1377,3 +1380,82 @@ def test_navigation_parent_close_and_destruction_release_resources(qapp, video, 
     assert not reader.cap.isOpened()
     assert not archive.folder.exists()
     playback.close()  # Cleanup is idempotent.
+
+
+def test_review_sorts_calibrations_by_name_and_date_with_formatted_timestamps(qapp, tmp_path):
+    cfg = Config(data_dir=str(tmp_path))
+    cal_dir = tmp_path / "calibrations"
+    base_range = ApprovedRange(
+        lower=-10.0,
+        upper=10.0,
+        unit="degrees",
+        view="all",
+        passages=[Passage(start=0.0, end=2.0)],
+        median=0.0,
+        p10=-5.0,
+        p90=5.0,
+        valid_duration=2.0,
+        selected_duration=2.0,
+        samples=20,
+        inside_fraction=1.0,
+    )
+    entries = [
+        ("z-id", "Zulu Walk", "2026-11-10T09:15:00", "zulu.tpc"),
+        ("a-id", "Alpha Embrace", "2026-11-14T20:05:00", "alpha.tpc"),
+        ("m-id", "Medio Pivot", "2026-11-12T14:30:00", "medio.tpc"),
+    ]
+    for cal_id, name, created_at, filename in entries:
+        rp = RangeProfile(
+            id=cal_id,
+            name=name,
+            created_at_utc=created_at,
+            context="Solo walking",
+            model_hash=MANIFEST["sha256"],
+            capture_profile=profile(cfg, 64, 48, "video"),
+            source={"archive": "ref.tpr"},
+            metrics={"head_pitch": base_range},
+        )
+        save_range_profile(cal_dir / filename, rp)
+
+    widget = ReviewScreen(ServiceBridge(cfg), Router())
+    try:
+        # Default sort: Name (A-Z) with dd/mm/yyyy HH:mm label
+        labels = [widget.reference_combo.itemText(i) for i in range(1, widget.reference_combo.count())]
+        assert labels == [
+            "Alpha Embrace (14/11/2026 20:05)",
+            "Medio Pivot (12/11/2026 14:30)",
+            "Zulu Walk (10/11/2026 09:15)",
+        ]
+
+        widget.reference_sort_combo.setCurrentIndex(
+            widget.reference_sort_combo.findData("name_desc")
+        )
+        labels = [widget.reference_combo.itemText(i) for i in range(1, widget.reference_combo.count())]
+        assert labels == [
+            "Zulu Walk (10/11/2026 09:15)",
+            "Medio Pivot (12/11/2026 14:30)",
+            "Alpha Embrace (14/11/2026 20:05)",
+        ]
+
+        widget.reference_sort_combo.setCurrentIndex(
+            widget.reference_sort_combo.findData("date_asc")
+        )
+        labels = [widget.reference_combo.itemText(i) for i in range(1, widget.reference_combo.count())]
+        assert labels == [
+            "Zulu Walk (10/11/2026 09:15)",
+            "Medio Pivot (12/11/2026 14:30)",
+            "Alpha Embrace (14/11/2026 20:05)",
+        ]
+
+        widget.reference_sort_combo.setCurrentIndex(
+            widget.reference_sort_combo.findData("date_desc")
+        )
+        labels = [widget.reference_combo.itemText(i) for i in range(1, widget.reference_combo.count())]
+        assert labels == [
+            "Alpha Embrace (14/11/2026 20:05)",
+            "Medio Pivot (12/11/2026 14:30)",
+            "Zulu Walk (10/11/2026 09:15)",
+        ]
+    finally:
+        widget.close()
+

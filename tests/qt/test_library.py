@@ -1,17 +1,23 @@
 """Qt Library discovers persisted reports and opens source files without copying them."""
 
+import re
 import threading
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from PySide6.QtWidgets import QApplication, QMessageBox, QPushButton
+from PySide6.QtWidgets import QApplication, QLabel, QMessageBox, QPushButton
 
 from tango_posture.archive import append_segment, read_manifest, save_calibration_archive
+from tango_posture.calibration.archives import save_range_profile
+from tango_posture.calibration.baseline import profile as build_capture_profile
+from tango_posture.calibration.models import ApprovedRange, Passage, RangeProfile
 from tango_posture.config import Config
 from tango_posture.desktop_qt.router import Route, Router
-from tango_posture.desktop_qt.screens.library import LibraryScreen
+from tango_posture.desktop_qt.screens.library import LibraryScreen, ProfileDetailsDialog
 from tango_posture.desktop_qt.service_bridge import ServiceBridge
+from tango_posture.models import MANIFEST
 from tango_posture.references.archives import promote_reference
 from tango_posture.references.errors import ImportCancelledError
 from tango_posture.references.results import ImportedClipResult
@@ -302,4 +308,130 @@ def test_library_has_no_online_download_or_live_calibration_buttons(qapp, tmp_pa
     assert not hasattr(screen, "url_import_btn")
     assert not hasattr(screen, "calibration_btn")
     screen.close()
+
+
+def test_library_formats_dates_and_sorts_by_name_and_date(qapp, tmp_path, monkeypatch):
+    bridge = ServiceBridge(Config(data_dir=str(tmp_path)))
+    entries = [
+        {
+            "name": "Zebra",
+            "path": tmp_path / "zebra.tp",
+            "segments_count": 1,
+            "created_at": "2026-11-10T09:15:00",
+        },
+        {
+            "name": "Alpha",
+            "path": tmp_path / "alpha.tp",
+            "segments_count": 2,
+            "created_at": "2026-11-14T18:45:00",
+        },
+        {
+            "name": "Medio",
+            "path": tmp_path / "medio.tp",
+            "segments_count": 1,
+            "created_at": "2026-11-12T12:05:00Z",
+        },
+    ]
+    monkeypatch.setattr(bridge, "list_library_archives", lambda: entries)
+    screen = LibraryScreen(bridge, Router())
+    try:
+        # Default sort is date_desc (newest first)
+        assert [screen.table.item(r, 0).text() for r in range(3)] == ["Alpha", "Medio", "Zebra"]
+        assert screen.table.item(0, 2).text() == "14/11/2026 18:45"
+        assert screen.table.item(2, 2).text() == "10/11/2026 09:15"
+        expected_medio = (
+            datetime.fromisoformat("2026-11-12T12:05:00+00:00")
+            .astimezone()
+            .strftime("%d/%m/%Y %H:%M")
+        )
+        assert screen.table.item(1, 2).text() == expected_medio
+        for r in range(3):
+            assert re.fullmatch(r"\d{2}/\d{2}/\d{4} \d{2}:\d{2}", screen.table.item(r, 2).text())
+
+        # Sort by Name A-Z then toggle header click to Name Z-A
+        screen.sort_combo.setCurrentIndex(screen.sort_combo.findData("name_asc"))
+        assert [screen.table.item(r, 0).text() for r in range(3)] == ["Alpha", "Medio", "Zebra"]
+        assert screen.table.cellWidget(0, 3) is not None
+
+        screen._on_header_clicked(0)
+        assert screen.sort_combo.currentData() == "name_desc"
+        assert [screen.table.item(r, 0).text() for r in range(3)] == ["Zebra", "Medio", "Alpha"]
+
+        # Sort by Date oldest via header click on Date/Created column
+        screen._on_header_clicked(2)
+        assert screen.sort_combo.currentData() == "date_desc"
+        screen._on_header_clicked(2)
+        assert screen.sort_combo.currentData() == "date_asc"
+        assert [screen.table.item(r, 0).text() for r in range(3)] == ["Zebra", "Medio", "Alpha"]
+    finally:
+        screen.close()
+
+
+def test_profile_details_dialog_renders_structured_layout_and_metrics(
+    qapp, tmp_path, monkeypatch
+):
+    cfg = Config(data_dir=str(tmp_path))
+    calibration = tmp_path / "calibrations" / "PivotBaseline.tpc"
+    profile = RangeProfile(
+        name="Pivot Baseline",
+        created_at_utc="2026-11-14T08:30:00",
+        context="Solo walking",
+        model_hash=MANIFEST["sha256"],
+        capture_profile=build_capture_profile(cfg, 1280, 720, "video"),
+        source={"archive": "teacher_walk.tpr"},
+        metrics={
+            "head_pitch": ApprovedRange(
+                lower=-12.0,
+                upper=8.0,
+                unit="degrees",
+                view="side",
+                passages=[Passage(start=0.0, end=5.0)],
+                median=-2.0,
+                p10=-10.0,
+                p90=6.0,
+                valid_duration=4.5,
+                selected_duration=5.0,
+                samples=45,
+                inside_fraction=0.92,
+            ),
+            "torso_axis_tilt": ApprovedRange(
+                lower=0.0,
+                upper=5.5,
+                unit="degrees",
+                view="all",
+                passages=[Passage(start=0.0, end=5.0)],
+                median=2.1,
+                p10=0.5,
+                p90=4.8,
+                valid_duration=5.0,
+                selected_duration=5.0,
+                samples=50,
+                inside_fraction=1.0,
+            ),
+        },
+    )
+    save_range_profile(calibration, profile)
+    screen = LibraryScreen(ServiceBridge(cfg), Router())
+    monkeypatch.setattr(ProfileDetailsDialog, "exec", lambda self: int(self.DialogCode.Accepted))
+    try:
+        screen._profile_details(calibration)
+        dialog = screen._profile_dialog
+        assert isinstance(dialog, ProfileDetailsDialog)
+        label_texts = [lbl.text() for lbl in dialog.findChildren(QLabel)]
+        assert "Pivot Baseline" in label_texts
+        assert "Solo walking" in label_texts
+        assert "14/11/2026 08:30" in label_texts
+        assert "Left side · Right facing" in label_texts
+        assert "1280×720" in label_texts
+        assert "teacher_walk.tpr" in label_texts
+        assert dialog.metrics_table.rowCount() == 2
+        assert dialog.metrics_table.item(0, 0).text() == "Head"
+        assert dialog.metrics_table.item(0, 1).text() == "Head pitch (ear-to-nose)"
+        assert "-12° … 8°" in dialog.metrics_table.item(0, 2).text()
+        assert dialog.metrics_table.item(1, 0).text() == "Torso"
+        assert dialog.metrics_table.item(1, 4).text() == "All"
+        dialog.close()
+    finally:
+        screen.close()
+
 

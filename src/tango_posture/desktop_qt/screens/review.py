@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -43,9 +44,9 @@ from ...archive import (
     store_analytics,
 )
 from ...calibration.baseline import load_calibration_file
+from ...calibration.models import METRIC_DETAILS, ApprovedRange, profile_from_calibration
 from ...movement import render_floor_guide, render_movement_overlay, validate_movement_analysis
 from ...references.coach import (
-    coach_notes_for_frame,
     compare_coach_data,
     interpolate_coach_data,
     render_coach_frame_overlay,
@@ -64,9 +65,13 @@ from ..review.analysis import (
 )
 from ..review.playback import VIDEO_SUFFIXES, ReviewPlayback
 from ..router import Route, Router
-from ..service_bridge import ServiceBridge
+from ..service_bridge import ServiceBridge, created_at_timestamp, format_created_at
 from ..theme import (
+    COLOR_BASE,
+    COLOR_BORDER,
+    COLOR_COPPER,
     COLOR_DANGER,
+    COLOR_ELEVATED,
     COLOR_SUCCESS,
     COLOR_TEXT_MUTED,
     COLOR_TEXT_PRIMARY,
@@ -74,6 +79,54 @@ from ..theme import (
 )
 
 REPLAY_ERRORS = (OSError, ValueError, RuntimeError, BadZipFile, cv2.error)
+
+_TONE_COLORS = {
+    "muted": COLOR_TEXT_MUTED,
+    "danger": COLOR_DANGER,
+    "warning": COLOR_WARNING,
+    "success": COLOR_SUCCESS,
+}
+_STATE_TONES = {
+    "WITHIN_REFERENCE": ("success", "Within approved range"),
+    "PENDING": ("warning", "Leaving approved range"),
+    "DEVIATION": ("danger", "Outside approved range"),
+    "UNKNOWN": ("muted", "Not measurable on this frame"),
+}
+_DISPLAY_METRICS = (
+    ("head_angle", "head_pitch"),
+    ("shoulder_elev_pct", "shoulder_clearance"),
+    ("axis_curve_smoothed", "hip_offset"),
+    ("torso_axis_tilt", "torso_axis_tilt"),
+    ("knee_bend_deg", "knee_flexion"),
+)
+
+
+def _section_label(text: str) -> QLabel:
+    label = QLabel(text.upper())
+    label.setStyleSheet(
+        f"color: {COLOR_COPPER}; font-size: 10px; font-weight: 700; letter-spacing: 1px;"
+    )
+    return label
+
+
+def _caption_label(text: str) -> QLabel:
+    label = QLabel(text)
+    label.setWordWrap(True)
+    label.setStyleSheet(f"color: {COLOR_TEXT_MUTED}; font-size: 11px;")
+    return label
+
+
+def _rgba(color: str, alpha: float) -> str:
+    red, green, blue = (int(color[index:index + 2], 16) for index in (1, 3, 5))
+    return f"rgba({red}, {green}, {blue}, {alpha})"
+
+
+def _format_measure(value: float, unit: str) -> str:
+    if unit == "degrees":
+        return f"{value:.1f}°"
+    if unit in {"axis_lengths", "torso_lengths"}:
+        return f"{value * 100:+.1f}%"
+    return f"{value:.2f}"
 
 
 class ReviewScreen(QWidget):
@@ -102,6 +155,8 @@ class ReviewScreen(QWidget):
         self._coach_data: dict[str, Any] | None = None
         self._compared_coach_data: dict[str, Any] | None = None
         self._calibration_error = ""
+        self._calibration_targets: dict[str, ApprovedRange] = {}
+        self._calibration_name = ""
         self._movement_data: dict[str, Any] | None = None
         self._analysis_events: queue.SimpleQueue[tuple[int, str, object]] = queue.SimpleQueue()
         self._analysis_cancel: Event | None = None
@@ -147,7 +202,7 @@ class ReviewScreen(QWidget):
         self.export_btn.clicked.connect(self._export_video)
         self.export_btn.setEnabled(False)
 
-        self.analytics_btn = QPushButton("Analyze posture & movement")
+        self.analytics_btn = QPushButton("Analyze posture && movement")
         self.analytics_btn.setEnabled(False)
         self.analytics_btn.setToolTip(
             "Analyze the raw video in the background to add synchronized skeleton and posture insights."
@@ -247,73 +302,143 @@ class ReviewScreen(QWidget):
         # Tab 1: Frame Insights
         insights_tab = QWidget()
         it_layout = QVBoxLayout(insights_tab)
-        it_layout.setContentsMargins(8, 10, 8, 10)
-        self.analysis_status = QLabel(
+        it_layout.setContentsMargins(4, 12, 4, 12)
+        it_layout.setSpacing(8)
+
+        # Analysis
+        it_layout.addWidget(_section_label("Analysis"))
+        self.analytics_btn.setProperty("class", "primary")
+        self.cancel_analysis_btn = QPushButton("Cancel analysis")
+        self.cancel_analysis_btn.setEnabled(False)
+        self.cancel_analysis_btn.setVisible(False)
+        self.cancel_analysis_btn.setToolTip("Stop the running analysis; the archive stays unchanged.")
+        self.cancel_analysis_btn.clicked.connect(self._cancel_posture_analysis)
+        it_layout.addWidget(self.analytics_btn)
+        it_layout.addWidget(self.cancel_analysis_btn)
+        self.analysis_status = _caption_label(
             "Analyze a raw video to add synchronized posture insights. Analysis runs in the background."
         )
-        self.analysis_status.setWordWrap(True)
-        self.analysis_status.setStyleSheet(f"color: {COLOR_TEXT_MUTED}; font-size: 11px;")
-        it_layout.addWidget(self.analytics_btn)
         it_layout.addWidget(self.analysis_status)
-        it_layout.addWidget(QLabel("Calibration profile:"))
+        it_layout.addSpacing(6)
+
+        # Calibration profile
+        cal_header = QHBoxLayout()
+        cal_header.addWidget(_section_label("Calibration profile"))
+        cal_header.addStretch()
+        self.reference_sort_combo = QComboBox()
+        self.reference_sort_combo.addItem("Name A–Z", "name_asc")
+        self.reference_sort_combo.addItem("Name Z–A", "name_desc")
+        self.reference_sort_combo.addItem("Newest first", "date_desc")
+        self.reference_sort_combo.addItem("Oldest first", "date_asc")
+        self.reference_sort_combo.setToolTip("Sort calibration profiles")
+        self.reference_sort_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.reference_sort_combo.setMinimumContentsLength(8)
+        self.reference_sort_combo.setStyleSheet("font-size: 11px; padding: 2px 6px;")
+        self.reference_sort_combo.currentIndexChanged.connect(lambda _: self.refresh())
+        cal_header.addWidget(self.reference_sort_combo)
+        it_layout.addLayout(cal_header)
         self.reference_combo = QComboBox()
+        self.reference_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        self.reference_combo.setMinimumContentsLength(12)
         self.reference_combo.currentIndexChanged.connect(self._calibration_changed)
         it_layout.addWidget(self.reference_combo)
-        self.show_coach_cb = QCheckBox("Skeleton / posture overlay")
-        self.show_torso_axis_cb = QCheckBox("Torso axis angle (pink line)")
+        it_layout.addSpacing(6)
+
+        # Overlay layers
+        it_layout.addWidget(_section_label("Overlay layers"))
+        self.show_coach_cb = QCheckBox("Skeleton")
+        self.show_coach_cb.setToolTip(
+            "Show the tracked skeleton. With a calibration selected, approved metrics and alerts are drawn too."
+        )
+        self.show_torso_axis_cb = QCheckBox("Torso axis")
         self.show_torso_axis_cb.setToolTip(
-            "Show the shoulder-to-hip midpoint line and its angle from image vertical. "
+            "Show the pink shoulder-to-hip midpoint line and its angle from image vertical. "
             "This is a measurement, not an alert."
         )
         self.show_pivots_cb = QCheckBox("Pivot rings")
         self.show_steps_cb = QCheckBox("Step footprints")
-        self.lines_only_cb = QCheckBox("Lines only on floor")
+        self.lines_only_cb = QCheckBox("Floor lines only")
+        self.lines_only_cb.setToolTip("Hide the video and show only the drawn lines on the floor.")
         for checkbox in (self.show_coach_cb, self.show_pivots_cb, self.show_steps_cb):
             checkbox.setChecked(True)
-        for checkbox in (
+        layers = QGridLayout()
+        layers.setHorizontalSpacing(12)
+        layers.setVerticalSpacing(6)
+        for position, checkbox in enumerate((
             self.show_coach_cb, self.show_torso_axis_cb, self.show_pivots_cb,
             self.show_steps_cb, self.lines_only_cb,
-        ):
+        )):
             checkbox.toggled.connect(self._refresh_overlay)
-            it_layout.addWidget(checkbox)
-        self.axis_status = QLabel()
-        self.axis_status.setWordWrap(True)
-        self.axis_status.setStyleSheet(f"color: {COLOR_TEXT_MUTED}; font-size: 11px;")
+            layers.addWidget(checkbox, position // 2, position % 2)
+        it_layout.addLayout(layers)
+        self.axis_status = _caption_label("")
+        self.axis_status.setVisible(False)
         it_layout.addWidget(self.axis_status)
+        it_layout.addSpacing(6)
 
+        # Frame status and metrics
+        it_layout.addWidget(_section_label("This frame"))
+        self.alerts_text = QLabel("Posture alerts will appear here when a frame is analyzed.")
+        self.alerts_text.setWordWrap(True)
+        self._set_alert(self.alerts_text.text(), "muted")
+        it_layout.addWidget(self.alerts_text)
+
+        metrics_card = QFrame()
+        metrics_card.setObjectName("metricsCard")
+        metrics_card.setStyleSheet(
+            f"QFrame#metricsCard {{ background-color: {COLOR_BASE}; "
+            f"border: 1px solid {COLOR_BORDER}; border-radius: 6px; }}"
+        )
+        metrics_grid = QGridLayout(metrics_card)
+        metrics_grid.setContentsMargins(10, 8, 10, 8)
+        metrics_grid.setHorizontalSpacing(8)
+        metrics_grid.setVerticalSpacing(2)
+        metrics_grid.setColumnStretch(1, 1)
         self.metric_values: dict[str, QLabel] = {}
-        for key, title in (
+        self.metric_states: dict[str, QLabel] = {}
+        self.metric_ranges: dict[str, QLabel] = {}
+        for row_index, (key, title) in enumerate((
             ("head_angle", "Head alignment"),
             ("shoulder_elev_pct", "Shoulder height"),
             ("axis_curve_smoothed", "Torso / hip alignment"),
-            ("torso_axis_tilt", "Torso axis (pink line)"),
+            ("torso_axis_tilt", "Torso axis"),
             ("knee_bend_deg", "Knee bend"),
-        ):
-            row = QHBoxLayout()
+        )):
+            state_dot = QLabel("●")
+            state_dot.setFixedWidth(12)
             name_label = QLabel(title)
-            name_label.setStyleSheet(f"color: {COLOR_TEXT_MUTED};")
+            name_label.setStyleSheet(f"color: {COLOR_TEXT_PRIMARY}; font-weight: 500;")
+            name_label.setWordWrap(True)
+            range_label = QLabel()
+            range_label.setWordWrap(True)
+            range_label.setStyleSheet(f"color: {COLOR_TEXT_MUTED}; font-size: 10px;")
+            range_label.setVisible(False)
             value_label = QLabel("Not observed")
             value_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            row.addWidget(name_label, 1)
-            row.addWidget(value_label)
-            it_layout.addLayout(row)
+            if row_index:
+                divider = QFrame()
+                divider.setFixedHeight(1)
+                divider.setStyleSheet(f"background-color: {COLOR_BORDER};")
+                metrics_grid.addWidget(divider, row_index * 3 - 1, 0, 1, 3)
+            base = row_index * 3
+            metrics_grid.addWidget(state_dot, base, 0, 2, 1, Qt.AlignmentFlag.AlignVCenter)
+            metrics_grid.addWidget(name_label, base, 1)
+            metrics_grid.addWidget(range_label, base + 1, 1)
+            metrics_grid.addWidget(value_label, base, 2, 2, 1, Qt.AlignmentFlag.AlignVCenter)
             self.metric_values[key] = value_label
+            self.metric_states[key] = state_dot
+            self.metric_ranges[key] = range_label
+            self._set_metric_state(key, None)
+        it_layout.addWidget(metrics_card)
 
-        self.alerts_text = QLabel("Posture alerts will appear here when a frame is analyzed.")
-        self.alerts_text.setWordWrap(True)
-        self.alerts_text.setStyleSheet(f"color: {COLOR_TEXT_MUTED}; font-weight: 600;")
-        it_layout.addWidget(self.alerts_text)
-
-        self.insights_text = QLabel(
+        self.insights_text = _caption_label(
             "The original video remains unchanged. Analysis follows the same posture thresholds as live practice."
         )
-        self.insights_text.setWordWrap(True)
-        self.insights_text.setStyleSheet(f"color: {COLOR_TEXT_PRIMARY}; font-size: 12px;")
         it_layout.addWidget(self.insights_text)
-        self.cancel_analysis_btn = QPushButton("Cancel analysis")
-        self.cancel_analysis_btn.setEnabled(False)
-        self.cancel_analysis_btn.clicked.connect(self._cancel_posture_analysis)
-        it_layout.addWidget(self.cancel_analysis_btn)
         it_layout.addStretch()
 
         # Tab 2: Report Markdown
@@ -338,6 +463,7 @@ class ReviewScreen(QWidget):
         insights_scroll = QScrollArea()
         insights_scroll.setWidgetResizable(True)
         insights_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        insights_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         insights_scroll.setWidget(insights_tab)
         tabs.addTab(insights_scroll, "Insights")
         tabs.addTab(report_tab, "Report")
@@ -362,12 +488,33 @@ class ReviewScreen(QWidget):
 
     def refresh(self) -> None:
         selected = self.reference_combo.currentData()
+        sort_mode = self.reference_sort_combo.currentData()
+        references = [
+            reference
+            for reference in self.bridge.list_references()
+            if reference.path.suffix.lower() == ".tpc" and reference.path.is_file()
+        ]
+        if sort_mode == "name_asc":
+            references.sort(key=lambda ref: (ref.name.casefold(), str(ref.path)))
+        elif sort_mode == "name_desc":
+            references.sort(key=lambda ref: (ref.name.casefold(), str(ref.path)), reverse=True)
+        elif sort_mode == "date_asc":
+            references.sort(key=lambda ref: created_at_timestamp(ref.created_at, ref.path))
+        elif sort_mode == "date_desc":
+            references.sort(key=lambda ref: -created_at_timestamp(ref.created_at, ref.path))
+
         self.reference_combo.blockSignals(True)
         self.reference_combo.clear()
         self.reference_combo.addItem("No calibration (visuals only)", None)
-        for reference in self.bridge.list_references():
-            if reference.path.suffix.lower() == ".tpc" and reference.path.is_file():
-                self.reference_combo.addItem(reference.name, str(reference.path))
+        for reference in references:
+            date_label = format_created_at(reference.created_at, reference.path)
+            label = f"{reference.name} ({date_label})" if date_label != "Recent" else reference.name
+            self.reference_combo.addItem(label, str(reference.path))
+            self.reference_combo.setItemData(
+                self.reference_combo.count() - 1,
+                f"{reference.name} · Created {date_label}",
+                Qt.ItemDataRole.ToolTipRole,
+            )
         index = self.reference_combo.findData(selected)
         if selected is not None and index < 0:
             self.reference_combo.addItem(f"Unavailable calibration: {Path(selected).name}", selected)
@@ -379,6 +526,8 @@ class ReviewScreen(QWidget):
     def _update_calibration_comparison(self) -> None:
         self._compared_coach_data = None
         self._calibration_error = ""
+        self._calibration_targets = {}
+        self._calibration_name = ""
         selected = self.reference_combo.currentData()
         if self._coach_data is None:
             return
@@ -390,6 +539,10 @@ class ReviewScreen(QWidget):
                 if reference is None:
                     raise ValueError(f"Calibration not found: {path.name}")
                 data = compare_coach_data(data, self.bridge.config, reference)
+                range_profile = profile_from_calibration(reference)
+                if range_profile is not None:
+                    self._calibration_targets = dict(range_profile.metrics)
+                    self._calibration_name = range_profile.name
             self._compared_coach_data = interpolate_coach_data(
                 data, self.bridge.config,
             )
@@ -461,7 +614,9 @@ class ReviewScreen(QWidget):
             self._playback_error(error)
 
     def _open_file(self) -> None:
-        path = self.bridge.choose_library_archive(self, "Open Library archive")
+        path = self.bridge.choose_library_archive(
+            self, "Open Library archive", self.reference_sort_combo.currentData()
+        )
         if path is not None:
             self.load_archive(path)
 
@@ -734,7 +889,9 @@ class ReviewScreen(QWidget):
             self.bridge.status_message.emit("Open a saved report first.")
 
     def _open_comparison(self) -> None:
-        path = self.bridge.choose_library_archive(self, "Compare Library archive")
+        path = self.bridge.choose_library_archive(
+            self, "Compare Library archive", self.reference_sort_combo.currentData()
+        )
         if path is None:
             return
         self._load_comparison(path)
@@ -843,6 +1000,7 @@ class ReviewScreen(QWidget):
                         )
                     except (TypeError, ValueError) as error:
                         self.axis_status.setText(f"Axis unavailable: {error}")
+            self.axis_status.setVisible(bool(self.axis_status.text()))
             frame = render_movement_overlay(
                 frame,
                 self._movement_data,
@@ -906,6 +1064,7 @@ class ReviewScreen(QWidget):
         self.cancel_analysis_btn.setEnabled(
             self._analysis_cancel is not None and not self._analysis_cancel.is_set()
         )
+        self.cancel_analysis_btn.setVisible(running or self.cancel_analysis_btn.isEnabled())
 
     def _start_posture_analysis(self) -> None:
         if self._analysis_thread is not None:
@@ -935,6 +1094,7 @@ class ReviewScreen(QWidget):
         self._active_analysis_job = job_id
         self.analysis_status.setText("Preparing posture analysis…")
         self.cancel_analysis_btn.setEnabled(True)
+        self.cancel_analysis_btn.setVisible(True)
         self.analytics_btn.setEnabled(False)
         self._analysis_timer.start()
         cfg = self.bridge.config.model_copy(deep=True)
@@ -1130,39 +1290,60 @@ class ReviewScreen(QWidget):
             self._analysis_timer.stop()
             self._update_analysis_controls()
 
+    def _set_alert(self, text: str, tone: str) -> None:
+        color = _TONE_COLORS[tone]
+        background = COLOR_ELEVATED if tone == "muted" else _rgba(color, 0.14)
+        text_color = COLOR_TEXT_MUTED if tone == "muted" else COLOR_TEXT_PRIMARY
+        self.alerts_text.setText(text)
+        self.alerts_text.setStyleSheet(
+            f"background-color: {background}; border-left: 3px solid {color}; "
+            f"border-radius: 4px; padding: 8px 10px; color: {text_color}; font-weight: 600;"
+        )
+
+    def _set_metric_state(self, key: str, state: str | None, detail: str = "") -> None:
+        tone, label = _STATE_TONES.get(state or "", ("muted", "No calibration comparison"))
+        color = _TONE_COLORS[tone] if state else COLOR_BORDER
+        dot = self.metric_states[key]
+        dot.setStyleSheet(f"color: {color}; font-size: 12px;")
+        tooltip = f"{label}\n{detail}" if detail else label
+        dot.setToolTip(tooltip)
+        self.metric_values[key].setToolTip(tooltip)
+        value_color = COLOR_TEXT_MUTED if state in (None, "UNKNOWN") else _TONE_COLORS[tone]
+        if state == "WITHIN_REFERENCE" or state is None:
+            value_color = COLOR_TEXT_PRIMARY
+        self.metric_values[key].setStyleSheet(
+            f"color: {value_color}; font-weight: 600;"
+        )
+
+    def _reset_metrics(self, text: str = "Not observed") -> None:
+        for key, value in self.metric_values.items():
+            value.setText(text)
+            self.metric_ranges[key].setVisible(False)
+            self._set_metric_state(key, None)
+
     def _update_frame_insights(self, frame_index: int) -> None:
         data = self._display_coach_data()
+        idle_note = (
+            "Analyze the raw video to track the skeleton and measure posture. "
+            "Existing full-lines recordings retain their original overlay."
+        )
         if self._calibration_error:
-            for value in self.metric_values.values():
-                value.setText("Not observed")
-            self.alerts_text.setText(self._calibration_error)
-            self.alerts_text.setStyleSheet(f"color: {COLOR_TEXT_MUTED}; font-weight: 600;")
+            self._reset_metrics()
+            self._set_alert(self._calibration_error, "warning")
             self.insights_text.setText("Posture comparison is unavailable.")
             return
         if data is None:
-            for value in self.metric_values.values():
-                value.setText("Not observed")
-            self.alerts_text.setText(
-                self._calibration_error or "No synchronized posture analysis is loaded."
-            )
-            self.alerts_text.setStyleSheet(f"color: {COLOR_TEXT_MUTED}; font-weight: 600;")
-            self.insights_text.setText(
-                "Analyze the raw video to track the skeleton and measure posture. "
-                "Existing full-lines recordings retain their original overlay."
-            )
+            self._reset_metrics()
+            self._set_alert("No synchronized posture analysis is loaded.", "muted")
+            self.insights_text.setText(idle_note)
             return
 
         frames = data.get("frames")
         entry = frames.get(str(frame_index)) if isinstance(frames, dict) else None
         if not isinstance(entry, dict):
-            for value in self.metric_values.values():
-                value.setText("Not observed")
-            self.alerts_text.setText("No pose data is available for this frame.")
-            self.alerts_text.setStyleSheet(f"color: {COLOR_TEXT_MUTED}; font-weight: 600;")
-            self.insights_text.setText(
-                "Analyze the raw video to track the skeleton and measure posture. "
-                "Existing full-lines recordings retain their original overlay."
-            )
+            self._reset_metrics()
+            self._set_alert("No pose data is available for this frame.", "muted")
+            self.insights_text.setText(idle_note)
             return
 
         def metric(name: str, suffix: str, scale: float = 1.0, signed: bool = False) -> str:
@@ -1173,6 +1354,7 @@ class ReviewScreen(QWidget):
             format_spec = "+.1f" if signed else ".1f"
             return f"{number:{format_spec}}{suffix}"
 
+        self._reset_metrics()
         self.metric_values["head_angle"].setText(metric("head_angle", "°", signed=True))
         self.metric_values["shoulder_elev_pct"].setText(
             metric("shoulder_elev_pct", "%", signed=True)
@@ -1182,47 +1364,61 @@ class ReviewScreen(QWidget):
         )
         self.metric_values["knee_bend_deg"].setText(metric("knee_bend_deg", "°"))
         self.metric_values["torso_axis_tilt"].setText(metric("torso_axis_tilt", "°"))
-        if self._using_range_targets():
-            rows = {row["metric"]: row for row in entry.get("calibration_rows", [])}
-            for display_key, key in (
-                ("head_angle", "head_pitch"), ("shoulder_elev_pct", "shoulder_clearance"),
-                ("axis_curve_smoothed", "hip_offset"), ("knee_bend_deg", "knee_flexion"),
-                ("torso_axis_tilt", "torso_axis_tilt"),
-            ):
-                row = rows.get(key)
-                measured_value = row.get("smoothed") if row is not None else None
-                self.metric_values[display_key].setText(
-                    f"{measured_value:.3g} {row['unit']}"
-                    if measured_value is not None and row is not None else "No approved / valid measurement"
-                )
 
         if not self._using_range_targets():
-            self.alerts_text.setText("Select a calibration profile to see posture alerts.")
-            self.alerts_text.setStyleSheet(f"color: {COLOR_TEXT_MUTED}; font-weight: 600;")
+            self._set_alert("Select a calibration profile to see posture alerts.", "muted")
             self.insights_text.setText("Tracking and movement are shown without posture coaching.")
             return
 
+        rows = {row["metric"]: row for row in entry.get("calibration_rows", [])}
+        for display_key, key in _DISPLAY_METRICS:
+            row = rows.get(key)
+            target = self._calibration_targets.get(key)
+            range_label = self.metric_ranges[display_key]
+            if row is None:
+                self.metric_values[display_key].setText("Not in profile")
+                self._set_metric_state(display_key, None, "This calibration did not approve this metric.")
+                self.metric_values[display_key].setStyleSheet(f"color: {COLOR_TEXT_MUTED};")
+                continue
+            unit = str(row.get("unit", ""))
+            measured_value = row.get("smoothed")
+            self.metric_values[display_key].setText(
+                _format_measure(float(measured_value), unit)
+                if isinstance(measured_value, int | float) else "Not measured"
+            )
+            if target is not None:
+                range_label.setText(
+                    f"Approved {_format_measure(target.lower, unit)} to "
+                    f"{_format_measure(target.upper, unit)}"
+                )
+                range_label.setVisible(True)
+            self._set_metric_state(display_key, str(row.get("state")), str(row.get("reason") or ""))
+
         message = entry.get("message")
         poses = entry.get("measurement_poses", entry.get("poses"))
+        unknown = [row for row in rows.values() if row.get("state") == "UNKNOWN"]
         if isinstance(message, str) and message.strip():
-            self.alerts_text.setText(message.strip())
-            self.alerts_text.setStyleSheet(f"color: {COLOR_DANGER}; font-weight: 600;")
+            self._set_alert(
+                "\n".join(f"• {part.strip()}" for part in message.split(";") if part.strip()),
+                "danger",
+            )
         elif not poses:
-            self.alerts_text.setText("No dancer detected; posture alerts are unavailable.")
-            self.alerts_text.setStyleSheet(f"color: {COLOR_WARNING}; font-weight: 600;")
-        elif any(row.get("state") == "UNKNOWN" for row in entry.get("calibration_rows", [])):
-            self.alerts_text.setText("Some approved-range measurements are unavailable (tracking/view).")
-            self.alerts_text.setStyleSheet(f"color: {COLOR_WARNING}; font-weight: 600;")
+            self._set_alert("No dancer detected; posture alerts are unavailable.", "warning")
+        elif unknown:
+            self._set_alert(
+                "Some approved-range measurements are unavailable (tracking/view).", "warning",
+            )
         else:
-            self.alerts_text.setText("No active posture alert on this frame.")
-            self.alerts_text.setStyleSheet(f"color: {COLOR_SUCCESS}; font-weight: 600;")
+            self._set_alert("No active posture alert on this frame.", "success")
 
-        notes = coach_notes_for_frame(data, frame_index)
-        self.insights_text.setText(
-            "\n".join(notes)
-            if notes
-            else "Frame-level metric notes are not available for this sample."
-        )
+        details = [f"Compared with {self._calibration_name or self.reference_combo.currentText()}."]
+        reasons: dict[str, list[str]] = {}
+        for row in unknown:
+            label = METRIC_DETAILS.get(row["metric"], ("", row["metric"]))[1]
+            reasons.setdefault(str(row.get("reason") or "Not visible"), []).append(label)
+        for reason, labels in reasons.items():
+            details.append(f"Not measured — {', '.join(labels)}: {reason}.")
+        self.insights_text.setText("\n".join(details))
 
     def _update_time_label(self) -> None:
         self.time_label.setText(

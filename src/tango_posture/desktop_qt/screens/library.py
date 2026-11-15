@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Event, Thread
 from typing import Any
 
 import cv2
-from PySide6.QtCore import QFile, QObject, QTimer, Signal
+from PySide6.QtCore import QFile, QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QApplication,
@@ -20,6 +21,7 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFormLayout,
     QFrame,
+    QGridLayout,
     QHBoxLayout,
     QHeaderView,
     QInputDialog,
@@ -36,6 +38,7 @@ from PySide6.QtWidgets import (
 
 from ...archive import PracticeArchive, _archive_lock, rename_archive
 from ...calibration.archives import read_range_profile
+from ...calibration.models import METRIC_DETAILS, RangeProfile
 from ...references.archives import promote_reference, reference_directory, reference_path
 from ...references.constants import MAX_IMPORT_RANGE_SECONDS
 from ...references.results import ImportedClipResult
@@ -45,7 +48,181 @@ from ...replay import VideoReader
 from ...review import report_directory
 from ..library.archives import archive_report
 from ..router import Route, Router
-from ..service_bridge import ServiceBridge
+from ..service_bridge import (
+    ServiceBridge,
+    format_created_at,
+    sort_named_dated_items,
+)
+
+
+def _format_metric_unit(unit: str) -> str:
+    return {
+        "degrees": "°",
+        "torso_lengths": "torso len",
+        "axis_lengths": "axis len",
+        "normalized_clearance": "clearance",
+    }.get(unit, unit)
+
+
+class ProfileDetailsDialog(QDialog):
+    """Structured modal dialog displaying a saved calibration profile's metadata and ranges."""
+
+    def __init__(
+        self,
+        profile: RangeProfile,
+        path: Path,
+        parent: QWidget | None = None,
+        *,
+        on_use_defaults: Callable[[], None] | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.profile = profile
+        self.path = path
+        self.setWindowTitle(f"Calibration Profile — {profile.name}")
+        self.resize(780, 520)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(14)
+
+        # Summary Card
+        summary_card = QFrame()
+        summary_card.setProperty("class", "card")
+        summary_layout = QVBoxLayout(summary_card)
+        summary_layout.setContentsMargins(16, 14, 16, 14)
+        summary_layout.setSpacing(10)
+
+        header_row = QHBoxLayout()
+        header_row.setSpacing(8)
+        title_label = QLabel(profile.name)
+        title_label.setProperty("class", "title")
+        header_row.addWidget(title_label)
+        header_row.addStretch()
+
+        context_badge = QLabel(profile.context)
+        context_badge.setProperty("class", "badge")
+        version_badge = QLabel(profile.measurement_version)
+        version_badge.setProperty("class", "badge")
+        header_row.addWidget(context_badge)
+        header_row.addWidget(version_badge)
+        summary_layout.addLayout(header_row)
+
+        capture = profile.capture_profile
+        side = str(capture.get("side", "left")).capitalize()
+        facing = str(capture.get("facing", "right")).capitalize()
+        width = capture.get("width", "?")
+        height = capture.get("height", "?")
+        source_name = str(
+            profile.source.get("archive")
+            or capture.get("source")
+            or path.name
+        )
+        created_text = format_created_at(profile.created_at_utc, path)
+
+        meta_grid = QGridLayout()
+        meta_grid.setHorizontalSpacing(18)
+        meta_grid.setVerticalSpacing(6)
+        metadata_items = [
+            ("Date Created:", created_text),
+            ("Capture Orientation:", f"{side} side · {facing} facing"),
+            ("Resolution:", f"{width}×{height}"),
+            ("Source:", source_name),
+        ]
+        for idx, (label_text, value_text) in enumerate(metadata_items):
+            row = idx // 2
+            col = (idx % 2) * 2
+            key_lbl = QLabel(label_text)
+            key_lbl.setProperty("class", "subtitle")
+            val_lbl = QLabel(value_text)
+            val_lbl.setWordWrap(True)
+            meta_grid.addWidget(key_lbl, row, col)
+            meta_grid.addWidget(val_lbl, row, col + 1)
+        meta_grid.setColumnStretch(1, 1)
+        meta_grid.setColumnStretch(3, 1)
+        summary_layout.addLayout(meta_grid)
+        layout.addWidget(summary_card)
+
+        # Approved Posture Ranges Card
+        ranges_card = QFrame()
+        ranges_card.setProperty("class", "card")
+        ranges_layout = QVBoxLayout(ranges_card)
+        ranges_layout.setContentsMargins(16, 14, 16, 14)
+        ranges_layout.setSpacing(10)
+
+        ranges_header = QHBoxLayout()
+        ranges_title = QLabel("Approved Posture Ranges")
+        ranges_title.setStyleSheet("font-size: 14px; font-weight: 600;")
+        count_badge = QLabel(f"{len(profile.metrics)} metrics")
+        count_badge.setProperty("class", "badge")
+        ranges_header.addWidget(ranges_title)
+        ranges_header.addStretch()
+        ranges_header.addWidget(count_badge)
+        ranges_layout.addLayout(ranges_header)
+
+        self.metrics_table = QTableWidget(len(profile.metrics), 6)
+        self.metrics_table.setHorizontalHeaderLabels(
+            ["Body Part", "Measurement", "Approved Range", "Median (P10–P90)", "View", "Coverage"]
+        )
+        self.metrics_table.verticalHeader().setVisible(False)
+        self.metrics_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.metrics_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        header_view = self.metrics_table.horizontalHeader()
+        header_view.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header_view.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        for col in (2, 3, 4, 5):
+            header_view.setSectionResizeMode(col, QHeaderView.ResizeMode.ResizeToContents)
+
+        for row_idx, (key, value) in enumerate(profile.metrics.items()):
+            body_part, label, default_unit = METRIC_DETAILS.get(key, ("Posture", key, value.unit))
+            unit_suffix = _format_metric_unit(value.unit or default_unit)
+            sep = "" if unit_suffix == "°" else " "
+            range_text = f"{value.lower:.4g}{sep}{unit_suffix} … {value.upper:.4g}{sep}{unit_suffix}"
+            stats_text = (
+                f"{value.median:.4g}{sep}{unit_suffix} "
+                f"({value.p10:.4g}–{value.p90:.4g})"
+            )
+            coverage_text = (
+                f"{value.valid_duration:.1f}/{value.selected_duration:.1f}s "
+                f"({value.samples} samples)"
+            )
+            row_values = (
+                body_part,
+                label,
+                range_text,
+                stats_text,
+                value.view.capitalize(),
+                coverage_text,
+            )
+            for col_idx, cell_text in enumerate(row_values):
+                item = QTableWidgetItem(cell_text)
+                if col_idx in (2, 3, 5):
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                elif col_idx == 4:
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.metrics_table.setItem(row_idx, col_idx, item)
+        self.metrics_table.resizeRowsToContents()
+        ranges_layout.addWidget(self.metrics_table)
+        layout.addWidget(ranges_card, 1)
+
+        # Footer
+        footer = QHBoxLayout()
+        footer_note = QLabel(
+            "Scoring and Review comparisons use these saved ranges directly; "
+            "the original reference video is not required."
+        )
+        footer_note.setProperty("class", "subtitle")
+        footer_note.setWordWrap(True)
+        footer.addWidget(footer_note, 1)
+
+        if on_use_defaults is not None:
+            defaults_btn = QPushButton("Use as Settings defaults")
+            defaults_btn.clicked.connect(on_use_defaults)
+            footer.addWidget(defaults_btn)
+        close_btn = QPushButton("Close")
+        close_btn.setProperty("class", "primary")
+        close_btn.clicked.connect(self.accept)
+        footer.addWidget(close_btn)
+        layout.addLayout(footer)
 
 
 class _ImportEvents(QObject):
@@ -67,6 +244,7 @@ class LibraryScreen(QWidget):
         self._package_cancel = Event()
         self._package_thread: Thread | None = None
         self._package_events: Queue[tuple[Any, ...]] = Queue()
+        self._profile_dialog: ProfileDetailsDialog | None = None
         self._package_timer = QTimer(self)
         self._package_timer.setInterval(100)
         self._package_timer.timeout.connect(self._poll_package_events)
@@ -120,6 +298,16 @@ class LibraryScreen(QWidget):
             lambda _: self._filter_table(self.search_input.text())
         )
         search_row.addWidget(self.type_filter)
+        search_row.addWidget(QLabel("Sort by:"))
+        self.sort_combo = QComboBox()
+        self.sort_combo.addItem("Date created (newest)", "date_desc")
+        self.sort_combo.addItem("Date created (oldest)", "date_asc")
+        self.sort_combo.addItem("Name (A–Z)", "name_asc")
+        self.sort_combo.addItem("Name (Z–A)", "name_desc")
+        self.sort_combo.currentIndexChanged.connect(
+            lambda _: self._filter_table(self.search_input.text())
+        )
+        search_row.addWidget(self.sort_combo)
         self.import_reference_cb = QCheckBox("Import as reference")
         self.import_reference_cb.setChecked(True)
         search_row.addWidget(self.import_reference_cb)
@@ -133,10 +321,15 @@ class LibraryScreen(QWidget):
 
         self.table = QTableWidget(0, 5)
         self.table.setHorizontalHeaderLabels(["Name", "Recordings", "Date / Created", "Actions", "Type"])
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        header_view = self.table.horizontalHeader()
+        header_view.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        header_view.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        header_view.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header_view.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        header_view.setSectionsClickable(True)
+        header_view.setSortIndicatorShown(True)
+        header_view.setSortIndicator(2, Qt.SortOrder.DescendingOrder)
+        header_view.sectionClicked.connect(self._on_header_clicked)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         tf_layout.addWidget(self.table)
@@ -173,13 +366,37 @@ class LibraryScreen(QWidget):
         self.practices = self.bridge.list_library_archives()
         self._filter_table(self.search_input.text())
 
+    def _on_header_clicked(self, logical_index: int) -> None:
+        current = self.sort_combo.currentData()
+        if logical_index == 0:
+            target = "name_desc" if current == "name_asc" else "name_asc"
+        elif logical_index == 2:
+            target = "date_asc" if current == "date_desc" else "date_desc"
+        else:
+            return
+        idx = self.sort_combo.findData(target)
+        if idx >= 0:
+            self.sort_combo.setCurrentIndex(idx)
+
     def _filter_table(self, query: str) -> None:
         q = query.strip().lower()
         suffix = self.type_filter.currentData()
+        sort_mode = self.sort_combo.currentData()
+        self.practices = sort_named_dated_items(self.practices, sort_mode)
         filtered = [
             p for p in self.practices
             if q in p["name"].lower() and (not suffix or p["path"].suffix.lower() == suffix)
         ]
+
+        header_view = self.table.horizontalHeader()
+        if sort_mode == "name_asc":
+            header_view.setSortIndicator(0, Qt.SortOrder.AscendingOrder)
+        elif sort_mode == "name_desc":
+            header_view.setSortIndicator(0, Qt.SortOrder.DescendingOrder)
+        elif sort_mode == "date_asc":
+            header_view.setSortIndicator(2, Qt.SortOrder.AscendingOrder)
+        else:
+            header_view.setSortIndicator(2, Qt.SortOrder.DescendingOrder)
 
         self.table.setRowCount(0)
         for row_idx, p in enumerate(filtered):
@@ -187,7 +404,8 @@ class LibraryScreen(QWidget):
             self.table.setItem(row_idx, 0, QTableWidgetItem(p["name"]))
             segments = "Report" if p.get("kind") == "report" else str(p["segments_count"])
             self.table.setItem(row_idx, 1, QTableWidgetItem(segments))
-            self.table.setItem(row_idx, 2, QTableWidgetItem(p["created_at"] or "Recent"))
+            created_display = format_created_at(p.get("created_at", ""), p.get("path"))
+            self.table.setItem(row_idx, 2, QTableWidgetItem(created_display))
             self.table.setItem(row_idx, 4, QTableWidgetItem(p["path"].suffix))
 
             profile_only = p["segments_count"] == 0
@@ -241,16 +459,14 @@ class LibraryScreen(QWidget):
     def _profile_details(self, path: Path) -> None:
         try:
             profile = read_range_profile(path)
-            metrics = "\n".join(
-                f"• {key}: {value.lower:.4g} … {value.upper:.4g} {value.unit} · {value.view} · "
-                f"{'camera checked' if value.camera_check_passed else 'comparison only'}"
-                for key, value in profile.metrics.items()
+            dialog = ProfileDetailsDialog(
+                profile,
+                path,
+                self,
+                on_use_defaults=lambda: self._use_defaults(path),
             )
-            QMessageBox.information(
-                self, profile.name,
-                f"{profile.context}\n{profile.measurement_version}\n\n{metrics}\n\n"
-                "Scoring uses these saved ranges; the original reference video is not required.",
-            )
+            self._profile_dialog = dialog
+            dialog.exec()
         except (OSError, ValueError, KeyError) as error:
             self.import_status.setText(f"Cannot read profile: {error}")
 

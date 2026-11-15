@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -30,6 +31,63 @@ def numpy_to_qimage(image_bgr: Any) -> QImage:
     # Note: store buffer reference so memory isn't collected prematurely
     qimg = QImage(rgb.data, width, height, bytes_per_line, QImage.Format.Format_RGB888)
     return qimg.copy()
+
+
+def parse_created_at(created_at: str | None, path: Path | None = None) -> tuple[str, float]:
+    """Return (dd/mm/yyyy HH:mm label, unix_timestamp) for an ISO timestamp or file path."""
+    if isinstance(created_at, str) and created_at.strip():
+        raw = created_at.strip()
+        try:
+            dt = datetime.fromisoformat(raw)
+            if dt.tzinfo is not None:
+                dt = dt.astimezone()
+            return dt.strftime("%d/%m/%Y %H:%M"), dt.timestamp()
+        except ValueError:
+            pass
+    if path is not None:
+        try:
+            if path.exists():
+                mtime = path.stat().st_mtime
+                dt = datetime.fromtimestamp(mtime)
+                return dt.strftime("%d/%m/%Y %H:%M"), float(mtime)
+        except OSError:
+            pass
+    return "Recent", 0.0
+
+
+def format_created_at(created_at: str | None, path: Path | None = None) -> str:
+    """Format an ISO timestamp or file modification time as dd/mm/yyyy HH:mm."""
+    return parse_created_at(created_at, path)[0]
+
+
+def created_at_timestamp(created_at: str | None, path: Path | None = None) -> float:
+    """Return a sortable local/UTC unix timestamp for an ISO timestamp or file path."""
+    return parse_created_at(created_at, path)[1]
+
+
+def sort_named_dated_items(
+    items: list[dict[str, Any]], sort_by: str | None
+) -> list[dict[str, Any]]:
+    """Sort archive or item dictionaries by name or creation timestamp."""
+    ordered = list(items)
+    if sort_by == "name_asc":
+        ordered.sort(
+            key=lambda item: (str(item.get("name", "")).casefold(), str(item.get("path", "")))
+        )
+    elif sort_by == "name_desc":
+        ordered.sort(
+            key=lambda item: (str(item.get("name", "")).casefold(), str(item.get("path", ""))),
+            reverse=True,
+        )
+    elif sort_by == "date_asc":
+        ordered.sort(
+            key=lambda item: created_at_timestamp(item.get("created_at", ""), item.get("path"))
+        )
+    elif sort_by == "date_desc":
+        ordered.sort(
+            key=lambda item: -created_at_timestamp(item.get("created_at", ""), item.get("path"))
+        )
+    return ordered
 
 
 class ServiceBridge(QObject):
@@ -153,6 +211,7 @@ class ServiceBridge(QObject):
                             side=prof.get("side", "left"),
                             facing=prof.get("facing", "right"),
                             camera=str(prof.get("camera", 0)),
+                            created_at=getattr(ref, "created_at_utc", ""),
                             is_archive=path.suffix.lower() == ".tpc",
                             scoring_ready=ranges is None or any(
                                 value.camera_check_passed for value in ranges.metrics.values()
@@ -225,14 +284,24 @@ class ServiceBridge(QObject):
                     self.status_message.emit(f"Library archive unavailable: {path.name}: {error}")
         return items
 
-    def choose_library_archive(self, parent: Any, title: str) -> Path | None:
+    def choose_library_archive(
+        self, parent: Any, title: str, sort_by: str | None = None
+    ) -> Path | None:
         from PySide6.QtWidgets import QInputDialog
 
         items = [item for item in self.list_library_archives() if item["segments_count"]]
         if not items:
             self.status_message.emit("Library is empty. Import a video through Library first.")
             return None
-        labels = [f"{item['name']} — {item['path'].name}" for item in items]
+        if sort_by is not None:
+            items = sort_named_dated_items(items, sort_by)
+        labels = []
+        for item in items:
+            date_label = format_created_at(item.get("created_at", ""), item.get("path"))
+            if date_label != "Recent":
+                labels.append(f"{item['name']} ({date_label}) — {item['path'].name}")
+            else:
+                labels.append(f"{item['name']} — {item['path'].name}")
         selected, accepted = QInputDialog.getItem(parent, title, "Library archive:", labels, 0, False)
         return items[labels.index(selected)]["path"] if accepted else None
 

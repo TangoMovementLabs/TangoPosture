@@ -96,8 +96,8 @@ approval.
 
 ### Rule 4: a missing measurement is not a good measurement
 
-**UNKNOWN**, **Unavailable**, **Not observed**, or
-**No approved / valid measurement** means the app cannot make that comparison.
+**UNKNOWN**, **Unavailable**, **Not observed**, **Not measured** (grey dot), or
+**Not in profile** means the app cannot make that comparison.
 It does not mean that the joint is correctly aligned.
 
 You may see a smooth-looking skeleton even when the underlying measurement is
@@ -136,8 +136,8 @@ and **Settings**. You do not need a References button in the navigation rail.
 | Analyze a recording's raw video | **Review**, frame-insights panel | **Analyze posture & movement** |
 | Draw the skeleton during practice | **Live Practice** | **Skeleton (V)** |
 | Show the pink torso axis during practice | **Live Practice** | **Vertical axis (Y)** |
-| Show synchronized skeleton/posture in Review | **Review**, frame-insights panel | **Skeleton / posture overlay** |
-| Show the pink torso axis and angle in Review | **Review**, frame-insights panel | **Torso axis angle (pink line)** |
+| Show synchronized skeleton/posture in Review | **Review**, frame-insights panel | **Overlay layers > Skeleton** |
+| Show the pink torso axis and angle in Review | **Review**, frame-insights panel | **Overlay layers > Torso axis** |
 | Copy approved ranges into default Settings | Calibration editor | **Use approved ranges as Settings defaults...** |
 | Copy an already saved profile into defaults | **Library**, profile-only `.tpc` row | **Use as Settings defaults** |
 | Edit copied ranges | **Settings > Calibration defaults** | **Use**, minimum, maximum and view for each metric |
@@ -1026,13 +1026,13 @@ to invent the other hip.
 An interpolated skeleton can look complete while this raw measurement remains
 UNKNOWN.
 
-In **Review**, turn on **Torso axis angle (pink line)** to see this line, its
+In **Review**, turn on **Torso axis** under **Overlay layers** to see this line, its
 vertical guide and its current angle independently of the skeleton checkbox.
 It is off initially. It uses cached raw landmarks, so a missing or unreliable
 shoulder or hip hides the axis even if the displayed skeleton is interpolated.
 It is a visual measurement, not an alert: alerts still require an approved
 calibration. Older caches without raw landmarks need video reanalysis.
-**Lines only on floor** hides the angle label while leaving the
+**Floor lines only** hides the angle label while leaving the
 axis lines visible. Dynamic controls require a raw/source video, not a baked
 overlay.
 

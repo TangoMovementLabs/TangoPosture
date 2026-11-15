@@ -1362,12 +1362,13 @@ history interval.
 
 ### Review checkboxes are presentation controls
 
-In the Review inspector, controls include:
+In the Review inspector, **Overlay layers** include:
 
-- **Skeleton / posture overlay**.
+- **Skeleton**.
+- **Torso axis** (pink line).
 - **Pivot rings**.
 - **Step footprints**.
-- **Lines only on floor**.
+- **Floor lines only**.
 
 Hiding a layer does not erase its analysis events or alter event counts.
 Choosing floor-only presentation does not calibrate a floor.

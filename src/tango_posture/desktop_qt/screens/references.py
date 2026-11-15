@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
 from ...config import Config
 from ...core.entities import ReferenceSummary
 from ..router import Route, Router
-from ..service_bridge import ServiceBridge
+from ..service_bridge import ServiceBridge, format_created_at
 from ..theme import COLOR_TEXT_MUTED
 
 
@@ -156,6 +156,7 @@ class ReferencesScreen(QWidget):
         self.detail_name.setText(ref.name)
         self.detail_meta.setText(
             f"ID: {ref.id[:8]}...\n"
+            f"Created: {format_created_at(ref.created_at, ref.path)}\n"
             f"Measurement side: {ref.side.capitalize()}\n"
             f"Facing: {ref.facing.capitalize()}\n"
             f"Camera device: {ref.camera}\n"

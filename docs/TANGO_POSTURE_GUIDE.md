@@ -252,7 +252,7 @@ This applies to analyzed raw/source Review streams, not live capture or baked ov
 Enable **Pivot rings** and **Step footprints** to display the same
 confidence-qualified movement evidence from the shared analysis pipeline. Existing archive movement
 data is loaded when available. Counts of zero mean no qualifying movement was
-detected, not that an overlay is hidden. **Lines only on floor** switches to
+detected, not that an overlay is hidden. **Floor lines only** switches to
 the raw/source stream and replaces the dancer pixels with a neutral floor,
 drawing only skeleton lines and the selected movement marks, without posture
 messages. **Open Comparison…** opens the selected Library archive's raw video
@@ -1166,11 +1166,12 @@ stream of a single dancer filmed from a fixed, approximately level camera:
 
 - **Controls**:
   - **Analyze posture & movement**: Runs (or re-runs) the offline pose pass on the entire selected recording, up to 120 seconds. Successful archived re-analysis replaces the cached results, both overlay videos and the complete report, including the actual pose model, version and SHA-256. The raw video remains unchanged. The saved overlays show tracking and movement without calibration alerts; select a calibration in Review for those alerts. **Cancel analysis** stops a running job; cancellation or failure preserves the previous archive.
-  - **Torso axis angle (pink line)**: Optionally shows the shoulder-midpoint to hip-midpoint line and its angle from image vertical, independently of the skeleton. Both shoulders and hips must be reliably observed; interpolation does not supply missing measurement landmarks. This visual cue alone does not produce an alert.
+  - **Torso axis** (pink line): Optionally shows the shoulder-midpoint to hip-midpoint line and its angle from image vertical, independently of the skeleton. Both shoulders and hips must be reliably observed; interpolation does not supply missing measurement landmarks. This visual cue alone does not produce an alert.
   - **Pivot rings**: Draws a perspective ellipse ring centered on the hip midpoint and aligned with the projected hip line only during an observed pivot interval, with a tangent directional arrow indicating **clockwise** or **anticlockwise** top-down rotation.
   - **Step footprints**: Draws left and right heel-to-toe footprint markers at their observed floor positions. Each marker fades in over a short ramp (`min(0.15s, 0.15 × T)`) and fades linearly to zero at `T = replay_step_history_seconds` (default `5.0s`) of replay media time. Pausing playback pauses the fade.
-  - Select **Raw video** for dynamic layers; baked overlay pixels cannot be removed by toggling layers. **Lines only on floor** switches to a raw stream when available.
+  - Select **Raw video** for dynamic layers; baked overlay pixels cannot be removed by toggling layers. **Floor lines only** switches to a raw stream when available.
   - Import new clips through **Library**. Qt saves posture and movement evidence in the recording's `analytics_XX.json`; older `movement_XX.v1.json` members remain readable.
+  - **This frame**: A coloured banner summarises the current frame (green no alert, amber unavailable measurement, red outside an approved range). Each metric row shows its value and, with a calibration selected, the approved range and a status dot. **Not in profile** means that calibration did not approve the metric; **Not measured** means it could not be measured on this frame.
 - **Scope and filming guidance**:
   - Outputs represent **estimated pivots** and **observed step placements**, not biomechanical weight-transfer measurements.
   - Keep the camera fixed and level with the dancer's full body (including both feet and ankles) clearly visible against the floor. Pair tracking, moving-camera compensation, and live coaching cues are outside this feature's scope.
