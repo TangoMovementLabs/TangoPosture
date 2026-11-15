@@ -18,6 +18,13 @@ from ..archive import file_sha256
 from ..calibration.baseline import calibrate, profile
 from ..calibration.readiness import check_calibration_readiness
 from ..config import Config
+from ..couple import (
+    AutoDecisionResult,
+    CoupleAnalysisRequest,
+    classify_opening_window,
+    extract_single_target_observations,
+    run_couple_analysis,
+)
 from ..domain import (
     METRIC_VERSION,
     Calibration,
@@ -58,14 +65,14 @@ from .coach import (
     _serialise_pose,
     interpolate_coach_data,
 )
-from .companions import save_coach_companion, save_movement_companion
+from .companions import save_coach_companion, save_couple_companion, save_movement_companion
 from .constants import MAX_IMPORT_RANGE_SECONDS
 from .coverage import _compute_family_coverage
 from .downloads import download_facebook_reel, download_youtube_video, imports_directory
 from .errors import ImportCancelledError
 from .links import YouTubeClockAlignment, parse_facebook_reel_url, parse_youtube_url
 from .results import ClipAnalysisResult, ImportedClipResult, RunManifest
-from .soundtrack import analyse_video_soundtrack
+from .soundtrack import SoundtrackAnalysisSummary, analyse_video_soundtrack
 from .video import VideoProbeInfo, iter_virtual_clip_frames, probe_import_video, validate_clip_range
 
 logger = logging.getLogger(__name__)
@@ -89,6 +96,7 @@ def analyze_clip(
     probe: VideoProbeInfo | None = None,
     source_sha256: str | None = None,
     recover_tracking: bool | None = None,
+    dancer_request: CoupleAnalysisRequest | dict[str, Any] | None = None,
 ) -> ClipAnalysisResult:
     """Analyze a local video clip in memory without writing reports or temporary databases."""
     if not video_path or not str(video_path).strip():
@@ -152,6 +160,30 @@ def analyze_clip(
     expected_frames = max(1, round(clip_duration * max(probe.fps, 1.0)))
     infer_times: list[float] = []
 
+    request_obj = (
+        CoupleAnalysisRequest.from_dict(dancer_request)
+        if dancer_request is not None
+        else None
+    )
+    requested_mode = (
+        request_obj.requested_mode
+        if request_obj is not None
+        else cfg.dancer_analysis.default_dancer_mode
+    )
+    forced_override = bool(request_obj.forced_override) if request_obj is not None else False
+    analysis_region = request_obj.analysis_region if request_obj is not None else None
+    anchors = list(request_obj.annotations.anchors) if request_obj is not None else []
+    effective_soundtrack = (
+        bool(request_obj.analyze_soundtrack)
+        if request_obj is not None and request_obj.analyze_soundtrack is not None
+        else bool(analyse_soundtrack)
+    )
+    window_duration = min(float(cfg.dancer_analysis.auto_detection_window_s), float(clip_duration))
+    window_end = clip_in + window_duration
+    run_auto_window = requested_mode == "auto" and not forced_override
+    auto_decision: AutoDecisionResult | None = None
+    selection_required = False
+
     try:
         for idx, item in enumerate(
             iter_virtual_clip_frames(
@@ -162,6 +194,26 @@ def analyze_clip(
                 cancel_check=cancel_check,
             )
         ):
+            if (
+                run_auto_window
+                and auto_decision is None
+                and item.source_time >= window_end - 1e-9
+                and decoded_frames
+            ):
+                auto_decision = classify_opening_window(
+                    [(f_idx, f_obs) for f_idx, _, _, f_obs in decoded_frames],
+                    cfg,
+                    clip_in=clip_in,
+                    clip_out=clip_out,
+                    requested_mode=requested_mode,
+                    forced_override=forced_override,
+                    analysis_region=analysis_region,
+                    anchors=anchors,
+                )
+                if request_obj is not None and auto_decision.resolved_mode == "needs_selection":
+                    selection_required = True
+                    break
+
             t0 = time.perf_counter()
             obs = est.estimate(item.image, item.source_time)
             infer_times.append(time.perf_counter() - t0)
@@ -169,9 +221,24 @@ def analyze_clip(
             frame_times.append((item.frame_index, item.source_time, item.clip_time))
             if progress_callback is not None and (idx % 5 == 0 or idx + 1 >= expected_frames):
                 pct = min(75, 20 + round(((idx + 1) / max(expected_frames, idx + 1)) * 55))
-                progress_callback(
-                    pct, 100, f"Analyzing forward with {cfg.analysis_model.capitalize()} ({idx + 1})…",
-                )
+                if (
+                    request_obj is not None
+                    and run_auto_window
+                    and auto_decision is None
+                    and idx + 1 < expected_frames
+                ):
+                    elapsed_w = min(window_duration, max(0.0, item.source_time - clip_in))
+                    progress_callback(
+                        pct,
+                        100,
+                        f"Detecting number of dancers · {elapsed_w:.1f} / {window_duration:.1f} s",
+                    )
+                else:
+                    progress_callback(
+                        pct,
+                        100,
+                        f"Analyzing forward frames with {cfg.analysis_model.capitalize()} ({idx + 1})…",
+                    )
     finally:
         with suppress(Exception):
             est.close()
@@ -182,6 +249,109 @@ def analyze_clip(
     if cancel_check is not None and cancel_check():
         raise ImportCancelledError("Reference video analysis was cancelled")
 
+    if auto_decision is None:
+        auto_decision = classify_opening_window(
+            [(f_idx, f_obs) for f_idx, _, _, f_obs in decoded_frames],
+            cfg,
+            clip_in=clip_in,
+            clip_out=clip_out,
+            requested_mode=requested_mode,
+            forced_override=forced_override,
+            analysis_region=analysis_region,
+            anchors=anchors,
+        )
+        if request_obj is not None and auto_decision.resolved_mode == "needs_selection":
+            selection_required = True
+
+    cap_profile = profile(cfg, probe.width, probe.height, "video")
+    clean_title = title.strip() or probe.path.stem
+    mean_duration = float(np.mean(infer_times)) if infer_times else 0.0
+    processed_fps = 1.0 / mean_duration if mean_duration > 0 else None
+    performance = {
+        "model_hash": model_hash,
+        "model_variant": cfg.analysis_model,
+        "resolution": [probe.width, probe.height],
+        "processed_fps": processed_fps,
+        "dropped_frames": 0,
+        "timestamp_fallback": False,
+    }
+
+    if selection_required:
+        manifest = RunManifest(
+            model_variant=cfg.analysis_model,
+            model_hash=model_hash,
+            metric_version=METRIC_VERSION,
+            capture_profile=cap_profile,
+            source_sha256=source_sha,
+            source_filename=probe.path.name,
+            width=probe.width,
+            height=probe.height,
+            fps=probe.fps,
+            selected_in=clip_in,
+            selected_out=clip_out,
+            clip_duration=clip_duration,
+            analysis_mode=analysis_mode,
+            processed_fps=processed_fps,
+            requested_dancer_mode=requested_mode,
+            resolved_dancer_mode="needs_selection",
+            detector_version="couple_auto_v1",
+        )
+        return ClipAnalysisResult(
+            manifest=manifest,
+            video_path=probe.path,
+            title=clean_title,
+            source_sha256=source_sha,
+            selected_in=clip_in,
+            selected_out=clip_out,
+            clip_duration=clip_duration,
+            analysis_mode=analysis_mode,
+            readiness=readiness,
+            reference=reference if analysis_mode == "posture" else None,
+            calibration_window=(
+                (float(calibration_interval[0]), float(calibration_interval[1]))
+                if analysis_mode == "posture" and calibration_interval is not None
+                else None
+            ),
+            coach_data={},
+            movement_data={},
+            soundtrack=SoundtrackAnalysisSummary(
+                enabled=effective_soundtrack,
+                available=False,
+                status="disabled",
+                reason="Stopped for manual Single/Couple selection",
+            ),
+            coverage={},
+            frame_log=[],
+            scored_frame_log=[],
+            frame_observations=[],
+            performance=performance,
+            requested_dancer_mode=requested_mode,
+            resolved_dancer_mode="needs_selection",
+            auto_decision=auto_decision.to_dict(),
+            couple_result=None,
+            selection_required=True,
+        )
+
+    resolved_mode = (
+        "single" if auto_decision.resolved_mode == "needs_selection" else auto_decision.resolved_mode
+    )
+    raw_observations = [(f_idx, f_obs) for f_idx, _, _, f_obs in decoded_frames]
+    if resolved_mode == "single" and (
+        request_obj is not None
+        or analysis_region is not None
+    ):
+        single_anchor = anchors[0] if anchors else None
+        filtered_single = extract_single_target_observations(
+            raw_observations,
+            cfg,
+            anchor=single_anchor,
+            analysis_region=analysis_region,
+        )
+        decoded_frames = [
+            (f_idx, s_time, c_time, f_obs)
+            for (f_idx, s_time, c_time, _), (_, f_obs) in zip(decoded_frames, filtered_single)
+        ]
+
     if progress_callback is not None:
         progress_callback(80, 100, "Analysing soundtrack & movement…")
 
@@ -191,11 +361,10 @@ def analyze_clip(
         clip_out,
         frame_times,
         cfg,
-        enabled=analyse_soundtrack,
+        enabled=effective_soundtrack,
         video_first_pts_seconds=probe.first_pts_seconds,
     )
 
-    cap_profile = profile(cfg, probe.width, probe.height, "video")
     active_reference: Calibration | None = reference if analysis_mode == "posture" else None
     cal_window: tuple[float, float] | None = (
         (float(calibration_interval[0]), float(calibration_interval[1]))
@@ -652,7 +821,10 @@ def analyze_clip(
         "frames": {str(k): v for k, v in coach_pending.items()},
     }
 
-    should_recover = cfg.replay_recovery_auto if recover_tracking is None else bool(recover_tracking)
+    should_recover = (
+        resolved_mode == "single"
+        and (cfg.replay_recovery_auto if recover_tracking is None else bool(recover_tracking))
+    )
     pose_recovery: dict[str, Any] | None = None
     if should_recover:
         try:
@@ -724,6 +896,36 @@ def analyze_clip(
         "dropped_frames": 0,
         "timestamp_fallback": False,
     }
+
+    couple_result_dict: dict[str, Any] | None = None
+    if resolved_mode == "couple":
+        beat_timestamps: list[float] = []
+        if soundtrack_summary.enabled and soundtrack_summary.frame_states:
+            prev_beat: int | None = None
+            for f_idx, _, _ in frame_times:
+                st = soundtrack_summary.frame_states.get(f_idx)
+                if not st or not st.get("playing"):
+                    prev_beat = None
+                    continue
+                b_num = st.get("beat")
+                if isinstance(b_num, int) and b_num > 0 and b_num != prev_beat:
+                    src_t = st.get("source_time")
+                    if src_t is not None:
+                        beat_timestamps.append(float(src_t))
+                prev_beat = b_num if isinstance(b_num, int) and b_num > 0 else None
+        couple_res = run_couple_analysis(
+            raw_observations,
+            cfg,
+            clip_in=clip_in,
+            clip_out=clip_out,
+            video_sha256=source_sha,
+            request=request_obj,
+            auto_decision=auto_decision,
+            soundtrack_beats=beat_timestamps,
+        )
+        couple_result_dict = couple_res.to_dict()
+        coach_data["couple_analysis"] = couple_result_dict
+
     session_summary: dict[str, Any] | None = None
     session_events: list[dict[str, Any]] | None = None
     if session is not None:
@@ -751,6 +953,9 @@ def analyze_clip(
         clip_duration=clip_duration,
         analysis_mode=analysis_mode,
         processed_fps=processed_fps,
+        requested_dancer_mode=requested_mode,
+        resolved_dancer_mode=resolved_mode,
+        detector_version="couple_auto_v1",
     )
 
     return ClipAnalysisResult(
@@ -777,6 +982,11 @@ def analyze_clip(
         session_summary=session_summary,
         session_events=session_events,
         pose_recovery=pose_recovery,
+        requested_dancer_mode=requested_mode,
+        resolved_dancer_mode=resolved_mode,
+        auto_decision=auto_decision.to_dict(),
+        couple_result=couple_result_dict,
+        selection_required=False,
     )
 
 
@@ -805,6 +1015,7 @@ def analyse_imported_clip(
     youtube_downloader: Callable[[str, Path], Path] | None = None,
     facebook_downloader: Callable[[str, Path], Path] | None = None,
     recover_tracking: bool | None = None,
+    dancer_request: CoupleAnalysisRequest | dict[str, Any] | None = None,
 ) -> ImportedClipResult:
     """Import and analyse a selected range `[selected_in, selected_out)` of a local video file.
 
@@ -890,14 +1101,16 @@ def analyse_imported_clip(
         if cfg.data_dir == "data"
         else Path(cfg.data_dir) / "reports"
     )
-    target_dir.mkdir(parents=True, exist_ok=True)
-    db_path = (
-        Path(cfg.data_dir) / "tango_posture.db"
-        if storage is not None or cfg.data_dir != "data"
-        else target_dir / "import_sessions.sqlite3"
-    )
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    store = storage or Storage(db_path)
+    pre_store = storage
+    if pre_store is None and analysis_mode != "movement":
+        target_dir.mkdir(parents=True, exist_ok=True)
+        db_path = (
+            Path(cfg.data_dir) / "tango_posture.db"
+            if cfg.data_dir != "data"
+            else target_dir / "import_sessions.sqlite3"
+        )
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        pre_store = Storage(db_path)
 
     clip_result = analyze_clip(
         video_path=probe.path,
@@ -909,13 +1122,45 @@ def analyse_imported_clip(
         reference=reference,
         calibration_interval=calibration_interval,
         analyse_soundtrack=analyse_soundtrack,
-        storage=store,
+        storage=pre_store,
         estimator_factory=estimator_factory,
         progress_callback=progress_callback,
         cancel_check=cancel_check,
         probe=probe,
         recover_tracking=recover_tracking,
+        dancer_request=dancer_request,
     )
+
+    if clip_result.selection_required:
+        if progress_callback is not None:
+            progress_callback(100, 100, "Choose Single or Couple analysis to continue.")
+        return ImportedClipResult(
+            report_path=target_dir / "_pending_selection.md",
+            metadata_path=target_dir / "_pending_selection.metadata.json",
+            movement_path=target_dir / "_pending_selection.movement.v1.json",
+            title=clip_result.title,
+            video_path=probe.path,
+            source_sha256=clip_result.source_sha256,
+            selected_in=clip_result.selected_in,
+            selected_out=clip_result.selected_out,
+            analysis_mode=analysis_mode,
+            readiness=clip_result.readiness,
+            reference=clip_result.reference,
+            movement_data={},
+            soundtrack=clip_result.soundtrack,
+            coverage={},
+            youtube_link=yt_link,
+            facebook_reel=facebook_link,
+            coach_path=None,
+            coach_data=None,
+            requested_dancer_mode=clip_result.requested_dancer_mode,
+            resolved_dancer_mode=clip_result.resolved_dancer_mode,
+            auto_decision=clip_result.auto_decision,
+            couple_result=None,
+            selection_required=True,
+        )
+
+    target_dir.mkdir(parents=True, exist_ok=True)
 
     clip_in = clip_result.selected_in
     clip_out = clip_result.selected_out
@@ -997,6 +1242,10 @@ def analyse_imported_clip(
     save_movement_companion(companion_movement_path, movement_data)
     companion_coach_path = target_dir / f"{report_path.stem}.coach.v1.json"
     save_coach_companion(companion_coach_path, coach_data)
+    companion_couple_path: Path | None = None
+    if clip_result.couple_result is not None:
+        companion_couple_path = target_dir / f"{report_path.stem}.couple.v1.json"
+        save_couple_companion(companion_couple_path, clip_result.couple_result)
 
     meta_path = write_metadata(
         report_path,
@@ -1032,6 +1281,10 @@ def analyse_imported_clip(
             ),
             "movement_analysis_file": companion_movement_path.name,
             "coach_overlay_file": companion_coach_path.name,
+            "couple_analysis_file": companion_couple_path.name if companion_couple_path is not None else None,
+            "requested_dancer_mode": clip_result.requested_dancer_mode,
+            "resolved_dancer_mode": clip_result.resolved_dancer_mode,
+            "auto_decision": clip_result.auto_decision,
             "coverage": {k: v.to_dict() for k, v in coverage.items()},
             "soundtrack": soundtrack_summary.to_metadata_dict(),
             "capture_profile": cap_profile,
@@ -1062,4 +1315,9 @@ def analyse_imported_clip(
         coach_path=companion_coach_path,
         coach_data=coach_data,
         pose_recovery=clip_result.pose_recovery,
+        requested_dancer_mode=clip_result.requested_dancer_mode,
+        resolved_dancer_mode=clip_result.resolved_dancer_mode,
+        auto_decision=clip_result.auto_decision,
+        couple_result=clip_result.couple_result,
+        selection_required=False,
     )

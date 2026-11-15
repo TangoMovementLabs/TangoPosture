@@ -17,9 +17,13 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFrame,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QPushButton,
     QScrollArea,
+    QTableWidget,
+    QTableWidgetItem,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -27,6 +31,7 @@ from PySide6.QtWidgets import (
 from ...archive import read_analytics, read_manifest
 from ...calibration.baseline import load_calibration_file
 from ...calibration.models import METRIC_DETAILS, RangeProfile
+from ...couple.csv_export import export_couple_csv
 from ...domain import Calibration
 from ...replay import time_label
 from ..analytics.data import (
@@ -95,6 +100,8 @@ class AnalyticsScreen(QWidget):
         self._external_archives: list[Path] = []
         self._external_calibrations: dict[str, Calibration] = {}
         self._comparison: ComparisonResult | None = None
+        self._active_couple_result: dict[str, Any] | None = None
+        self._active_couple_run_id: str | None = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 20, 24, 20)
@@ -110,6 +117,14 @@ class AnalyticsScreen(QWidget):
         layout.addWidget(subtitle)
 
         toolbar = QHBoxLayout()
+        toolbar.addWidget(QLabel("Mode:"))
+        self.mode_filter_combo = QComboBox()
+        self.mode_filter_combo.setObjectName("analyticsModeFilterCombo")
+        self.mode_filter_combo.addItem("All", "all")
+        self.mode_filter_combo.addItem("Single", "single")
+        self.mode_filter_combo.addItem("Couple", "couple")
+        self.mode_filter_combo.currentIndexChanged.connect(lambda _: self.refresh())
+        toolbar.addWidget(self.mode_filter_combo)
         toolbar.addWidget(QLabel("Archive:"))
         self.session_combo = QComboBox()
         self.session_combo.setAccessibleName("Library archive and recording analytics")
@@ -143,6 +158,11 @@ class AnalyticsScreen(QWidget):
         self.export_charts_btn.setEnabled(False)
         self.export_charts_btn.clicked.connect(lambda: self.export_all_charts())
         ref_toolbar.addWidget(self.export_charts_btn)
+        self.export_couple_csv_btn = QPushButton("Export Couple CSV…")
+        self.export_couple_csv_btn.setObjectName("exportCoupleCsvBtn")
+        self.export_couple_csv_btn.setEnabled(False)
+        self.export_couple_csv_btn.clicked.connect(lambda: self.export_couple_csv_file())
+        ref_toolbar.addWidget(self.export_couple_csv_btn)
         layout.addLayout(ref_toolbar)
 
         self.state_label = QLabel()
@@ -201,7 +221,12 @@ class AnalyticsScreen(QWidget):
             self.coverage_labels[metric] = coverage
             self.export_buttons[metric] = export_btn
         scroll.setWidget(content)
-        layout.addWidget(scroll, 1)
+        couple_view = self._build_couple_analytics_view()
+        self.analytics_mode_tabs = QTabWidget()
+        self.analytics_mode_tabs.setObjectName("analyticsModeTabs")
+        self.analytics_mode_tabs.addTab(scroll, "Posture & calibration metrics")
+        self.analytics_mode_tabs.addTab(couple_view, "Couple analysis")
+        layout.addWidget(self.analytics_mode_tabs, 1)
         self.bridge.config_changed.connect(lambda _cfg: self.refresh())
         self.refresh()
 
@@ -210,6 +235,12 @@ class AnalyticsScreen(QWidget):
         self.recordings = []
         self._current_source = None
         self._comparison = None
+        self._active_couple_result = None
+        self._active_couple_run_id = None
+        if hasattr(self, "export_couple_csv_btn"):
+            self.export_couple_csv_btn.setEnabled(False)
+        if hasattr(self, "couple_panes"):
+            self._populate_couple_analysis(None)
         self.state_label.setText(message)
         self.tracking_recovery_label.clear()
         self.tracking_recovery_label.setVisible(False)
@@ -269,6 +300,11 @@ class AnalyticsScreen(QWidget):
                 key=lambda item: -created_at_timestamp(item.get("created_at", ""), item.get("path"))
             )
             listed_paths: set[Path] = set()
+            mode_filter = str(
+                self.mode_filter_combo.currentData()
+                if hasattr(self, "mode_filter_combo")
+                else "all"
+            )
             for archive in archives:
                 archive_path = archive["path"].resolve()
                 listed_paths.add(archive_path)
@@ -276,7 +312,11 @@ class AnalyticsScreen(QWidget):
                 kind_tag = " (Reference .tpr)" if archive_path.suffix.lower() == ".tpr" else ""
                 date_label = format_created_at(archive.get("created_at", ""), archive_path)
                 for index, _ in enumerate(manifest["segments"]):
-                    label = f"{archive['name']}{kind_tag} · Recording {index:02d}"
+                    modes = self._segment_modes(archive_path, index)
+                    if mode_filter != "all" and mode_filter not in modes:
+                        continue
+                    mode_tag = f" [{' + '.join(m.capitalize() for m in modes)}]" if modes else ""
+                    label = f"{archive['name']}{kind_tag} · Recording {index:02d}{mode_tag}"
                     self.session_combo.addItem(label, (archive_path, index))
                     self.session_combo.setItemData(
                         self.session_combo.count() - 1,
@@ -291,8 +331,12 @@ class AnalyticsScreen(QWidget):
                 display_name = str(manifest.get("name") or resolved.stem)
                 kind_tag = " (Reference .tpr)" if resolved.suffix.lower() == ".tpr" else ""
                 for index, _ in enumerate(manifest["segments"]):
+                    modes = self._segment_modes(resolved, index)
+                    if mode_filter != "all" and mode_filter not in modes:
+                        continue
+                    mode_tag = f" [{' + '.join(m.capitalize() for m in modes)}]" if modes else ""
                     self.session_combo.addItem(
-                        f"{display_name}{kind_tag} · Recording {index:02d} (opened)",
+                        f"{display_name}{kind_tag} · Recording {index:02d}{mode_tag} (opened)",
                         (resolved, index),
                     )
             if self.session_combo.count() == 1:
@@ -409,6 +453,14 @@ class AnalyticsScreen(QWidget):
         except (OSError, sqlite3.Error, ValueError, TypeError, KeyError, BadZipFile) as exc:
             self.recordings = []
             self.bridge.status_message.emit(f"Session video navigation unavailable: {exc}")
+        self._active_couple_result = dataset.couple_result
+        self._active_couple_run_id = dataset.couple_run_id
+        self.export_couple_csv_btn.setEnabled(isinstance(dataset.couple_result, dict))
+        self._populate_couple_analysis(dataset.couple_result)
+        if dataset.couple_result is not None and (
+            dataset.dancer_mode == "couple" or self.mode_filter_combo.currentData() == "couple"
+        ):
+            self.analytics_mode_tabs.setCurrentIndex(1)
         self._apply_calibration_reference()
 
     def _apply_calibration_reference(self) -> None:
@@ -872,3 +924,399 @@ class AnalyticsScreen(QWidget):
             Route.REVIEW,
             {"archive_path": path, "segment_index": index, "timestamp": timestamp},
         )
+
+    def _segment_modes(self, path: Path, index: int) -> list[str]:
+        try:
+            analytics = read_analytics(path, index)
+        except (OSError, ValueError, TypeError, BadZipFile):
+            return []
+        if not isinstance(analytics, dict):
+            return []
+        da = analytics.get("dancer_analysis")
+        if isinstance(da, dict) and isinstance(da.get("runs"), dict):
+            modes = [m for m in ("single", "couple") if isinstance(da["runs"].get(m), dict)]
+            if modes:
+                return modes
+        return ["single"]
+
+    def _build_couple_analytics_view(self) -> QWidget:
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(10)
+
+        header = QHBoxLayout()
+        self.couple_run_info_label = QLabel("Select a recording with Couple analysis to view metrics.")
+        self.couple_run_info_label.setWordWrap(True)
+        header.addWidget(self.couple_run_info_label, 1)
+        layout.addLayout(header)
+
+        self.couple_panes = QTabWidget()
+        self.couple_panes.setObjectName("coupleAnalyticsPanes")
+        self._couple_summary_tables: dict[str, QTableWidget] = {}
+        self._couple_event_tables: dict[str, QTableWidget] = {}
+
+        pane_specs = (
+            ("coordination", "Coordination", "Lead/follow start, slow, settle, contact lags & travel alignment"),
+            ("step_beat", "Step and beat timing", "Step-to-beat offsets, cadence & beat stability"),
+            ("transitions", "Transitions", "Halt/slow/reversal latency, valid coverage & planned exclusions"),
+            ("posture_axes", "Posture and axes", "Signed torso tilt, head pitch, hip separation & couple midpoint axis"),
+            ("turns_exits", "Turns and exits", "Pivot angular velocity, exit initiation/separation overlap & foot behavior"),
+        )
+        for key, title, subtitle in pane_specs:
+            pane = QWidget()
+            p_layout = QVBoxLayout(pane)
+            p_layout.setSpacing(8)
+            sub = QLabel(subtitle)
+            sub.setProperty("class", "muted")
+            p_layout.addWidget(sub)
+
+            s_table = QTableWidget(0, 4)
+            s_table.setHorizontalHeaderLabels(["Metric", "Value", "Unit", "Quality Status"])
+            s_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+            s_table.setMaximumHeight(220)
+            s_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+            p_layout.addWidget(s_table)
+
+            e_table = QTableWidget(0, 5)
+            e_table.setHorizontalHeaderLabels(["Time (s)", "Event / Item", "Subject", "Value / Timing", "Status"])
+            e_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+            e_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+            e_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+            e_table.cellClicked.connect(
+                lambda row, _col, tbl=e_table: self._on_couple_event_row_clicked(tbl, row)
+            )
+            p_layout.addWidget(e_table, 1)
+
+            self._couple_summary_tables[key] = s_table
+            self._couple_event_tables[key] = e_table
+            self.couple_panes.addTab(pane, title)
+
+        layout.addWidget(self.couple_panes, 1)
+        return panel
+
+    def _populate_couple_analysis(self, couple_result: dict[str, Any] | None) -> None:
+        for table in (*self._couple_summary_tables.values(), *self._couple_event_tables.values()):
+            table.setRowCount(0)
+        if not isinstance(couple_result, dict):
+            self.couple_run_info_label.setText(
+                "No Couple run available on this recording."
+            )
+            return
+
+        rid = str(couple_result.get("run_id") or "")
+        ann = couple_result.get("annotations") or {}
+        name_a = str(ann.get("dancer_a_name") or "Dancer A")
+        name_b = str(ann.get("dancer_b_name") or "Dancer B")
+        dec = couple_result.get("auto_decision") or {}
+        dec_txt = (
+            f"{dec.get('requested_mode', 'auto')} -> {dec.get('resolved_mode', 'couple')}"
+            if isinstance(dec, dict) and dec
+            else "couple"
+        )
+        scene = couple_result.get("post_window_scene_change") or {}
+        scene_note = ""
+        if isinstance(scene, dict) and scene.get("detected"):
+            scene_note = f" · Scene note: {scene.get('message', '')}"
+        else:
+            for diag in couple_result.get("diagnostics") or []:
+                if isinstance(diag, dict) and str(diag.get("type", "")).startswith(
+                    ("post_window", "shot_cut")
+                ):
+                    scene_note = f" · Scene note: {diag.get('message', '')}"
+                    break
+        self.couple_run_info_label.setText(
+            f"Run {rid[:12]} · {name_a} & {name_b} · Mode: {dec_txt}{scene_note}"
+        )
+
+        summaries = couple_result.get("summaries") or {}
+        if isinstance(summaries, dict) and summaries:
+            coord_sum = summaries.get("coordination") or {}
+            if isinstance(coord_sum, dict):
+                for ckey in ("start_lag_ms", "slow_lag_ms", "settle_lag_ms"):
+                    citem = coord_sum.get(ckey)
+                    if isinstance(citem, dict):
+                        self._append_summary_row(self._couple_summary_tables["coordination"], ckey, citem)
+
+            step_sum = summaries.get("step_timing") or {}
+            if isinstance(step_sum, dict):
+                for subj in ("A", "B"):
+                    st = step_sum.get(subj)
+                    if isinstance(st, dict):
+                        self._append_summary_row(
+                            self._couple_summary_tables["step_beat"],
+                            f"median_beat_offset_ms ({subj})",
+                            {
+                                "value": st.get("median_beat_offset_ms"),
+                                "unit": "ms",
+                                "status": st.get("status", "unavailable"),
+                            },
+                        )
+                        self._append_summary_row(
+                            self._couple_summary_tables["step_beat"],
+                            f"matched_contacts ({subj})",
+                            {
+                                "value": st.get("matched_count"),
+                                "unit": "count",
+                                "status": st.get("status", "unavailable"),
+                            },
+                        )
+
+            trans_sum = summaries.get("transitions") or {}
+            if isinstance(trans_sum, dict) and trans_sum:
+                for tkey in (
+                    "secondary_speed_peaks",
+                    "unintended_reversals",
+                    "planned_pauses",
+                    "planned_reversals",
+                    "settling_steps",
+                ):
+                    if tkey in trans_sum:
+                        self._append_summary_row(
+                            self._couple_summary_tables["transitions"],
+                            tkey,
+                            {
+                                "value": trans_sum.get(tkey),
+                                "unit": "count",
+                                "status": trans_sum.get("status", "unavailable"),
+                            },
+                        )
+
+            pos_sum = summaries.get("posture") or {}
+            if isinstance(pos_sum, dict):
+                for pkey in (
+                    "torso_tilt_a",
+                    "torso_tilt_b",
+                    "couple_midpoint_tilt",
+                    "torso_separation",
+                    "head_pitch_a",
+                    "head_pitch_b",
+                ):
+                    pitem = pos_sum.get(pkey)
+                    if isinstance(pitem, dict):
+                        self._append_summary_row(
+                            self._couple_summary_tables["posture_axes"],
+                            pkey,
+                            {
+                                "value": (
+                                    pitem.get("median_deg")
+                                    if "median_deg" in pitem
+                                    else pitem.get("value")
+                                ),
+                                "unit": "deg",
+                                "status": pitem.get("status", "unavailable"),
+                            },
+                        )
+
+            turn_sum = summaries.get("turns") or {}
+            if isinstance(turn_sum, dict) and turn_sum:
+                for ukey, unit in (
+                    ("median_turn_duration_s", "s"),
+                    ("median_exit_minus_turn_end_ms", "ms"),
+                    ("turn_count", "count"),
+                    ("overlap_count", "count"),
+                ):
+                    if ukey in turn_sum:
+                        self._append_summary_row(
+                            self._couple_summary_tables["turns_exits"],
+                            ukey,
+                            {
+                                "value": turn_sum.get(ukey),
+                                "unit": unit,
+                                "status": turn_sum.get("status", "unavailable"),
+                            },
+                        )
+
+        summary = couple_result.get("summary") or {}
+        if isinstance(summary, dict) and summary:
+            pane_metric_prefixes: dict[str, tuple[str, ...]] = {
+                "coordination": ("travel_", "coord_", "lag_"),
+                "step_beat": ("step_", "beat_", "cadence"),
+                "transitions": ("transition_", "planned_"),
+                "posture_axes": ("torso_", "head_", "hip_", "pair_", "separation", "axis"),
+                "turns_exits": ("turn_", "exit_", "pivot_"),
+            }
+            assigned_keys: set[str] = set()
+            for pane_key, prefixes in pane_metric_prefixes.items():
+                tbl = self._couple_summary_tables[pane_key]
+                for metric_name, item in summary.items():
+                    if not isinstance(item, dict):
+                        continue
+                    if any(metric_name.startswith(p) or p in metric_name for p in prefixes):
+                        assigned_keys.add(metric_name)
+                        self._append_summary_row(tbl, metric_name, item)
+            for metric_name, item in summary.items():
+                if metric_name not in assigned_keys and isinstance(item, dict):
+                    self._append_summary_row(
+                        self._couple_summary_tables["coordination"], metric_name, item
+                    )
+
+        events = [ev for ev in (couple_result.get("events") or []) if isinstance(ev, dict) and not ev.get("deleted")]
+        event_pane_map = {
+            "start": "coordination",
+            "slow": "coordination",
+            "settle": "coordination",
+            "contact": "step_beat",
+            "musical_target": "step_beat",
+            "speed_cue": "transitions",
+            "turn": "turns_exits",
+            "turn_start": "turns_exits",
+            "turn_end": "turns_exits",
+            "exit": "turns_exits",
+            "embrace_opening": "turns_exits",
+        }
+        for ev in events:
+            etype = str(ev.get("event_type") or "")
+            pkey = event_pane_map.get(etype, "transitions")
+            tbl = self._couple_event_tables[pkey]
+            r = tbl.rowCount()
+            tbl.insertRow(r)
+            ts = float(ev.get("timestamp", 0.0))
+            t_item = QTableWidgetItem(f"{ts:.2f}")
+            t_item.setData(Qt.ItemDataRole.UserRole, ev)
+            meta = ev.get("metadata") or {}
+            detail = ""
+            if isinstance(ev.get("lag_ms"), (int, float)):
+                detail = f"lag {float(ev['lag_ms']):+.0f} ms"
+            elif isinstance(ev.get("beat_offset_ms"), (int, float)):
+                detail = f"beat {float(ev['beat_offset_ms']):+.0f} ms"
+            elif "lag_s" in meta and isinstance(meta["lag_s"], (int, float)):
+                detail = f"lag {float(meta['lag_s']) * 1000.0:+.0f} ms"
+            elif ev.get("pivot_behavior"):
+                detail = str(ev["pivot_behavior"])
+            elif ev.get("reason"):
+                detail = str(ev["reason"])
+            elif ev.get("label"):
+                detail = str(ev["label"])
+            tbl.setItem(r, 0, t_item)
+            tbl.setItem(r, 1, QTableWidgetItem(etype))
+            tbl.setItem(r, 2, QTableWidgetItem(str(ev.get("subject", "pair"))))
+            tbl.setItem(r, 3, QTableWidgetItem(detail))
+            tbl.setItem(r, 4, QTableWidgetItem(str(ev.get("status", "measured"))))
+
+        # Populate transitions pane with transition coverage if present, and posture frames sample rows
+        transitions_info = couple_result.get("transitions") or []
+        if isinstance(transitions_info, list):
+            tr_tbl = self._couple_event_tables["transitions"]
+            for tr in transitions_info:
+                if not isinstance(tr, dict):
+                    continue
+                r = tr_tbl.rowCount()
+                tr_tbl.insertRow(r)
+                ts = float(tr.get("timestamp", 0.0))
+                t_item = QTableWidgetItem(f"{ts:.2f}")
+                t_item.setData(Qt.ItemDataRole.UserRole, {"timestamp": ts})
+                val = tr.get("latency_s")
+                val_txt = f"{float(val):.3f} s" if isinstance(val, (int, float)) else str(tr.get("reason") or "")
+                tr_tbl.setItem(r, 0, t_item)
+                tr_tbl.setItem(r, 1, QTableWidgetItem(str(tr.get("kind", "transition"))))
+                tr_tbl.setItem(r, 2, QTableWidgetItem("pair"))
+                tr_tbl.setItem(r, 3, QTableWidgetItem(val_txt))
+                tr_tbl.setItem(r, 4, QTableWidgetItem(str(tr.get("status", "measured"))))
+
+        samples = couple_result.get("samples") or []
+        pos_tbl = self._couple_event_tables["posture_axes"]
+        if isinstance(samples, list) and samples:
+            stride = max(1, len(samples) // 50)
+            for sample in samples[::stride]:
+                if not isinstance(sample, dict):
+                    continue
+                r = pos_tbl.rowCount()
+                pos_tbl.insertRow(r)
+                ts = float(sample.get("timestamp", 0.0))
+                t_item = QTableWidgetItem(f"{ts:.2f}")
+                t_item.setData(Qt.ItemDataRole.UserRole, {"timestamp": ts})
+                sep = sample.get("hip_separation_torso")
+                axis_t = sample.get("pair_axis_tilt_deg")
+                detail_parts = []
+                if isinstance(axis_t, (int, float)):
+                    detail_parts.append(f"axis {axis_t:+.1f}°")
+                if isinstance(sep, (int, float)):
+                    detail_parts.append(f"sep {sep:.2f}")
+                pos_tbl.setItem(r, 0, t_item)
+                pos_tbl.setItem(r, 1, QTableWidgetItem("Couple frame posture"))
+                pos_tbl.setItem(r, 2, QTableWidgetItem("pair"))
+                pos_tbl.setItem(r, 3, QTableWidgetItem(", ".join(detail_parts) or "—"))
+                pos_tbl.setItem(r, 4, QTableWidgetItem(str(sample.get("quality_status", "measured"))))
+        else:
+            series = couple_result.get("series") or {}
+            mid_series = series.get("couple_midpoint_tilt") or []
+            sep_series = series.get("torso_separation") or []
+            if isinstance(mid_series, list) and mid_series:
+                stride = max(1, len(mid_series) // 50)
+                for idx in range(0, len(mid_series), stride):
+                    mp = mid_series[idx]
+                    if not isinstance(mp, dict):
+                        continue
+                    sp = sep_series[idx] if idx < len(sep_series) and isinstance(sep_series[idx], dict) else {}
+                    r = pos_tbl.rowCount()
+                    pos_tbl.insertRow(r)
+                    ts = float(mp.get("timestamp", 0.0))
+                    t_item = QTableWidgetItem(f"{ts:.2f}")
+                    t_item.setData(Qt.ItemDataRole.UserRole, {"timestamp": ts})
+                    detail_parts = []
+                    if isinstance(mp.get("value"), (int, float)):
+                        detail_parts.append(f"axis {float(mp['value']):+.1f}°")
+                    if isinstance(sp.get("value"), (int, float)):
+                        detail_parts.append(f"sep {float(sp['value']):.1f}°")
+                    pos_tbl.setItem(r, 0, t_item)
+                    pos_tbl.setItem(r, 1, QTableWidgetItem("Couple frame posture"))
+                    pos_tbl.setItem(r, 2, QTableWidgetItem("pair"))
+                    pos_tbl.setItem(r, 3, QTableWidgetItem(", ".join(detail_parts) or "—"))
+                    pos_tbl.setItem(r, 4, QTableWidgetItem(str(mp.get("status", "unavailable"))))
+
+    def _append_summary_row(self, table: QTableWidget, name: str, item: dict[str, Any]) -> None:
+        r = table.rowCount()
+        table.insertRow(r)
+        val = item.get("value")
+        val_txt = f"{val:.3f}" if isinstance(val, (int, float)) else "Unavailable"
+        table.setItem(r, 0, QTableWidgetItem(name.replace("_", " ")))
+        table.setItem(r, 1, QTableWidgetItem(val_txt))
+        table.setItem(r, 2, QTableWidgetItem(str(item.get("unit") or "")))
+        table.setItem(r, 3, QTableWidgetItem(str(item.get("status") or "unavailable")))
+
+    def _on_couple_event_row_clicked(self, table: QTableWidget, row: int) -> None:
+        item = table.item(row, 0)
+        if item is None:
+            return
+        ev = item.data(Qt.ItemDataRole.UserRole)
+        if isinstance(ev, dict) and "timestamp" in ev:
+            self._seek_to_couple_event(float(ev["timestamp"]))
+
+    def _seek_to_couple_event(self, timestamp: float) -> None:
+        source = self._current_source
+        if source is None:
+            self.bridge.status_message.emit("No Couple recording loaded to seek.")
+            return
+        path, index = source
+        payload: dict[str, Any] = {
+            "archive_path": path,
+            "segment_index": index,
+            "timestamp": float(timestamp),
+        }
+        if self._active_couple_run_id:
+            payload["run_id"] = self._active_couple_run_id
+        self.router.navigate(Route.REVIEW, payload)
+
+    def export_couple_csv_file(self, destination: Path | None = None) -> Path | None:
+        couple = self._active_couple_result
+        source = self._current_source
+        if not isinstance(couple, dict) or source is None:
+            self.bridge.status_message.emit("Load a Couple analysis recording before exporting CSV.")
+            return None
+        path, index = source
+        if destination is None:
+            default_name = f"{path.stem}_seg{index:02d}_couple.csv"
+            selected, _ = QFileDialog.getSaveFileName(
+                self,
+                "Export Couple Analysis CSV",
+                default_name,
+                "CSV files (*.csv)",
+            )
+            if not selected:
+                return None
+            destination = Path(selected)
+        csv_text = export_couple_csv(couple, path.stem, index)
+        destination.write_text(csv_text, encoding="utf-8")
+        self.bridge.status_message.emit(f"Exported Couple CSV to {destination.name}")
+        return destination

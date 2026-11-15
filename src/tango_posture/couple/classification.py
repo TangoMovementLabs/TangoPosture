@@ -140,7 +140,7 @@ def classify_opening_window(
 
     if eff_duration <= 1e-6:
         resolved: ResolvedDancerMode = (
-            requested_mode if requested_mode in ("single", "couple") and forced_override else "needs_selection"
+            requested_mode if requested_mode in ("single", "couple") else "needs_selection"
         )
         return AutoDecisionResult(
             detector_version="couple_auto_v1",
@@ -170,7 +170,7 @@ def classify_opening_window(
 
     if not window_obs:
         resolved = (
-            requested_mode if requested_mode in ("single", "couple") and forced_override else "needs_selection"
+            requested_mode if requested_mode in ("single", "couple") else "needs_selection"
         )
         return AutoDecisionResult(
             detector_version="couple_auto_v1",

@@ -23,7 +23,11 @@ from ...config import Config
 from ...movement import render_floor_guide, render_movement_overlay
 from ...pose.recovery import rebase_pose_recovery
 from ...references.coach import render_coach_frame_overlay
-from ...references.companions import load_report_coach_data, load_report_movement_data
+from ...references.companions import (
+    load_couple_companion,
+    load_report_coach_data,
+    load_report_movement_data,
+)
 from ...references.errors import ImportCancelledError
 from ...replay import VideoReader, save_overlay_video
 from ...review import read_report
@@ -51,6 +55,9 @@ def archive_report(
         raise FileExistsError(f"Archive already exists: {destination.name}")
     coach = load_report_coach_data(record)
     movement = load_report_movement_data(record)
+    couple_data = load_couple_companion(report_path.parent / f"{report_path.stem}.couple.v1.json")
+    if couple_data is None and isinstance(coach, dict) and isinstance(coach.get("couple_analysis"), dict):
+        couple_data = copy.deepcopy(coach["couple_analysis"])
     reader = VideoReader(source)
     try:
         start = max(0, round((record.clip_in or 0) * reader.fps))
@@ -146,10 +153,49 @@ def archive_report(
                 frame - start for frame in indexed_movement.get("cut_frames", [])
                 if start <= frame <= end
             ]
+        raw_sha = file_sha256(raw)
         timestamps = (
             record.timestamps if len(record.timestamps) == end - start + 1
             else [frame / fps for frame in range(start, end + 1)]
         )
+        dancer_analysis: dict[str, Any] | None = None
+        if isinstance(couple_data, dict):
+            indexed_couple = copy.deepcopy(couple_data)
+            indexed_couple["video_sha256"] = raw_sha
+            indexed_couple["segment_index"] = 0
+            overlay = indexed_couple.get("overlay")
+            if isinstance(overlay, dict) and isinstance(overlay.get("by_frame"), dict):
+                overlay["by_frame"] = {
+                    str(int(k) - start): entry
+                    for k, entry in overlay["by_frame"].items()
+                    if str(k).lstrip("-").isdigit() and start <= int(k) <= end
+                }
+            if isinstance(indexed_couple.get("samples"), list):
+                indexed_couple["samples"] = [
+                    {**s, "frame_index": int(s["frame_index"]) - start}
+                    for s in indexed_couple["samples"]
+                    if isinstance(s, dict) and start <= int(s.get("frame_index", -1)) <= end
+                ]
+            run_id = str(indexed_couple.get("run_id") or f"couple-0-{raw_sha[:8]}")
+            decision = indexed_couple.get("auto_decision")
+            dancer_analysis = {
+                "schema_version": 1,
+                "active_mode": "couple",
+                "active_run_id": run_id,
+                "runs": {
+                    "couple": {
+                        "run_id": run_id,
+                        "requested_mode": (
+                            str(decision.get("requested_mode", "auto"))
+                            if isinstance(decision, dict)
+                            else "auto"
+                        ),
+                        "resolved_mode": "couple",
+                        "auto_decision": decision,
+                        "couple_result": indexed_couple,
+                    }
+                },
+            }
         analytics: dict[str, Any] = {
             "model_hash": coach.get("model_hash") if coach else None,
             "capture_profile": coach.get("capture_profile") if coach else None,
@@ -163,6 +209,8 @@ def archive_report(
                 "youtube_link": record.youtube_link, "facebook_reel": record.facebook_reel,
             },
         }
+        if dancer_analysis is not None:
+            analytics["dancer_analysis"] = dancer_analysis
         if cancel_check():
             raise ImportCancelledError("Archive import canceled")
         output = folder / "reference.tp" if as_reference else destination

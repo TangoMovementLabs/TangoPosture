@@ -11,6 +11,7 @@ class Route(StrEnum):
     HOME = "home"
     REFERENCES = "references"
     LIBRARY = "library"
+    ANALYSIS = "analysis"
     REVIEW = "review"
     ANALYTICS = "analytics"
     COACH = "coach"

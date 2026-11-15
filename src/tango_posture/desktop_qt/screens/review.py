@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import copy
+import inspect
 import queue
 import re
 import threading
@@ -11,6 +13,7 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile, TemporaryDirectory
 from threading import Event, Thread
 from typing import Any
+from uuid import uuid4
 from zipfile import BadZipFile, ZipFile
 
 import cv2
@@ -29,11 +32,15 @@ from PySide6.QtWidgets import (
     QFrame,
     QGridLayout,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
+    QLineEdit,
     QPushButton,
     QScrollArea,
     QSlider,
     QSplitter,
+    QTableWidget,
+    QTableWidgetItem,
     QTabWidget,
     QTextBrowser,
     QVBoxLayout,
@@ -45,12 +52,23 @@ from ...archive import (
     read_analytics,
     read_manifest,
     read_movement_analysis,
+    set_active_dancer_run,
     store_analytics,
+    update_couple_annotations,
 )
 from ...calibration.baseline import load_calibration_file
 from ...calibration.measurements import measure_ranges
 from ...calibration.models import METRIC_DETAILS, ApprovedRange, profile_from_calibration
 from ...calibration.normalization import HoldSourceIdentity, resolve_raw_media_sha256
+from ...couple.measurements import rebuild_couple_result_with_annotations
+from ...couple.models import (
+    CoupleAnalysisRequest,
+    CoupleAnnotationItem,
+    CoupleAnnotations,
+    DancerAnchor,
+    PlannedTransitionMark,
+)
+from ...couple.overlay import render_couple_frame_overlay
 from ...movement import render_floor_guide, render_movement_overlay, validate_movement_analysis
 from ...pose.recovery import recover_clip_tracking_range
 from ...references.coach import (
@@ -63,13 +81,16 @@ from ...references.coach import (
     render_coach_torso_axis,
 )
 from ...references.companions import (
+    load_couple_companion,
     load_report_coach_data,
     load_report_movement_data,
     save_coach_companion,
+    save_couple_companion,
 )
 from ...references.constants import MAX_IMPORT_RANGE_SECONDS
 from ...replay import VideoReader, time_label
 from ...reports import latest_analysis_model_section
+from ..components.analysis_options import NeedsSelectionDialog
 from ..components.video_stage import VideoStage
 from ..review.analysis import (
     ReviewAnalysis,
@@ -193,6 +214,14 @@ class ReviewScreen(QWidget):
         self._anchor_start_sec: float | None = None
         self._anchor_end_sec: float | None = None
         self._movement_data: dict[str, Any] | None = None
+        self._dancer_analysis: dict[str, Any] | None = None
+        self._couple_result: dict[str, Any] | None = None
+        self._active_dancer_view_mode: str = "single"
+        self._couple_run_id: str | None = None
+        self._couple_companion_path: Path | None = None
+        self._annotation_undo_stack: list[dict[str, Any]] = []
+        self._pending_dancer_request: CoupleAnalysisRequest | None = None
+        self._active_run_dancer_request: CoupleAnalysisRequest | None = None
         self._analysis_events: queue.SimpleQueue[tuple[int, str, object]] = queue.SimpleQueue()
         self._analysis_cancel: Event | None = None
         self._analysis_thread: Thread | None = None
@@ -351,6 +380,37 @@ class ReviewScreen(QWidget):
 
         # Analysis
         it_layout.addWidget(_section_label("Analysis"))
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("Dancer mode:"))
+        self.dancer_mode_combo = QComboBox()
+        self.dancer_mode_combo.setObjectName("reviewDancerModeCombo")
+        self.dancer_mode_combo.addItem("Auto", "auto")
+        self.dancer_mode_combo.addItem("Single", "single")
+        self.dancer_mode_combo.addItem("Couple", "couple")
+        idx_mode = self.dancer_mode_combo.findData(
+            str(self.bridge.config.dancer_analysis.default_dancer_mode)
+        )
+        if idx_mode >= 0:
+            self.dancer_mode_combo.setCurrentIndex(idx_mode)
+        self.dancer_mode_combo.currentIndexChanged.connect(
+            lambda _: self._update_saved_vs_next_label()
+        )
+        mode_row.addWidget(self.dancer_mode_combo, 1)
+        it_layout.addLayout(mode_row)
+
+        view_run_row = QHBoxLayout()
+        view_run_row.addWidget(QLabel("View run:"))
+        self.view_run_combo = QComboBox()
+        self.view_run_combo.setObjectName("reviewViewRunCombo")
+        self.view_run_combo.setEnabled(False)
+        self.view_run_combo.currentIndexChanged.connect(self._on_view_run_changed)
+        view_run_row.addWidget(self.view_run_combo, 1)
+        it_layout.addLayout(view_run_row)
+
+        self.saved_vs_next_label = _caption_label("Saved result: None · Next run: Auto")
+        self.saved_vs_next_label.setObjectName("reviewSavedVsNextLabel")
+        it_layout.addWidget(self.saved_vs_next_label)
+
         self.analytics_btn.setProperty("class", "primary")
         self.cancel_analysis_btn = QPushButton("Cancel analysis")
         self.cancel_analysis_btn.setEnabled(False)
@@ -458,7 +518,19 @@ class ReviewScreen(QWidget):
         self.show_steps_cb = QCheckBox("Step footprints")
         self.lines_only_cb = QCheckBox("Floor lines only")
         self.lines_only_cb.setToolTip("Hide the video and show only the drawn lines on the floor.")
-        for checkbox in (self.show_coach_cb, self.show_pivots_cb, self.show_steps_cb):
+        self.show_dancer_a_cb = QCheckBox("Dancer A axis")
+        self.show_dancer_b_cb = QCheckBox("Dancer B axis")
+        self.show_couple_axis_cb = QCheckBox("Couple midpoint axis")
+        self.show_couple_steps_cb = QCheckBox("Couple steps & turns")
+        for checkbox in (
+            self.show_coach_cb,
+            self.show_pivots_cb,
+            self.show_steps_cb,
+            self.show_dancer_a_cb,
+            self.show_dancer_b_cb,
+            self.show_couple_axis_cb,
+            self.show_couple_steps_cb,
+        ):
             checkbox.setChecked(True)
         layers = QGridLayout()
         layers.setHorizontalSpacing(12)
@@ -471,6 +543,10 @@ class ReviewScreen(QWidget):
             self.show_pivots_cb,
             self.show_steps_cb,
             self.lines_only_cb,
+            self.show_dancer_a_cb,
+            self.show_dancer_b_cb,
+            self.show_couple_axis_cb,
+            self.show_couple_steps_cb,
         )):
             checkbox.toggled.connect(self._refresh_overlay)
             layers.addWidget(checkbox, position // 2, position % 2)
@@ -599,8 +675,11 @@ class ReviewScreen(QWidget):
         insights_scroll.setFrameShape(QFrame.Shape.NoFrame)
         insights_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         insights_scroll.setWidget(insights_tab)
+        couple_scroll = self._build_couple_evidence_tab()
+        self.inspector_tabs = tabs
         tabs.addTab(insights_scroll, "Insights")
         tabs.addTab(report_tab, "Report")
+        tabs.addTab(couple_scroll, "Couple evidence")
         insp_layout.addWidget(tabs)
 
         self.splitter.addWidget(inspector)
@@ -837,7 +916,12 @@ class ReviewScreen(QWidget):
         return self.reference_combo.currentData() is not None
 
     def load_archive(
-        self, path: Path, *, segment_index: int = 0, timestamp: float | None = None
+        self,
+        path: Path,
+        *,
+        segment_index: int = 0,
+        timestamp: float | None = None,
+        run_id: str | None = None,
     ) -> None:
         """Open either a local video or a validated practice archive."""
         self._reopen_path = None
@@ -862,6 +946,31 @@ class ReviewScreen(QWidget):
                 self._coach_data = load_report_coach_data(self._playback._report)
                 self._update_calibration_comparison()
                 self._movement_data = load_report_movement_data(self._playback._report)
+                comp_couple = load_couple_companion(
+                    path.parent / f"{path.stem}.couple.v1.json"
+                )
+                if comp_couple is None and isinstance(self._coach_data, dict):
+                    raw_c = self._coach_data.get("couple_analysis")
+                    comp_couple = raw_c if isinstance(raw_c, dict) else None
+                if comp_couple is not None:
+                    self._couple_companion_path = path.parent / f"{path.stem}.couple.v1.json"
+                    self._couple_result = comp_couple
+                    self._couple_run_id = str(comp_couple.get("run_id") or "")
+                    self._dancer_analysis = {
+                        "schema_version": 1,
+                        "active_mode": "couple",
+                        "active_run_id": self._couple_run_id,
+                        "runs": {
+                            "couple": {
+                                "run_id": self._couple_run_id,
+                                "resolved_mode": "couple",
+                                "couple_result": comp_couple,
+                            }
+                        },
+                    }
+                    self._sync_dancer_analysis_state(preferred_run_id=run_id)
+                else:
+                    self._sync_dancer_analysis_state(preferred_run_id=run_id)
                 self.coach_btn.setEnabled(True)
                 self._set_relink_availability()
                 if self._playback.variants:
@@ -873,6 +982,8 @@ class ReviewScreen(QWidget):
                     )
             else:
                 self._populate_streams()
+            if run_id:
+                self._select_run_by_id(run_id)
             self._update_analysis_controls()
             if timestamp is not None:
                 self._show_frame(self._playback.frame_for_timestamp(timestamp))
@@ -1073,6 +1184,10 @@ class ReviewScreen(QWidget):
         self._active_analysis_job = None
         self._coach_data = None
         self._movement_data = None
+        self._dancer_analysis = None
+        self._couple_result = None
+        self._couple_run_id = None
+        self._annotation_undo_stack.clear()
         self._reset_transport()
         self.report_view.clear()
         try:
@@ -1083,11 +1198,15 @@ class ReviewScreen(QWidget):
                 if analytics is not None:
                     self._coach_data = analytics.get("coach_data")
                     self._movement_data = analytics.get("movement_data")
+                    raw_da = analytics.get("dancer_analysis")
+                    if isinstance(raw_da, dict):
+                        self._dancer_analysis = raw_da
                 movement = read_movement_analysis(archive.path, index)
                 if movement is not None and self._movement_data is None:
                     self._movement_data = validate_movement_analysis(
                         movement, expected_segment_index=index
                     )
+            self._sync_dancer_analysis_state()
             self._update_calibration_comparison()
             self._refresh_archive_report()
             self.coach_btn.setEnabled(self._playback._report is not None)
@@ -1343,6 +1462,32 @@ class ReviewScreen(QWidget):
         rendered = frame.copy()
         if self.lines_only_cb.isChecked():
             rendered = render_floor_guide(rendered)
+        if self._active_dancer_view_mode == "couple" and isinstance(self._couple_result, dict):
+            if update_status:
+                self.axis_status.clear()
+                self.axis_status.setVisible(False)
+            overlay_root = self._couple_result.get("overlay") or {}
+            by_frame = overlay_root.get("by_frame") or {}
+            frame_overlay = by_frame.get(str(frame_index))
+            ann = self._couple_result.get("annotations") or {}
+            events = [
+                ev
+                for ev in (self._couple_result.get("events") or [])
+                if isinstance(ev, dict)
+                and not ev.get("deleted")
+                and abs(float(ev.get("timestamp", -999.0)) - frame_time_sec) <= 0.35
+            ]
+            return render_couple_frame_overlay(
+                rendered,
+                frame_overlay if isinstance(frame_overlay, dict) else None,
+                show_dancer_a=self.show_dancer_a_cb.isChecked(),
+                show_dancer_b=self.show_dancer_b_cb.isChecked(),
+                show_couple_axis=self.show_couple_axis_cb.isChecked(),
+                show_steps_turns=self.show_couple_steps_cb.isChecked(),
+                dancer_a_name=str(ann.get("dancer_a_name") or "A"),
+                dancer_b_name=str(ann.get("dancer_b_name") or "B"),
+                active_events=events,
+            )
         coach_data = self._display_coach_data()
         if coach_data is not None and self.show_coach_cb.isChecked():
             rendered = render_coach_frame_overlay(
@@ -1576,7 +1721,9 @@ class ReviewScreen(QWidget):
         reader = self._playback.reader
         self._update_tracking_evidence_ui(reader.index if reader is not None else None)
 
-    def _start_posture_analysis(self) -> None:
+    def _start_posture_analysis(
+        self, *, override_request: CoupleAnalysisRequest | None = None
+    ) -> None:
         if self._analysis_thread is not None:
             self._poll_posture_analysis()
         reader = self._playback.reader
@@ -1597,21 +1744,28 @@ class ReviewScreen(QWidget):
             )
             return
 
+        req_obj = (
+            override_request
+            if override_request is not None
+            else self._build_review_dancer_request()
+        )
+        self._active_run_dancer_request = req_obj
+
         self._analysis_job_id += 1
         job_id = self._analysis_job_id
         cancel_event = threading.Event()
         self._analysis_cancel = cancel_event
         self._active_analysis_job = job_id
-        self.analysis_status.setText("Preparing posture analysis…")
+        self.analysis_status.setText("Preparing posture & dancer analysis…")
         self.cancel_analysis_btn.setEnabled(True)
         self.cancel_analysis_btn.setVisible(True)
         self.analytics_btn.setEnabled(False)
         self._analysis_timer.start()
         cfg = self.bridge.config.model_copy(deep=True)
+        cfg.replay_recovery_auto = self.recover_gaps_cb.isChecked()
         archive_path = self.current_archive_path
         segment_index = self._playback.selected_segment_index
 
-        recover_tracking = self.recover_gaps_cb.isChecked()
         archive_lease = (
             self._playback.archive.acquire()
             if self._playback.archive is not None
@@ -1624,21 +1778,32 @@ class ReviewScreen(QWidget):
         def work() -> None:
             try:
                 video_sha256 = file_sha256(video_path)
+                sig_params = inspect.signature(analyse_review_clip).parameters
+                call_kwargs: dict[str, Any] = {
+                    "selected_out": selected_out,
+                    "progress_callback": report_progress,
+                    "cancel_check": cancel_event.is_set,
+                }
+                if "dancer_request" in sig_params:
+                    call_kwargs["dancer_request"] = req_obj.to_dict()
                 coach_data = analyse_review_clip(
                     video_path,
                     cfg,
-                    selected_out=selected_out,
-                    progress_callback=report_progress,
-                    cancel_check=cancel_event.is_set,
-                    recover_tracking=recover_tracking,
+                    **call_kwargs,
                 )
+                if getattr(coach_data, "selection_required", False):
+                    with self._analysis_commit_lock:
+                        cancelled = cancel_event.is_set() or self._active_analysis_job != job_id
+                        event = "cancelled" if cancelled else "selection_required"
+                        self._analysis_events.put((job_id, event, coach_data))
+                    return
                 if (
                     not cancel_event.is_set()
                     and archive_path is not None
                     and archive_path.suffix.lower() in (".tp", ".tpr")
                     and segment_index is not None
                 ):
-                    if coach_data.result is None:
+                    if getattr(coach_data, "result", None) is None:
                         raise ValueError("Analysis did not produce the data required for a report")
                     result = coach_data.result
                     if result.source_sha256 != video_sha256:
@@ -1670,6 +1835,28 @@ class ReviewScreen(QWidget):
                             "frame_timestamps": timestamps,
                             "frames": [],
                         }
+                        couple_result = getattr(result, "couple_result", None)
+                        requested_mode = getattr(result, "requested_dancer_mode", "auto")
+                        resolved_mode = getattr(result, "resolved_dancer_mode", "single")
+                        auto_decision = getattr(result, "auto_decision", None)
+                        run_id = (
+                            str(couple_result.get("run_id") or "")
+                            if isinstance(couple_result, dict)
+                            else f"single-{segment_index}-{uuid4().hex[:8]}"
+                        )
+                        dancer_run: dict[str, Any] = {
+                            "run_id": run_id,
+                            "requested_mode": requested_mode,
+                            "resolved_mode": resolved_mode,
+                            "auto_decision": auto_decision,
+                        }
+                        if resolved_mode == "couple" and couple_result is not None:
+                            dancer_run["couple_result"] = couple_result
+                        else:
+                            dancer_run["coach_data"] = coach_data.coach_data
+                            dancer_run["movement_data"] = coach_data.movement_data
+                            dancer_run["session"] = getattr(result, "session_summary", {})
+                            dancer_run["frames"] = getattr(result, "scored_frame_log", [])
                         with self._analysis_commit_lock:
                             cancelled = cancel_event.is_set() or self._active_analysis_job != job_id
                             if not cancelled:
@@ -1677,6 +1864,7 @@ class ReviewScreen(QWidget):
                                     archive_path, segment_index, payload,
                                     expected_video_sha256=video_sha256, report_text=report,
                                     overlay_path=overlay, lines_path=lines, frame_log=result.frame_log,
+                                    dancer_analysis_run=dancer_run,
                                     metadata_updates={
                                         "frame_timestamps": timestamps,
                                         "analysis_mode": result.analysis_mode,
@@ -1693,6 +1881,8 @@ class ReviewScreen(QWidget):
                                         },
                                         "soundtrack": result.soundtrack.to_metadata_dict(),
                                         "capture_profile": result.manifest.capture_profile,
+                                        "requested_dancer_mode": requested_mode,
+                                        "resolved_dancer_mode": resolved_mode,
                                     },
                                 )
                             event = "cancelled" if cancelled else "done"
@@ -1977,6 +2167,7 @@ class ReviewScreen(QWidget):
     def _poll_posture_analysis(self) -> None:
         thread = self._analysis_thread
         finished = thread is not None and not thread.is_alive()
+        pending_override_req: CoupleAnalysisRequest | None = None
         while True:
             try:
                 job_id, event, payload = self._analysis_events.get_nowait()
@@ -1987,9 +2178,28 @@ class ReviewScreen(QWidget):
             if event == "progress" and isinstance(payload, tuple):
                 current, total, message = payload
                 self.analysis_status.setText(f"{message} ({current}/{total}%)")
+            elif event == "selection_required" and isinstance(payload, ReviewAnalysis):
+                dlg = NeedsSelectionDialog(
+                    payload.auto_decision or {},
+                    video_path=self._analysis_video_path(),
+                    parent=self,
+                )
+                if dlg.exec() == NeedsSelectionDialog.DialogCode.Accepted:
+                    pending_override_req = dlg.apply_to_request(self._active_run_dancer_request)
+                else:
+                    self.analysis_status.setText(
+                        "Needs selection cancelled; saved archive was left unchanged."
+                    )
             elif event == "done" and isinstance(payload, ReviewAnalysis):
                 self._coach_data = payload.coach_data
                 self._movement_data = payload.movement_data
+                if isinstance(payload.couple_result, dict):
+                    self._couple_result = payload.couple_result
+                    self._couple_run_id = str(payload.couple_result.get("run_id") or "")
+                    self._active_dancer_view_mode = "couple"
+                else:
+                    self._couple_result = None
+                    self._active_dancer_view_mode = "single"
                 self._update_calibration_comparison()
                 try:
                     if self._playback.archive is not None:
@@ -2002,6 +2212,7 @@ class ReviewScreen(QWidget):
                         if self._playback.reader is not None:
                             self._show_frame(min(frame, self._playback.reader.count - 1))
                     else:
+                        self._sync_dancer_analysis_state()
                         original = self._playback.report
                         section = latest_analysis_model_section(
                             payload.coach_data.get("model_hash"), has_original_report=bool(original),
@@ -2068,6 +2279,8 @@ class ReviewScreen(QWidget):
             self._active_analysis_job = None
             self._analysis_timer.stop()
             self._update_analysis_controls()
+            if pending_override_req is not None:
+                self._start_posture_analysis(override_request=pending_override_req)
 
     def _set_alert(self, text: str, tone: str) -> None:
         color = _TONE_COLORS[tone]
@@ -2374,6 +2587,14 @@ class ReviewScreen(QWidget):
         self._anchor_start_sec = None
         self._anchor_end_sec = None
         self._movement_data = None
+        self._dancer_analysis = None
+        self._couple_result = None
+        self._active_dancer_view_mode = "single"
+        self._couple_run_id = None
+        self._couple_companion_path = None
+        self._annotation_undo_stack.clear()
+        if hasattr(self, "view_run_combo"):
+            self._sync_dancer_analysis_state()
         if hasattr(self, "normalization_recheck_bar"):
             self._sync_normalization_notices()
         self._reopen_path = None
@@ -2399,6 +2620,557 @@ class ReviewScreen(QWidget):
         )
         self._update_analysis_controls()
         self.status_label.setText("Playback closed. Open a video or .tp archive to replay.")
+
+    def _build_couple_evidence_tab(self) -> QScrollArea:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(10)
+
+        layout.addWidget(_section_label("Couple Decision & Provenance"))
+        self.couple_provenance_label = _caption_label(
+            "No Couple run loaded for this recording."
+        )
+        layout.addWidget(self.couple_provenance_label)
+
+        self.couple_markers_summary = _caption_label("Timeline markers: none")
+        self.couple_markers_summary.setObjectName("coupleTimelineMarkersLabel")
+        layout.addWidget(self.couple_markers_summary)
+
+        layout.addWidget(_section_label("Dancer Labels & Roles"))
+        names_form = QFormLayout()
+        names_form.setContentsMargins(0, 0, 0, 0)
+        self.dancer_a_name_edit = QLineEdit("Dancer A")
+        self.dancer_a_role_edit = QLineEdit()
+        self.dancer_b_name_edit = QLineEdit("Dancer B")
+        self.dancer_b_role_edit = QLineEdit()
+        names_form.addRow("Dancer A name:", self.dancer_a_name_edit)
+        names_form.addRow("Dancer A role:", self.dancer_a_role_edit)
+        names_form.addRow("Dancer B name:", self.dancer_b_name_edit)
+        names_form.addRow("Dancer B role:", self.dancer_b_role_edit)
+        layout.addLayout(names_form)
+
+        names_btn_row = QHBoxLayout()
+        self.apply_names_btn = QPushButton("Apply Labels")
+        self.apply_names_btn.clicked.connect(self._apply_couple_names)
+        names_btn_row.addWidget(self.apply_names_btn)
+        names_btn_row.addStretch()
+        layout.addLayout(names_btn_row)
+
+        layout.addWidget(_section_label("Planned Transitions & Events"))
+        plan_row = QHBoxLayout()
+        mark_rev_btn = QPushButton("Mark Planned Reversal @ frame")
+        mark_pause_btn = QPushButton("Mark Planned Pause")
+        mark_settle_btn = QPushButton("Mark Settling Step")
+        mark_rev_btn.clicked.connect(lambda: self._mark_planned_transition("planned_reversal"))
+        mark_pause_btn.clicked.connect(lambda: self._mark_planned_transition("planned_pause"))
+        mark_settle_btn.clicked.connect(lambda: self._mark_planned_transition("settling_step"))
+        plan_row.addWidget(mark_rev_btn)
+        plan_row.addWidget(mark_pause_btn)
+        plan_row.addWidget(mark_settle_btn)
+        layout.addLayout(plan_row)
+
+        ev_edit_form = QFormLayout()
+        ev_edit_form.setContentsMargins(0, 0, 0, 0)
+        self.couple_event_type_combo = QComboBox()
+        for et in (
+            "start",
+            "slow",
+            "settle",
+            "contact",
+            "musical_target",
+            "speed_cue",
+            "turn_start",
+            "turn_end",
+            "exit",
+            "embrace_opening",
+        ):
+            self.couple_event_type_combo.addItem(et, et)
+        self.couple_event_subject_combo = QComboBox()
+        for subj in ("pair", "A", "B"):
+            self.couple_event_subject_combo.addItem(subj, subj)
+        self.couple_pivot_behavior_combo = QComboBox()
+        for pb in ("appears_planted", "rotates_in_place", "repositions", "unknown"):
+            self.couple_pivot_behavior_combo.addItem(pb.replace("_", " "), pb)
+        ev_edit_form.addRow("Event type:", self.couple_event_type_combo)
+        ev_edit_form.addRow("Subject:", self.couple_event_subject_combo)
+        ev_edit_form.addRow("Pivot foot:", self.couple_pivot_behavior_combo)
+        layout.addLayout(ev_edit_form)
+
+        ev_btns = QHBoxLayout()
+        self.add_couple_event_btn = QPushButton("Add @ frame")
+        self.confirm_couple_event_btn = QPushButton("Confirm")
+        self.update_couple_event_btn = QPushButton("Update")
+        self.delete_couple_event_btn = QPushButton("Delete")
+        self.add_couple_event_btn.clicked.connect(self._add_couple_event)
+        self.confirm_couple_event_btn.clicked.connect(self._confirm_couple_candidate)
+        self.update_couple_event_btn.clicked.connect(self._update_couple_event)
+        self.delete_couple_event_btn.clicked.connect(self._delete_couple_event)
+        for btn in (
+            self.add_couple_event_btn,
+            self.confirm_couple_event_btn,
+            self.update_couple_event_btn,
+            self.delete_couple_event_btn,
+        ):
+            ev_btns.addWidget(btn)
+        layout.addLayout(ev_btns)
+
+        self.couple_events_table = QTableWidget(0, 5)
+        self.couple_events_table.setObjectName("coupleEventsTable")
+        self.couple_events_table.setHorizontalHeaderLabels(
+            ["Time (s)", "Event", "Subject", "Status", "Detail"]
+        )
+        self.couple_events_table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeMode.Stretch
+        )
+        self.couple_events_table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows
+        )
+        self.couple_events_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.couple_events_table.setMinimumHeight(200)
+        self.couple_events_table.cellClicked.connect(self._on_couple_event_clicked)
+        layout.addWidget(self.couple_events_table)
+
+        save_row = QHBoxLayout()
+        self.couple_undo_btn = QPushButton("Undo")
+        self.couple_undo_btn.setEnabled(False)
+        self.couple_undo_btn.clicked.connect(self._undo_couple_annotations)
+        self.couple_save_annotations_btn = QPushButton("Save Annotations")
+        self.couple_save_annotations_btn.setObjectName("saveCoupleAnnotationsBtn")
+        self.couple_save_annotations_btn.setProperty("class", "primary")
+        self.couple_save_annotations_btn.clicked.connect(self._save_couple_annotations)
+        save_row.addWidget(self.couple_undo_btn)
+        save_row.addWidget(self.couple_save_annotations_btn)
+        layout.addLayout(save_row)
+
+        self.couple_evidence_status = _caption_label("")
+        layout.addWidget(self.couple_evidence_status)
+        layout.addStretch()
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setWidget(tab)
+        return scroll
+
+    def _build_review_dancer_request(self) -> CoupleAnalysisRequest:
+        raw_mode = str(self.dancer_mode_combo.currentData() or "auto")
+        mode = raw_mode if raw_mode in ("auto", "single", "couple") else "auto"
+        ann = self._current_annotations_model()
+        return CoupleAnalysisRequest(
+            requested_mode=mode,  # type: ignore[arg-type]
+            forced_override=False,
+            annotations=ann,
+            auto_turn_suggestions=bool(self.bridge.config.dancer_analysis.auto_turn_suggestions),
+        )
+
+    def _update_saved_vs_next_label(self) -> None:
+        if not hasattr(self, "saved_vs_next_label"):
+            return
+        next_label = str(self.dancer_mode_combo.currentText() or "Auto")
+        saved_label = "None"
+        if isinstance(self._dancer_analysis, dict) and isinstance(
+            self._dancer_analysis.get("runs"), dict
+        ):
+            runs = self._dancer_analysis["runs"]
+            modes = [m.capitalize() for m in ("single", "couple") if m in runs]
+            if modes:
+                active = str(self._dancer_analysis.get("active_mode") or modes[0]).capitalize()
+                saved_label = f"{' + '.join(modes)} (viewing {self._active_dancer_view_mode.capitalize() or active})"
+        elif self._coach_data is not None or self._movement_data is not None:
+            saved_label = "Single (legacy)"
+        self.saved_vs_next_label.setText(f"Saved result: {saved_label} · Next run: {next_label}")
+
+    def _sync_dancer_analysis_state(self, *, preferred_run_id: str | None = None) -> None:
+        self.view_run_combo.blockSignals(True)
+        self.view_run_combo.clear()
+        da = self._dancer_analysis
+        runs = da.get("runs") if isinstance(da, dict) and isinstance(da.get("runs"), dict) else {}
+        if runs:
+            for m_key in ("couple", "single"):
+                entry = runs.get(m_key)
+                if isinstance(entry, dict):
+                    rid = str(entry.get("run_id") or m_key)
+                    self.view_run_combo.addItem(f"{m_key.capitalize()} run ({rid[:12]})", m_key)
+            self.view_run_combo.setEnabled(self.view_run_combo.count() > 1)
+            active_mode = str(da.get("active_mode") or "single") if isinstance(da, dict) else "single"
+            if preferred_run_id:
+                for m_key, entry in runs.items():
+                    if isinstance(entry, dict) and str(entry.get("run_id") or "") == preferred_run_id:
+                        active_mode = m_key
+                        break
+            idx = self.view_run_combo.findData(active_mode)
+            if idx >= 0:
+                self.view_run_combo.setCurrentIndex(idx)
+            self._apply_run_selection(active_mode)
+        else:
+            self.view_run_combo.setEnabled(False)
+            self._active_dancer_view_mode = "couple" if self._couple_result is not None else "single"
+        self.view_run_combo.blockSignals(False)
+        self._update_saved_vs_next_label()
+        self._refresh_couple_evidence_tab()
+
+    def _apply_run_selection(self, mode_key: str) -> None:
+        da = self._dancer_analysis
+        runs = da.get("runs") if isinstance(da, dict) and isinstance(da.get("runs"), dict) else {}
+        entry = runs.get(mode_key)
+        self._active_dancer_view_mode = mode_key if isinstance(entry, dict) else "single"
+        if mode_key == "couple" and isinstance(entry, dict) and isinstance(entry.get("couple_result"), dict):
+            self._couple_result = copy.deepcopy(entry["couple_result"])
+            self._couple_run_id = str(
+                entry.get("run_id") or self._couple_result.get("run_id") or ""
+            )
+        elif mode_key == "single" and isinstance(entry, dict):
+            if isinstance(entry.get("coach_data"), dict):
+                self._coach_data = entry["coach_data"]
+            if isinstance(entry.get("movement_data"), dict):
+                self._movement_data = entry["movement_data"]
+            self._couple_result = None
+            self._couple_run_id = str(entry.get("run_id") or "")
+
+    def _select_run_by_id(self, run_id: str) -> None:
+        da = self._dancer_analysis
+        runs = da.get("runs") if isinstance(da, dict) and isinstance(da.get("runs"), dict) else {}
+        for m_key, entry in runs.items():
+            if not isinstance(entry, dict):
+                continue
+            cand_rid = str(entry.get("run_id") or "")
+            couple_rid = (
+                str((entry.get("couple_result") or {}).get("run_id") or "")
+                if isinstance(entry.get("couple_result"), dict)
+                else ""
+            )
+            if run_id in (cand_rid, couple_rid):
+                self.view_run_combo.blockSignals(True)
+                idx = self.view_run_combo.findData(m_key)
+                if idx >= 0:
+                    self.view_run_combo.setCurrentIndex(idx)
+                self.view_run_combo.blockSignals(False)
+                self._apply_run_selection(m_key)
+                self._refresh_couple_evidence_tab()
+                self._refresh_overlay()
+                return
+        self.analysis_status.setText(
+            f"Run '{run_id}' was not found or was superseded; archive unchanged."
+        )
+        self.status_label.setText(
+            f"Requested run '{run_id}' is unavailable on this recording."
+        )
+
+    def _on_view_run_changed(self) -> None:
+        mode_key = str(self.view_run_combo.currentData() or "")
+        if not mode_key:
+            return
+        self._apply_run_selection(mode_key)
+        archive = self._playback.archive
+        index = self._playback.selected_segment_index
+        if archive is not None and index is not None and self._dancer_analysis is not None:
+            try:
+                updated = set_active_dancer_run(archive.path, index, mode_key)
+                if isinstance(updated.get("dancer_analysis"), dict):
+                    self._dancer_analysis = updated["dancer_analysis"]
+            except (OSError, ValueError):
+                pass
+        self._update_saved_vs_next_label()
+        self._refresh_couple_evidence_tab()
+        self._refresh_overlay()
+
+    def _refresh_couple_evidence_tab(self) -> None:
+        if not hasattr(self, "couple_events_table"):
+            return
+        self.couple_events_table.setRowCount(0)
+        res = self._couple_result
+        if not isinstance(res, dict):
+            self.couple_provenance_label.setText("No Couple run active for this recording.")
+            self.couple_markers_summary.setText("Timeline markers: none")
+            self.couple_undo_btn.setEnabled(False)
+            self.couple_save_annotations_btn.setEnabled(False)
+            return
+
+        dec = res.get("auto_decision") or {}
+        if isinstance(dec, dict) and dec:
+            self.couple_provenance_label.setText(
+                f"Resolved: {dec.get('resolved_mode', 'couple')} "
+                f"(requested: {dec.get('requested_mode', 'auto')}) · "
+                f"{dec.get('explanation', '')}"
+            )
+        else:
+            self.couple_provenance_label.setText("Couple run active.")
+
+        ann = res.get("annotations") or {}
+        self.dancer_a_name_edit.setText(str(ann.get("dancer_a_name") or "Dancer A"))
+        self.dancer_a_role_edit.setText(str(ann.get("dancer_a_role") or ""))
+        self.dancer_b_name_edit.setText(str(ann.get("dancer_b_name") or "Dancer B"))
+        self.dancer_b_role_edit.setText(str(ann.get("dancer_b_role") or ""))
+
+        events = [ev for ev in (res.get("events") or []) if isinstance(ev, dict)]
+        planned = list(ann.get("planned_transitions") or [])
+        marker_parts: list[str] = []
+        for ev in events:
+            if ev.get("deleted"):
+                continue
+            r = self.couple_events_table.rowCount()
+            self.couple_events_table.insertRow(r)
+            ts = float(ev.get("timestamp", 0.0))
+            etype = str(ev.get("event_type", ""))
+            subj = str(ev.get("subject", "pair"))
+            status = str(ev.get("status", "measured"))
+            detail = str(ev.get("pivot_behavior") or ev.get("label") or "")
+            t_item = QTableWidgetItem(f"{ts:.2f}")
+            t_item.setData(Qt.ItemDataRole.UserRole, ev)
+            self.couple_events_table.setItem(r, 0, t_item)
+            self.couple_events_table.setItem(r, 1, QTableWidgetItem(etype))
+            self.couple_events_table.setItem(r, 2, QTableWidgetItem(subj))
+            self.couple_events_table.setItem(r, 3, QTableWidgetItem(status))
+            self.couple_events_table.setItem(r, 4, QTableWidgetItem(detail))
+            if len(marker_parts) < 8:
+                marker_parts.append(f"{etype}@{ts:.1f}s")
+        for pm in planned:
+            if isinstance(pm, dict):
+                marker_parts.append(f"{pm.get('kind', 'planned')}@{float(pm.get('timestamp', 0.0)):.1f}s")
+
+        self.couple_markers_summary.setText(
+            "Timeline markers: " + (", ".join(marker_parts) if marker_parts else "none")
+        )
+        self.couple_undo_btn.setEnabled(bool(self._annotation_undo_stack))
+        self.couple_save_annotations_btn.setEnabled(True)
+
+    def _current_annotations_model(self) -> CoupleAnnotations:
+        if isinstance(self._couple_result, dict) and isinstance(
+            self._couple_result.get("annotations"), dict
+        ):
+            return CoupleAnnotations.from_dict(self._couple_result["annotations"])
+        return CoupleAnnotations()
+
+    def _push_annotation_undo(self) -> None:
+        if isinstance(self._couple_result, dict):
+            self._annotation_undo_stack.append(
+                copy.deepcopy(self._couple_result.get("annotations") or {})
+            )
+            self.couple_undo_btn.setEnabled(True)
+
+    def _rebuild_local_couple_preview(self, annotations: CoupleAnnotations) -> None:
+        if not isinstance(self._couple_result, dict):
+            return
+        self._couple_result = rebuild_couple_result_with_annotations(
+            self._couple_result,
+            annotations.to_dict(),
+            self.bridge.config,
+        )
+        self._refresh_couple_evidence_tab()
+        self._refresh_overlay()
+
+    def _apply_couple_names(self) -> None:
+        if not isinstance(self._couple_result, dict):
+            return
+        self._push_annotation_undo()
+        ann = self._current_annotations_model()
+        ann.dancer_a_name = self.dancer_a_name_edit.text().strip() or "Dancer A"
+        ann.dancer_a_role = self.dancer_a_role_edit.text().strip()
+        ann.dancer_b_name = self.dancer_b_name_edit.text().strip() or "Dancer B"
+        ann.dancer_b_role = self.dancer_b_role_edit.text().strip()
+        self._rebuild_local_couple_preview(ann)
+        self.couple_evidence_status.setText("Updated dancer labels; click Save Annotations to persist.")
+
+    def _mark_planned_transition(self, kind: str) -> None:
+        if not isinstance(self._couple_result, dict):
+            return
+        self._push_annotation_undo()
+        ann = self._current_annotations_model()
+        ts = float(self.current_time_sec)
+        ann.planned_transitions.append(
+            PlannedTransitionMark(
+                mark_id=f"plan-{uuid4().hex[:8]}",
+                timestamp=ts,
+                window_end=ts + 0.25,
+                kind=kind,  # type: ignore[arg-type]
+                note=f"Marked at {ts:.2f}s",
+            )
+        )
+        self._rebuild_local_couple_preview(ann)
+        self.couple_evidence_status.setText(f"Marked {kind} at {ts:.2f}s; click Save Annotations to persist.")
+
+    def _add_couple_event(self) -> None:
+        if not isinstance(self._couple_result, dict):
+            return
+        self._push_annotation_undo()
+        ann = self._current_annotations_model()
+        etype = str(self.couple_event_type_combo.currentData() or "turn_start")
+        subj = str(self.couple_event_subject_combo.currentData() or "pair")
+        pb = str(self.couple_pivot_behavior_combo.currentData() or "unknown")
+        ts = float(self.current_time_sec)
+        ann.items.append(
+            CoupleAnnotationItem(
+                annotation_id=f"ann-{uuid4().hex[:8]}",
+                event_type=etype,  # type: ignore[arg-type]
+                timestamp=ts,
+                subject=subj,  # type: ignore[arg-type]
+                status="user_confirmed",
+                pivot_behavior=pb if etype in ("turn_start", "turn_end", "exit") else None,  # type: ignore[arg-type]
+            )
+        )
+        self._rebuild_local_couple_preview(ann)
+        self.couple_evidence_status.setText(f"Added {etype} ({subj}) at {ts:.2f}s.")
+
+    def _selected_couple_event(self) -> dict[str, Any] | None:
+        row = self.couple_events_table.currentRow()
+        if row < 0:
+            return None
+        item = self.couple_events_table.item(row, 0)
+        if item is None:
+            return None
+        ev = item.data(Qt.ItemDataRole.UserRole)
+        return ev if isinstance(ev, dict) else None
+
+    def _confirm_couple_candidate(self) -> None:
+        ev = self._selected_couple_event()
+        if ev is None or not isinstance(self._couple_result, dict):
+            return
+        self._push_annotation_undo()
+        ann = self._current_annotations_model()
+        ev_id = str(ev.get("event_id") or "")
+        ann_id = str(ev.get("annotation_id") or "")
+        existing = next(
+            (i for i in ann.items if i.annotation_id == ann_id or (ev_id and i.source_candidate_id == ev_id)),
+            None,
+        )
+        if existing is not None:
+            existing.status = "user_confirmed"
+            existing.deleted = False
+        else:
+            ann.items.append(
+                CoupleAnnotationItem(
+                    annotation_id=f"conf-{uuid4().hex[:8]}",
+                    event_type=ev["event_type"],
+                    timestamp=float(ev.get("timestamp", 0.0)),
+                    end_timestamp=ev.get("end_timestamp"),
+                    subject=ev.get("subject", "pair"),
+                    status="user_confirmed",
+                    source_candidate_id=ev_id or None,
+                    pivot_behavior=ev.get("pivot_behavior"),
+                    label=str(ev.get("label") or ""),
+                )
+            )
+        self._rebuild_local_couple_preview(ann)
+
+    def _update_couple_event(self) -> None:
+        ev = self._selected_couple_event()
+        if ev is None or not isinstance(self._couple_result, dict):
+            return
+        self._push_annotation_undo()
+        ann = self._current_annotations_model()
+        etype = str(self.couple_event_type_combo.currentData() or ev["event_type"])
+        subj = str(self.couple_event_subject_combo.currentData() or ev.get("subject", "pair"))
+        pb = str(self.couple_pivot_behavior_combo.currentData() or "unknown")
+        ev_id = str(ev.get("event_id") or "")
+        ann_id = str(ev.get("annotation_id") or "")
+        existing = next(
+            (i for i in ann.items if i.annotation_id == ann_id or (ev_id and i.source_candidate_id == ev_id)),
+            None,
+        )
+        if existing is not None:
+            existing.event_type = etype  # type: ignore[assignment]
+            existing.subject = subj  # type: ignore[assignment]
+            existing.status = "user_confirmed"
+            existing.pivot_behavior = pb if etype in ("turn_start", "turn_end", "exit") else None  # type: ignore[assignment]
+        else:
+            ann.items.append(
+                CoupleAnnotationItem(
+                    annotation_id=f"edit-{uuid4().hex[:8]}",
+                    event_type=etype,  # type: ignore[arg-type]
+                    timestamp=float(ev.get("timestamp", 0.0)),
+                    end_timestamp=ev.get("end_timestamp"),
+                    subject=subj,  # type: ignore[arg-type]
+                    status="user_confirmed",
+                    source_candidate_id=ev_id or None,
+                    pivot_behavior=pb if etype in ("turn_start", "turn_end", "exit") else None,  # type: ignore[arg-type]
+                )
+            )
+        self._rebuild_local_couple_preview(ann)
+
+    def _delete_couple_event(self) -> None:
+        ev = self._selected_couple_event()
+        if ev is None or not isinstance(self._couple_result, dict):
+            return
+        self._push_annotation_undo()
+        ann = self._current_annotations_model()
+        ev_id = str(ev.get("event_id") or "")
+        ann_id = str(ev.get("annotation_id") or "")
+        existing = next(
+            (i for i in ann.items if i.annotation_id == ann_id or (ev_id and i.source_candidate_id == ev_id)),
+            None,
+        )
+        if existing is not None:
+            existing.deleted = True
+        else:
+            ann.items.append(
+                CoupleAnnotationItem(
+                    annotation_id=f"del-{uuid4().hex[:8]}",
+                    event_type=ev["event_type"],
+                    timestamp=float(ev.get("timestamp", 0.0)),
+                    subject=ev.get("subject", "pair"),
+                    status="user_confirmed",
+                    source_candidate_id=ev_id or None,
+                    deleted=True,
+                )
+            )
+        self._rebuild_local_couple_preview(ann)
+
+    def _undo_couple_annotations(self) -> None:
+        if not self._annotation_undo_stack or not isinstance(self._couple_result, dict):
+            return
+        prev = self._annotation_undo_stack.pop()
+        self._rebuild_local_couple_preview(CoupleAnnotations.from_dict(prev))
+        self.couple_undo_btn.setEnabled(bool(self._annotation_undo_stack))
+
+    def _save_couple_annotations(self) -> None:
+        if not isinstance(self._couple_result, dict):
+            return
+        annotations_dict = self._current_annotations_model().to_dict()
+        run_id = str(self._couple_run_id or self._couple_result.get("run_id") or "")
+        archive = self._playback.archive
+        seg_idx = self._playback.selected_segment_index
+        if archive is not None and seg_idx is not None:
+            try:
+                expected_sha = str(self._couple_result.get("video_sha256") or "") or None
+                rebuilt = update_couple_annotations(
+                    archive.path,
+                    seg_idx,
+                    run_id=run_id,
+                    annotations=annotations_dict,
+                    cfg=self.bridge.config,
+                    expected_video_sha256=expected_sha,
+                )
+                self._couple_result = rebuilt
+                analytics = read_analytics(archive.path, seg_idx)
+                if isinstance(analytics, dict) and isinstance(analytics.get("dancer_analysis"), dict):
+                    self._dancer_analysis = analytics["dancer_analysis"]
+                self._refresh_couple_evidence_tab()
+                self._refresh_overlay()
+                self.couple_evidence_status.setText("Saved annotations atomically into archive.")
+                return
+            except (OSError, ValueError, RuntimeError) as exc:
+                self.couple_evidence_status.setText(f"Could not save annotations: {exc}")
+                return
+        if self._couple_companion_path is not None:
+            rebuilt = rebuild_couple_result_with_annotations(
+                self._couple_result, annotations_dict, self.bridge.config
+            )
+            save_couple_companion(self._couple_companion_path, rebuilt)
+            self._couple_result = rebuilt
+            self._refresh_couple_evidence_tab()
+            self._refresh_overlay()
+            self.couple_evidence_status.setText("Saved annotations into Couple companion file.")
+
+    def _on_couple_event_clicked(self, row: int, _col: int) -> None:
+        item = self.couple_events_table.item(row, 0)
+        if item is None:
+            return
+        ev = item.data(Qt.ItemDataRole.UserRole)
+        if isinstance(ev, dict) and "timestamp" in ev and self._playback.reader is not None:
+            ts = float(ev["timestamp"])
+            self._show_frame(self._playback.frame_for_timestamp(ts))
 
     def hideEvent(self, event: QHideEvent) -> None:
         path = self.current_archive_path

@@ -220,7 +220,7 @@ class _TrackMemory:
     def predicted_hip(self, timestamp: float) -> tuple[float, float] | None:
         if self.last_hip_px is None or self.last_time is None:
             return None
-        dt = max(0.0, min(0.25, timestamp - self.last_time))
+        dt = max(0.0, min(0.55, timestamp - self.last_time))
         return (
             self.last_hip_px[0] + self.vel_px[0] * dt,
             self.last_hip_px[1] + self.vel_px[1] * dt,
@@ -236,7 +236,7 @@ class _TrackMemory:
             return
         if self.last_hip_px is not None and self.last_time is not None:
             dt = timestamp - self.last_time
-            if 1e-4 < dt <= 0.35:
+            if 1e-4 < dt <= 0.60:
                 vx = (cand.hip_px[0] - self.last_hip_px[0]) / dt
                 vy = (cand.hip_px[1] - self.last_hip_px[1]) / dt
                 self.vel_px = (
@@ -392,6 +392,8 @@ def track_couple_frames(
     max_innov = float(da_cfg.identity_max_innovation_torso_lengths)
     margin_min = float(da_cfg.identity_margin_torso_lengths)
     max_gap = float(da_cfg.max_observation_gap_s)
+    shot_cut_min_disp = max(1.5, 2.0 * max_innov)
+    shot_cut_frac = 0.6
 
     pending_anchors = sorted(list(anchors or []), key=lambda a: a.timestamp)
     consumed_anchors: set[int] = set()
@@ -412,16 +414,47 @@ def track_couple_frames(
         long_gap = prev_ts is not None and (t - prev_ts) > max_gap
         prev_ts = t
 
+        if not shot_cut and candidates:
+            active_mems = [m for m in (track_a, track_b) if m.active and m.last_hip_px is not None]
+            if active_mems:
+                cand_hips = [c.hip_px for c in candidates if c.hip_px is not None]
+                if cand_hips:
+                    jumped = 0
+                    for m in active_mems:
+                        assert m.last_hip_px is not None
+                        sc = max(8.0, m.current_scale(default_scale))
+                        nearest = min(
+                            math.hypot(ch[0] - m.last_hip_px[0], ch[1] - m.last_hip_px[1]) / sc
+                            for ch in cand_hips
+                        )
+                        if nearest >= shot_cut_min_disp:
+                            jumped += 1
+                    if (jumped / len(active_mems)) >= shot_cut_frac:
+                        shot_cut = True
+                        diagnostics.append(
+                            {
+                                "type": "shot_cut",
+                                "timestamp": t,
+                                "frame_index": frame_index,
+                                "message": f"Shot or camera cut detected at {t:.2f}s.",
+                            }
+                        )
+
         if shot_cut:
+            track_a.active = False
+            track_b.active = False
             track_a.gap_broken = True
             track_b.gap_broken = True
             track_a.vel_px = (0.0, 0.0)
             track_b.vel_px = (0.0, 0.0)
+            track_a.scale_history.clear()
+            track_b.scale_history.clear()
 
         for t_mem in (track_a, track_b):
             if t_mem.last_time is not None and (t - t_mem.last_time) > max_gap:
                 t_mem.gap_broken = True
-                t_mem.vel_px = (0.0, 0.0)
+                if (t - t_mem.last_time) > max(0.60, 3.0 * max_gap):
+                    t_mem.vel_px = (0.0, 0.0)
 
         # Apply explicit user anchors matching this frame or within 0.15s of timestamp
         anchored_a: PoseCandidate | None = None

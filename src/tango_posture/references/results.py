@@ -34,6 +34,9 @@ class RunManifest:
     clip_duration: float
     analysis_mode: str
     processed_fps: float | None = None
+    requested_dancer_mode: str = "auto"
+    resolved_dancer_mode: str = "single"
+    detector_version: str = "couple_auto_v1"
 
 
 @dataclass(frozen=True)
@@ -63,6 +66,11 @@ class ClipAnalysisResult:
     session_summary: dict[str, Any] | None = None
     session_events: list[dict[str, Any]] | None = None
     pose_recovery: dict[str, Any] | None = None
+    requested_dancer_mode: str = "auto"
+    resolved_dancer_mode: str = "single"
+    auto_decision: dict[str, Any] | None = None
+    couple_result: dict[str, Any] | None = None
+    selection_required: bool = False
 
 
 @dataclass(frozen=True)
@@ -89,3 +97,8 @@ class ImportedClipResult:
     coach_path: Path | None = None
     coach_data: dict[str, Any] | None = None
     pose_recovery: dict[str, Any] | None = None
+    requested_dancer_mode: str = "auto"
+    resolved_dancer_mode: str = "single"
+    auto_decision: dict[str, Any] | None = None
+    couple_result: dict[str, Any] | None = None
+    selection_required: bool = False

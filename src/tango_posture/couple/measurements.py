@@ -379,12 +379,14 @@ def _median_iqr(values: list[float]) -> tuple[float | None, float | None]:
 def _expand_beat_targets(
     auto_beats: list[float],
     annotations: CoupleAnnotations,
+    confirmed_item_beats: list[float] | None = None,
 ) -> list[dict[str, Any]]:
     """Build beat target timestamps from user-confirmed or estimated beats with subdivisions."""
     subdiv = max(1, int(annotations.beat_subdivision))
     offset = float(annotations.beat_offset_s)
-    if annotations.manual_beats:
-        base = sorted(float(t) for t in annotations.manual_beats)
+    combined_manual = list(annotations.manual_beats) + list(confirmed_item_beats or [])
+    if combined_manual:
+        base = sorted(float(t) for t in combined_manual)
         status = "user_confirmed"
     else:
         base = sorted(float(t) for t in auto_beats)
@@ -966,7 +968,12 @@ def _apply_annotations_to_candidates(
         for e in paired
         if e.get("event_type") == "musical_target" and e.get("status") == "estimated"
     ]
-    beat_targets = _expand_beat_targets(auto_beats, annotations)
+    confirmed_item_beats = [
+        float(e["timestamp"])
+        for e in paired
+        if e.get("event_type") == "musical_target" and e.get("status") == "user_confirmed"
+    ]
+    beat_targets = _expand_beat_targets(auto_beats, annotations, confirmed_item_beats)
     _attach_beat_offsets(paired, beat_targets)
 
     # Re-evaluate transitions respecting planned marks

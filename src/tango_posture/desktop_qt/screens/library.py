@@ -36,9 +36,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ...archive import PracticeArchive, _archive_lock, rename_archive
+from ...archive import PracticeArchive, _archive_lock, read_analytics, rename_archive
 from ...calibration.archives import read_range_profile
 from ...calibration.models import METRIC_DETAILS, RangeProfile
+from ...couple.models import CoupleAnalysisRequest
 from ...references.archives import promote_reference, reference_directory, reference_path
 from ...references.constants import MAX_IMPORT_RANGE_SECONDS
 from ...references.results import ImportedClipResult
@@ -46,6 +47,7 @@ from ...references.video import probe_import_video
 from ...references.worker import ReferenceImportWorker
 from ...replay import VideoReader
 from ...review import report_directory
+from ..components.analysis_options import AnalysisOptionsWidget, NeedsSelectionDialog
 from ..library.archives import archive_report
 from ..router import Route, Router
 from ..service_bridge import (
@@ -252,6 +254,7 @@ class LibraryScreen(QWidget):
         self._import_job_id: str | None = None
         self._import_cfg = bridge.config.model_copy(deep=True)
         self._import_as_reference = True
+        self._last_import_params: dict[str, Any] = {}
         self._package_cancel = Event()
         self._package_thread: Thread | None = None
         self._package_events: Queue[tuple[Any, ...]] = Queue()
@@ -417,9 +420,13 @@ class LibraryScreen(QWidget):
             self.table.setItem(row_idx, 1, QTableWidgetItem(segments))
             created_display = format_created_at(p.get("created_at", ""), p.get("path"))
             self.table.setItem(row_idx, 2, QTableWidgetItem(created_display))
-            self.table.setItem(row_idx, 4, QTableWidgetItem(p["path"].suffix))
-
             profile_only = p["segments_count"] == 0
+            type_label = p["path"].suffix
+            mode_badge = "" if profile_only else self._archive_mode_badge(p["path"])
+            if mode_badge:
+                type_label = f"{type_label} · {mode_badge}"
+            self.table.setItem(row_idx, 4, QTableWidgetItem(type_label))
+
             btn = QPushButton("Profile details" if profile_only else "Open in Review")
             btn.clicked.connect(
                 lambda _, path=p["path"], profile_only=profile_only:
@@ -436,6 +443,12 @@ class LibraryScreen(QWidget):
             actions_layout.setContentsMargins(0, 0, 0, 0)
             for button in (btn, rename_btn, delete_btn):
                 actions_layout.addWidget(button)
+            if not profile_only and p["path"].suffix.lower() in (".tp", ".tpr"):
+                analyze_btn = QPushButton("Analyze")
+                analyze_btn.clicked.connect(
+                    lambda _, path=p["path"]: self.router.navigate(Route.ANALYSIS, path)
+                )
+                actions_layout.addWidget(analyze_btn)
             if p["path"].suffix.lower() == ".tpr":
                 calibrate_btn = QPushButton("Create calibration")
                 calibrate_btn.clicked.connect(lambda _, path=p["path"]: self._calibrate_reference(path))
@@ -661,16 +674,13 @@ class LibraryScreen(QWidget):
         form.addRow("Title:", title_input)
         form.addRow("Clip start (seconds):", start_input)
         form.addRow("Clip end (seconds):", end_input)
-        recover_gaps_cb = QCheckBox("Recover short tracking gaps")
-        recover_gaps_cb.setObjectName("recoverGapsCheckBox")
-        recover_gaps_cb.setChecked(bool(self.bridge.config.replay_recovery_auto))
-        recover_gaps_cb.setToolTip(
-            "Run display-only backward pose recovery on short lower-limb dropouts during import."
+        options_widget = AnalysisOptionsWidget(
+            self.bridge.config, show_recover_gaps=True, compact=True, parent=dialog
         )
-        form.addRow(recover_gaps_cb)
+        form.addRow(options_widget)
         form.addRow(
             QLabel(
-                f"Movement review · maximum clip length {MAX_IMPORT_RANGE_SECONDS:.0f} seconds. "
+                f"Maximum clip length {MAX_IMPORT_RANGE_SECONDS:.0f} seconds. "
                 "The source video is not modified."
             )
         )
@@ -694,13 +704,35 @@ class LibraryScreen(QWidget):
                 f"Choose a clip no longer than {MAX_IMPORT_RANGE_SECONDS:.0f} seconds."
             )
             return
+        request = options_widget.build_request()
         self._start_import(
             probe.path,
             selected_in,
             selected_out,
             title_input.text().strip() or probe.path.stem,
-            recover_tracking=recover_gaps_cb.isChecked(),
+            recover_tracking=options_widget.recover_gaps_cb.isChecked(),
+            dancer_request=request.to_dict(),
+            analyse_soundtrack=bool(request.analyze_soundtrack),
         )
+
+    def _archive_mode_badge(self, archive_path: Path) -> str:
+        try:
+            analytics = read_analytics(archive_path, 0)
+        except (OSError, ValueError):
+            return ""
+        if not isinstance(analytics, dict):
+            return ""
+        da = analytics.get("dancer_analysis")
+        if isinstance(da, dict) and isinstance(da.get("runs"), dict):
+            has_s = "single" in da["runs"]
+            has_c = "couple" in da["runs"]
+            if has_s and has_c:
+                return "Single + Couple"
+            if has_c:
+                return "Couple"
+            if has_s:
+                return "Single"
+        return "Single"
 
     def _start_import(
         self,
@@ -710,10 +742,21 @@ class LibraryScreen(QWidget):
         title: str,
         *,
         recover_tracking: bool | None = None,
+        dancer_request: dict[str, Any] | None = None,
+        analyse_soundtrack: bool = False,
     ) -> None:
         self._package_cancel.clear()
         self._import_cfg = self.bridge.config.model_copy(deep=True)
         self._import_as_reference = self.import_reference_cb.isChecked()
+        self._last_import_params = {
+            "path": path,
+            "selected_in": selected_in,
+            "selected_out": selected_out,
+            "title": title,
+            "recover_tracking": recover_tracking,
+            "dancer_request": dancer_request,
+            "analyse_soundtrack": analyse_soundtrack,
+        }
         try:
             self._import_job_id = self._import_worker.start(
                 video_path=path,
@@ -723,12 +766,13 @@ class LibraryScreen(QWidget):
                 selected_out=selected_out,
                 title=title,
                 analysis_mode="movement",
-                analyse_soundtrack=False,
+                analyse_soundtrack=bool(analyse_soundtrack),
                 recover_tracking=(
                     bool(self._import_cfg.replay_recovery_auto)
                     if recover_tracking is None
                     else bool(recover_tracking)
                 ),
+                dancer_request=dancer_request,
             )
         except (OSError, RuntimeError, ValueError) as error:
             self.import_status.setText(f"Could not start import: {error}")
@@ -767,6 +811,35 @@ class LibraryScreen(QWidget):
             values[0], ImportedClipResult
         ):
             result = values[0]
+            if result.selection_required:
+                self._finish_import()
+                dlg = NeedsSelectionDialog(
+                    result.auto_decision or {},
+                    video_path=result.video_path,
+                    parent=self,
+                )
+                if dlg.exec() == NeedsSelectionDialog.DialogCode.Accepted:
+                    base_req = CoupleAnalysisRequest.from_dict(
+                        self._last_import_params.get("dancer_request")
+                    )
+                    override_req = dlg.apply_to_request(base_req)
+                    if override_req is not None:
+                        self._start_import(
+                            self._last_import_params["path"],
+                            float(self._last_import_params["selected_in"]),
+                            self._last_import_params["selected_out"],
+                            str(self._last_import_params["title"]),
+                            recover_tracking=self._last_import_params.get("recover_tracking"),
+                            dancer_request=override_req.to_dict(),
+                            analyse_soundtrack=bool(
+                                self._last_import_params.get("analyse_soundtrack", False)
+                            ),
+                        )
+                        return
+                self.import_status.setText(
+                    "Import paused at Needs selection; no files were written."
+                )
+                return
             job = job_id
             cfg = self._import_cfg
             as_reference = self._import_as_reference

@@ -39,7 +39,7 @@ from tango_posture.review import write_metadata
 
 @pytest.fixture(scope="session")
 def qapp():
-    return QApplication.instance() or QApplication(["-platform", "offscreen"])
+    return QApplication.instance() or QApplication(["TangoPosture", "-platform", "offscreen"])
 
 
 @pytest.fixture
@@ -1846,4 +1846,367 @@ def test_review_sorts_calibrations_by_name_and_date_with_formatted_timestamps(qa
         ]
     finally:
         widget.close()
+
+
+def _recovery_full_pose(*, missing: set[str] | None = None) -> dict[str, list[float]]:
+    missing = missing or set()
+    coords = {
+        "nose": (0.50, 0.14),
+        "left_ear": (0.47, 0.15),
+        "right_ear": (0.53, 0.15),
+        "left_shoulder": (0.43, 0.25),
+        "right_shoulder": (0.57, 0.25),
+        "left_elbow": (0.40, 0.36),
+        "right_elbow": (0.60, 0.36),
+        "left_wrist": (0.39, 0.45),
+        "right_wrist": (0.61, 0.45),
+        "left_hip": (0.45, 0.48),
+        "right_hip": (0.55, 0.48),
+        "left_knee": (0.45, 0.66),
+        "right_knee": (0.55, 0.66),
+        "left_ankle": (0.45, 0.84),
+        "right_ankle": (0.55, 0.84),
+        "left_heel": (0.44, 0.88),
+        "right_heel": (0.56, 0.88),
+        "left_foot_index": (0.46, 0.90),
+        "right_foot_index": (0.54, 0.90),
+    }
+    return {
+        joint: [x, y, 0.0, 0.96, 0.96]
+        for joint, (x, y) in coords.items()
+        if joint not in missing
+    }
+
+
+def _make_recovery_archive(tmp_path, video, *, with_recovery: bool = True):
+    sha = file_sha256(video)
+    timestamps = [round(i * 0.1, 3) for i in range(12)]
+    missing_left = {"left_knee", "left_ankle", "left_heel", "left_foot_index"}
+    frames_dict = {}
+    for i, ts in enumerate(timestamps):
+        pose = _recovery_full_pose(missing=missing_left if i == 5 else None)
+        frames_dict[str(i)] = {
+            "timestamp": ts,
+            "clip_timestamp": ts,
+            "measurement_poses": [pose],
+            "poses": [pose],
+            "calibration_rows": [{"metric": "hip_offset", "state": "UNKNOWN"}],
+            "message": "",
+        }
+    pose_recovery = (
+        {
+            "schema_version": 1,
+            "status": "completed",
+            "status_message": "Recovered 1 of 1 window(s) for display.",
+            "source_sha256": sha,
+            "model_sha256": MANIFEST["sha256"],
+            "source_width": 64,
+            "source_height": 48,
+            "frame_count": 12,
+            "windows": [
+                {
+                    "window_id": "shot0_f3_8",
+                    "gap_start_frame": 5,
+                    "gap_end_frame": 5,
+                    "window_start_frame": 3,
+                    "window_end_frame": 8,
+                    "gap_start_time": 0.5,
+                    "gap_end_time": 0.5,
+                }
+            ],
+            "frames": {
+                "5": {
+                    "frame_index": 5,
+                    "source_time": 0.5,
+                    "clip_time": 0.5,
+                    "landmarks": {
+                        "left_knee": {"x": 0.45, "y": 0.66, "z": 0.0, "visibility": 0.92, "presence": 0.92, "origin": "backward"},
+                        "left_ankle": {"x": 0.45, "y": 0.84, "z": 0.0, "visibility": 0.92, "presence": 0.92, "origin": "backward"},
+                    },
+                    "diagnostics": {},
+                    "status_summary": "Recovered for display (backward pass).",
+                }
+            },
+            "summary": {
+                "windows_detected": 1,
+                "windows_recovered": 1,
+                "windows_unresolved": 0,
+                "windows_skipped_budget": 0,
+                "recovered_frames": 1,
+                "recovered_joints": 2,
+                "interpolated_joints": 0,
+            },
+        }
+        if with_recovery
+        else None
+    )
+    coach_data = {
+        "version": 1,
+        "model_hash": MANIFEST["sha256"],
+        "source_sha256": sha,
+        "width": 64,
+        "height": 48,
+        "fps": 10.0,
+        "frames": frames_dict,
+    }
+    if pose_recovery is not None:
+        coach_data["pose_recovery"] = pose_recovery
+    movement_data = {
+        "schema_version": 1,
+        "segment_index": 0,
+        "source_sha256": sha,
+        "width": 64,
+        "height": 48,
+        "fps": 10.0,
+        "frame_count": 12,
+        "pivots": [
+            {
+                "start_frame": 4,
+                "end_frame": 6,
+                "start_time": 0.4,
+                "end_time": 0.6,
+                "direction": "left",
+                "net_rotation_deg": 75.0,
+                "mean_rate_deg_s": 375.0,
+                "support_side": "right",
+                "quality": "valid",
+            }
+        ],
+        "steps": [],
+        "hip_frames": [],
+        "cut_frames": [],
+    }
+    archive_path = tmp_path / "practice.tp"
+    report = tmp_path / "report.md"
+    report.write_text("# Stored report\nActual recorded findings.\n", encoding="utf-8")
+    append_segment(archive_path, report, video, video, timestamps)
+    store_analytics(
+        archive_path,
+        0,
+        {
+            "frame_timestamps": timestamps,
+            "frames": [{"frame_index": i, "timestamp": ts, "knee_bend_deg": 170.0} for i, ts in enumerate(timestamps)],
+            "coach_data": coach_data,
+            "movement_data": movement_data,
+        },
+    )
+    return archive_path
+
+
+def test_settings_replay_recovery_options_sync_to_review(qapp):
+    from tango_posture.desktop_qt.screens.settings import SettingsScreen
+
+    cfg = Config(replay_recovery_auto=True, replay_show_recovered_joints=True)
+    bridge = ServiceBridge(cfg)
+    settings = SettingsScreen(bridge, Router())
+    review = ReviewScreen(bridge, Router())
+    try:
+        for key in (
+            "replay_recovery_auto",
+            "replay_recovery_max_gap_s",
+            "replay_recovery_context_s",
+            "replay_pivot_interpolation_max_gap_s",
+            "replay_show_recovered_joints",
+            "replay_recovery_budget_s",
+        ):
+            assert key in settings.field_widgets
+
+        settings.field_widgets["replay_recovery_auto"].setChecked(False)
+        settings.field_widgets["replay_show_recovered_joints"].setChecked(False)
+        settings.field_widgets["replay_recovery_max_gap_s"].setValue(1.5)
+        settings.field_widgets["replay_recovery_context_s"].setValue(0.8)
+        settings.field_widgets["replay_pivot_interpolation_max_gap_s"].setValue(0.5)
+        settings.field_widgets["replay_recovery_budget_s"].setValue(18.0)
+        settings.apply_btn.click()
+
+        assert bridge.config.replay_recovery_auto is False
+        assert bridge.config.replay_show_recovered_joints is False
+        assert bridge.config.replay_recovery_max_gap_s == pytest.approx(1.5)
+        assert bridge.config.replay_recovery_context_s == pytest.approx(0.8)
+        assert bridge.config.replay_pivot_interpolation_max_gap_s == pytest.approx(0.5)
+        assert bridge.config.replay_recovery_budget_s == pytest.approx(18.0)
+        assert review.recover_gaps_cb.isChecked() is False
+        assert review.show_estimates_cb.isChecked() is False
+    finally:
+        review.close()
+        settings.close()
+
+
+def test_review_recovery_survives_calibration_error_and_toggles(qapp, tmp_path, video, monkeypatch):
+    archive_path = _make_recovery_archive(tmp_path, video, with_recovery=True)
+    cfg = Config(data_dir=str(tmp_path), max_gap=0.05, replay_show_recovered_joints=True)
+    widget = ReviewScreen(ServiceBridge(cfg), Router())
+    try:
+        widget.load_archive(archive_path)
+        widget._show_frame(5)
+        assert "Recovered for display" in widget.tracking_evidence_status.text()
+
+        # Simulate incompatible/missing calibration so _calibration_error is active
+        widget.reference_combo.addItem("Broken cal", str(tmp_path / "missing.tpc"))
+        widget.reference_combo.setCurrentIndex(widget.reference_combo.count() - 1)
+        assert widget._calibration_error
+
+        display = widget._display_coach_data()
+        assert display is not None
+        assert "left_ankle" in display["frames"]["5"]["display_poses"][0]
+        assert "left_ankle" not in widget._coach_data["frames"]["5"]["measurement_poses"][0]
+
+        blank = np.zeros((48, 64, 3), dtype=np.uint8)
+        widget.show_estimates_cb.setChecked(True)
+        widget.forward_only_cb.setChecked(False)
+        img_est = widget._render_primary_frame(blank, 5, 0.5, fps=10.0)
+        # Recovered shin around x≈29 (0.45*64), y=32..40 (0.66..0.84 * 48) has green channel
+        assert img_est[33:41, 26:31, 1].max() > 0
+
+        widget.forward_only_cb.setChecked(True)
+        assert "Forward only" in widget.tracking_evidence_status.text()
+        img_fwd = widget._render_primary_frame(blank, 5, 0.5, fps=10.0)
+        assert img_fwd[33:41, 26:31, 1].max() == 0
+
+        widget.forward_only_cb.setChecked(False)
+        widget.show_estimates_cb.setChecked(False)
+        assert "Estimates hidden" in widget.tracking_evidence_status.text()
+        img_hidden = widget._render_primary_frame(blank, 5, 0.5, fps=10.0)
+        assert img_hidden[33:41, 26:31, 1].max() == 0
+    finally:
+        widget.close()
+
+
+def test_review_baked_stream_and_missing_raw_guard(qapp, tmp_path, video):
+    archive_path = _make_recovery_archive(tmp_path, video, with_recovery=True)
+    widget = ReviewScreen(ServiceBridge(Config(data_dir=str(tmp_path))), Router())
+    try:
+        widget.load_archive(archive_path)
+        widget._playback.variants["Overlay"] = video
+        widget._on_stream_changed("Overlay")
+        assert not widget.show_estimates_cb.isEnabled()
+        assert not widget.forward_only_cb.isEnabled()
+        assert not widget.show_on_raw_btn.isHidden()
+        assert widget.show_on_raw_btn.isEnabled()
+
+        # Clicking Show on raw video restores live toggles
+        widget.show_on_raw_btn.click()
+        assert widget._is_dynamic_stream()
+        assert widget.show_estimates_cb.isEnabled()
+        assert widget.forward_only_cb.isEnabled()
+        assert widget.show_on_raw_btn.isHidden()
+
+        # Overlay-only without raw video disables recovery cleanly
+        for raw_key in ("Raw video", "Local video", "Source video"):
+            widget._playback.variants.pop(raw_key, None)
+        widget._playback.variants["Overlay"] = video
+        widget._on_stream_changed("Overlay")
+        assert not widget.recover_tracking_btn.isEnabled()
+        assert widget.show_on_raw_btn.isHidden()
+        assert "Raw video needed for tracking recovery" in widget.tracking_evidence_status.text()
+    finally:
+        widget.close()
+
+
+def test_review_targeted_recovery_persists_without_mutating_measured_analytics(qapp, tmp_path, video):
+    from tango_posture.domain import FrameObservation, Landmark
+
+    archive_path = _make_recovery_archive(tmp_path, video, with_recovery=False)
+    before_analytics = read_analytics(archive_path, 0)
+    assert before_analytics is not None
+    cfg = Config(
+        data_dir=str(tmp_path),
+        replay_recovery_max_gap_s=1.0,
+        replay_recovery_context_s=0.3,
+        confidence=0.5,
+    )
+    widget = ReviewScreen(ServiceBridge(cfg), Router())
+    try:
+        widget.load_archive(archive_path)
+        widget._show_frame(5)
+
+        class TargetedEst:
+            def estimate(self, image: np.ndarray, timestamp: float) -> FrameObservation:
+                lms = {
+                    k: Landmark(x=v[0], y=v[1], z=v[2], visibility=v[3], presence=v[4])
+                    for k, v in _recovery_full_pose().items()
+                }
+                return FrameObservation(timestamp, 64, 48, [lms])
+
+            def close(self) -> None:
+                return
+
+        started = widget.run_targeted_recovery(0.2, 0.9, estimator_factory=TargetedEst)
+        assert started is True
+
+        deadline = time.monotonic() + 5.0
+        while widget.has_active_jobs() and time.monotonic() < deadline:
+            qapp.processEvents()
+            time.sleep(0.02)
+        widget._poll_posture_analysis()
+        qapp.processEvents()
+
+        after_analytics = read_analytics(archive_path, 0)
+        assert after_analytics is not None
+        recovered_payload = after_analytics["coach_data"].get("pose_recovery")
+        assert recovered_payload is not None
+        assert "5" in recovered_payload["frames"]
+        assert recovered_payload["frames"]["5"]["landmarks"]["left_ankle"]["origin"] == "backward"
+        # Strict invariant: measured posture & movement outputs untouched
+        assert after_analytics["frames"] == before_analytics["frames"]
+        assert after_analytics["movement_data"]["pivots"] == before_analytics["movement_data"]["pivots"]
+        assert (
+            after_analytics["coach_data"]["frames"]["5"]["measurement_poses"]
+            == before_analytics["coach_data"]["frames"]["5"]["measurement_poses"]
+        )
+    finally:
+        widget.close()
+
+
+def test_analytics_recovery_summary_seek_and_library_import_checkbox(qapp, tmp_path, video, monkeypatch):
+    from PySide6.QtWidgets import QCheckBox, QDialog, QFileDialog
+    from tango_posture.desktop_qt.screens.analytics import AnalyticsScreen
+    from tango_posture.desktop_qt.screens.library import LibraryScreen
+
+    archive_path = _make_recovery_archive(tmp_path, video, with_recovery=True)
+    cfg = Config(data_dir=str(tmp_path), replay_recovery_auto=False)
+    bridge = ServiceBridge(cfg)
+    router = Router()
+
+    analytics = AnalyticsScreen(bridge, router)
+    navigated: list[tuple[object, object]] = []
+    router.route_changed.connect(lambda r, p: navigated.append((r, p)))
+    try:
+        analytics.load_archive(archive_path, 0)
+        assert not analytics.tracking_recovery_label.isHidden()
+        text = analytics.tracking_recovery_label.text()
+        assert "Tracking recovery" in text
+        assert "1 gap window" in text
+        assert "seek:" in text
+        analytics._on_recovery_link("seek:0.500000")
+        assert navigated and navigated[-1][1]["timestamp"] == pytest.approx(0.5)
+    finally:
+        analytics.close()
+
+    # Library import dialog exposes Recover short tracking gaps initialized from config
+    library = LibraryScreen(bridge, router)
+    seen_checkbox: list[bool] = []
+    captured_start: dict[str, object] = {}
+
+    def fake_exec(dialog_self):
+        cb = dialog_self.findChild(QCheckBox, "recoverGapsCheckBox")
+        assert cb is not None
+        seen_checkbox.append(cb.isChecked())
+        cb.setChecked(True)
+        return int(QDialog.DialogCode.Accepted)
+
+    monkeypatch.setattr(QFileDialog, "getOpenFileName", lambda *a, **kw: (str(video), ""))
+    monkeypatch.setattr(QDialog, "exec", fake_exec)
+    monkeypatch.setattr(
+        library,
+        "_start_import",
+        lambda *args, **kwargs: captured_start.update({"args": args, "kwargs": kwargs}),
+    )
+    try:
+        library._analyze_import_video()
+        assert seen_checkbox == [False]
+        assert captured_start["kwargs"]["recover_tracking"] is True
+    finally:
+        library.close()
+
 

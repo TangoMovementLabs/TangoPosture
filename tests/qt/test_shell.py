@@ -205,7 +205,8 @@ def test_help_renders_styled_manual_with_hierarchical_contents_and_search(qapp, 
 def test_navigation_buttons_have_icons_and_accessible_labels(qapp):
     window = MainWindow(Config())
 
-    assert len(window.nav_buttons) == 8
+    assert len(window.nav_buttons) == 9
+    assert Route.ANALYSIS in window.nav_buttons
     assert Route.REFERENCES not in window.nav_buttons
     for button in window.nav_buttons.values():
         assert not button.icon().isNull()

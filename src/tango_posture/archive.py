@@ -217,6 +217,19 @@ def _validate_analytics(data: Any, index: int) -> dict[str, Any]:
         except (ValueError, TypeError) as exc:
             logger.warning("Ignoring invalid or stale top-level pose_recovery in %s: %s", name, exc)
             data = {k: v for k, v in data.items() if k != "pose_recovery"}
+    dancer_analysis = data.get("dancer_analysis")
+    if dancer_analysis is not None:
+        if not isinstance(dancer_analysis, dict) or dancer_analysis.get("schema_version") != 1:
+            raise ValueError(f"Invalid archived dancer_analysis schema in {name}")
+        active_mode = dancer_analysis.get("active_mode")
+        if active_mode not in ("single", "couple"):
+            raise ValueError(f"Invalid archived dancer_analysis active_mode in {name}")
+        runs = dancer_analysis.get("runs")
+        if not isinstance(runs, dict):
+            raise ValueError(f"Invalid archived dancer_analysis runs in {name}")
+        for mode_key, entry in runs.items():
+            if mode_key not in ("single", "couple") or not isinstance(entry, dict):
+                raise ValueError(f"Invalid archived dancer_analysis run entry {mode_key!r} in {name}")
     return data
 
 
@@ -228,6 +241,7 @@ def store_analytics(
     lines_path: Path | None = None,
     metadata_updates: dict[str, Any] | None = None,
     frame_log: list[dict[str, Any]] | None = None,
+    dancer_analysis_run: dict[str, Any] | None = None,
 ) -> None:
     with _archive_lock(path):
         manifest = read_manifest(path)
@@ -242,6 +256,77 @@ def store_analytics(
         previous = read_analytics(path, index)
         if previous is not None:
             data = {**previous, **data}
+        if dancer_analysis_run is not None or "dancer_analysis" in data or (
+            isinstance(previous, dict) and "dancer_analysis" in previous
+        ):
+            prev_da = (
+                previous.get("dancer_analysis")
+                if isinstance(previous, dict) and isinstance(previous.get("dancer_analysis"), dict)
+                else None
+            )
+            payload_da = (
+                payload.get("dancer_analysis")
+                if isinstance(payload.get("dancer_analysis"), dict)
+                else None
+            )
+            runs: dict[str, Any] = {}
+            if prev_da and isinstance(prev_da.get("runs"), dict):
+                runs.update({k: dict(v) for k, v in prev_da["runs"].items() if isinstance(v, dict)})
+            elif isinstance(previous, dict) and (
+                previous.get("coach_data") or previous.get("movement_data") or previous.get("session")
+            ):
+                runs["single"] = {
+                    "run_id": str(previous.get("run_id") or f"legacy-single-{index}"),
+                    "requested_mode": "single",
+                    "resolved_mode": "single",
+                    "coach_data": previous.get("coach_data"),
+                    "movement_data": previous.get("movement_data"),
+                    "session": previous.get("session"),
+                    "frames": previous.get("frames", []),
+                    "frame_timestamps": previous.get("frame_timestamps", []),
+                }
+            if payload_da and isinstance(payload_da.get("runs"), dict):
+                runs.update({k: dict(v) for k, v in payload_da["runs"].items() if isinstance(v, dict)})
+            active_mode = str(
+                (payload_da or {}).get("active_mode")
+                or (prev_da or {}).get("active_mode")
+                or "single"
+            )
+            active_run_id = str(
+                (payload_da or {}).get("active_run_id")
+                or (prev_da or {}).get("active_run_id")
+                or ""
+            )
+            if dancer_analysis_run is not None:
+                run_mode = str(
+                    dancer_analysis_run.get("resolved_mode")
+                    or dancer_analysis_run.get("mode")
+                    or "single"
+                ).lower()
+                if run_mode not in ("single", "couple"):
+                    raise ValueError(f"Unsupported dancer analysis run mode: {run_mode!r}")
+                couple_res = dancer_analysis_run.get("couple_result")
+                run_id = str(
+                    dancer_analysis_run.get("run_id")
+                    or (couple_res.get("run_id") if isinstance(couple_res, dict) else "")
+                    or f"{run_mode}-{index}-{int(time.time() * 1000)}"
+                )
+                runs[run_mode] = {
+                    **dancer_analysis_run,
+                    "resolved_mode": run_mode,
+                    "run_id": run_id,
+                }
+                active_mode = run_mode
+                active_run_id = run_id
+            if active_mode not in runs and runs:
+                active_mode = "couple" if "couple" in runs else "single"
+                active_run_id = str(runs[active_mode].get("run_id") or "")
+            data["dancer_analysis"] = {
+                "schema_version": 1,
+                "active_mode": active_mode,
+                "active_run_id": active_run_id,
+                "runs": runs,
+            }
         _validate_analytics(data, index)
         manifest["segments"][index]["analytics"] = analytics_member_name(index)
         replacements: dict[str, bytes | Path] = {
@@ -296,6 +381,102 @@ def store_analytics(
                 f"{start}{report_section.rstrip()}\n{end}{report}"
             ).encode()
         _rewrite_members(path, replacements)
+
+
+def update_couple_annotations(
+    path: Path,
+    index: int,
+    *,
+    run_id: str,
+    annotations: dict[str, Any],
+    cfg: Any,
+    expected_video_sha256: str | None = None,
+) -> dict[str, Any]:
+    """Atomically rebuild and store edited Couple annotations for a matching run_id."""
+    from .couple.measurements import rebuild_couple_result_with_annotations
+
+    with _archive_lock(path):
+        manifest = read_manifest(path)
+        if not 0 <= index < len(manifest["segments"]):
+            raise ValueError("Recording not found in archive")
+        if expected_video_sha256 is not None:
+            video = manifest["segments"][index].get("video")
+            with ZipFile(path) as archive:
+                if not video or _stream_member_sha256(archive, video) != expected_video_sha256:
+                    raise ValueError("Recorded video changed before Couple annotations could be saved")
+        previous = read_analytics(path, index)
+        if previous is None:
+            raise ValueError("No saved analytics found for recording")
+        da = previous.get("dancer_analysis")
+        if not isinstance(da, dict) or not isinstance(da.get("runs"), dict):
+            raise ValueError("No saved Couple run found in archive analytics")
+        couple_entry = da["runs"].get("couple")
+        if not isinstance(couple_entry, dict) or not isinstance(couple_entry.get("couple_result"), dict):
+            raise ValueError("No saved Couple analysis result found in archive analytics")
+        stored_run_id = str(
+            couple_entry.get("run_id") or couple_entry["couple_result"].get("run_id") or ""
+        )
+        if not run_id or stored_run_id != str(run_id):
+            raise ValueError(
+                f"Couple annotation run_id mismatch: expected {run_id!r}, stored {stored_run_id!r}"
+            )
+        couple_video_sha = str(couple_entry["couple_result"].get("video_sha256") or "")
+        if (
+            expected_video_sha256 is not None
+            and couple_video_sha
+            and couple_video_sha != expected_video_sha256
+        ):
+            raise ValueError("Couple run video SHA-256 mismatch")
+
+        rebuilt = rebuild_couple_result_with_annotations(
+            couple_entry["couple_result"],
+            annotations,
+            cfg,
+        )
+        new_couple_entry = {**couple_entry, "couple_result": rebuilt, "run_id": stored_run_id}
+        new_runs = {**da["runs"], "couple": new_couple_entry}
+        new_da = {**da, "runs": new_runs}
+        updated = {**previous, "dancer_analysis": new_da}
+        _validate_analytics(updated, index)
+        _rewrite_members(
+            path,
+            {analytics_member_name(index): json.dumps(updated, allow_nan=False).encode("utf-8")},
+        )
+        return rebuilt
+
+
+def set_active_dancer_run(path: Path, index: int, mode: str) -> dict[str, Any]:
+    """Switch the active saved run mode ('single' or 'couple') for an archived segment."""
+    mode_clean = str(mode).lower()
+    if mode_clean not in ("single", "couple"):
+        raise ValueError(f"Invalid dancer mode: {mode!r}")
+    with _archive_lock(path):
+        manifest = read_manifest(path)
+        if not 0 <= index < len(manifest["segments"]):
+            raise ValueError("Recording not found in archive")
+        previous = read_analytics(path, index)
+        if previous is None:
+            raise ValueError("No saved analytics found for recording")
+        da = previous.get("dancer_analysis")
+        if not isinstance(da, dict) or not isinstance(da.get("runs"), dict):
+            raise ValueError("No saved dancer analysis runs found in archive analytics")
+        if mode_clean not in da["runs"] or not isinstance(da["runs"][mode_clean], dict):
+            raise ValueError(f"No saved {mode_clean!r} run found for segment {index}")
+        active_run_id = str(da["runs"][mode_clean].get("run_id") or "")
+        updated = {
+            **previous,
+            "dancer_analysis": {
+                **da,
+                "active_mode": mode_clean,
+                "active_run_id": active_run_id,
+            },
+        }
+        _validate_analytics(updated, index)
+        _rewrite_members(
+            path,
+            {analytics_member_name(index): json.dumps(updated, allow_nan=False).encode("utf-8")},
+        )
+        return updated
 
 
 def practice_directory(data_dir: str) -> Path:

@@ -29,6 +29,7 @@ from .components.status_strip import StatusStrip
 from .navigation_icons import navigation_icon
 from .router import Route, Router
 from .screens.about import AboutDialog
+from .screens.analysis import AnalysisScreen
 from .screens.analytics import AnalyticsScreen
 from .screens.coach import CoachScreen
 from .screens.database import DatabaseScreen
@@ -110,6 +111,7 @@ class MainWindow(QMainWindow):
         nav_items = [
             (Route.HOME, "Home", "home"),
             (Route.LIBRARY, "Library", "library"),
+            (Route.ANALYSIS, "Analysis", "analysis"),
             (Route.REVIEW, "Review", "review"),
             (Route.ANALYTICS, "Analytics", "analytics"),
             (Route.COACH, "AI Coach", "coach"),
@@ -147,6 +149,7 @@ class MainWindow(QMainWindow):
             Route.HOME: HomeScreen(self.bridge, self.router),
             Route.REFERENCES: ReferencesScreen(self.bridge, self.router),
             Route.LIBRARY: LibraryScreen(self.bridge, self.router),
+            Route.ANALYSIS: AnalysisScreen(self.bridge, self.router),
             Route.REVIEW: ReviewScreen(self.bridge, self.router),
             Route.ANALYTICS: AnalyticsScreen(self.bridge, self.router),
             Route.COACH: CoachScreen(self.bridge, self.router),
@@ -181,12 +184,14 @@ class MainWindow(QMainWindow):
 
     def _database_cleanup_blocker(self) -> str | None:
         library = self.screens[Route.LIBRARY]
+        analysis = self.screens[Route.ANALYSIS]
         review = self.screens[Route.REVIEW]
         if (
             isinstance(library, LibraryScreen) and library.has_active_jobs()
+            or isinstance(analysis, AnalysisScreen) and analysis.has_active_jobs()
             or isinstance(review, ReviewScreen) and review.has_active_jobs()
         ):
-            return "Wait for Library imports/packaging and Review analysis to finish before cleanup."
+            return "Wait for Library imports/packaging, Analysis, and Review jobs to finish before cleanup."
         return None
 
     def _navigate_shortcut(self, route: Route) -> None:
@@ -223,6 +228,8 @@ class MainWindow(QMainWindow):
             self.stack.setCurrentWidget(screen)
             if hasattr(screen, "refresh"):
                 screen.refresh()
+            if route is Route.ANALYSIS and isinstance(screen, AnalysisScreen) and payload is not None:
+                screen.load_source(payload)
             if route is Route.REVIEW and isinstance(screen, ReviewScreen):
                 if isinstance(payload, Path):
                     screen.load_archive(payload)
@@ -230,13 +237,17 @@ class MainWindow(QMainWindow):
                     archive_path = payload.get("archive_path")
                     segment_index = payload.get("segment_index", 0)
                     timestamp = payload.get("timestamp")
+                    run_id = payload.get("run_id")
                     if (
                         isinstance(archive_path, Path)
                         and isinstance(segment_index, int)
                         and (timestamp is None or isinstance(timestamp, (int, float)))
                     ):
                         screen.load_archive(
-                            archive_path, segment_index=segment_index, timestamp=timestamp
+                            archive_path,
+                            segment_index=segment_index,
+                            timestamp=timestamp,
+                            run_id=str(run_id) if isinstance(run_id, str) and run_id else None,
                         )
             if route is Route.ANALYTICS and isinstance(screen, AnalyticsScreen):
                 if isinstance(payload, Path):

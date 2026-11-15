@@ -63,6 +63,11 @@ class SessionData:
     max_gap: float | None
     origin_timestamp: float
     events: list[PersistedEvent]
+    dancer_mode: str = "single"
+    available_dancer_modes: tuple[str, ...] = ()
+    couple_result: dict[str, Any] | None = None
+    couple_run_id: str | None = None
+    auto_decision: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -557,14 +562,50 @@ def load_archive_dataset(path: Path, index: int, cfg: Config | None = None) -> S
         elif len(observations) >= 2:
             active_duration = max(0.0, observations[-1].timestamp - observations[0].timestamp)
 
+    raw_da = payload.get("dancer_analysis")
+    dancer_mode = "single"
+    available_modes: list[str] = []
+    couple_result: dict[str, Any] | None = None
+    couple_run_id: str | None = None
+    auto_decision: dict[str, Any] | None = None
+    if isinstance(raw_da, dict):
+        dancer_mode = str(raw_da.get("active_mode") or "single")
+        runs = raw_da.get("runs") if isinstance(raw_da.get("runs"), dict) else {}
+        for m_key in ("single", "couple"):
+            if isinstance(runs.get(m_key), dict):
+                available_modes.append(m_key)
+        couple_entry = runs.get("couple")
+        if isinstance(couple_entry, dict):
+            raw_cr = couple_entry.get("couple_result")
+            if isinstance(raw_cr, dict):
+                couple_result = raw_cr
+                couple_run_id = str(couple_entry.get("run_id") or raw_cr.get("run_id") or "")
+                auto_decision = (
+                    couple_entry.get("auto_decision")
+                    if isinstance(couple_entry.get("auto_decision"), dict)
+                    else raw_cr.get("auto_decision")
+                )
+    if not available_modes:
+        available_modes = ["single"]
+
     if not has_session:
         return SessionData(
             dataset.identifier, dataset.status, dataset.metrics, active_duration,
             dataset.max_gap, origin, dataset.events,
+            dancer_mode=dancer_mode,
+            available_dancer_modes=tuple(available_modes),
+            couple_result=couple_result,
+            couple_run_id=couple_run_id,
+            auto_decision=auto_decision,
         )
     return SessionData(
         dataset.identifier, dataset.status, dataset.metrics, active_duration,
         dataset.max_gap, dataset.origin_timestamp, dataset.events,
+        dancer_mode=dancer_mode,
+        available_dancer_modes=tuple(available_modes),
+        couple_result=couple_result,
+        couple_run_id=couple_run_id,
+        auto_decision=auto_decision,
     )
 
 

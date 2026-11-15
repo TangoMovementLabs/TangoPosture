@@ -24,6 +24,11 @@ class ReviewAnalysis:
     movement_data: dict[str, Any]
     manifest: RunManifest | None = None
     result: ClipAnalysisResult | None = None
+    requested_dancer_mode: str = "auto"
+    resolved_dancer_mode: str = "single"
+    auto_decision: dict[str, Any] | None = None
+    couple_result: dict[str, Any] | None = None
+    selection_required: bool = False
 
 
 def analyse_review_clip(
@@ -34,22 +39,53 @@ def analyse_review_clip(
     progress_callback: Callable[[int, int, str], None],
     cancel_check: Callable[[], bool],
     recover_tracking: bool | None = None,
+    dancer_request: dict[str, Any] | None = None,
 ) -> ReviewAnalysis:
     """Analyze a local clip in memory without persisting a temporary report or database."""
+    extra_kwargs: dict[str, Any] = {}
+    if dancer_request is not None:
+        extra_kwargs["dancer_request"] = dancer_request
     result = analyze_clip(
         video_path=video_path,
         cfg=cfg,
         selected_in=0.0,
         selected_out=selected_out,
         analysis_mode="movement",
-        analyse_soundtrack=False,
+        analyse_soundtrack=(
+            bool(dancer_request.get("analyze_soundtrack", False))
+            if isinstance(dancer_request, dict)
+            else False
+        ),
         progress_callback=progress_callback,
         cancel_check=cancel_check,
         recover_tracking=recover_tracking,
+        **extra_kwargs,
     )
+    if getattr(result, "selection_required", False):
+        return ReviewAnalysis(
+            coach_data={},
+            movement_data={},
+            manifest=getattr(result, "manifest", None),
+            result=result,
+            requested_dancer_mode=getattr(result, "requested_dancer_mode", "auto"),
+            resolved_dancer_mode="needs_selection",
+            auto_decision=getattr(result, "auto_decision", None),
+            couple_result=None,
+            selection_required=True,
+        )
     if result.coach_data is None:
         raise ValueError("Posture analysis completed without frame-level coaching data")
-    return ReviewAnalysis(result.coach_data, result.movement_data, result.manifest, result)
+    return ReviewAnalysis(
+        result.coach_data,
+        result.movement_data,
+        getattr(result, "manifest", None),
+        result,
+        requested_dancer_mode=getattr(result, "requested_dancer_mode", "auto"),
+        resolved_dancer_mode=getattr(result, "resolved_dancer_mode", "single"),
+        auto_decision=getattr(result, "auto_decision", None),
+        couple_result=getattr(result, "couple_result", None),
+        selection_required=False,
+    )
 
 
 def render_review_report(

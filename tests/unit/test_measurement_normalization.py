@@ -4,17 +4,19 @@ from __future__ import annotations
 
 import json
 import math
-from pathlib import Path
 import tomllib
+from pathlib import Path
 from zipfile import ZipFile
 
 import pytest
 
 from tango_posture.archive import rename_archive
 from tango_posture.calibration.archives import read_range_profile, save_range_profile
+from tango_posture.calibration.baseline import profile as build_capture_profile
 from tango_posture.calibration.models import ApprovedRange, Passage, RangeProfile
 from tango_posture.calibration.normalization import (
     HoldSourceIdentity,
+    HoldWindow,
     MeasurementNormalizationConfig,
     MetricNormalizationRule,
     NormalizationPairRule,
@@ -108,7 +110,7 @@ def _serialise_pose(pose: dict[str, Landmark]) -> dict[str, list[float | None]]:
 def _coach_data_from_frames(
     frames: list[FrameObservation],
     *,
-    model_hash: str = "model-1",
+    model_hash: str = "a" * 64,
     raw_media_sha256: str | None = "video-sha-1",
     interpolated_indices: set[int] | None = None,
 ) -> dict:
@@ -124,7 +126,7 @@ def _coach_data_from_frames(
         entries[str(idx)] = entry
     payload = {
         "model_hash": model_hash,
-        "capture_profile": {"side": "left", "facing": "right", "width": 1000, "height": 1000},
+        "capture_profile": build_capture_profile(Config(), 1000, 1000, "video"),
         "width": 1000,
         "height": 1000,
         "frames": entries,
@@ -160,8 +162,8 @@ def _profile(metrics: dict[str, ApprovedRange], cal_id: str = "cal-pitch") -> Ra
         name="Teacher Neutral",
         created_at_utc="2026-11-15T12:00:00Z",
         context="open_embrace",
-        model_hash="model-1",
-        capture_profile={"side": "left", "facing": "right"},
+        model_hash="a" * 64,
+        capture_profile=build_capture_profile(Config(), 1000, 1000, "video"),
         source={"archive": "ref.tpr", "archive_sha256": "abc"},
         metrics=metrics,
         camera_checks={},
@@ -170,7 +172,7 @@ def _profile(metrics: dict[str, ApprovedRange], cal_id: str = "cal-pitch") -> Ra
 
 def test_worked_example_head_pitch_matched_holds_and_review() -> None:
     """Worked example: ref fit 3°, prac fit 7° -> -4°; check 3.2°/7.4° -> error 0.2°; 8°->4°, 11°->7°."""
-    cfg = Config(smoothing=0.01, entry_duration=0.0, clear_duration=0.0)
+    cfg = Config(smoothing=0.01, entry_duration=0.01, clear_duration=0.01)
     profile = _profile({"head_pitch": _range(1.0, 5.0)})
 
     # 10 frames per 1s hold (0..1s Fit, 2..3s Check).
@@ -182,7 +184,9 @@ def test_worked_example_head_pitch_matched_holds_and_review() -> None:
         *[_pose_frame(0.1 * i, head_pitch_deg=7.0) for i in range(10)],
         *[_pose_frame(2.0 + 0.1 * i, head_pitch_deg=7.4) for i in range(10)],
         _pose_frame(4.0, head_pitch_deg=8.0),
+        _pose_frame(4.05, head_pitch_deg=8.0),
         _pose_frame(5.0, head_pitch_deg=11.0),
+        _pose_frame(5.05, head_pitch_deg=11.0),
     ]
 
     draft_rule = MetricNormalizationRule(
@@ -207,18 +211,13 @@ def test_worked_example_head_pitch_matched_holds_and_review() -> None:
     assert matched.rule.verification_error == pytest.approx(0.2, abs=1e-4)
 
     prac_data = _coach_data_from_frames(prac_hold_frames, raw_media_sha256="prac-sha-1")
-    prac_id = HoldSourceIdentity(
+    prac_id = build_source_identity(
+        archive_path=None,
+        segment_index=0,
+        cfg=cfg,
+        observations=extract_coach_observations(prac_data),
+        capture_profile=prac_data["capture_profile"],
         raw_media_sha256="prac-sha-1",
-        capture_identity={"side": "left", "facing": "right", "width": 1000, "height": 1000},
-        settings_fingerprint=build_source_identity(
-            archive_path=None,
-            segment_index=0,
-            cfg=cfg,
-            observations=prac_hold_frames,
-            capture_profile=prac_data["capture_profile"],
-            raw_media_sha256="prac-sha-1",
-        ).settings_fingerprint,
-        frames_fingerprint=frames_fingerprint(extract_coach_observations(prac_data)),
     )
     pair = NormalizationPairRule(
         id=make_pair_rule_id(profile.id, "prac-sha-1"),
@@ -248,21 +247,22 @@ def test_worked_example_head_pitch_matched_holds_and_review() -> None:
     assert row_8["state"] == "WITHIN_REFERENCE"
     assert row_8["normalization_status"] == "applied"
 
-    row_11 = compared["frames"]["21"]["calibration_rows"][0]
+    row_11 = compared["frames"]["22"]["calibration_rows"][0]
     assert row_11["observed_raw"] == pytest.approx(11.0, abs=1e-3)
     assert row_11["reference_scale_raw"] == pytest.approx(7.0, abs=1e-3)
-    assert row_11["state"] == "DEVIATION"
+    row_11_held = compared["frames"]["23"]["calibration_rows"][0]
+    assert row_11_held["state"] == "DEVIATION"
 
     # Bounds on .tpc remain untouched on original reference scale; disabling gives DEVIATION on 8°.
     baseline = compare_coach_data(prac_data, cfg, profile.calibration())
-    assert baseline["frames"]["20"]["calibration_rows"][0]["state"] == "DEVIATION"
+    assert baseline["frames"]["21"]["calibration_rows"][0]["state"] == "DEVIATION"
     assert profile.metrics["head_pitch"].lower == 1.0
     assert profile.metrics["head_pitch"].upper == 5.0
 
 
 def test_matched_holds_failure_gates_block_normalization() -> None:
     """Missing check, overlapping fit/check, low samples, low coverage, or large check error fail."""
-    cfg = Config(smoothing=0.01, entry_duration=0.0, clear_duration=0.0)
+    cfg = Config(smoothing=0.01, entry_duration=0.01, clear_duration=0.01)
     profile = _profile({"head_pitch": _range(1.0, 5.0)})
     ref_frames = [
         *[_pose_frame(0.1 * i, head_pitch_deg=3.0) for i in range(10)],
@@ -280,8 +280,8 @@ def test_matched_holds_failure_gates_block_normalization() -> None:
         rule=MetricNormalizationRule(
             enabled=True,
             method="matched_holds",
-            fit_reference_window=Passage(0.0, 1.0),
-            fit_practice_window=Passage(0.0, 1.0),
+            fit_reference_window=HoldWindow(start=0.0, end=1.0),
+            fit_practice_window=HoldWindow(start=0.0, end=1.0),
         ),
         reference_frames=ref_frames,
         practice_frames=prac_bad_check,
@@ -296,10 +296,10 @@ def test_matched_holds_failure_gates_block_normalization() -> None:
         rule=MetricNormalizationRule(
             enabled=True,
             method="matched_holds",
-            fit_reference_window=Passage(0.0, 1.0),
-            fit_practice_window=Passage(0.0, 1.5),
-            check_reference_window=Passage(2.0, 3.0),
-            check_practice_window=Passage(1.0, 2.5),
+            fit_reference_window=HoldWindow(start=0.0, end=1.0),
+            fit_practice_window=HoldWindow(start=0.0, end=1.5),
+            check_reference_window=HoldWindow(start=2.0, end=3.0),
+            check_practice_window=HoldWindow(start=1.0, end=2.5),
         ),
         reference_frames=ref_frames,
         practice_frames=prac_bad_check,
@@ -317,10 +317,10 @@ def test_matched_holds_failure_gates_block_normalization() -> None:
         rule=MetricNormalizationRule(
             enabled=True,
             method="matched_holds",
-            fit_reference_window=Passage(0.0, 1.0),
-            fit_practice_window=Passage(0.0, 1.0),
-            check_reference_window=Passage(2.0, 3.0),
-            check_practice_window=Passage(2.0, 3.0),
+            fit_reference_window=HoldWindow(start=0.0, end=1.0),
+            fit_practice_window=HoldWindow(start=0.0, end=1.0),
+            check_reference_window=HoldWindow(start=2.0, end=3.0),
+            check_practice_window=HoldWindow(start=2.0, end=3.0),
         ),
         reference_frames=ref_frames,
         practice_frames=short_prac,
@@ -341,10 +341,10 @@ def test_matched_holds_failure_gates_block_normalization() -> None:
         rule=MetricNormalizationRule(
             enabled=True,
             method="matched_holds",
-            fit_reference_window=Passage(0.0, 1.0),
-            fit_practice_window=Passage(0.0, 1.0),
-            check_reference_window=Passage(2.0, 3.0),
-            check_practice_window=Passage(2.0, 3.0),
+            fit_reference_window=HoldWindow(start=0.0, end=1.0),
+            fit_practice_window=HoldWindow(start=0.0, end=1.0),
+            check_reference_window=HoldWindow(start=2.0, end=3.0),
+            check_practice_window=HoldWindow(start=2.0, end=3.0),
         ),
         reference_frames=ref_frames,
         practice_frames=gapped_prac,
@@ -359,10 +359,10 @@ def test_matched_holds_failure_gates_block_normalization() -> None:
         rule=MetricNormalizationRule(
             enabled=True,
             method="matched_holds",
-            fit_reference_window=Passage(0.0, 1.0),
-            fit_practice_window=Passage(0.0, 1.0),
-            check_reference_window=Passage(2.0, 3.0),
-            check_practice_window=Passage(2.0, 3.0),
+            fit_reference_window=HoldWindow(start=0.0, end=1.0),
+            fit_practice_window=HoldWindow(start=0.0, end=1.0),
+            check_reference_window=HoldWindow(start=2.0, end=3.0),
+            check_practice_window=HoldWindow(start=2.0, end=3.0),
         ),
         reference_frames=ref_frames,
         practice_frames=prac_bad_check,
@@ -401,7 +401,7 @@ def test_matched_holds_failure_gates_block_normalization() -> None:
 
 def test_invalid_or_interpolated_frames_remain_unknown() -> None:
     """Missing landmarks or interpolated-only frames stay UNKNOWN rather than using offset."""
-    cfg = Config(smoothing=0.01, entry_duration=0.0, clear_duration=0.0)
+    cfg = Config(smoothing=0.01, entry_duration=0.01, clear_duration=0.01)
     profile = _profile({"head_pitch": _range(1.0, 5.0)})
     frames = [
         _pose_frame(0.0, head_pitch_deg=8.0, valid=True),
@@ -441,7 +441,7 @@ def test_invalid_or_interpolated_frames_remain_unknown() -> None:
 
 def test_independent_head_and_shoulder_rules() -> None:
     """One metric can be normalized while another metric stays on Direct comparison."""
-    cfg = Config(smoothing=0.01, entry_duration=0.0, clear_duration=0.0)
+    cfg = Config(smoothing=0.01, entry_duration=0.01, clear_duration=0.01)
     profile = _profile({
         "head_pitch": _range(1.0, 5.0),
         "shoulder_clearance": _range(1.0, 2.0, unit="normalized_clearance"),
@@ -493,7 +493,7 @@ def test_cyclic_wrapping_and_physical_domain_rejection() -> None:
     assert not in_physical_domain("shoulder_clearance", -0.01)
 
     # Frame comparison rejects out-of-domain negative knee_flexion and leaves Evaluator unadjusted
-    cfg = Config(smoothing=0.01, entry_duration=0.0, clear_duration=0.0)
+    cfg = Config(smoothing=0.01, entry_duration=0.01, clear_duration=0.01)
     profile = _profile({
         "knee_flexion": _range(10.0, 25.0),
         "shoulder_clearance": _range(1.0, 2.0, unit="normalized_clearance"),
@@ -591,8 +591,10 @@ def test_identity_rename_vs_reanalysis_settings_and_toml_roundtrip(tmp_path: Pat
         "measurement_normalization": MeasurementNormalizationConfig(enabled=True, pairs=[pair])
     })
 
-    # Rename .tp archive -> media sha and frame fingerprints stay identical -> still applies
-    renamed_tp = rename_archive(tp_path, "Renamed Session")
+    # Rename .tp archive (manifest + file path) -> media sha and frame fingerprints stay identical -> still applies
+    rename_archive(tp_path, "Renamed Session")
+    renamed_tp = tmp_path / "renamed_session.tp"
+    tp_path.rename(renamed_tp)
     renamed_sha = resolve_raw_media_sha256(renamed_tp, 0)
     renamed_id = build_source_identity(
         archive_path=renamed_tp,
@@ -621,7 +623,15 @@ def test_identity_rename_vs_reanalysis_settings_and_toml_roundtrip(tmp_path: Pat
 
     # Changed measurement setting -> needs_recheck
     tweaked_cfg = norm_cfg.model_copy(update={"confidence": 0.85})
-    app_settings = evaluate_pair_applicability(tweaked_cfg, loaded_profile, renamed_id)
+    tweaked_id = build_source_identity(
+        archive_path=renamed_tp,
+        segment_index=0,
+        cfg=tweaked_cfg,
+        observations=frames,
+        capture_profile=data["capture_profile"],
+        raw_media_sha256=renamed_sha,
+    )
+    app_settings = evaluate_pair_applicability(tweaked_cfg, loaded_profile, tweaked_id)
     assert app_settings.status == "needs_recheck"
 
     # Changed calibration bounds -> needs_recheck
@@ -650,5 +660,5 @@ def test_identity_rename_vs_reanalysis_settings_and_toml_roundtrip(tmp_path: Pat
 
     toml_file = tmp_path / "settings.toml"
     toml_file.write_text(toml_text, encoding="utf-8")
-    loaded_from_disk = load(toml_file)
+    loaded_from_disk = load(toml_file, {})
     assert loaded_from_disk.measurement_normalization == norm_cfg.measurement_normalization

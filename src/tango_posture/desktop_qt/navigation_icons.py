@@ -74,6 +74,25 @@ def _draw_review(painter: QPainter) -> None:
     painter.drawPath(path)
 
 
+def _draw_analysis(painter: QPainter) -> None:
+    painter.drawEllipse(QRectF(4.5, 4, 5, 5))
+    painter.drawEllipse(QRectF(14.5, 4, 5, 5))
+    path = QPainterPath()
+    path.moveTo(7, 9)
+    path.lineTo(7, 15)
+    path.lineTo(4.5, 20)
+    path.moveTo(7, 15)
+    path.lineTo(9.5, 20)
+    path.moveTo(17, 9)
+    path.lineTo(17, 15)
+    path.lineTo(14.5, 20)
+    path.moveTo(17, 15)
+    path.lineTo(19.5, 20)
+    path.moveTo(9, 12)
+    path.lineTo(15, 12)
+    painter.drawPath(path)
+
+
 def _draw_analytics(painter: QPainter) -> None:
     painter.drawLine(4, 20, 4, 5)
     painter.drawLine(4, 20, 21, 20)
@@ -145,6 +164,7 @@ _ICON_DRAWERS = {
     "practice": _draw_practice,
     "references": _draw_references,
     "library": _draw_library,
+    "analysis": _draw_analysis,
     "review": _draw_review,
     "analytics": _draw_analytics,
     "coach": _draw_coach,

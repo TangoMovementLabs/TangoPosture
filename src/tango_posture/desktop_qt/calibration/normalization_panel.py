@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import math
-from pathlib import Path
 import threading
-from typing import Any, Callable, Mapping
+from collections.abc import Callable, Mapping
+from pathlib import Path
+from typing import Any
 
 from PySide6.QtCore import QObject, Qt, Signal
 from PySide6.QtGui import QDoubleValidator
@@ -30,7 +31,7 @@ from PySide6.QtWidgets import (
 
 from ...archive import read_analytics
 from ...calibration.archives import read_range_profile
-from ...calibration.models import ApprovedRange, METRIC_DETAILS, Passage, RangeProfile
+from ...calibration.models import METRIC_DETAILS, ApprovedRange, RangeProfile
 from ...calibration.normalization import (
     HoldSourceIdentity,
     HoldWindow,
@@ -43,7 +44,6 @@ from ...calibration.normalization import (
     build_source_identity,
     evaluate_matched_holds,
     evaluate_pair_applicability,
-    find_matching_pair,
     in_physical_domain,
     make_pair_rule_id,
     profile_content_digest,
@@ -90,6 +90,7 @@ class NullableDoubleEdit(QLineEdit):
         self.setPlaceholderText(placeholder)
         validator = QDoubleValidator(minimum, maximum, decimals, self)
         validator.setNotation(QDoubleValidator.Notation.StandardNotation)
+        self._validator = validator
         self.setValidator(validator)
         self.textChanged.connect(lambda _text: self.valueChanged.emit())
 
@@ -161,7 +162,7 @@ class MetricNormalizationRowWidget(QFrame):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self.metric = metric
+        self.metric_key = metric
         self.target = target
         self._playhead_provider = playhead_provider
         self._review_frame_provider = review_frame_provider
@@ -230,7 +231,7 @@ class MetricNormalizationRowWidget(QFrame):
         layout.addLayout(mode_row)
 
         # Manual container
-        self.manual_container = QWidget()
+        self.manual_container = QWidget(self)
         manual_layout = QHBoxLayout(self.manual_container)
         manual_layout.setContentsMargins(0, 0, 0, 0)
         manual_layout.setSpacing(8)
@@ -247,13 +248,14 @@ class MetricNormalizationRowWidget(QFrame):
         layout.addWidget(self.manual_container)
 
         # Matched holds container
-        self.matched_container = QFrame()
+        self.matched_container = QFrame(self)
         self.matched_container.setStyleSheet(f"border: 1px solid {COLOR_BORDER}; border-radius: 4px;")
         matched_layout = QVBoxLayout(self.matched_container)
         matched_layout.setContentsMargins(10, 8, 10, 8)
         matched_layout.setSpacing(6)
 
         grid = QGridLayout()
+        matched_layout.addLayout(grid)
         grid.setHorizontalSpacing(8)
         grid.setVerticalSpacing(4)
         grid.addWidget(QLabel("<b>Hold window</b>"), 0, 0)
@@ -295,12 +297,13 @@ class MetricNormalizationRowWidget(QFrame):
         grid.addWidget(QLabel("Practice Fit hold:"), 2, 0)
         grid.addWidget(self.fit_prac_start, 2, 1)
         grid.addWidget(self.fit_prac_end, 2, 2)
-        fit_btn_box = QHBoxLayout()
+        fit_btn_host = QWidget(self.matched_container)
+        fit_btn_box = QHBoxLayout(fit_btn_host)
         fit_btn_box.setContentsMargins(0, 0, 0, 0)
         fit_btn_box.setSpacing(4)
         fit_btn_box.addWidget(self.fit_prac_set_start_btn)
         fit_btn_box.addWidget(self.fit_prac_set_end_btn)
-        grid.addLayout(fit_btn_box, 2, 3)
+        grid.addWidget(fit_btn_host, 2, 3)
 
         grid.addWidget(QLabel("Reference Check hold:"), 3, 0)
         grid.addWidget(self.check_ref_start, 3, 1)
@@ -309,14 +312,13 @@ class MetricNormalizationRowWidget(QFrame):
         grid.addWidget(QLabel("Practice Check hold:"), 4, 0)
         grid.addWidget(self.check_prac_start, 4, 1)
         grid.addWidget(self.check_prac_end, 4, 2)
-        chk_btn_box = QHBoxLayout()
+        chk_btn_host = QWidget(self.matched_container)
+        chk_btn_box = QHBoxLayout(chk_btn_host)
         chk_btn_box.setContentsMargins(0, 0, 0, 0)
         chk_btn_box.setSpacing(4)
         chk_btn_box.addWidget(self.check_prac_set_start_btn)
         chk_btn_box.addWidget(self.check_prac_set_end_btn)
-        grid.addLayout(chk_btn_box, 4, 3)
-
-        matched_layout.addLayout(grid)
+        grid.addWidget(chk_btn_host, 4, 3)
 
         tol_row = QHBoxLayout()
         tol_row.setSpacing(8)
@@ -327,7 +329,7 @@ class MetricNormalizationRowWidget(QFrame):
         self.max_error_edit.setMaximumWidth(120)
         tol_row.addWidget(self.max_error_edit)
         self.compute_btn = QPushButton("Compute && verify holds")
-        self.compute_btn.clicked.connect(lambda: self.compute_requested.emit(self.metric))
+        self.compute_btn.clicked.connect(lambda: self.compute_requested.emit(self.metric_key))
         tol_row.addWidget(self.compute_btn)
         tol_row.addStretch(1)
         matched_layout.addLayout(tol_row)
@@ -352,6 +354,7 @@ class MetricNormalizationRowWidget(QFrame):
         self.preview_output_lbl.setWordWrap(True)
         preview_row.addWidget(self.preview_output_lbl, 1)
         layout.addLayout(preview_row)
+        self._sublayouts = [header, mode_row, grid, tol_row, preview_row]
 
         # Signals
         self.direct_radio.toggled.connect(self._on_widget_edited)
@@ -396,7 +399,7 @@ class MetricNormalizationRowWidget(QFrame):
             end_spin.setValue(max(0.0, float(ts)))
 
     def _apply_current_review_frame(self) -> None:
-        val = self._review_frame_provider(self.metric)
+        val = self._review_frame_provider(self.metric_key)
         self.preview_input.setValue(val)
         self.update_preview()
 
@@ -615,11 +618,11 @@ class MetricNormalizationRowWidget(QFrame):
             self.preview_output_lbl.setText("Needs recheck: compute and pass Check hold verification first")
             self.preview_output_lbl.setStyleSheet(f"color: {COLOR_WARNING};")
             return
-        adjusted = apply_metric_offset(self.metric, raw, offset)
-        if not in_physical_domain(self.metric, adjusted):
+        adjusted = apply_metric_offset(self.metric_key, raw, offset)
+        if not in_physical_domain(self.metric_key, adjusted):
             self.preview_output_lbl.setText(
                 f"Adjustment unavailable: {_format_metric_value(raw, self._unit)} {_format_signed_offset(offset, self._unit)} "
-                f"falls outside valid physical domain for {METRIC_DETAILS[self.metric][1]}"
+                f"falls outside valid physical domain for {METRIC_DETAILS[self.metric_key][1]}"
             )
             self.preview_output_lbl.setStyleSheet(f"color: {COLOR_DANGER}; font-weight: 600;")
             return
@@ -685,7 +688,7 @@ class MeasurementNormalizationPanel(QFrame):
         root.addWidget(disclaimer)
 
         # Hold quality global controls
-        quality_box = QFrame()
+        quality_box = QFrame(self)
         quality_box.setStyleSheet(f"border: 1px solid {COLOR_BORDER}; border-radius: 4px;")
         quality_form = QGridLayout(quality_box)
         quality_form.setContentsMargins(10, 8, 10, 8)
@@ -756,11 +759,12 @@ class MeasurementNormalizationPanel(QFrame):
         self.pair_status_lbl.setStyleSheet(f"color: {COLOR_TEXT_MUTED}; font-size: 12px;")
         root.addWidget(self.pair_status_lbl)
 
-        self.metrics_host = QWidget()
+        self.metrics_host = QWidget(self)
         self.metrics_layout = QVBoxLayout(self.metrics_host)
         self.metrics_layout.setContentsMargins(0, 0, 0, 0)
         self.metrics_layout.setSpacing(8)
         root.addWidget(self.metrics_host)
+        self._sublayouts = [top_row, pair_form, pair_actions]
 
     @property
     def metric_rows(self) -> dict[str, MetricNormalizationRowWidget]:
@@ -786,8 +790,8 @@ class MeasurementNormalizationPanel(QFrame):
         self.config_modified.emit()
 
     def _current_review_context(self) -> dict[str, Any]:
-        merged = dict(getattr(self.bridge, "review_context", {}) or {})
-        merged.update(self._review_context)
+        merged = dict(self._review_context)
+        merged.update(dict(getattr(self.bridge, "review_context", {}) or {}))
         return merged
 
     def _current_playhead(self) -> float | None:
@@ -802,10 +806,25 @@ class MeasurementNormalizationPanel(QFrame):
                 return float(raw)
         return None
 
+    @staticmethod
+    def _normalize_practice_key(raw: Any) -> tuple[str, int] | None:
+        if isinstance(raw, (tuple, list)) and len(raw) == 2:
+            return (str(raw[0]), int(raw[1]))
+        return None
+
+    def _find_practice_index(self, raw_key: Any) -> int:
+        norm_key = self._normalize_practice_key(raw_key)
+        if norm_key is None:
+            return -1
+        for idx in range(self.practice_combo.count()):
+            if self._normalize_practice_key(self.practice_combo.itemData(idx)) == norm_key:
+                return idx
+        return -1
+
     def refresh_library_choices(self) -> None:
         """Scan Library `.tpc` profiles and `.tp`/`.tpr` recordings without losing active selection."""
         current_profile_id = self.profile_combo.currentData()
-        current_practice_key = self.practice_combo.currentData()
+        current_practice_key = self._normalize_practice_key(self.practice_combo.currentData())
 
         self._profiles_by_id.clear()
         for ref in self.bridge.list_references():
@@ -855,7 +874,7 @@ class MeasurementNormalizationPanel(QFrame):
             for key, info in self._practices_by_key.items():
                 self.practice_combo.addItem(info["label"], key)
             if current_practice_key is not None:
-                idx = self.practice_combo.findData(current_practice_key)
+                idx = self._find_practice_index(current_practice_key)
                 if idx >= 0:
                     self.practice_combo.setCurrentIndex(idx)
         finally:
@@ -884,6 +903,8 @@ class MeasurementNormalizationPanel(QFrame):
     def select_context(self, payload: Mapping[str, Any]) -> None:
         """Focus normalization controls and preselect profile/recording from Review payload."""
         self._review_context = dict(payload)
+        if isinstance(getattr(self.bridge, "review_context", None), dict):
+            self.bridge.review_context.update(payload)
         self.refresh_library_choices()
         cal_id = payload.get("calibration_id")
         cal_path = payload.get("calibration_path")
@@ -906,7 +927,7 @@ class MeasurementNormalizationPanel(QFrame):
 
             if isinstance(archive_path, (Path, str)):
                 key = (str(Path(archive_path).resolve()), segment_index)
-                idx = self.practice_combo.findData(key)
+                idx = self._find_practice_index(key)
                 if idx >= 0:
                     self.practice_combo.setCurrentIndex(idx)
             self._load_selected_pair()
@@ -925,10 +946,10 @@ class MeasurementNormalizationPanel(QFrame):
         self,
     ) -> tuple[str, Path, RangeProfile, Path, int, str] | None:
         cal_id = self.profile_combo.currentData()
-        prac_key = self.practice_combo.currentData()
+        prac_key = self._normalize_practice_key(self.practice_combo.currentData())
         if not isinstance(cal_id, str) or cal_id not in self._profiles_by_id:
             return None
-        if not isinstance(prac_key, tuple) or prac_key not in self._practices_by_key:
+        if prac_key is None or prac_key not in self._practices_by_key:
             return None
         cal_path, profile = self._profiles_by_id[cal_id]
         prac_info = self._practices_by_key[prac_key]
@@ -956,6 +977,8 @@ class MeasurementNormalizationPanel(QFrame):
             item = self.metrics_layout.takeAt(0)
             widget = item.widget()
             if widget is not None:
+                widget.hide()
+                widget.setParent(None)
                 widget.deleteLater()
 
     def _build_current_practice_identity(
@@ -985,14 +1008,14 @@ class MeasurementNormalizationPanel(QFrame):
             )
 
     def _load_selected_pair(self) -> None:
-        self._clear_metric_rows()
         sel = self._selected_profile_and_practice()
         if sel is None:
+            self._clear_metric_rows()
             self._current_pair_key = None
             self.pair_status_lbl.setText("Add or select both a calibration profile (.tpc) and a recording in Library.")
             return
 
-        cal_id, cal_path, profile, prac_path, seg_idx, prac_label = sel
+        cal_id, _cal_path, profile, prac_path, seg_idx, prac_label = sel
         self._current_pair_key = (cal_id, (str(prac_path.resolve()), seg_idx))
         existing = self._find_working_pair(cal_id, prac_path, seg_idx)
 
@@ -1001,44 +1024,57 @@ class MeasurementNormalizationPanel(QFrame):
             "side": profile.capture_profile.get("side", cfg.side),
             "facing": profile.capture_profile.get("facing", cfg.facing),
         })
-        if existing is not None:
-            self.pair_enabled_cb.setChecked(bool(existing.enabled))
-            temp_cfg = comp_cfg.model_copy(update={
-                "measurement_normalization": comp_cfg.measurement_normalization.model_copy(update={
-                    "enabled": True,
-                    "pairs": [existing],
+        blocked_pair_cb = self.pair_enabled_cb.blockSignals(True)
+        try:
+            if existing is not None:
+                self.pair_enabled_cb.setChecked(bool(existing.enabled))
+                temp_cfg = comp_cfg.model_copy(update={
+                    "measurement_normalization": comp_cfg.measurement_normalization.model_copy(update={
+                        "enabled": True,
+                        "pairs": [existing],
+                    })
                 })
-            })
-            prac_id = self._build_current_practice_identity(prac_path, seg_idx, comp_cfg)
-            applicability = evaluate_pair_applicability(temp_cfg, profile, prac_id)
-            if applicability.status == "needs_recheck":
-                self.pair_status_lbl.setText(f"Needs recheck: {applicability.reason}")
-                self.pair_status_lbl.setStyleSheet(f"color: {COLOR_DANGER}; font-size: 12px; font-weight: 600;")
+                prac_id = self._build_current_practice_identity(prac_path, seg_idx, comp_cfg)
+                applicability = evaluate_pair_applicability(temp_cfg, profile, prac_id)
+                if applicability.status == "needs_recheck":
+                    self.pair_status_lbl.setText(f"Needs recheck: {applicability.reason}")
+                    self.pair_status_lbl.setStyleSheet(f"color: {COLOR_DANGER}; font-size: 12px; font-weight: 600;")
+                else:
+                    self.pair_status_lbl.setText(f"Configured comparison: {profile.name} <-> {prac_label}")
+                    self.pair_status_lbl.setStyleSheet(f"color: {COLOR_TEXT_MUTED}; font-size: 12px;")
             else:
-                self.pair_status_lbl.setText(f"Configured comparison: {profile.name} <-> {prac_label}")
+                self.pair_enabled_cb.setChecked(True)
+                self.pair_status_lbl.setText(f"Direct comparison (no adjustments saved yet for {profile.name} <-> {prac_label})")
                 self.pair_status_lbl.setStyleSheet(f"color: {COLOR_TEXT_MUTED}; font-size: 12px;")
-        else:
-            self.pair_enabled_cb.setChecked(True)
-            self.pair_status_lbl.setText(f"Direct comparison (no adjustments saved yet for {profile.name} <-> {prac_label})")
-            self.pair_status_lbl.setStyleSheet(f"color: {COLOR_TEXT_MUTED}; font-size: 12px;")
+        finally:
+            self.pair_enabled_cb.blockSignals(blocked_pair_cb)
 
-        for key, target in profile.metrics.items():
-            row = MetricNormalizationRowWidget(
-                key,
-                target,
-                playhead_provider=self._current_playhead,
-                review_frame_provider=self._current_frame_raw,
-                default_tolerance_provider=lambda: float(self.default_max_error_spin.value()),
-                parent=self.metrics_host,
-            )
+        can_reuse = (
+            list(self._metric_rows.keys()) == list(profile.metrics.keys())
+            and all(self._metric_rows[k].target == target for k, target in profile.metrics.items())
+        )
+        if not can_reuse:
+            self._clear_metric_rows()
+            for key, target in profile.metrics.items():
+                row = MetricNormalizationRowWidget(
+                    key,
+                    target,
+                    playhead_provider=self._current_playhead,
+                    review_frame_provider=self._current_frame_raw,
+                    default_tolerance_provider=lambda: float(self.default_max_error_spin.value()),
+                    parent=self.metrics_host,
+                )
+                row.changed.connect(self._on_row_changed)
+                row.compute_requested.connect(lambda m: self.compute_matched_holds_async(m))
+                self._metric_rows[key] = row
+                self.metrics_layout.addWidget(row)
+
+        for key in profile.metrics:
+            row = self._metric_rows[key]
             if existing is not None and key in existing.metrics:
                 row.set_rule(existing.metrics[key])
             else:
                 row.set_rule(MetricNormalizationRule())
-            row.changed.connect(self._on_row_changed)
-            row.compute_requested.connect(lambda m: self.compute_matched_holds_async(m))
-            self._metric_rows[key] = row
-            self.metrics_layout.addWidget(row)
 
     def _current_effective_cfg(self) -> Config:
         norm = MeasurementNormalizationConfig(

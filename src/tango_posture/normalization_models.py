@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import math
-from typing import Any, Mapping, Literal
+from collections.abc import Mapping
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
-
 
 _METRIC_KEYS: frozenset[str] = frozenset({
     "head_pitch",
@@ -57,7 +57,7 @@ class HoldWindow(BaseModel):
     end: float = Field(gt=0)
 
     @model_validator(mode="after")
-    def _ordered(self) -> "HoldWindow":
+    def _ordered(self) -> HoldWindow:
         if self.end <= self.start:
             raise ValueError("Hold window end must exceed start")
         return self
@@ -79,7 +79,7 @@ class HoldWindowStats(BaseModel):
     q90: float | None = None
 
     @model_validator(mode="after")
-    def _validate_bounds(self) -> "HoldWindowStats":
+    def _validate_bounds(self) -> HoldWindowStats:
         if self.end_seconds <= self.start_seconds:
             raise ValueError("Hold window end must exceed start")
         if self.valid_frames > self.total_frames:

@@ -42,6 +42,26 @@ def save_coach_companion(path: Path, data: dict[str, Any]) -> Path:
     return path
 
 
+def save_couple_companion(path: Path, data: dict[str, Any]) -> Path:
+    """Save a validated Couple analysis JSON companion file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, separators=(",", ":"), allow_nan=False) + "\n", encoding="utf-8")
+    return path
+
+
+def load_couple_companion(path: Path) -> dict[str, Any] | None:
+    """Load a Couple analysis JSON companion file if it exists and is valid."""
+    if not path.is_file():
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict) or raw.get("schema_version") != 1 or not raw.get("run_id"):
+            return None
+        return raw
+    except (OSError, ValueError, TypeError):
+        return None
+
+
 def load_coach_companion(path: Path) -> dict[str, Any] | None:
     """Load a per-frame Open Practice Coach companion file if it exists and is valid."""
     if not path.is_file():

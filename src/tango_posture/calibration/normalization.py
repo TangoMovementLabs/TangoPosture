@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timezone
 import hashlib
 import json
 import math
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Literal
 from zipfile import BadZipFile, ZipFile
 
 import numpy as np
@@ -22,9 +23,9 @@ from ..normalization_models import (
     MeasurementNormalizationConfig,
     MetricNormalizationRule,
     NormalizationPairRule,
-    clean_toml_dict as _clean_toml_dict,
-    require_finite as _require_finite,
 )
+from ..normalization_models import clean_toml_dict as _clean_toml_dict
+from ..normalization_models import require_finite as _require_finite
 
 if TYPE_CHECKING:
     from ..config import Config, RangeDefault
@@ -61,7 +62,7 @@ MEASUREMENT_AFFECTING_FIELDS: tuple[str, ...] = (
 
 
 def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
 @dataclass(frozen=True)
@@ -212,9 +213,10 @@ def extract_coach_observations(data: Mapping[str, Any]) -> list[FrameObservation
     width = data.get("width")
     height = data.get("height")
     if type(width) is not int or type(height) is not int or width <= 0 or height <= 0:
-        capture = data.get("capture_profile") if isinstance(data.get("capture_profile"), Mapping) else {}
-        width = capture.get("width")
-        height = capture.get("height")
+        raw_capture = data.get("capture_profile")
+        if isinstance(raw_capture, Mapping):
+            width = raw_capture.get("width")
+            height = raw_capture.get("height")
     if type(width) is not int or type(height) is not int or width <= 0 or height <= 0:
         return []
     observations: list[FrameObservation] = []
@@ -659,15 +661,18 @@ def _pair_matches_practice(
     stored = pair.practice_source
     if stored.raw_media_sha256 and current_identity.raw_media_sha256:
         return stored.raw_media_sha256 == current_identity.raw_media_sha256
-    if stored.frames_fingerprint and current_identity.frames_fingerprint:
-        if stored.frames_fingerprint == current_identity.frames_fingerprint:
-            return True
-    if stored.raw_media_sha256 is None and current_identity.raw_media_sha256 is None:
-        if stored.segment_index == current_identity.segment_index and _paths_equal(
-            stored.archive_path, current_identity.archive_path
-        ):
-            return True
-    return False
+    if (
+        stored.frames_fingerprint
+        and current_identity.frames_fingerprint
+        and stored.frames_fingerprint == current_identity.frames_fingerprint
+    ):
+        return True
+    return bool(
+        stored.raw_media_sha256 is None
+        and current_identity.raw_media_sha256 is None
+        and stored.segment_index == current_identity.segment_index
+        and _paths_equal(stored.archive_path, current_identity.archive_path)
+    )
 
 
 def find_matching_pair(
