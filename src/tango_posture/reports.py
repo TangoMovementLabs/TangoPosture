@@ -101,8 +101,30 @@ def _format_video_ref(path: Path | None, *, omit_absolute_path: bool = False) ->
     return f"[`{path}`](file://{resolved})"
 
 
-def write_markdown_report(
-    report_dir: Path,
+def pose_model_details(model_hash: object) -> tuple[str, str, str]:
+    """Identify a model only from its verified weight fingerprint."""
+    digest = model_hash if isinstance(model_hash, str) and model_hash else "Unavailable"
+    for variant in ("lite", "full", "heavy"):
+        manifest = model_manifest(variant)
+        if manifest["sha256"] == digest:
+            return f"MediaPipe Pose Landmarker {variant.capitalize()}", manifest["version"], digest
+    return "Unavailable", "Unavailable", digest
+
+
+def latest_analysis_model_section(model_hash: object, *, has_original_report: bool = True) -> str:
+    name, version, digest = pose_model_details(model_hash)
+    return (
+        "## Latest Review posture & movement analysis\n\n"
+        "| Field | Value |\n| --- | --- |\n"
+        f"| Pose Model | {name} |\n"
+        f"| Pose Model Version | `{version}` |\n"
+        f"| Pose Model SHA-256 | `{digest}` |\n\n"
+        + ("The original report below describes its original run; its findings were not regenerated."
+           if has_original_report else "")
+    )
+
+
+def render_markdown_report(
     cfg: Config,
     source: str,
     status: str,
@@ -116,17 +138,8 @@ def write_markdown_report(
     recorded_overlay: Path | None = None,
     import_context: dict[str, Any] | None = None,
     movement_data: dict[str, Any] | None = None,
-) -> Path:
-    report_dir.mkdir(parents=True, exist_ok=True)
+) -> str:
     now_utc = datetime.now(UTC)
-    stamp = now_utc.strftime("%Y%m%d_%H%M%S")
-    suffix = f"_{session_id[:8]}" if session_id else ""
-    report_path = report_dir / f"report_{stamp}{suffix}.md"
-    counter = 1
-    while report_path.exists():
-        report_path = report_dir / f"report_{stamp}{suffix}_{counter:02d}.md"
-        counter += 1
-    latest_path = report_dir / "latest_report.md"
     is_imported = bool(import_context and import_context.get("is_imported_reference"))
     movement_only = bool(is_imported and import_context and import_context.get("analysis_mode") == "movement")
 
@@ -267,15 +280,7 @@ def write_markdown_report(
         if phrases_seen and bpms_seen
         else f"`{cfg.tango_bpm:.1f} BPM` (8 beats/phrase)"
     )
-    model_hash = performance.get("model_hash")
-    model_name = model_version = "Unavailable"
-    if isinstance(model_hash, str) and model_hash:
-        for variant in ("lite", "full", "heavy"):
-            manifest = model_manifest(variant)
-            if manifest["sha256"] == model_hash:
-                model_name = f"MediaPipe Pose Landmarker {variant.capitalize()}"
-                model_version = manifest["version"]
-                break
+    model_name, model_version, model_hash = pose_model_details(performance.get("model_hash"))
 
     lines = [
         "# Tango Posture & Body Alignment Report",
@@ -308,7 +313,7 @@ def write_markdown_report(
         f"| Selected Side / Facing | `side={cfg.side}`, `facing={cfg.facing}` |",
         f"| Pose Model | {model_name} |",
         f"| Pose Model Version | `{model_version}` |",
-        f"| Pose Model SHA-256 | `{model_hash if isinstance(model_hash, str) and model_hash else 'Unavailable'}` |",
+        f"| Pose Model SHA-256 | `{model_hash}` |",
         *([] if movement_only else [
             f"| Head-Down Alert Config (`.env`) | Angle `< {cfg.head_down_angle:+.1f} deg` for `>= {cfg.head_down_duration:.1f}s` (neutral offset `{cfg.head_neutral_offset:+.1f} deg`) |",
             f"| Shoulder Tension Config (`.env`) | Elevation `>= +{cfg.shoulder_raise_threshold:.1f}%` for `>= {cfg.shoulder_tension_duration:.1f}s` |",
@@ -820,7 +825,39 @@ def write_markdown_report(
             "- No alignment deviations, head-down alerts, or camera framing issues were detected during this run."
         )
 
-    content = "\n".join(lines).rstrip() + "\n"
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def write_markdown_report(
+    report_dir: Path,
+    cfg: Config,
+    source: str,
+    status: str,
+    frame_log: list[dict[str, Any]],
+    performance: dict[str, Any],
+    reference: Calibration | None = None,
+    session_id: str | None = None,
+    session_summary: dict[str, Any] | None = None,
+    session_events: list[dict[str, Any]] | None = None,
+    recorded_video: Path | None = None,
+    recorded_overlay: Path | None = None,
+    import_context: dict[str, Any] | None = None,
+    movement_data: dict[str, Any] | None = None,
+) -> Path:
+    report_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+    suffix = f"_{session_id[:8]}" if session_id else ""
+    report_path = report_dir / f"report_{stamp}{suffix}.md"
+    counter = 1
+    while report_path.exists():
+        report_path = report_dir / f"report_{stamp}{suffix}_{counter:02d}.md"
+        counter += 1
+    latest_path = report_dir / "latest_report.md"
+    content = render_markdown_report(
+        cfg, source, status, frame_log, performance, reference, session_id,
+        session_summary, session_events, recorded_video, recorded_overlay,
+        import_context, movement_data,
+    )
     report_path.write_text(content, encoding="utf-8")
     latest_path.write_text(content, encoding="utf-8")
     timestamps = [

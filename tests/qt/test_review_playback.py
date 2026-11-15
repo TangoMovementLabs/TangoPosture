@@ -13,7 +13,13 @@ from conftest import frame
 from PySide6.QtCore import QCoreApplication, QEvent, QUrl
 from PySide6.QtWidgets import QApplication, QStackedWidget, QWidget
 
-from tango_posture.archive import append_segment, file_sha256, read_analytics, read_manifest
+from tango_posture.archive import (
+    append_segment,
+    file_sha256,
+    read_analytics,
+    read_manifest,
+    store_analytics,
+)
 from tango_posture.calibration.archives import save_range_profile
 from tango_posture.calibration.baseline import profile
 from tango_posture.calibration.models import ApprovedRange, Passage, RangeProfile
@@ -24,8 +30,9 @@ from tango_posture.desktop_qt.review.playback import ReviewPlayback
 from tango_posture.desktop_qt.router import Router
 from tango_posture.desktop_qt.screens.review import ReviewScreen
 from tango_posture.desktop_qt.service_bridge import ServiceBridge
-from tango_posture.models import MANIFEST
+from tango_posture.models import MANIFEST, model_manifest
 from tango_posture.movement import render_floor_guide
+from tango_posture.references.archives import promote_reference
 from tango_posture.references.coach import _serialise_pose, render_coach_frame_overlay
 from tango_posture.review import write_metadata
 
@@ -343,9 +350,21 @@ def test_review_posture_analysis_runs_off_ui_thread_and_syncs_overlay(
     def analyze(path, cfg, *, selected_out, progress_callback, cancel_check):
         observed["thread"] = threading.get_ident()
         observed["path"] = path
+        observed["source_bytes"] = path.read_bytes()
         observed["selected_out"] = selected_out
         observed["cancel_check"] = cancel_check
         progress_callback(50, 100, "Analyzing posture")
+        if archived:
+            coach_data["frames"].update({str(i): {} for i in range(1, 12)})
+            result = SimpleNamespace(
+                frame_log=[{"timestamp": i / 10} for i in range(12)],
+                analysis_mode="movement", selected_out=selected_out, title="Test",
+                source_sha256=file_sha256(path),
+                readiness=SimpleNamespace(to_dict=dict), coverage={},
+                soundtrack=SimpleNamespace(to_metadata_dict=dict),
+                manifest=SimpleNamespace(capture_profile={}),
+            )
+            return ReviewAnalysis(coach_data, {"pivots": [], "steps": []}, result=result)
         return ReviewAnalysis(coach_data, {"pivots": [], "steps": []})
 
     def render(image, data, frame_index, cfg, **kwargs):
@@ -367,6 +386,10 @@ def test_review_posture_analysis_runs_off_ui_thread_and_syncs_overlay(
     monkeypatch.setattr(
         "tango_posture.desktop_qt.screens.review.render_movement_overlay", render_movement
     )
+    monkeypatch.setattr(
+        "tango_posture.desktop_qt.screens.review.render_review_report",
+        lambda *args: "# Updated analysis report",
+    )
     path = video
     if archived:
         report = tmp_path / "report.md"
@@ -376,7 +399,7 @@ def test_review_posture_analysis_runs_off_ui_thread_and_syncs_overlay(
     screen.load_archive(path)
     screen._start_posture_analysis()
 
-    deadline = time.monotonic() + 3
+    deadline = time.monotonic() + 10
     while screen._analysis_thread is not None and time.monotonic() < deadline:
         qapp.processEvents()
         screen._poll_posture_analysis()
@@ -384,7 +407,7 @@ def test_review_posture_analysis_runs_off_ui_thread_and_syncs_overlay(
 
     assert screen._analysis_thread is None
     assert observed["thread"] != threading.get_ident()
-    assert observed["path"].read_bytes() == video.read_bytes()
+    assert observed["source_bytes"] == video.read_bytes()
     assert observed["selected_out"] == pytest.approx(1.2)
     assert not observed["cancel_check"]()
     assert observed["overlay_frame"] == 0
@@ -403,7 +426,260 @@ def test_review_posture_analysis_runs_off_ui_thread_and_syncs_overlay(
         assert read_analytics(path, 0)["coach_data"] == coach_data
         screen.load_archive(path)
         assert screen.metric_values["head_angle"].text() == "-8.0°"
-        assert screen._movement_data == {"pivots": [], "steps": []}
+        assert screen._movement_data["pivots"] == []
+        assert screen._movement_data["steps"] == []
+    else:
+        assert "Latest Review posture" in screen.report_view.toPlainText()
+        assert "not saved with the standalone source" in screen.report_view.toPlainText()
+
+
+@pytest.mark.parametrize("kind", ["tp", "tpr"])
+def test_reference_reanalysis_replaces_cached_results_and_survives_reload(
+    screen, video, tmp_path, monkeypatch, qapp, kind,
+):
+    practice = tmp_path / "source.tp"
+    report = tmp_path / "teacher.md"
+    report.write_text("# Original reference report")
+    append_segment(practice, report, video, None, [index / 10 for index in range(12)])
+    if kind == "tpr":
+        reference = tmp_path / "teacher.tpr"
+        promote_reference(practice, reference, "Teacher")
+    else:
+        reference = practice
+        append_segment(practice, report, video, None, [index / 10 for index in range(12)])
+    with ZipFile(reference, "a") as archive:
+        archive.writestr("overlay_00_lines.mp4", b"old lines")
+        archive.writestr("overlay_00.notes.jsonl", '{"old": true}\n')
+    with ZipFile(reference) as archive:
+        raw_video = archive.read("video_00.mp4")
+        other = {
+            name: archive.read(name) for name in archive.namelist() if "_01." in name
+        }
+    store_analytics(reference, 0, {
+        "frames": [{"old": "legacy landmarks"}],
+        "coach_data": {"frames": {"0": {"head_angle": -1}}},
+        "movement_data": {"steps": [], "pivots": [], "tag": "old"},
+        "source_provenance": {"origin": "original"},
+    })
+    from tango_posture.references.pipeline import analyze_clip
+
+    values = iter((1, 2))
+
+    def analyze(path, cfg, *, selected_out, progress_callback, cancel_check):
+        value = next(values)
+
+        class Estimator:
+            def estimate(self, image, timestamp):
+                return frame(timestamp, forward=value * 0.3)
+
+            def close(self):
+                pass
+
+        result = analyze_clip(
+            video_path=path, cfg=cfg, selected_out=selected_out, analysis_mode="movement",
+            analyse_soundtrack=False, estimator_factory=Estimator,
+            progress_callback=progress_callback, cancel_check=cancel_check,
+        )
+        digest = model_manifest("lite" if value == 1 else "heavy")["sha256"]
+        result.performance["model_hash"] = digest
+        result.coach_data["model_hash"] = digest
+        result.coach_data["frames"]["0"]["run_tag"] = value
+        if value == 2:
+            result.movement_data["steps"] = [{
+                "frame": 0, "time": 0.0, "side": "left", "confidence": 0.9,
+                "hx": 15, "hy": 35, "tx": 25, "ty": 35, "ax": 20, "ay": 35,
+            }]
+        result.movement_data["tag"] = value
+        return ReviewAnalysis(result.coach_data, result.movement_data, result.manifest, result)
+
+    monkeypatch.setattr(
+        "tango_posture.desktop_qt.screens.review.analyse_review_clip",
+        analyze,
+    )
+    screen.load_archive(reference)
+    previous_overlay = None
+    previous_lines = None
+    previous_report = None
+    previous_pixels = {}
+    for value in (1, 2):
+        screen.analytics_btn.click()
+        deadline = time.monotonic() + 15
+        while screen._analysis_thread is not None and time.monotonic() < deadline:
+            qapp.processEvents()
+            screen._poll_posture_analysis()
+            time.sleep(0.01)
+        assert screen._analysis_thread is None
+        stored = read_analytics(reference, 0)
+        assert stored["coach_data"]["frames"]["0"]["run_tag"] == value
+        assert stored["movement_data"]["tag"] == value
+        if kind == "tpr":
+            assert stored["frames"] == []
+        assert stored["source_provenance"] == {"origin": "original"}
+        variant = "lite" if value == 1 else "heavy"
+        manifest = model_manifest(variant)
+        report_text = screen.report_view.toPlainText()
+        assert f"MediaPipe Pose Landmarker {variant.capitalize()}" in report_text
+        assert manifest["version"] in report_text
+        with ZipFile(reference) as archive:
+            saved_report = archive.read("report_00.md").decode()
+            overlay = archive.read("overlay_00.mp4")
+            lines = archive.read("lines_00.mp4")
+            assert json.loads(archive.read("movement_00.v1.json"))["tag"] == value
+            assert archive.read("overlay_00_lines.mp4") == lines
+            assert "old" not in archive.read("overlay_00.notes.jsonl").decode()
+            assert archive.read("video_00.mp4") == raw_video
+            assert all(archive.read(name) == content for name, content in other.items())
+            metadata = json.loads(archive.read("report_00.metadata.json"))
+            assert len(metadata["frame_timestamps"]) == 12
+            assert metadata["overlay_video"] == "overlay_00.mp4"
+            assert metadata["lines_video"] == "lines_00.mp4"
+        assert overlay and lines
+        if previous_overlay is not None:
+            assert overlay != previous_overlay
+            assert lines != previous_lines
+            assert saved_report != previous_report
+        previous_overlay = overlay
+        previous_lines = lines
+        previous_report = saved_report
+        for name, content in (("overlay", overlay), ("lines", lines)):
+            output = tmp_path / f"{name}-{value}.mp4"
+            output.write_bytes(content)
+            capture = cv2.VideoCapture(str(output))
+            try:
+                decoded = 0
+                first_frame = None
+                while True:
+                    ok, image = capture.read()
+                    if not ok:
+                        break
+                    if first_frame is None:
+                        first_frame = image
+                    decoded += 1
+                assert decoded == 12
+                assert first_frame is not None
+                if name in previous_pixels:
+                    assert not np.array_equal(first_frame, previous_pixels[name])
+                previous_pixels[name] = first_frame
+            finally:
+                capture.release()
+        assert f"| Pose Model Version | `{manifest['version']}` |" in saved_report
+        assert f"| Pose Model SHA-256 | `{manifest['sha256']}` |" in saved_report
+        assert "# Original reference report" not in saved_report
+        assert f"`0` pivots, `{value - 1}` steps" in saved_report
+        screen._on_segment_changed(0)
+        assert screen._coach_data["frames"]["0"]["run_tag"] == value
+        assert manifest["version"] in screen.report_view.toPlainText()
+    screen.load_archive(reference)
+    assert screen._coach_data["frames"]["0"]["run_tag"] == 2
+    assert screen._movement_data["tag"] == 2
+    assert "Original reference report" not in screen.report_view.toPlainText()
+    assert model_manifest("heavy")["version"] in screen.report_view.toPlainText()
+
+
+@pytest.mark.parametrize("outcome", ["failed", "canceled"])
+def test_overlay_regeneration_failure_preserves_entire_archive(
+    screen, video, tmp_path, monkeypatch, qapp, outcome,
+):
+    archive = tmp_path / "practice.tp"
+    report = tmp_path / "original.md"
+    report.write_text("# Original")
+    append_segment(archive, report, video, None, [i / 10 for i in range(12)])
+    before = archive.read_bytes()
+    result = SimpleNamespace(
+        frame_log=[{"timestamp": i / 10} for i in range(12)], analysis_mode="movement",
+        selected_out=1.2, title="Test", readiness=SimpleNamespace(to_dict=dict),
+        source_sha256=file_sha256(video),
+        coverage={}, soundtrack=SimpleNamespace(to_metadata_dict=dict),
+        manifest=SimpleNamespace(capture_profile={}),
+    )
+    monkeypatch.setattr(
+        "tango_posture.desktop_qt.screens.review.analyse_review_clip",
+        lambda *args, **kwargs: ReviewAnalysis(
+            {"frames": {}}, {"pivots": [], "steps": []}, result=result,
+        ),
+    )
+    monkeypatch.setattr(
+        "tango_posture.desktop_qt.screens.review.render_review_report", lambda *args: "# New",
+    )
+    started = threading.Event()
+
+    def fail(_video, _folder, _analysis, _cfg, cancel_check):
+        started.set()
+        if outcome == "canceled":
+            while not cancel_check():
+                time.sleep(0.005)
+        raise ValueError("overlay encoder failed")
+
+    monkeypatch.setattr("tango_posture.desktop_qt.screens.review.render_review_overlays", fail)
+    screen.load_archive(archive)
+    screen.analytics_btn.click()
+    assert started.wait(timeout=3)
+    if outcome == "canceled":
+        screen._cancel_posture_analysis()
+    deadline = time.monotonic() + 5
+    while screen._analysis_thread is not None and time.monotonic() < deadline:
+        qapp.processEvents()
+        screen._poll_posture_analysis()
+        time.sleep(0.01)
+    assert screen._analysis_thread is None
+    assert ("canceled" if outcome == "canceled" else "overlay encoder failed") in (
+        screen.analysis_status.text()
+    )
+    assert archive.read_bytes() == before
+
+
+def test_long_recording_is_not_partially_reanalyzed(screen, video, monkeypatch):
+    screen.load_archive(video)
+    monkeypatch.setattr(type(screen._playback.reader), "duration", property(lambda self: 121))
+    screen._start_posture_analysis()
+    assert screen._analysis_thread is None
+    assert "limited to 120 seconds" in screen.analysis_status.text()
+
+
+@pytest.mark.parametrize("outcome", ["failed", "canceled"])
+def test_unsuccessful_reference_reanalysis_preserves_previous_results(
+    screen, video, tmp_path, monkeypatch, qapp, outcome,
+):
+    reference = tmp_path / "teacher.tpr"
+    practice = tmp_path / "source.tp"
+    report = tmp_path / "teacher.md"
+    report.write_text("# Reference")
+    append_segment(practice, report, video, None, [index / 10 for index in range(12)])
+    promote_reference(practice, reference, "Teacher")
+    store_analytics(reference, 0, {
+        "coach_data": {"frames": {"0": {"head_angle": 7}}},
+        "movement_data": {"steps": [], "pivots": []},
+    })
+    previous = read_analytics(reference, 0)
+    with ZipFile(reference) as archive:
+        previous_report = archive.read("report_00.md")
+    started = threading.Event()
+
+    def fail(*args, cancel_check, **kwargs):
+        started.set()
+        if outcome == "canceled":
+            while not cancel_check():
+                time.sleep(0.005)
+            raise RuntimeError("canceled")
+        raise ValueError("model unavailable")
+
+    monkeypatch.setattr("tango_posture.desktop_qt.screens.review.analyse_review_clip", fail)
+    screen.load_archive(reference)
+    screen.analytics_btn.click()
+    if outcome == "canceled":
+        assert started.wait(timeout=3)
+        screen._cancel_posture_analysis()
+    deadline = time.monotonic() + 3
+    while screen._analysis_thread is not None and time.monotonic() < deadline:
+        qapp.processEvents()
+        screen._poll_posture_analysis()
+        time.sleep(0.01)
+    assert screen._analysis_thread is None
+    assert ("model unavailable" if outcome == "failed" else "canceled") in screen.analysis_status.text()
+    assert read_analytics(reference, 0) == previous
+    assert screen._coach_data["frames"]["0"]["head_angle"] == 7
+    with ZipFile(reference) as archive:
+        assert archive.read("report_00.md") == previous_report
 
 
 def test_review_analysis_uses_in_memory_clip_analyzer_without_temp_db_or_report(

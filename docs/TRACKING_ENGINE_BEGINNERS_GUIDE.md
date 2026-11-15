@@ -1598,18 +1598,13 @@ It does not reduce the actual stored step count or change foot confirmation.
 
 ### Save and reload deliberately
 
-**Apply Settings** changes the current configuration, not a saved file.
 **Apply & Save settings.toml** confirms overwrite and saves to the process
-working directory, not necessarily `data_dir`.
-
-Read write failures: applying can succeed while saving fails.
-The profile-default copy workflow only publishes its new configuration after
-the confirmed atomic save succeeds.
+working directory, not necessarily `data_dir`. The new configuration is applied
+only after the atomic save succeeds.
 
 Use **Export TOML...** for a chosen backup location.
-Use **Import TOML...** or explicit startup configuration to load it.
-Simply naming a file settings.toml does not guarantee ordinary startup will
-automatically load it.
+The app loads `settings.toml` from its working directory on startup.
+Use **Import TOML...** or `--config` to load a different file.
 
 A running preview worker has its own configuration. Restart it when changing
 processing/setup settings, and reanalyze stored evidence when appropriate.

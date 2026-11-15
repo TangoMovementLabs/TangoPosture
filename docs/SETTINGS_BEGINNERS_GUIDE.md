@@ -53,10 +53,10 @@ their own purposes and must not be confused with choosing posture limits.
 ### How to use the examples
 
 1. Inspect the dots and the correct dancer first.
-2. Change one parameter and click **Apply Settings**.
+2. Change one parameter and click **Apply & Save settings.toml**.
 3. Reanalyze when changing the model or cached processing results.
 4. Compare the same video passage before and after.
-5. Save explicitly once satisfied.
+5. Confirm the saved setting is suitable.
 
 An unavailable measurement means insufficient usable evidence, not bad
 posture. Wider ranges cannot fix a misplaced joint. Interpolated drawing is
@@ -858,16 +858,15 @@ assessments.
 
 | Action | What it does | Practical example |
 | --- | --- | --- |
-| Apply Settings | Validates and publishes current in-memory edits, without writing a file. | Change Entry duration, Apply, then rebuild the relevant comparison. |
-| Apply & Save settings.toml | Confirms overwrite, applies valid edits and saves in the process working directory. | Read the displayed destination; it is not automatically Data folder. |
+| Apply & Save settings.toml | Confirms overwrite, saves valid edits and then applies them. | Read the displayed destination; it is not automatically Data folder. |
 | Export TOML... | Applies valid edits and writes current editable settings to your chosen file. | Export a named video-analysis preset. Removed legacy-only values are omitted. |
 | Import TOML... | Validates and loads a chosen configuration. | Load that preset, inspect visible values, then reanalyze where required. |
 | Reset Defaults | Restores built-in configuration and disables default ranges. | Reset experimental edits without deleting Library archives or saved files. |
 
-If applying succeeds but saving fails, the new values can be active but unsaved.
-Read errors rather than assuming success. A file named `settings.toml` is not
-automatically loaded merely because it exists; startup must be configured to
-load it or it must be imported.
+If saving fails, the current configuration remains unchanged. Read errors rather
+than assuming success. Startup automatically loads `settings.toml` from the
+process working directory; an explicit `--config` and CLI overrides take
+precedence. The factory `configs/default.toml` is not overwritten.
 
 Changing the inference model requires new analysis for new landmarks.
 Changing cached descriptive processing also requires regeneration.

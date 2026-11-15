@@ -411,7 +411,9 @@ sequenceDiagram
 
 Important semantics:
 
-- **Apply Settings:** current in-memory configuration only.
+- **Apply & Save settings.toml:** atomic save followed by applying the new
+  configuration. Desktop startup reloads that file from its working directory;
+  an explicit `--config` takes precedence for the source CLI.
 - **Settings TOML:** exports registered editable fields plus Calibration defaults,
   not the complete internal Config model. Old baseline-only controls and the
   three legacy per-metric entry/clear pairs are absent from Settings/templates/new

@@ -622,6 +622,16 @@ recording it again. Choose the appropriate recording index and excerpt.
 4. If you changed the offline model, reanalyze to regenerate evidence with that
    model. Merely changing Settings does not rewrite cached results.
 
+For a reference or practice, a successful Review analysis replaces its cached
+posture and movement analysis, both overlay videos and the complete report.
+The report identifies the pose model, pinned version and SHA-256. The raw video
+is unchanged; cancellation or failure keeps the previous archive. Review analyzes
+the entire recording and refuses recordings longer than 120 seconds rather than
+saving a partial result. Saved overlays show tracking and movement, not posture
+alerts; choose a calibration in Review to see those alerts.
+Recheck dancer selection and calibration ranges after reanalysis, especially if
+the model changed.
+
 A baked overlay is a video with text and skeleton pixels already painted into
 it. The app cannot remove old painted warnings by selecting a new calibration.
 Use the raw/source stream whenever possible.
@@ -1642,17 +1652,14 @@ unreliable evidence instead.
 
 | Action | Updates the current app configuration? | Writes a settings file? |
 | --- | --- | --- |
-| **Apply Settings** | Yes, if validation succeeds | No |
-| **Apply & Save settings.toml** | Applies the Settings and attempts an atomic file save | Yes, after overwrite confirmation |
+| **Apply & Save settings.toml** | Applies the Settings after an atomic save succeeds | Yes, after overwrite confirmation |
 | **Export TOML...** | Applies valid current edits before exporting | Yes, at your chosen destination |
 | **Import TOML...** | Loads the chosen file into the app | Does not automatically rewrite another file |
 | **Reset Defaults** | Replaces current configuration with built-in defaults | Not automatically |
 | **Use as Settings defaults** from a calibration | Replaces the default-range set after successful saving | Yes, overwrites `settings.toml` after confirmation |
 
-The calibration-copy save publishes its new configuration after a successful
-write. The Settings page's Apply-and-Save action first applies the edits; if the
-file write then fails, the current app can have applied changes that are not
-persisted. Always read the result/status message.
+Both calibration-copy and Settings saves publish the new configuration only
+after a successful write. Always read the result/status message.
 
 ### Where is settings.toml?
 
@@ -1663,13 +1670,10 @@ Read the exact destination displayed by the confirmation dialog.
 Do not assume that changing `data_dir` changes the TOML destination.
 If you want a known location, use **Export TOML...** and choose it explicitly.
 
-The app's ordinary configuration loader reads an explicitly supplied settings
-path; it does not automatically read an arbitrary file merely because it is
-named `settings.toml`.
-
-After restarting, use **Import TOML...** to load your saved file, or launch the
-source CLI with its supported configuration-file option. Verify the visible
-Settings before relying on the saved defaults.
+On startup, the app automatically loads `settings.toml` from its working
+directory. The packaged app uses its application-support directory. An explicit
+CLI `--config` selects that file instead, and command-line overrides take
+precedence. Factory `configs/default.toml` is not modified.
 
 ### Copying a calibration into defaults
 

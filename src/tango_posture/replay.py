@@ -214,7 +214,7 @@ def save_overlay_video(
             for frame_index in range(start_frame, end_frame + 1):
                 ok, image = capture.read()
                 if not ok or image is None:
-                    break
+                    raise ValueError(f"Cannot decode video frame {frame_index} during overlay export")
                 rendered = frame_transform(image, frame_index, fps)
                 height, width = rendered.shape[:2]
                 if rendered_size is None:

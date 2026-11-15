@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 from PySide6.QtGui import QPixmap
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 
 from tango_posture import desktop
 from tango_posture.config import Config, export_toml
@@ -261,6 +261,40 @@ def test_video_stage_rendering(qapp):
 
     stage.clear_badge()
     assert stage._badge_text == ""
+
+
+def test_settings_save_reloads_at_startup_and_failure_keeps_config(qapp, tmp_path, monkeypatch):
+    from tango_posture import cli
+
+    window = MainWindow(Config())
+    settings = window.screens[Route.SETTINGS]
+    monkeypatch.setattr(QMessageBox, "question", lambda *args: QMessageBox.StandardButton.Yes)
+    settings.bpm_spin.setValue(135)
+    settings.save_btn.click()
+    assert (tmp_path / "settings.toml").is_file()
+    assert window.bridge.config.tango_bpm == 135
+    captured = []
+    monkeypatch.setattr("tango_posture.desktop_qt.launch_qt", lambda cfg: captured.append(cfg) or 0)
+    assert cli.main(["gui"]) == 0
+    assert captured[-1].tango_bpm == 135
+
+    explicit = tmp_path / "chosen.toml"
+    explicit.write_text("tango_bpm = 145\n")
+    assert cli.main(["--config", str(explicit), "gui"]) == 0
+    assert captured[-1].tango_bpm == 145
+
+    previous = (tmp_path / "settings.toml").read_bytes()
+    settings.bpm_spin.setValue(150)
+
+    def fail(*args):
+        raise OSError("Disk full")
+
+    monkeypatch.setattr(window.bridge, "save_settings", fail)
+    settings.save_btn.click()
+    assert window.bridge.config.tango_bpm == 135
+    assert (tmp_path / "settings.toml").read_bytes() == previous
+    assert "Disk full" in window.status_strip._status_label.text()
+    window.close()
 
 
 def test_settings_screen_update(qapp, tmp_path, monkeypatch):

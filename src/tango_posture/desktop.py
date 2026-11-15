@@ -68,10 +68,10 @@ def main() -> int:
     if sys.argv[1:]:
         raise ValueError("The desktop application does not accept command-line arguments")
 
-    from .config import load
+    from .config import load, startup_config_path
     from .desktop_qt import launch_qt
 
     directory = data_directory()
     directory.mkdir(parents=True, exist_ok=True)
     os.chdir(directory)
-    return launch_qt(load(None, {"model_path": str(bundled_model())}))
+    return launch_qt(load(startup_config_path(None), {"model_path": str(bundled_model())}))

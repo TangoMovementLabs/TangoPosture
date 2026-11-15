@@ -18,7 +18,7 @@ from ...geometry import (
     shoulder_tension_alignment,
     torso_axis_alignment,
 )
-from ...overlay import screen_point
+from ...overlay import TORSO_AXIS_EXTENSION, screen_point
 from ...quality import reliable
 
 COLORS = {
@@ -133,8 +133,13 @@ def render_approved_feedback(
                 length = math.hypot(sx - hx, sy - hy)
                 cv2.line(canvas, (hx, max(0, round(hy - length))), (hx, hy),
                          (255, 220, 0), 2, cv2.LINE_AA)
-                line(torso_hip, torso_shoulder, color, 5)
-                line(torso_hip, torso_shoulder, (255, 140, 255), 2)
+                dx, dy = sx - hx, sy - hy
+                axis_start = (round(hx - TORSO_AXIS_EXTENSION * dx),
+                              round(hy - TORSO_AXIS_EXTENSION * dy))
+                axis_end = (round(sx + TORSO_AXIS_EXTENSION * dx),
+                            round(sy + TORSO_AXIS_EXTENSION * dy))
+                cv2.line(canvas, axis_start, axis_end, color, 5, cv2.LINE_AA)
+                cv2.line(canvas, axis_start, axis_end, (255, 140, 255), 2, cv2.LINE_AA)
         elif key == "knee_flexion":
             candidates = []
             for side in ("left", "right"):

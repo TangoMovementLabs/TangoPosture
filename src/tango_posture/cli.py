@@ -5,7 +5,7 @@ import sys
 from pathlib import Path
 
 from .calibration.baseline import load_calibration_file
-from .config import load
+from .config import load, startup_config_path
 from .display import PracticeDisplay
 from .models import fetch
 from .storage import Storage
@@ -96,7 +96,8 @@ def main(argv: list[str] | None = None, *, display: PracticeDisplay | None = Non
                 "mirror",
             )
         }
-        cfg = load(args.config, overrides)
+        config_path = startup_config_path(args.config) if args.command in ("gui", "qt") else args.config
+        cfg = load(config_path, overrides)
         if args.command in ("gui", "qt"):
             from .desktop_qt import launch_qt
 

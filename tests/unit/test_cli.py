@@ -13,7 +13,8 @@ def test_gui_no_longer_has_ignore_env_flag():
 
 
 @pytest.mark.parametrize("arguments", [[], ["gui"], ["qt"], ["gui", "--qt"]])
-def test_all_desktop_entrypoints_launch_qt(arguments, monkeypatch):
+def test_all_desktop_entrypoints_launch_qt(arguments, monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
     received = []
 
     def launch(cfg):

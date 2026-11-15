@@ -9,9 +9,10 @@ import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from threading import Event, Thread
 from typing import Any
-from zipfile import BadZipFile
+from zipfile import BadZipFile, ZipFile
 
 import cv2
 from PySide6.QtCore import Qt, QTimer, QUrl
@@ -34,7 +35,13 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ...archive import file_sha256, read_analytics, read_movement_analysis, store_analytics
+from ...archive import (
+    file_sha256,
+    read_analytics,
+    read_manifest,
+    read_movement_analysis,
+    store_analytics,
+)
 from ...calibration.baseline import load_calibration_file
 from ...movement import render_floor_guide, render_movement_overlay, validate_movement_analysis
 from ...references.coach import (
@@ -47,8 +54,14 @@ from ...references.coach import (
 from ...references.companions import load_report_coach_data, load_report_movement_data
 from ...references.constants import MAX_IMPORT_RANGE_SECONDS
 from ...replay import time_label
+from ...reports import latest_analysis_model_section
 from ..components.video_stage import VideoStage
-from ..review.analysis import ReviewAnalysis, analyse_review_clip
+from ..review.analysis import (
+    ReviewAnalysis,
+    analyse_review_clip,
+    render_review_overlays,
+    render_review_report,
+)
 from ..review.playback import VIDEO_SUFFIXES, ReviewPlayback
 from ..router import Route, Router
 from ..service_bridge import ServiceBridge
@@ -525,17 +538,17 @@ class ReviewScreen(QWidget):
             self._playback.select_segment(index)
             archive = self._playback.archive
             if archive is not None:
-                analytics = read_analytics(archive.folder, index)
+                analytics = read_analytics(archive.path, index)
                 if analytics is not None:
                     self._coach_data = analytics.get("coach_data")
                     self._movement_data = analytics.get("movement_data")
-                movement = read_movement_analysis(archive.folder, index)
+                movement = read_movement_analysis(archive.path, index)
                 if movement is not None and self._movement_data is None:
                     self._movement_data = validate_movement_analysis(
                         movement, expected_segment_index=index
                     )
             self._update_calibration_comparison()
-            self.report_view.setMarkdown(self._link_report_timestamps(self._playback.report))
+            self._refresh_archive_report()
             self.coach_btn.setEnabled(self._playback._report is not None)
             self._set_relink_availability()
             self._populate_streams()
@@ -552,6 +565,21 @@ class ReviewScreen(QWidget):
         if not self._playback.variants:
             raise ValueError("This recording has no raw or overlay video available")
         self._on_stream_changed(self.stream_combo.currentText())
+
+    def _refresh_archive_report(self) -> None:
+        archive = self._playback.archive
+        index = self._playback.selected_segment_index
+        if archive is None or index is None:
+            return
+        try:
+            with ZipFile(archive.path) as stored:
+                report = stored.read(archive.manifest["segments"][index]["report"]).decode("utf-8")
+        except (KeyError, UnicodeError) as error:
+            raise ValueError(f"Cannot read archived analysis report: {error}") from error
+        self._playback.report = report
+        if self._playback._report is not None:
+            self._playback._report.markdown = report
+        self.report_view.setMarkdown(self._link_report_timestamps(report))
 
     def _on_stream_changed(self, label: str) -> None:
         self._reset_transport()
@@ -889,9 +917,15 @@ class ReviewScreen(QWidget):
             return
         if self._analysis_thread is not None and self._analysis_thread.is_alive():
             return
-        selected_out = min(reader.duration, MAX_IMPORT_RANGE_SECONDS)
+        selected_out = reader.duration
         if selected_out <= 0:
             self.analysis_status.setText("This video has no analyzable duration.")
+            return
+        if selected_out > MAX_IMPORT_RANGE_SECONDS + 1e-6:
+            self.analysis_status.setText(
+                f"Full-recording analysis is limited to {MAX_IMPORT_RANGE_SECONDS:.0f} seconds. "
+                "Choose a shorter recording; the archive was not changed."
+            )
             return
 
         self._analysis_job_id += 1
@@ -906,9 +940,6 @@ class ReviewScreen(QWidget):
         cfg = self.bridge.config.model_copy(deep=True)
         archive_path = self.current_archive_path
         segment_index = self._playback.selected_segment_index
-        timestamps = list(self._playback.timestamps) or [
-            frame / reader.fps for frame in range(reader.count)
-        ]
 
         archive_lease = (
             self._playback.archive.acquire()
@@ -929,23 +960,74 @@ class ReviewScreen(QWidget):
                     progress_callback=report_progress,
                     cancel_check=cancel_event.is_set,
                 )
+                if (
+                    not cancel_event.is_set()
+                    and archive_path is not None
+                    and archive_path.suffix.lower() in (".tp", ".tpr")
+                    and segment_index is not None
+                ):
+                    if coach_data.result is None:
+                        raise ValueError("Analysis did not produce the data required for a report")
+                    result = coach_data.result
+                    if result.source_sha256 != video_sha256:
+                        raise ValueError("Source video changed during analysis; archive was not changed")
+                    timestamps = [float(frame["timestamp"]) for frame in result.frame_log]
+                    coach_data.movement_data.update(
+                        segment_index=segment_index, source_member=video_path.name,
+                        source_sha256=video_sha256,
+                    )
+                    previous = read_analytics(archive_path, segment_index) or {}
+                    provenance = previous.get("source_provenance") or {}
+                    if not isinstance(provenance, dict):
+                        raise ValueError("Invalid archived source provenance")
+                    manifest = read_manifest(archive_path)
+                    provenance = {**provenance, "title": manifest.get("name")}
+                    report = render_review_report(result, cfg, segment_index, provenance)
+                    report_progress(90, 100, "Rendering updated overlay videos")
+                    with TemporaryDirectory(prefix="tango-review-analysis-") as temporary:
+                        overlay, lines = render_review_overlays(
+                            video_path, Path(temporary), coach_data, cfg, cancel_event.is_set,
+                        )
+                        if file_sha256(video_path) != video_sha256:
+                            raise ValueError("Source video changed during overlay rendering")
+                        payload = {
+                            "coach_data": coach_data.coach_data,
+                            "movement_data": coach_data.movement_data, "max_gap": cfg.max_gap,
+                            "model_hash": coach_data.coach_data.get("model_hash"),
+                            "capture_profile": coach_data.coach_data.get("capture_profile"),
+                            "frame_timestamps": timestamps,
+                            "frames": [],
+                        }
+                        with self._analysis_commit_lock:
+                            cancelled = cancel_event.is_set() or self._active_analysis_job != job_id
+                            if not cancelled:
+                                store_analytics(
+                                    archive_path, segment_index, payload,
+                                    expected_video_sha256=video_sha256, report_text=report,
+                                    overlay_path=overlay, lines_path=lines, frame_log=result.frame_log,
+                                    metadata_updates={
+                                        "frame_timestamps": timestamps,
+                                        "analysis_mode": result.analysis_mode,
+                                        "is_imported_reference": True,
+                                        "source": f"import:{video_path.name}",
+                                        "source_sha256": video_sha256,
+                                        "title": provenance.get("title") or result.title,
+                                        "clip_in": 0.0, "clip_out": result.selected_out,
+                                        "readiness": result.readiness.to_dict(),
+                                        "reference_summary": None,
+                                        "coverage": {
+                                            key: value.to_dict()
+                                            for key, value in result.coverage.items()
+                                        },
+                                        "soundtrack": result.soundtrack.to_metadata_dict(),
+                                        "capture_profile": result.manifest.capture_profile,
+                                    },
+                                )
+                            event = "cancelled" if cancelled else "done"
+                            self._analysis_events.put((job_id, event, coach_data))
+                        return
                 with self._analysis_commit_lock:
                     cancelled = cancel_event.is_set() or self._active_analysis_job != job_id
-                    if (
-                        not cancelled
-                        and archive_path is not None
-                        and archive_path.suffix.lower() in (".tp", ".tpr")
-                        and segment_index is not None
-                    ):
-                        store_analytics(
-                            archive_path, segment_index,
-                            {"coach_data": coach_data.coach_data,
-                             "movement_data": coach_data.movement_data, "max_gap": cfg.max_gap,
-                             "model_hash": coach_data.coach_data.get("model_hash"),
-                             "capture_profile": coach_data.coach_data.get("capture_profile"),
-                             "frame_timestamps": timestamps},
-                            expected_video_sha256=video_sha256,
-                        )
                     event = "cancelled" if cancelled else "done"
                     self._analysis_events.put((job_id, event, coach_data))
             except Exception as error:  # noqa: BLE001 - surface background analysis errors in the UI
@@ -995,13 +1077,39 @@ class ReviewScreen(QWidget):
                 self._coach_data = payload.coach_data
                 self._movement_data = payload.movement_data
                 self._update_calibration_comparison()
+                try:
+                    if self._playback.archive is not None:
+                        path = self._playback.archive.path
+                        index = self._playback.selected_segment_index or 0
+                        frame = self._playback.reader.index if self._playback.reader else 0
+                        self._analysis_cancel = None
+                        self._active_analysis_job = None
+                        self.load_archive(path, segment_index=index)
+                        if self._playback.reader is not None:
+                            self._show_frame(min(frame, self._playback.reader.count - 1))
+                    else:
+                        original = self._playback.report
+                        section = latest_analysis_model_section(
+                            payload.coach_data.get("model_hash"), has_original_report=bool(original),
+                        )
+                        section += "\n\nThis Review analysis is not saved with the standalone source."
+                        self.report_view.setMarkdown(self._link_report_timestamps(
+                            f"{section}\n\n{original}" if original else section
+                        ))
+                except (OSError, ValueError, UnicodeError, KeyError, BadZipFile) as error:
+                    self.bridge.status_message.emit(f"Could not refresh the analysis report: {error}")
                 frames = payload.coach_data.get("frames")
                 frame_count = len(frames) if isinstance(frames, dict) else 0
+                saved_note = (
+                    "Previous analysis, report and overlay videos were replaced and saved. "
+                    if self.current_archive_path is not None
+                    and self.current_archive_path.suffix.lower() in (".tp", ".tpr") else ""
+                )
                 self.analysis_status.setText(
                     f"Analysis ready: {frame_count} frames, "
                     f"{len(payload.movement_data.get('pivots', []))} pivots, "
                     f"{len(payload.movement_data.get('steps', []))} steps. "
-                    "The review overlay and insights follow the current playback frame."
+                    f"{saved_note}The review overlay and insights follow the current playback frame."
                 )
                 if self._calibration_error:
                     self.analysis_status.setText(self._calibration_error)

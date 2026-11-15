@@ -167,9 +167,11 @@ stream to a destination you choose.
 
 Settings are organized into groups covering
 camera and view, calibration, tracking, movement, music, replay and Ollama.
-**Apply Settings** validates and applies changes for the current app session;
-use **Apply & Save settings.toml** to confirm and overwrite that file, or
-**Export TOML…** to choose a different destination.
+**Apply & Save settings.toml** validates and saves changes after confirmation,
+then applies them. Use **Export TOML…** to choose a different destination.
+The app automatically reloads `settings.toml` from its working directory on
+startup; `--config` selects a different file and command-line overrides take precedence.
+The factory template `configs/default.toml` is not overwritten.
 
 **Settings → Files → Offline analysis model** lets you select **Lite**, **Full**,
 or **Heavy** for Review and Library video analysis. Lite is the default; Full and
@@ -189,8 +191,8 @@ Settings, then use **Apply & Save settings.toml** to persist your changes.
 In Live Practice with no calibration selected, enabled default ranges replace legacy posture
 thresholds; missing metrics have no fallback. Disable all default ranges to restore
 the legacy thresholds. A selected calibration takes priority, and copying defaults
-does not enable calibrated camera scoring. Load the saved file next time with
-`--config settings.toml`, or use **Import TOML…**.
+does not enable calibrated camera scoring. The saved file is loaded automatically
+at startup from the same working directory.
 
 Calibration and Live Practice use the shared pose pipeline: the video shows
 skeleton tracking and the inspector reports head, shoulder, torso/hip and knee
@@ -1163,7 +1165,7 @@ In **Review**, an offline analysis layer can inspect the unmirrored **Raw video*
 stream of a single dancer filmed from a fixed, approximately level camera:
 
 - **Controls**:
-  - **Analyze posture & movement**: Runs (or re-runs) the offline pose pass on the selected recording. **Cancel analysis** stops a running job; cancelling a re-run preserves the previous valid result.
+  - **Analyze posture & movement**: Runs (or re-runs) the offline pose pass on the entire selected recording, up to 120 seconds. Successful archived re-analysis replaces the cached results, both overlay videos and the complete report, including the actual pose model, version and SHA-256. The raw video remains unchanged. The saved overlays show tracking and movement without calibration alerts; select a calibration in Review for those alerts. **Cancel analysis** stops a running job; cancellation or failure preserves the previous archive.
   - **Torso axis angle (pink line)**: Optionally shows the shoulder-midpoint to hip-midpoint line and its angle from image vertical, independently of the skeleton. Both shoulders and hips must be reliably observed; interpolation does not supply missing measurement landmarks. This visual cue alone does not produce an alert.
   - **Pivot rings**: Draws a perspective ellipse ring centered on the hip midpoint and aligned with the projected hip line only during an observed pivot interval, with a tangent directional arrow indicating **clockwise** or **anticlockwise** top-down rotation.
   - **Step footprints**: Draws left and right heel-to-toe footprint markers at their observed floor positions. Each marker fades in over a short ramp (`min(0.15s, 0.15 × T)`) and fades linearly to zero at `T = replay_step_history_seconds` (default `5.0s`) of replay media time. Pausing playback pauses the fade.

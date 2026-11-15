@@ -97,6 +97,25 @@ def test_rename_and_hash_checked_analytics_preserve_members(tmp_path):
     assert read_analytics(path, 0)["coach_data"]["frames"]["0"]["head_angle"] == 5
 
 
+def test_full_analysis_commit_is_atomic_on_hash_or_overlay_failure(tmp_path):
+    path, report, video = (tmp_path / name for name in ("practice.tp", "report.md", "raw.mp4"))
+    report.write_text("# Old report")
+    video.write_bytes(b"old video")
+    append_segment(path, report, video, None, [0.0], analytics={"frames": []})
+    before = path.read_bytes()
+    options = {
+        "report_text": "# New report",
+        "overlay_path": tmp_path / "missing.mp4",
+        "metadata_updates": {"frame_timestamps": [0.0]},
+    }
+    with pytest.raises(ValueError, match="changed"):
+        store_analytics(path, 0, {"frames": []}, expected_video_sha256="wrong", **options)
+    assert path.read_bytes() == before
+    with pytest.raises(FileNotFoundError):
+        store_analytics(path, 0, {"frames": []}, expected_video_sha256=file_sha256(video), **options)
+    assert path.read_bytes() == before
+
+
 @pytest.mark.parametrize("payload", [
     {"frame_timestamps": [0.1, 0.0]},
     {"frame_timestamps": [0.0, 0.0]},

@@ -128,8 +128,8 @@ def test_overlay_renders_extended_torso_and_dashed_hip_vertical(monkeypatch, mir
     torso = [(a, b) for a, b, c in line_calls if c == (255, 140, 255)]
     assert len(torso) == 1
     start, end = torso[0]
-    # Line follows the torso midpoints and extends above/below them.
-    assert start[1] > hy > sy > end[1]
+    assert start == (round(hx - 0.25 * (sx - hx)), round(hy - 0.25 * (sy - hy)))
+    assert end == (round(sx + 0.25 * (sx - hx)), round(sy + 0.25 * (sy - hy)))
     vx, vy = end[0] - start[0], end[1] - start[1]
     for x, y in ((sx, sy), (hx, hy)):
         distance = abs(vx * (y - start[1]) - vy * (x - start[0])) / math.hypot(vx, vy)

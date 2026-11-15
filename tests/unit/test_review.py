@@ -5,7 +5,7 @@ import pytest
 from tango_posture.config import Config
 from tango_posture.models import MANIFEST
 from tango_posture.replay import VideoReader, cut_video_segment, parse_time, save_overlay_video
-from tango_posture.reports import write_markdown_report
+from tango_posture.reports import latest_analysis_model_section, write_markdown_report
 from tango_posture.review import read_report, save_analysis, saved_analyses, write_metadata
 
 
@@ -94,6 +94,13 @@ def test_report_does_not_guess_unknown_model_version(tmp_path, model_hash):
     assert "| Pose Model | Unavailable |" in report
     assert "| Pose Model Version | `Unavailable` |" in report
     assert f"| Pose Model SHA-256 | `{model_hash or 'Unavailable'}` |" in report
+
+
+def test_latest_analysis_model_section_does_not_guess_unknown_identity():
+    section = latest_analysis_model_section("unknown-model-hash")
+    assert "| Pose Model | Unavailable |" in section
+    assert "| Pose Model Version | `Unavailable` |" in section
+    assert "| Pose Model SHA-256 | `unknown-model-hash` |" in section
 
 
 @pytest.mark.parametrize("value,expected", [("12.5", 12.5), ("01:02.5", 62.5), ("01:02:03", 3723)])

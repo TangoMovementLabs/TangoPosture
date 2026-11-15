@@ -30,6 +30,22 @@ def test_desktop_uses_user_data_and_bundled_model(monkeypatch, tmp_path):
     assert captured == {"cwd": user_data, "model": str(model), "data": "data"}
 
 
+def test_desktop_reloads_saved_settings_from_application_directory(monkeypatch, tmp_path):
+    from tango_posture import desktop_qt
+
+    user_data = tmp_path / "application"
+    user_data.mkdir()
+    (user_data / "settings.toml").write_text('analysis_model = "heavy"\ntango_bpm = 135\n')
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "argv", ["TangoPosture"])
+    monkeypatch.setattr(desktop, "data_directory", lambda: user_data)
+    captured = []
+    monkeypatch.setattr(desktop_qt, "launch_qt", lambda cfg: captured.append(cfg) or 0)
+    assert desktop.main() == 0
+    assert captured[0].analysis_model == "heavy"
+    assert captured[0].tango_bpm == 135
+
+
 def test_default_desktop_starts_without_tk(tmp_path):
     result = subprocess.run(
         [sys.executable, "-c", """

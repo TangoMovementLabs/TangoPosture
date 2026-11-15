@@ -158,14 +158,12 @@ class SettingsScreen(QScrollArea):
         self.tabs.addTab(ranges_page, "Calibration defaults")
         layout.addWidget(self.tabs, 1)
 
-        self.save_btn = QPushButton("Apply Settings")
+        self.save_btn = QPushButton("Apply && Save settings.toml")
         self.save_btn.setProperty("class", "primary")
         self.save_btn.setFixedHeight(38)
-        self.save_btn.clicked.connect(self._save_settings)
+        self.save_btn.clicked.connect(self._save_toml)
         layout.addWidget(self.save_btn)
-        self.save_toml_btn = QPushButton("Apply && Save settings.toml")
-        self.save_toml_btn.clicked.connect(self._save_toml)
-        layout.addWidget(self.save_toml_btn)
+        self.save_toml_btn = self.save_btn
 
         self._set_legacy_widget_aliases()
         self._apply_config(cfg)
@@ -282,30 +280,33 @@ class SettingsScreen(QScrollArea):
         self.ollama_url = ollama_url
         self.ollama_model = ollama_model
 
+    def _collect_settings(self) -> Config:
+        data = self.bridge.config.model_dump(exclude={"axis_curve"})
+        for field, editor in self.field_widgets.items():
+            if isinstance(editor, QCheckBox):
+                value = str(editor.isChecked())
+            elif isinstance(editor, QComboBox):
+                value = editor.currentText()
+            elif isinstance(editor, (QSpinBox, QDoubleSpinBox)):
+                value = str(editor.value())
+            elif isinstance(editor, QLineEdit):
+                value = editor.text().strip()
+            else:
+                raise TypeError(f"Unsupported settings editor for {field}")
+            set_setting(data, field, value)
+        data["calibration_defaults"] = {
+            key: RangeDefault.model_validate({
+                "lower": lower.value(), "upper": upper.value(), "unit": METRIC_DETAILS[key][2],
+                "view": view.currentText(),
+            }).model_dump()
+            for key, (enabled, lower, upper, view) in self.range_widgets.items()
+            if enabled.isChecked()
+        }
+        return Config.model_validate(data)
+
     def _save_settings(self) -> bool:
         try:
-            data = self.bridge.config.model_dump(exclude={"axis_curve"})
-            for field, editor in self.field_widgets.items():
-                if isinstance(editor, QCheckBox):
-                    value = str(editor.isChecked())
-                elif isinstance(editor, QComboBox):
-                    value = editor.currentText()
-                elif isinstance(editor, (QSpinBox, QDoubleSpinBox)):
-                    value = str(editor.value())
-                elif isinstance(editor, QLineEdit):
-                    value = editor.text().strip()
-                else:
-                    raise TypeError(f"Unsupported settings editor for {field}")
-                set_setting(data, field, value)
-            data["calibration_defaults"] = {
-                key: RangeDefault.model_validate({
-                    "lower": lower.value(), "upper": upper.value(), "unit": METRIC_DETAILS[key][2],
-                    "view": view.currentText(),
-                }).model_dump()
-                for key, (enabled, lower, upper, view) in self.range_widgets.items()
-                if enabled.isChecked()
-            }
-            cfg = Config.model_validate(data)
+            cfg = self._collect_settings()
         except (TypeError, ValueError, ValidationError) as error:
             self.bridge.status_message.emit(f"Could not apply settings: {error}")
             return False
@@ -348,11 +349,10 @@ class SettingsScreen(QScrollArea):
             QMessageBox.StandardButton.No,
         ) != QMessageBox.StandardButton.Yes:
             return
-        if not self._save_settings():
-            return
         try:
-            self.bridge.save_settings(self.bridge.config, destination)
-        except OSError as error:
+            cfg = self._collect_settings()
+            self.bridge.save_settings(cfg, destination)
+        except (OSError, TypeError, ValueError, ValidationError) as error:
             self.bridge.status_message.emit(f"Could not save settings.toml: {error}")
             return
         self.bridge.status_message.emit(f"Settings saved to {destination}")

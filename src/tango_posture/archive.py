@@ -84,7 +84,7 @@ def analytics_member_name(index: int) -> str:
     return f"analytics_{index:02d}.json"
 
 
-def _rewrite_members(path: Path, replacements: dict[str, bytes]) -> None:
+def _rewrite_members(path: Path, replacements: dict[str, bytes | Path]) -> None:
     with NamedTemporaryFile(dir=path.parent, suffix=".archive.tmp", delete=False) as stream:
         temporary = Path(stream.name)
     try:
@@ -94,7 +94,10 @@ def _rewrite_members(path: Path, replacements: dict[str, bytes]) -> None:
                     with previous.open(member) as source, output.open(member, "w") as target:
                         shutil.copyfileobj(source, target)
             for name, content in replacements.items():
-                output.writestr(name, content)
+                if isinstance(content, Path):
+                    output.write(content, name, compress_type=ZIP_STORED)
+                else:
+                    output.writestr(name, content)
         _replace_archive(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
@@ -165,7 +168,13 @@ def _validate_analytics(data: Any, index: int) -> dict[str, Any]:
 
 
 def store_analytics(
-    path: Path, index: int, payload: dict[str, Any], *, expected_video_sha256: str | None = None
+    path: Path, index: int, payload: dict[str, Any], *, expected_video_sha256: str | None = None,
+    report_section: str | None = None,
+    report_text: str | None = None,
+    overlay_path: Path | None = None,
+    lines_path: Path | None = None,
+    metadata_updates: dict[str, Any] | None = None,
+    frame_log: list[dict[str, Any]] | None = None,
 ) -> None:
     with _archive_lock(path):
         manifest = read_manifest(path)
@@ -182,10 +191,57 @@ def store_analytics(
             data = {**previous, **data}
         _validate_analytics(data, index)
         manifest["segments"][index]["analytics"] = analytics_member_name(index)
-        replacements = {
+        replacements: dict[str, bytes | Path] = {
             analytics_member_name(index): json.dumps(data, allow_nan=False).encode("utf-8"),
-            "manifest.json": json.dumps(manifest, allow_nan=False).encode("utf-8"),
         }
+        if report_text is not None:
+            replacements[manifest["segments"][index]["report"]] = report_text.encode("utf-8")
+        for key, source in (("overlay", overlay_path), ("lines", lines_path)):
+            if source is not None:
+                member = f"{key}_{index:02d}.mp4"
+                manifest["segments"][index][key] = member
+                replacements[member] = source
+        if lines_path is not None or frame_log is not None:
+            with ZipFile(path) as archive:
+                names = set(archive.namelist())
+            legacy_lines = f"overlay_{index:02d}_lines.mp4"
+            legacy_notes = f"overlay_{index:02d}.notes.jsonl"
+            if lines_path is not None and legacy_lines in names:
+                replacements[legacy_lines] = lines_path
+            if frame_log is not None and legacy_notes in names:
+                replacements[legacy_notes] = "".join(
+                    json.dumps(row, separators=(",", ":"), allow_nan=False) + "\n"
+                    for row in frame_log
+                ).encode("utf-8")
+        if metadata_updates is not None:
+            metadata_name = manifest["segments"][index]["metadata"]
+            with ZipFile(path) as archive:
+                metadata = json.loads(archive.read(metadata_name))
+            if not isinstance(metadata, dict):
+                raise ValueError("Invalid archived report metadata")
+            metadata.update(metadata_updates)
+            metadata["overlay_video"] = manifest["segments"][index].get("overlay")
+            metadata["lines_video"] = manifest["segments"][index].get("lines")
+            replacements[metadata_name] = json.dumps(metadata, allow_nan=False).encode("utf-8")
+        if report_text is not None and data.get("movement_data") is not None:
+            movement = json.dumps(data["movement_data"], allow_nan=False).encode("utf-8")
+            if len(movement) > 10 * 1024 * 1024:
+                raise ValueError("Movement analysis exceeds the supported archive size")
+            replacements[movement_member_name(index)] = movement
+        replacements["manifest.json"] = json.dumps(manifest, allow_nan=False).encode("utf-8")
+        if report_section is not None:
+            report_name = manifest["segments"][index]["report"]
+            with ZipFile(path) as archive:
+                report = archive.read(report_name).decode("utf-8")
+            start = "<!-- TangoPosture latest Review analysis -->\n"
+            end = "<!-- End TangoPosture latest Review analysis -->\n\n"
+            if report.startswith(start):
+                _, marker, report = report.partition(end)
+                if not marker:
+                    raise ValueError("Invalid latest analysis section in archived report")
+            replacements[report_name] = (
+                f"{start}{report_section.rstrip()}\n{end}{report}"
+            ).encode()
         _rewrite_members(path, replacements)
 
 

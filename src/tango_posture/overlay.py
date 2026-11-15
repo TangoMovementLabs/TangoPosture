@@ -21,6 +21,7 @@ MESSAGES = {
     "head_inclination": "Head angle differs from reference",
     "trunk_inclination": "Trunk angle differs from reference",
 }
+TORSO_AXIS_EXTENSION = 0.25
 
 
 def screen_point(x: float, y: float, width: int, height: int, mirror: bool) -> tuple[int, int]:
@@ -50,11 +51,10 @@ def draw_torso_axis(
     bottom = min(height - 1, round(hy + 0.35 * length))
     for y in range(top, bottom + 1, 20):
         cv2.line(image, (hx, y), (hx, min(y + 11, bottom)), vertical_color, 2, cv2.LINE_AA)
-    # Extend the torso direction by 15% beyond each midpoint.
     cv2.line(
         image,
-        (round(hx - 0.15 * dx), round(hy - 0.15 * dy)),
-        (round(sx + 0.15 * dx), round(sy + 0.15 * dy)),
+        (round(hx - TORSO_AXIS_EXTENSION * dx), round(hy - TORSO_AXIS_EXTENSION * dy)),
+        (round(sx + TORSO_AXIS_EXTENSION * dx), round(sy + TORSO_AXIS_EXTENSION * dy)),
         torso_color,
         3,
         cv2.LINE_AA,

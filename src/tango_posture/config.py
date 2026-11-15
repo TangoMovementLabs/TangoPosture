@@ -365,6 +365,13 @@ ENV_MAP: dict[str, tuple[str, Callable[[str], float | int | bool]]] = {
 }
 
 
+def startup_config_path(explicit: Path | None) -> Path | None:
+    if explicit is not None:
+        return explicit
+    settings = Path("settings.toml")
+    return settings if settings.exists() else None
+
+
 def load(
     path: Path | None,
     overrides: dict,

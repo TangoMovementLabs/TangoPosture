@@ -23,7 +23,9 @@ from tango_posture.desktop_qt.screens.library import LibraryScreen
 from tango_posture.desktop_qt.screens.settings import SettingsScreen
 from tango_posture.desktop_qt.service_bridge import ServiceBridge
 from tango_posture.domain import Landmark
+from tango_posture.geometry import torso_axis_alignment
 from tango_posture.models import MANIFEST
+from tango_posture.overlay import screen_point
 from tango_posture.references.archives import promote_reference
 
 
@@ -276,6 +278,17 @@ def test_approved_metric_geometry_and_unknown_abstention(key, monkeypatch):
     if key == "head_pitch":
         assert any(start[1] == end[1] and color == (255, 220, 0)
                    for start, end, color in drawn)
+    if key == "torso_axis_tilt":
+        axis = torso_axis_alignment(pose, 640, 480, cfg.confidence)
+        assert axis is not None
+        _, shoulder, hip = axis
+        sx, sy = screen_point(shoulder.x, shoulder.y, 640, 480, False)
+        hx, hy = screen_point(hip.x, hip.y, 640, 480, False)
+        assert (
+            (round(hx - 0.25 * (sx - hx)), round(hy - 0.25 * (sy - hy))),
+            (round(sx + 0.25 * (sx - hx)), round(sy + 0.25 * (sy - hy))),
+            (255, 140, 255),
+        ) in drawn
     drawn.clear()
     row["state"] = "UNKNOWN"
     render_approved_feedback(image, observation, cfg, {key: target}, [row])
