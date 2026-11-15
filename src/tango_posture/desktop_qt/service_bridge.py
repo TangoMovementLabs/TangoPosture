@@ -107,6 +107,7 @@ class ServiceBridge(QObject):
         self._running_worker = None
         self._reference_cache: dict[tuple[Path, int, int], ReferenceSummary] = {}
         self._manifest_cache: dict[tuple[Path, int, int], dict[str, Any]] = {}
+        self.review_context: dict[str, Any] = {}
 
     @property
     def config(self) -> Config:

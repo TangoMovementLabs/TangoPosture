@@ -261,6 +261,12 @@ class MainWindow(QMainWindow):
                 and isinstance(payload, (Path, dict))
             ):
                 screen.load_report(payload)
+            if (
+                route is Route.SETTINGS
+                and isinstance(screen, SettingsScreen)
+                and isinstance(payload, dict)
+            ):
+                screen.open_measurement_normalization(payload)
 
     def closeEvent(self, event: QCloseEvent) -> None:
         super().closeEvent(event)

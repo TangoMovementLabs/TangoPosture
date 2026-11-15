@@ -1,5 +1,6 @@
 import math
-from typing import Any
+from collections.abc import Mapping
+from typing import Any, Literal
 
 import cv2
 
@@ -110,6 +111,62 @@ def _draw_dashed_line(
         p1 = (round(start[0] + ux * seg_end), round(start[1] + uy * seg_end))
         cv2.line(image, p0, p1, color, thickness, cv2.LINE_AA)
         pos += step
+
+
+def _draw_dotted_line(
+    image: Any,
+    start: tuple[int, int],
+    end: tuple[int, int],
+    color: tuple[int, int, int],
+    thickness: int = 2,
+    spacing: int = 8,
+) -> None:
+    dx = end[0] - start[0]
+    dy = end[1] - start[1]
+    length = math.hypot(dx, dy)
+    if length < 1.0:
+        return
+    ux, uy = dx / length, dy / length
+    radius = max(1, thickness)
+    pos = 0.0
+    while pos <= length:
+        pt = (round(start[0] + ux * pos), round(start[1] + uy * pos))
+        cv2.circle(image, pt, radius, color, -1, cv2.LINE_AA)
+        pos += spacing
+
+
+def edge_provenance_style(
+    a: str,
+    b: str,
+    joint_origins: Mapping[str, str] | None,
+) -> Literal["solid", "dashed", "dotted"]:
+    """Return bone line style for endpoints (`dotted` if either is interpolated, else `dashed` if backward)."""
+    if not joint_origins:
+        return "solid"
+    oa = joint_origins.get(a, "forward")
+    ob = joint_origins.get(b, "forward")
+    if oa == "interpolated" or ob == "interpolated":
+        return "dotted"
+    if oa == "backward" or ob == "backward":
+        return "dashed"
+    return "solid"
+
+
+def draw_styled_bone(
+    image: Any,
+    start: tuple[int, int],
+    end: tuple[int, int],
+    color: tuple[int, int, int],
+    thickness: int = 2,
+    style: Literal["solid", "dashed", "dotted"] = "solid",
+) -> None:
+    """Draw a skeleton bone segment in solid, dashed, or dotted provenance style."""
+    if style == "dashed":
+        _draw_dashed_line(image, start, end, color, thickness=thickness, dash=10, gap=6)
+    elif style == "dotted":
+        _draw_dotted_line(image, start, end, color, thickness=thickness, spacing=8)
+    else:
+        cv2.line(image, start, end, color, thickness, cv2.LINE_AA)
 
 
 def draw_head_alignment(
@@ -337,6 +394,7 @@ def draw(
     show_footer: bool = True,
     settings_coaching: bool = True,
     skeleton_poses: list[dict[str, Landmark]] | None = None,
+    skeleton_joint_origins: Mapping[str, str] | None = None,
     shoulder_geometry: dict[str, float] | None = None,
     knee_geometry: dict[str, float] | None = None,
 ) -> Any:
@@ -360,31 +418,31 @@ def draw(
             for a, b in CONNECTIONS:
                 if reliable(pose.get(a), confidence) and reliable(pose.get(b), confidence):
                     pa, pb = pose[a], pose[b]
-                    cv2.line(
+                    draw_styled_bone(
                         image,
                         screen_point(pa.x, pa.y, disp_w, disp_h, mirror),
                         screen_point(pb.x, pb.y, disp_w, disp_h, mirror),
                         (80, 220, 80),
                         2,
+                        style=edge_provenance_style(a, b, skeleton_joint_origins),
                     )
-        for p in pose.values():
+        for name, p in pose.items():
             if math.isfinite(p.x) and math.isfinite(p.y) and 0 <= p.x <= 1 and 0 <= p.y <= 1:
+                origin = (
+                    skeleton_joint_origins.get(name, "forward")
+                    if skeleton_joint_origins
+                    else "forward"
+                )
+                dot_center = screen_point(p.x, p.y, disp_w, disp_h, mirror)
                 if verbose_skeleton:
-                    cv2.circle(
-                        image,
-                        screen_point(p.x, p.y, disp_w, disp_h, mirror),
-                        3,
-                        (80, 220, 80) if reliable(p, confidence) else (0, 180, 255),
-                        -1,
-                    )
+                    if not reliable(p, confidence):
+                        cv2.circle(image, dot_center, 3, (0, 180, 255), -1)
+                    elif origin in ("backward", "interpolated"):
+                        cv2.circle(image, dot_center, 4, (80, 220, 80), 1, cv2.LINE_AA)
+                    else:
+                        cv2.circle(image, dot_center, 3, (80, 220, 80), -1)
                 elif reliable(p, confidence):
-                    cv2.circle(
-                        image,
-                        screen_point(p.x, p.y, disp_w, disp_h, mirror),
-                        4,
-                        (80, 220, 80),
-                        -1,
-                    )
+                    cv2.circle(image, dot_center, 4, (80, 220, 80), -1)
     for pose in observation.poses:
         if detected_role is None:
             detected_role = detect_role(pose)

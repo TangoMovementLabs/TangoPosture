@@ -6,19 +6,23 @@ import pytest
 from tango_posture.config import (
     SETTING_GROUPS,
     SETTING_MAP,
+    AnalysisRegion,
     Config,
+    DancerAnalysisConfig,
     export_toml,
     load,
 )
 
 
 def test_every_setting_has_a_toml_name_and_editor_group():
-    expected = set(Config.model_fields) - {
+    expected = (set(Config.model_fields) - {
         "head_forward",
         "head_inclination",
         "trunk_inclination",
         "axis_curve",
         "calibration_defaults",
+        "measurement_normalization",
+        "dancer_analysis",
         "replay_audio",
         "replay_auto_analyse_movement",
         "view_change_tolerance",
@@ -36,7 +40,7 @@ def test_every_setting_has_a_toml_name_and_editor_group():
         "auto_record_start_delay",
         "auto_record_stop_delay",
         "max_recordings",
-    }
+    }) | {f"dancer_analysis.{name}" for name in DancerAnalysisConfig.model_fields}
     fields = [field for group in SETTING_GROUPS.values() for field in group]
     assert len(fields) == len(set(fields))
     assert set(fields) == expected == set(SETTING_MAP)
@@ -227,3 +231,24 @@ def test_custom_algorithmic_settings_round_trip_through_toml():
         calibration_min_usable_samples=5,
     )
     assert Config.model_validate(tomllib.loads(export_toml(cfg))) == cfg
+
+
+def test_dancer_analysis_settings_round_trip_and_validation():
+    cfg = Config(
+        dancer_analysis=DancerAnalysisConfig(
+            default_dancer_mode="couple",
+            auto_detection_window_s=15.0,
+            primary_coverage_min=0.70,
+            analyze_soundtrack=True,
+            auto_turn_suggestions=True,
+        )
+    )
+    reloaded = Config.model_validate(tomllib.loads(export_toml(cfg)))
+    assert reloaded.dancer_analysis == cfg.dancer_analysis
+
+    with pytest.raises(ValueError):
+        DancerAnalysisConfig(brief_second_max_s=1.5, second_sustained_min_s=1.5)
+    with pytest.raises(ValueError):
+        DancerAnalysisConfig(start_speed=0.10, stop_speed=0.15)
+    with pytest.raises(ValueError):
+        AnalysisRegion(x_min=0.8, y_min=0.1, x_max=0.4, y_max=0.9)

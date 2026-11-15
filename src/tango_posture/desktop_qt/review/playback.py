@@ -51,7 +51,6 @@ class ReviewPlayback:
             self.warning = report.warning
             self._record_timestamps = report.timestamps
             for label, report_label in (
-                ("Overlay video", "Overlay"),
                 ("Raw video", "Raw video"),
                 ("Source video", "Source video"),
             ):
@@ -80,22 +79,11 @@ class ReviewPlayback:
             raise ValueError("Recording not found in archive")
         segment = self.archive.manifest["segments"][index]
         # Manifest members are validated by PracticeArchive; do not follow external report links.
-        for label, key in (("Overlay video", "overlay"), ("Raw video", "video")):
-            if segment.get(key):
-                path = self.archive.folder / segment[key]
-                if not path.is_file():
-                    raise ValueError(f"Missing archived {label.lower()}")
-                self.variants[label] = path
-        overlay_member = segment.get("overlay")
-        lines_member = segment.get("lines")
-        if lines_member == f"lines_{index:02d}.mp4":
-            lines_path = self.archive.folder / lines_member
-            if lines_path.is_file():
-                self.variants["Full lines + messages"] = lines_path
-        if overlay_member:
-            lines_path = self.archive.folder / f"{Path(overlay_member).stem}_lines.mp4"
-            if lines_path.is_file():
-                self.variants["Full lines + messages"] = lines_path
+        if segment.get("video"):
+            path = self.archive.folder / segment["video"]
+            if not path.is_file():
+                raise ValueError("Missing archived raw video")
+            self.variants["Raw video"] = path
         record = read_report(self.archive.report(index))
         self._report = record
         self.report = record.markdown

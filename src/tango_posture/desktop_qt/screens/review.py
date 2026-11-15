@@ -6,7 +6,7 @@ import queue
 import re
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from tempfile import NamedTemporaryFile, TemporaryDirectory
 from threading import Event, Thread
@@ -44,9 +44,12 @@ from ...archive import (
     store_analytics,
 )
 from ...calibration.baseline import load_calibration_file
+from ...calibration.measurements import measure_ranges
 from ...calibration.models import METRIC_DETAILS, ApprovedRange, profile_from_calibration
+from ...calibration.normalization import HoldSourceIdentity, resolve_raw_media_sha256
 from ...movement import render_floor_guide, render_movement_overlay, validate_movement_analysis
 from ...references.coach import (
+    _coach_observation,
     compare_coach_data,
     interpolate_coach_data,
     render_coach_frame_overlay,
@@ -138,6 +141,16 @@ def _format_measure(value: float, unit: str) -> str:
     return f"{value:.2f}"
 
 
+def _format_signed_adjustment(value: float, unit: str) -> str:
+    sign = "+" if value >= 0 else "−"
+    mag = abs(value)
+    if unit == "degrees":
+        return f"{sign}{mag:.1f}°"
+    if unit in {"axis_lengths", "torso_lengths"}:
+        return f"{sign}{mag * 100:.1f}%"
+    return f"{sign}{mag:.2f}"
+
+
 class ReviewScreen(QWidget):
     def __init__(
         self,
@@ -166,6 +179,10 @@ class ReviewScreen(QWidget):
         self._calibration_error = ""
         self._calibration_targets: dict[str, ApprovedRange] = {}
         self._calibration_name = ""
+        self._calibration_id = ""
+        self._bypass_normalization_for_current = False
+        self._anchor_start_sec: float | None = None
+        self._anchor_end_sec: float | None = None
         self._movement_data: dict[str, Any] | None = None
         self._analysis_events: queue.SimpleQueue[tuple[int, str, object]] = queue.SimpleQueue()
         self._analysis_cancel: Event | None = None
@@ -195,9 +212,6 @@ class ReviewScreen(QWidget):
         tb_layout.setContentsMargins(12, 8, 12, 8)
         tb_layout.setSpacing(10)
 
-        self.stream_combo = QComboBox()
-        self.stream_combo.currentTextChanged.connect(self._on_stream_changed)
-        self.stream_combo.setEnabled(False)
         self.segment_combo = QComboBox()
         self.segment_combo.currentIndexChanged.connect(self._on_segment_changed)
         self.segment_combo.setEnabled(False)
@@ -228,8 +242,6 @@ class ReviewScreen(QWidget):
 
         tb_layout.addWidget(QLabel("Recording:"))
         tb_layout.addWidget(self.segment_combo)
-        tb_layout.addWidget(QLabel("Stream:"))
-        tb_layout.addWidget(self.stream_combo)
         tb_layout.addWidget(open_btn)
         tb_layout.addWidget(self.relink_btn)
         tb_layout.addWidget(self.export_btn)
@@ -293,6 +305,18 @@ class ReviewScreen(QWidget):
         self.speed_combo.setCurrentIndex(2)
         self.speed_combo.currentIndexChanged.connect(self._set_playback_speed)
         tr_layout.addWidget(self.speed_combo)
+        self.mark_hold_start_btn = QPushButton("Mark hold start")
+        self.mark_hold_start_btn.setToolTip(
+            "Save the current playhead time as a hold start anchor for Measurement normalization in Settings."
+        )
+        self.mark_hold_start_btn.clicked.connect(lambda: self._mark_hold_anchor(is_start=True))
+        tr_layout.addWidget(self.mark_hold_start_btn)
+        self.mark_hold_end_btn = QPushButton("Mark hold end")
+        self.mark_hold_end_btn.setToolTip(
+            "Save the current playhead time as a hold end anchor for Measurement normalization in Settings."
+        )
+        self.mark_hold_end_btn.clicked.connect(lambda: self._mark_hold_anchor(is_start=False))
+        tr_layout.addWidget(self.mark_hold_end_btn)
         vc_layout.addWidget(transport_card)
 
         self.splitter.addWidget(video_col)
@@ -353,8 +377,38 @@ class ReviewScreen(QWidget):
             QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
         )
         self.reference_combo.setMinimumContentsLength(12)
-        self.reference_combo.currentIndexChanged.connect(self._calibration_changed)
+        self.reference_combo.currentIndexChanged.connect(self._on_reference_combo_changed)
         it_layout.addWidget(self.reference_combo)
+        self.normalization_settings_btn = QPushButton("Measurement normalization settings…")
+        self.normalization_settings_btn.setToolTip(
+            "Configure optional offsets mapping this recording onto the selected calibration's scale."
+        )
+        self.normalization_settings_btn.clicked.connect(self._open_normalization_settings)
+        it_layout.addWidget(self.normalization_settings_btn)
+        self.normalization_recheck_bar = QFrame()
+        self.normalization_recheck_bar.setProperty("class", "card")
+        self.normalization_recheck_bar.setStyleSheet(
+            f"border: 1px solid {COLOR_WARNING}; border-radius: 4px;"
+        )
+        recheck_layout = QVBoxLayout(self.normalization_recheck_bar)
+        recheck_layout.setContentsMargins(8, 6, 8, 6)
+        recheck_layout.setSpacing(6)
+        self.recheck_status_lbl = QLabel("Needs recheck: stored normalization is stale.")
+        self.recheck_status_lbl.setWordWrap(True)
+        self.recheck_status_lbl.setStyleSheet(f"color: {COLOR_WARNING}; font-size: 11px; font-weight: 600;")
+        recheck_layout.addWidget(self.recheck_status_lbl)
+        recheck_actions = QHBoxLayout()
+        recheck_actions.setContentsMargins(0, 0, 0, 0)
+        recheck_actions.setSpacing(6)
+        self.recheck_open_settings_btn = QPushButton("Open Settings")
+        self.recheck_open_settings_btn.clicked.connect(self._open_normalization_settings)
+        recheck_actions.addWidget(self.recheck_open_settings_btn)
+        self.recheck_use_original_btn = QPushButton("Use original scale for this comparison")
+        self.recheck_use_original_btn.clicked.connect(self._use_original_scale_for_current)
+        recheck_actions.addWidget(self.recheck_use_original_btn)
+        recheck_layout.addLayout(recheck_actions)
+        self.normalization_recheck_bar.setVisible(False)
+        it_layout.addWidget(self.normalization_recheck_bar)
         it_layout.addSpacing(6)
 
         # Overlay layers
@@ -474,6 +528,16 @@ class ReviewScreen(QWidget):
         report_actions.addWidget(self.coach_btn)
         report_actions.addStretch()
         rt_layout.addLayout(report_actions)
+        self.report_normalization_notice = QLabel(
+            "Note: This archived Markdown report reflects the original unadjusted analysis scale. "
+            "Normalized Review adjustments apply during interactive Review playback."
+        )
+        self.report_normalization_notice.setWordWrap(True)
+        self.report_normalization_notice.setStyleSheet(
+            f"color: {COLOR_COPPER}; font-size: 11px; padding: 4px 6px;"
+        )
+        self.report_normalization_notice.setVisible(False)
+        rt_layout.addWidget(self.report_normalization_notice)
         rt_layout.addWidget(self.report_view)
 
         insights_scroll = QScrollArea()
@@ -538,18 +602,119 @@ class ReviewScreen(QWidget):
         self.reference_combo.setCurrentIndex(max(0, index))
         self.reference_combo.blockSignals(False)
         calibration_changed = self.reference_combo.currentData() != selected
-        dynamic_stream = self.stream_combo.currentText() in (
-            "Raw video", "Local video", "Source video"
-        )
+        dynamic_stream = self._is_dynamic_stream()
         self._calibration_changed(refresh_overlay=calibration_changed or dynamic_stream)
+
+    def _on_reference_combo_changed(self, *_args: object) -> None:
+        self._bypass_normalization_for_current = False
+        self._calibration_changed()
+
+    def _practice_identity_for_comparison(self, data: Mapping[str, Any]) -> HoldSourceIdentity | None:
+        if self.current_archive_path is None:
+            return None
+        seg_idx = int(self._playback.selected_segment_index or 0)
+        raw_sha = resolve_raw_media_sha256(
+            self.current_archive_path, seg_idx, {"coach_data": data},
+        )
+        return HoldSourceIdentity(
+            archive_path=str(self.current_archive_path),
+            archive_name=self.current_archive_path.name,
+            segment_index=seg_idx,
+            raw_media_sha256=raw_sha,
+            media_sha256=raw_sha,
+        )
+
+    def _is_normalization_applied(self) -> bool:
+        norm = (self._compared_coach_data or {}).get("normalization")
+        return isinstance(norm, Mapping) and norm.get("status") == "applied"
+
+    def _sync_normalization_notices(self) -> None:
+        norm = (self._compared_coach_data or {}).get("normalization")
+        if isinstance(norm, Mapping) and norm.get("status") == "needs_recheck" and not self._bypass_normalization_for_current:
+            reason = str(norm.get("reason") or "Stored offset requires recheck before applying.")
+            self.recheck_status_lbl.setText(f"Needs recheck: {reason} Not applied.")
+            self.normalization_recheck_bar.setVisible(True)
+        else:
+            self.normalization_recheck_bar.setVisible(False)
+        self.report_normalization_notice.setVisible(self._is_normalization_applied())
+
+    def _mark_hold_anchor(self, *, is_start: bool) -> None:
+        ts = float(self.current_time_sec)
+        if is_start:
+            self._anchor_start_sec = ts
+            label = "start"
+        else:
+            self._anchor_end_sec = ts
+            label = "end"
+        self._publish_review_context()
+        self.bridge.status_message.emit(f"Hold {label} anchor marked at {ts:.2f}s.")
+
+    def _open_normalization_settings(self) -> None:
+        self._publish_review_context()
+        self.router.navigate(Route.SETTINGS, dict(self.bridge.review_context))
+
+    def _use_original_scale_for_current(self) -> None:
+        self._bypass_normalization_for_current = True
+        self._calibration_changed()
+
+    def _extract_frame_raw_values(self, frame_index: int) -> dict[str, float | None]:
+        values: dict[str, float | None] = {}
+        data = self._compared_coach_data or self._coach_data
+        if not isinstance(data, Mapping):
+            return values
+        frames = data.get("frames")
+        entry = frames.get(str(frame_index)) if isinstance(frames, Mapping) else None
+        if not isinstance(entry, Mapping):
+            return values
+        for row in entry.get("calibration_rows", []):
+            if isinstance(row, Mapping) and "metric" in row:
+                raw_val = row.get("observed_raw")
+                if raw_val is None and row.get("normalization_status") in (None, "unadjusted", "direct_comparison"):
+                    raw_val = row.get("raw")
+                if isinstance(raw_val, (int, float)) and not isinstance(raw_val, bool):
+                    values[str(row["metric"])] = float(raw_val)
+        if values:
+            return values
+        width, height = data.get("width"), data.get("height")
+        if type(width) is not int or type(height) is not int or width <= 0 or height <= 0:
+            return values
+        try:
+            obs = _coach_observation(dict(entry), width, height, require_measurements=False)
+            measured = measure_ranges(obs, self.bridge.config)
+            for key, quality in measured.quality.items():
+                val = measured.values.get(key)
+                if quality.valid and isinstance(val, (int, float)):
+                    values[key] = float(val)
+        except (OSError, ValueError, TypeError):
+            pass
+        return values
+
+    def _publish_review_context(self, frame_index: int | None = None) -> None:
+        if frame_index is None:
+            reader = self._playback.reader
+            frame_index = reader.index if reader is not None else 0
+        cal_path = self.reference_combo.currentData()
+        self.bridge.review_context = {
+            "archive_path": self.current_archive_path,
+            "segment_index": int(self._playback.selected_segment_index or 0),
+            "calibration_id": self._calibration_id or None,
+            "calibration_path": cal_path,
+            "playhead_seconds": float(self.current_time_sec),
+            "anchor_start": self._anchor_start_sec,
+            "anchor_end": self._anchor_end_sec,
+            "frame_raw_values": self._extract_frame_raw_values(frame_index),
+        }
 
     def _update_calibration_comparison(self) -> None:
         self._compared_coach_data = None
         self._calibration_error = ""
         self._calibration_targets = {}
         self._calibration_name = ""
+        self._calibration_id = ""
         selected = self.reference_combo.currentData()
         if self._coach_data is None:
+            self._sync_normalization_notices()
+            self._publish_review_context()
             return
         try:
             data = self._coach_data
@@ -558,19 +723,37 @@ class ReviewScreen(QWidget):
                 reference = load_calibration_file(str(path), path.parent)
                 if reference is None:
                     raise ValueError(f"Calibration not found: {path.name}")
-                data = compare_coach_data(data, self.bridge.config, reference)
+                practice_identity = self._practice_identity_for_comparison(data)
+                data = compare_coach_data(
+                    data,
+                    self.bridge.config,
+                    reference,
+                    practice_identity=practice_identity,
+                    bypass_normalization=self._bypass_normalization_for_current,
+                )
                 range_profile = profile_from_calibration(reference)
                 if range_profile is not None:
                     self._calibration_targets = dict(range_profile.metrics)
                     self._calibration_name = range_profile.name
+                    self._calibration_id = range_profile.id
             self._compared_coach_data = interpolate_coach_data(
-                data, self.bridge.config,
+                data,
+                self.bridge.config,
+                pose_recovery=data.get("pose_recovery"),
+                movement_data=getattr(self, "_movement_data", None),
             )
         except (OSError, ValueError, TypeError, KeyError) as error:
             self._calibration_error = f"Calibration comparison unavailable: {error}"
-            self._compared_coach_data = self._coach_data
+            self._compared_coach_data = interpolate_coach_data(
+                self._coach_data,
+                self.bridge.config,
+                pose_recovery=self._coach_data.get("pose_recovery"),
+                movement_data=getattr(self, "_movement_data", None),
+            )
             self.analysis_status.setText(self._calibration_error)
             self.bridge.status_message.emit(self._calibration_error)
+        self._sync_normalization_notices()
+        self._publish_review_context()
 
     def _calibration_changed(self, *_args: object, refresh_overlay: bool = True) -> None:
         self._update_calibration_comparison()
@@ -677,7 +860,7 @@ class ReviewScreen(QWidget):
         self.bridge.status_message.emit(outcome.message)
 
     def _is_dynamic_stream(self) -> bool:
-        return self.stream_combo.currentText() in ("Raw video", "Local video", "Source video")
+        return self._playback._selected_variant in ("Raw video", "Local video", "Source video")
 
     def _export_primary_size(self, export_reader: VideoReader) -> tuple[int, int]:
         default_size = (export_reader.width, export_reader.height)
@@ -828,10 +1011,6 @@ class ReviewScreen(QWidget):
         self._movement_data = None
         self._reset_transport()
         self.report_view.clear()
-        self.stream_combo.blockSignals(True)
-        self.stream_combo.clear()
-        self.stream_combo.blockSignals(False)
-        self.stream_combo.setEnabled(False)
         try:
             self._playback.select_segment(index)
             archive = self._playback.archive
@@ -855,18 +1034,11 @@ class ReviewScreen(QWidget):
             self._playback_error(error)
 
     def _populate_streams(self) -> None:
-        self.stream_combo.blockSignals(True)
-        self.stream_combo.clear()
-        self.stream_combo.addItems(list(self._playback.variants))
         for raw in ("Raw video", "Local video", "Source video"):
             if raw in self._playback.variants:
-                self.stream_combo.setCurrentText(raw)
-                break
-        self.stream_combo.blockSignals(False)
-        self.stream_combo.setEnabled(bool(self._playback.variants))
-        if not self._playback.variants:
-            raise ValueError("This recording has no raw or overlay video available")
-        self._on_stream_changed(self.stream_combo.currentText())
+                self._on_stream_changed(raw)
+                return
+        raise ValueError("This recording has no raw video available")
 
     def _refresh_archive_report(self) -> None:
         archive = self._playback.archive
@@ -903,18 +1075,8 @@ class ReviewScreen(QWidget):
             self.compare_btn.setEnabled(True)
             self._update_analysis_controls()
             name = self.current_archive_path.name if self.current_archive_path else ""
-            unavailable = [
-                stream
-                for stream in ("Raw video", "Overlay video")
-                if self._playback.archive is not None and stream not in self._playback.variants
-            ]
             self.status_label.setText(
                 f"{name} — {label}. Video only (no audio)."
-                + (
-                    f"\nUnavailable in this recording: {', '.join(unavailable)}."
-                    if unavailable
-                    else ""
-                )
                 + (
                     f"\nMetadata warning: {self._playback.warning}"
                     if self._playback.warning
@@ -1015,10 +1177,19 @@ class ReviewScreen(QWidget):
         if path is None:
             self.bridge.status_message.emit("Open a saved report first.")
             return
+        normalized = self._is_normalization_applied()
         if path.suffix.lower() == ".md":
-            self.router.navigate(Route.COACH, path)
+            if normalized:
+                self.router.navigate(
+                    Route.COACH, {"report_path": path, "normalized_review": True},
+                )
+            else:
+                self.router.navigate(Route.COACH, path)
         elif index is not None and path.suffix.lower() in (".tp", ".tpc", ".tpr"):
-            self.router.navigate(Route.COACH, {"archive_path": path, "segment_index": index})
+            payload: dict[str, Any] = {"archive_path": path, "segment_index": index}
+            if normalized:
+                payload["normalized_review"] = True
+            self.router.navigate(Route.COACH, payload)
         else:
             self.bridge.status_message.emit("Open a saved report first.")
 
@@ -1181,8 +1352,8 @@ class ReviewScreen(QWidget):
         if reader is None:
             return
         frame = reader.frame(index)
-        self._update_frame_insights(reader.index)
         self.current_time_sec = self._playback.timestamp_for_frame(reader.index)
+        self._update_frame_insights(reader.index)
         frame = self._render_primary_frame(
             frame,
             reader.index,
@@ -1206,23 +1377,6 @@ class ReviewScreen(QWidget):
     def _refresh_overlay(self) -> None:
         reader = self._playback.reader
         if reader is None:
-            return
-        if self.stream_combo.currentText() not in (
-            "Raw video", "Local video", "Source video"
-        ):
-            for label in ("Raw video", "Local video", "Source video"):
-                if label in self._playback.variants:
-                    self.stream_combo.setCurrentText(label)
-                    return
-            self.lines_only_cb.blockSignals(True)
-            self.lines_only_cb.setChecked(False)
-            self.lines_only_cb.blockSignals(False)
-            self.analysis_status.setText(
-                "Tracking and calibration comparison require a raw/source video; "
-                "baked overlay pixels cannot be removed."
-            )
-            self._reset_transport()
-            self.primary_stage.clear_frame()
             return
         try:
             self._show_frame(reader.index)
@@ -1421,15 +1575,9 @@ class ReviewScreen(QWidget):
                         path = self._playback.archive.path
                         index = self._playback.selected_segment_index or 0
                         frame = self._playback.reader.index if self._playback.reader else 0
-                        selected_stream = self.stream_combo.currentText()
                         self._analysis_cancel = None
                         self._active_analysis_job = None
                         self.load_archive(path, segment_index=index)
-                        if (
-                            selected_stream in self._playback.variants
-                            and self.stream_combo.currentText() != selected_stream
-                        ):
-                            self.stream_combo.setCurrentText(selected_stream)
                         if self._playback.reader is not None:
                             self._show_frame(min(frame, self._playback.reader.count - 1))
                     else:
@@ -1615,6 +1763,56 @@ class ReviewScreen(QWidget):
             alert = ("No active posture alert on this frame.", "success")
 
         details = [f"Compared with {self._calibration_name or self.reference_combo.currentText()}."]
+        norm_meta = data.get("normalization")
+        norm_status = norm_meta.get("status") if isinstance(norm_meta, Mapping) else None
+        has_applied_row = any(
+            row.get("normalization_status") in ("applied", "unavailable")
+            for row in rows.values()
+        )
+        if norm_status == "needs_recheck" and not self._bypass_normalization_for_current:
+            reason_txt = str((norm_meta or {}).get("reason") or "Recheck required in Settings.")
+            details.append(
+                f"Needs recheck — {reason_txt} · Not applied (showing original calibration scale)."
+            )
+        elif norm_status != "applied" and not has_applied_row:
+            details.append("Original calibration scale · no adjustment applied.")
+        else:
+            for row in rows.values():
+                row_status = row.get("normalization_status")
+                label = METRIC_DETAILS.get(row["metric"], ("", row["metric"]))[1]
+                unit = str(row.get("unit", ""))
+                if row_status == "applied" and row.get("show_calculation_in_review", True):
+                    raw_val = row.get("observed_raw")
+                    off_val = row.get("normalization_offset")
+                    ref_val = row.get("reference_scale_raw")
+                    smooth_val = row.get("smoothed")
+                    raw_txt = _format_measure(float(raw_val), unit) if isinstance(raw_val, (int, float)) else "—"
+                    adj_txt = _format_signed_adjustment(float(off_val), unit) if isinstance(off_val, (int, float)) else "—"
+                    ref_txt = _format_measure(float(ref_val), unit) if isinstance(ref_val, (int, float)) else "—"
+                    smooth_txt = _format_measure(float(smooth_val), unit) if isinstance(smooth_val, (int, float)) else "—"
+                    if row.get("normalization_method") == "manual":
+                        verify_tag = "Manual · unverified"
+                    elif isinstance(row.get("verification_error"), (int, float)):
+                        verify_tag = f"Verified · check error {float(row['verification_error']):.2f}"
+                    else:
+                        verify_tag = "Verified on check hold"
+                    details.append(
+                        f"{label}: Raw {raw_txt} · Adjustment {adj_txt} · Reference scale {ref_txt} "
+                        f"· Used for assessment (smoothed) {smooth_txt} ({verify_tag})."
+                    )
+                elif row_status == "unavailable":
+                    raw_val = row.get("observed_raw")
+                    raw_txt = _format_measure(float(raw_val), unit) if isinstance(raw_val, (int, float)) else "—"
+                    details.append(
+                        f"{label}: Raw {raw_txt} · Unavailable · Not applied (outside physical domain)."
+                    )
+                elif row_status == "needs_recheck":
+                    details.append(
+                        f"{label}: Needs recheck · Not applied ({row.get('normalization_detail') or 'Recheck required'})."
+                    )
+                elif row_status == "direct_comparison":
+                    details.append(f"{label}: Direct comparison.")
+
         reasons: dict[str, list[str]] = {}
         for row in unknown:
             label = METRIC_DETAILS.get(row["metric"], ("", row["metric"]))[1]
@@ -1686,6 +1884,7 @@ class ReviewScreen(QWidget):
         alert_text, alert_tone = snapshot["alert"]
         self._set_alert(alert_text, alert_tone)
         self.insights_text.setText(snapshot["details"])
+        self._publish_review_context(frame_index)
 
     def _update_time_label(self) -> None:
         self.time_label.setText(
@@ -1723,7 +1922,13 @@ class ReviewScreen(QWidget):
         self._coach_data = None
         self._compared_coach_data = None
         self._calibration_error = ""
+        self._calibration_id = ""
+        self._bypass_normalization_for_current = False
+        self._anchor_start_sec = None
+        self._anchor_end_sec = None
         self._movement_data = None
+        if hasattr(self, "normalization_recheck_bar"):
+            self._sync_normalization_notices()
         self._reopen_path = None
         self._reset_transport()
         self._playback.close()
@@ -1735,11 +1940,10 @@ class ReviewScreen(QWidget):
         self.relink_btn.setEnabled(False)
         self.comparison_stage.clear_frame()
         self.comparison_stage.setVisible(False)
-        for combo in (self.stream_combo, self.segment_combo):
-            combo.blockSignals(True)
-            combo.clear()
-            combo.blockSignals(False)
-            combo.setEnabled(False)
+        self.segment_combo.blockSignals(True)
+        self.segment_combo.clear()
+        self.segment_combo.blockSignals(False)
+        self.segment_combo.setEnabled(False)
         self.report_view.clear()
         self.coach_btn.setEnabled(False)
         self._update_frame_insights(0)

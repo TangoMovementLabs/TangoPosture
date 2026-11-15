@@ -82,7 +82,7 @@ Manages your local `.tp` (practice recordings), `.tpr` (replayable references), 
 
 Detailed playback and frame inspection for any `.tp` or `.tpr` archive:
 
-- **Stream Selection**: Switch between **Raw video** (required for live dynamic overlays), **Annotated overlay**, or **Floor lines only**. Note that baked overlay pixels already rendered into an overlay video stream cannot be removed by layer toggles.
+- **Video Playback**: Plays the **Raw video** directly with live dynamic overlays controlled via **Overlay layers**.
 - **Playback Transport**: Play/Pause, `-1 frame`, `+1 frame`, timeline scrubbing, and playback speed control.
 - **Dynamic Visual Layers**:
   - **Skeleton**: Confidence-colored joint dots (green = reliable, orange = low confidence) with optional display-only gap interpolation.
@@ -363,6 +363,12 @@ All **72 settings** in `SETTING_MAP` and all **8 Calibration defaults rows** are
 | `replay_step_history_seconds` | Replay movement | Media-time window in seconds over which floor step footprints fade out (default `5.0s`). |
 | `replay_joint_interpolation` | Replay movement | Display-only Review skeleton gap filling method (`linear` or `quadratic`). |
 | `replay_joint_max_gap` | Replay movement | Maximum bracketed gap duration in seconds filled visually in Review (`3.0s`; `0` disables). |
+| `replay_recovery_auto` | Replay movement | Automatically runs display-only backward pose recovery on short lower-limb dropouts during analysis (default disabled). |
+| `replay_recovery_max_gap_s` | Replay movement | Maximum lower-limb dropout duration in seconds considered for backward tracking recovery (`0.05`–`2.00s`, default `0.75s`). |
+| `replay_recovery_context_s` | Replay movement | Context window duration in seconds included before and after each gap for backward inference (`0.10`–`2.00s`, default `0.50s`). |
+| `replay_pivot_interpolation_max_gap_s` | Replay movement | Maximum leg-joint gap in seconds filled by visual interpolation inside a pivot (`0.00`–`1.00s`, default `0.20s`). |
+| `replay_show_recovered_joints` | Replay movement | Default display toggle showing recovered backward-pass and interpolated joints on Review skeletons (default enabled). |
+| `replay_recovery_budget_s` | Replay movement | Maximum cumulative seconds of recovery windows processed automatically per clip (`1.0`–`60.0s`, default `12.0s`). |
 | `ollama_base_url` | Review & Ollama | URL of the local or reachable Ollama HTTP endpoint (default `http://127.0.0.1:11434`). |
 | `ollama_model` | Review & Ollama | Installed Ollama language-model tag requested for report commentary (default `llama3.2`). |
 | `ollama_timeout` | Review & Ollama | Maximum wait in seconds for an Ollama generation response (default `120.0s`). |
@@ -1122,6 +1128,350 @@ It is different from Tracking's continuity limit.
 **Example:** endpoints separated by `0.4` seconds can be filled at `0.5`,
 but not at `0.2`. Setting zero disables filling. Increasing to `3` bridges
 longer, more uncertain intervals; there is no indefinite edge extrapolation.
+
+### Recover short tracking gaps during analysis - `replay_recovery_auto`
+
+**Default:** disabled (`false`).
+
+When enabled, Library and Review analysis automatically run a bounded backward
+inference pass across short lower-limb dropouts (especially during pivots) to
+populate display-only skeleton estimates. Measured posture metrics, calibration
+approvals, and step/pivot counts still depend exclusively on forward
+observations.
+
+**Example:** keep `false` when you want fastest default analysis and run
+**Recover tracking…** manually on specific pivots in Review, or enable `true`
+to inspect recovered leg trajectories immediately after analyzing clips with
+frequent turns.
+
+### Maximum recoverable gap - `replay_recovery_max_gap_s`
+
+**Default:** `0.75 seconds`; allowed `0.05` to `2.00`.
+
+Maximum elapsed duration in seconds of a lower-limb landmark dropout eligible
+for offline backward tracking recovery. Longer dropouts require manual
+**Recover tracking…** inspection and are not filled blindly.
+
+**Example:** a `0.45s` far-leg occlusion during an ocho pivot qualifies under
+`0.75s`, whereas a `1.4s` walk off-camera is skipped during automatic recovery.
+
+### Context on each side - `replay_recovery_context_s`
+
+**Default:** `0.50 seconds`; allowed `0.10` to `2.00`.
+
+Context duration included before the start and after the end of a gap window
+when decoding frames in reverse. A clean post-gap anchor segment seeds the
+fresh backward detector so MediaPipe stabilizes before re-entering the pivot.
+
+**Example:** for a gap spanning `2.00s` to `2.40s`, setting `0.50s` decodes
+and runs backward inference from `2.90s` back to `1.50s`, clipped to shot cuts.
+
+### Maximum interpolated leg gap during a pivot - `replay_pivot_interpolation_max_gap_s`
+
+**Default:** `0.20 seconds`; allowed `0.00` to `1.00`.
+
+Tighter visual interpolation limit applied to leg joints during pivot/recovery
+intervals when both forward and backward passes still miss a landmark. This
+avoids sweeping unrealistic straight-line leg shortcuts across long turns.
+
+**Example:** if forward and backward passes leave a `0.50s` pivot ankle gap,
+`0.20s` leaves those frames unresolved rather than drawing a misleading
+half-second chord across the body; increasing to `0.35s` permits short
+sub-gaps within that limit.
+
+### Show estimated joints - `replay_show_recovered_joints`
+
+**Default:** enabled (`true`).
+
+Controls the default state of Review's **Show estimates** layer toggle. Dashed
+lines mark backward-recovered bones and dotted lines mark interpolated bones.
+
+**Example:** disable this default if you prefer Review to open showing strictly
+forward observations unless you toggle **Show estimates** back on.
+
+### Automatic recovery budget - `replay_recovery_budget_s`
+
+**Default:** `12.0 seconds`; allowed `1.0` to `60.0`.
+
+Maximum cumulative duration of prioritized recovery windows processed
+automatically on a single clip. Windows intersecting detected pivots are
+processed before non-pivot gaps.
+
+**Example:** on a clip containing fifteen `1.5s` windows, a `12.0s` budget
+recovers the highest-priority pivot windows first and reports remaining gaps as
+skipped rather than blocking analysis indefinitely.
+
+### Analysis settings (Single, Couple & Auto mode)
+
+These settings govern `Auto` opening-window classification, two-dancer 1-to-1
+gated tracking, display-only per-track interpolation, and Couple coordination,
+transition, and turn thresholds. **Changing these parameters applies to future
+runs** and does not alter previously saved archives.
+
+Practical tuning recipes:
+- **120 s clip with an 8 s walk-in before dancing**: the default `10.0 s`
+  opening window catches `2 s` of dancing and `8 s` of setup. Increase
+  `dancer_analysis.auto_detection_window_s` to `15.0–20.0 s` or trim `clip_in`
+  to start after the walk-in; do not lower `primary_coverage_min` blindly.
+- **Background dancers or mirror reflections in a studio**: select an explicit
+  image region (`analysis_region`) or click your target dancer, or tighten
+  `dancer_analysis.brief_second_max_s` / `together_max_hip_separation_torso_lengths`
+  so an unrelated distant bystander does not look like a co-moving partner.
+- **Close-embrace rotational drills with frequent arm crossings**: reduce
+  `dancer_analysis.display_interpolation_max_gap_s` slightly if visual bridging
+  is too loose, keep `dancer_analysis.identity_margin_torso_lengths` near `0.15`
+  (or raise slightly to avoid false swaps during tight pivots), and confirm
+  reacquisition anchors if a partner leaves frame cleanly for > `max_observation_gap_s`.
+
+### Default dancer mode - `dancer_analysis.default_dancer_mode`
+
+**Default:** `auto`; choices `auto`, `single`, `couple`.
+
+Default dancer mode preselected across **Analysis**, **Library → Import &
+Analyze Video…**, and **Review**.
+
+**Example:** set `couple` when every imported practice recording is a two-dancer
+drill and you never need `Auto` opening-window checks. Keep `auto` when mixing
+solo exercises and partner drills.
+
+### Auto detection window (seconds) - `dancer_analysis.auto_detection_window_s`
+
+**Default:** `10.0 seconds`; positive.
+
+Duration from `clip_in` inspected by `Auto` mode over `[clip_in, min(clip_in + window, clip_out))`
+before deciding `Single`, `Couple`, or `Needs selection`. Increasing inspects
+more of the opening before deciding; decreasing decides earlier.
+
+**Example:** on a `120 s` recording with an `8 s` walk-in before partner
+movement begins, increasing from `10.0 s` to `18.0 s` captures `10 s` of active
+couple dancing instead of resolving to `Needs selection`.
+
+### Primary coverage minimum - `dancer_analysis.primary_coverage_min`
+
+**Default:** `0.60`; greater than `0` up to `1.0`.
+
+Minimum fraction of the opening window with eligible observations for the
+primary dancer. Increasing makes `Auto` stricter against gaps or occlusions;
+decreasing accepts more fragmented opening footage.
+
+**Example:** in a `10.0 s` window, at least `6.0 s` (`0.60`) of eligible primary
+observations is needed. Lowering to `0.50` accepts `5.0 s` when setup stalls.
+
+### Primary minimum duration (seconds) - `dancer_analysis.primary_duration_min_s`
+
+**Default:** `2.0 seconds`; positive.
+
+Absolute floor of eligible primary-subject seconds inside the opening window,
+preventing tiny trimmed fragments from auto-classifying as `Single` or `Couple`.
+
+**Example:** a `3.0 s` clip with `0.80` coverage has `2.4 s >= 2.0 s` and
+qualifies; a `2.0 s` clip with `0.70` coverage yields `1.4 s < 2.0 s` and asks
+`Needs selection`.
+
+### Second dancer joint coverage minimum - `dancer_analysis.second_joint_coverage_min`
+
+**Default:** `0.45`; greater than `0` up to `1.0`.
+
+Minimum fraction of the opening window where *both* tracked dancers (`A` and
+`B`) have valid 1-to-1 associated observations to qualify as `Couple`.
+
+**Example:** in a `10.0 s` window, `4.5 s` (`0.45`) of joint coverage qualifies.
+Increasing to `0.60` rejects clips where the partner is mostly behind the leader.
+
+### Second dancer sustained span (seconds) - `dancer_analysis.second_sustained_min_s`
+
+**Default:** `1.5 seconds`; positive, strictly above `brief_second_max_s`.
+
+Longest continuous paired span without a break greater than `max_observation_gap_s`
+required before `Auto` considers the second person a partner rather than transient.
+
+**Example:** a `2.0 s` sustained paired embrace qualifies under `1.5 s`, whereas
+someone walking through frame for `0.9 s` falls short and triggers `Needs selection`
+if above `brief_second_max_s`.
+
+### Brief second coexistence max (seconds) - `dancer_analysis.brief_second_max_s`
+
+**Default:** `0.5 seconds`; zero or greater, strictly below `second_sustained_min_s`.
+
+Total duration a second person may briefly appear in a solo clip without
+blocking `Single` auto-classification.
+
+**Example:** a bystander crossing behind a solo dancer for `0.4 s` still resolves
+cleanly to `Single`; raising to `0.8 s` tolerates slower walk-throughs, while
+lowering to `0.2 s` sends borderline clips to `Needs selection`.
+
+### Co-movement minimum span (seconds) - `dancer_analysis.together_min_s`
+
+**Default:** `0.4 seconds`; positive.
+
+Minimum cumulative or continuous span where both tracked dancers move coherently
+in the same region (both above `stop_speed`, within hip separation limit, and
+aligned within `together_direction_cosine_min`) to confirm `Couple` rather than an
+unrelated bystander.
+
+**Example:** two partners travelling together for `0.6 s` exceed `0.4 s` and
+qualify as `Couple`; two spectators standing across the studio do not.
+
+### Co-movement max hip separation (torso lengths) - `dancer_analysis.together_max_hip_separation_torso_lengths`
+
+**Default:** `2.0 torso lengths`; positive.
+
+Maximum projected distance between Dancer A and Dancer B hip midpoints
+normalized by fixed pair torso length for qualifying as moving together.
+
+**Example:** open-embrace practice with hip centers `1.2` torso lengths apart
+passes `2.0`; a background student `3.5` torso lengths away in a studio mirror is
+excluded from co-movement.
+
+### Co-movement direction cosine min - `dancer_analysis.together_direction_cosine_min`
+
+**Default:** `0.5`; allowed `-1.0` to `1.0` (`cos(60°)`).
+
+Minimum cosine similarity between Dancer A and Dancer B velocity vectors to count
+as travelling coherently together in `Auto` detection.
+
+**Example:** moving along nearly the same line (`cos ≈ 0.95`) passes `0.5`; someone
+walking perpendicularly across behind the soloist (`cos ≈ 0.0`) fails `0.5`.
+
+### Identity max innovation (torso lengths) - `dancer_analysis.identity_max_innovation_torso_lengths`
+
+**Default:** `0.75 torso lengths`; positive.
+
+Gating radius around each track's predicted hip midpoint used by the 1-to-1
+two-dancer tracker when associating per-frame detections.
+
+**Example:** lowering to `0.45` prevents distant spurious mirror detections from
+hijacking an occluded track; raising to `1.0` allows faster frame-to-frame motion
+at lower frame rates.
+
+### Identity assignment margin (torso lengths) - `dancer_analysis.identity_margin_torso_lengths`
+
+**Default:** `0.15 torso lengths`; zero or greater.
+
+Required cost advantage of the best A/B pose assignment over the swapped
+alternative; tighter crossings below this margin are marked unavailable instead of
+guessing or trusting detector array index order.
+
+**Example:** during a tight close-embrace cross where the swapped assignment cost
+differs by only `0.05`, the frame is marked unavailable rather than risking a swap.
+
+### Max observation gap (seconds) - `dancer_analysis.max_observation_gap_s`
+
+**Default:** `0.20 seconds`; positive.
+
+Maximum elapsed time between consecutive valid observations before continuous
+spans and centred velocity windows break cleanly.
+
+**Example:** at 30 FPS a `0.10 s` drop bridges inside `0.20 s`, while a `0.35 s`
+turn-away breaks the regression velocity window rather than spanning across the blind gap.
+
+### Display interpolation max gap (seconds) - `dancer_analysis.display_interpolation_max_gap_s`
+
+**Default:** `0.13 seconds`; zero or greater.
+
+Maximum per-track gap linearly filled in `Display-only` dashed overlay rendering.
+**Never** enters raw velocity, contact, angle, or coverage measurements.
+
+**Example:** a 2-frame (`0.067 s`) shoulder flicker is drawn smoothly with dashed
+segments under `0.13 s`, while a `0.30 s` occlusion stays hidden visually and unavailable.
+
+### Velocity regression half-window (seconds) - `dancer_analysis.velocity_filter_window_s`
+
+**Default:** `0.15 seconds`; positive.
+
+Half-width `h` of the centred symmetric regression window `[t - h, t + h]`
+requiring at least 3 samples and support on both sides of `t`.
+
+**Example:** widening to `0.25 s` smooths high-frequency detector noise at the
+cost of rounding sharp acceleration corners; `0.10 s` sharpens onset timing.
+
+### State persistence (seconds) - `dancer_analysis.persistence_s`
+
+**Default:** `0.15 seconds`; positive.
+
+Duration a `start`, `slow`, or `settle` speed condition (or secondary speed peak /
+direction reversal) must stay sustained to register an event.
+
+**Example:** a `0.07 s` single-frame jitter spike above `start_speed` is ignored;
+lowering to `0.08 s` catches snappier micro-impulses at higher false-positive risk.
+
+### Event pairing window (seconds) - `dancer_analysis.pairing_window_s`
+
+**Default:** `0.50 seconds`; positive.
+
+Maximum time difference `|t_B - t_A|` allowed when pairing corresponding Dancer A
+and Dancer B onset, slowing, or settle events in the same drill phase.
+
+**Example:** A starting at `1.22 s` and B starting at `1.32 s` pairs with lag
+`+100 ms`; an isolated false event `0.8 s` away stays unpaired rather than mismatching.
+
+### Travel start speed (torso lengths/s) - `dancer_analysis.start_speed`
+
+**Default:** `0.20 torso lengths/s`; positive, strictly above `stop_speed`.
+
+Speed magnitude along the travel axis that signals motion onset (`start` / `restart`).
+
+**Example:** raising to `0.30` requires brisker walk departure before marking onset;
+lowering to `0.15` triggers earlier on gentle weight-transfer walks.
+
+### Travel stop speed (torso lengths/s) - `dancer_analysis.stop_speed`
+
+**Default:** `0.10 torso lengths/s`; non-negative, strictly below `start_speed`.
+
+Speed magnitude ceiling below which a dancer is classified as settled (`settle`).
+
+**Example:** slight post-stop postural breathing (`0.05` torso lengths/s) stays
+settled under `0.10`; tightening to `0.05` delays settled onset until nearly still.
+
+### Slowing drop fraction - `dancer_analysis.slowing_fraction`
+
+**Default:** `0.25`; greater than `0` and below `1.0`.
+
+Fractional deceleration below the travelling phase's steady median speed
+required to mark a `slow` event.
+
+**Example:** if steady walk speed is `0.80` torso lengths/s, slowing below
+`0.60` (`1 - 0.25`) triggers deceleration onset.
+
+### Transition minimum coverage - `dancer_analysis.transition_min_coverage`
+
+**Default:** `0.75`; greater than `0` up to `1.0`.
+
+Minimum fraction of measured frames where both dancers' hip midpoints are visible
+within a transition window to summarize smoothness cues.
+
+**Example:** if partner occlusion leaves only `0.62` valid pair coverage in a
+transition window, secondary peak and reversal metrics report `Unavailable`.
+
+### Secondary speed peak rise (pair torso lengths/s) - `dancer_analysis.secondary_speed_rise`
+
+**Default:** `0.12 pair torso lengths/s`; positive.
+
+Minimum rebound speed rise above the local minimum after slowing starts required to
+flag a secondary speed peak cue.
+
+**Example:** a smooth monotonic settle has zero rebound; a choppy late recovery
+step rebounding `+0.18` pair torso lengths/s exceeds `0.12` and is flagged.
+
+### Analyze soundtrack beats by default - `dancer_analysis.analyze_soundtrack`
+
+**Default:** disabled (`false`).
+
+Controls whether new runs extract estimated beat candidates from the video
+soundtrack automatically for Step Timing alignment.
+
+**Example:** enable when analyzing studio videos with clear tango music; keep off
+for silent technique drills or when using manually placed beats in Review.
+
+### Suggest turn markers automatically - `dancer_analysis.auto_turn_suggestions`
+
+**Default:** disabled (`false`).
+
+Generates estimated `turn_start` / `turn_end` candidates when sustained paired
+rotation cues appear; otherwise turns are annotated explicitly in Review.
+
+**Example:** keep `false` for pure linear walking drills or enable `true` to
+pre-populate editable turn markers on giro/ocho exercises.
 
 ### Review & Ollama settings
 

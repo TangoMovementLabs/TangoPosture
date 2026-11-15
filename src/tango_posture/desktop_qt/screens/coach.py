@@ -31,7 +31,7 @@ from ...ollama import OllamaClient
 from ...review import ReportRecord, read_report, save_analysis, saved_analyses
 from ..router import Router
 from ..service_bridge import ServiceBridge
-from ..theme import COLOR_TEXT_MUTED
+from ..theme import COLOR_COPPER, COLOR_TEXT_MUTED
 
 
 class _CoachEvents(QObject):

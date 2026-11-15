@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import math
 import time
 from collections.abc import Callable
@@ -45,11 +46,18 @@ from ..metrics import measure
 from ..models import analysis_model_path, model_manifest, prepare_analysis_model, verify
 from ..movement import analyse_movement_observations
 from ..pose.mediapipe_backend import MediaPipeEstimator
+from ..pose.recovery import run_clip_tracking_recovery
 from ..reports import write_markdown_report
 from ..review import write_metadata
 from ..session import Session
 from ..storage import Storage
-from .coach import _AlertTimers, _build_coach_frame_entry, _movement_note_lines, _serialise_pose
+from .coach import (
+    _AlertTimers,
+    _build_coach_frame_entry,
+    _movement_note_lines,
+    _serialise_pose,
+    interpolate_coach_data,
+)
 from .companions import save_coach_companion, save_movement_companion
 from .constants import MAX_IMPORT_RANGE_SECONDS
 from .coverage import _compute_family_coverage
@@ -59,6 +67,8 @@ from .links import YouTubeClockAlignment, parse_facebook_reel_url, parse_youtube
 from .results import ClipAnalysisResult, ImportedClipResult, RunManifest
 from .soundtrack import analyse_video_soundtrack
 from .video import VideoProbeInfo, iter_virtual_clip_frames, probe_import_video, validate_clip_range
+
+logger = logging.getLogger(__name__)
 
 
 def analyze_clip(
@@ -78,6 +88,7 @@ def analyze_clip(
     cancel_check: Callable[[], bool] | None = None,
     probe: VideoProbeInfo | None = None,
     source_sha256: str | None = None,
+    recover_tracking: bool | None = None,
 ) -> ClipAnalysisResult:
     """Analyze a local video clip in memory without writing reports or temporary databases."""
     if not video_path or not str(video_path).strip():
@@ -159,7 +170,7 @@ def analyze_clip(
             if progress_callback is not None and (idx % 5 == 0 or idx + 1 >= expected_frames):
                 pct = min(75, 20 + round(((idx + 1) / max(expected_frames, idx + 1)) * 55))
                 progress_callback(
-                    pct, 100, f"Analysing video frames with {cfg.analysis_model.capitalize()} ({idx + 1})…",
+                    pct, 100, f"Analyzing forward with {cfg.analysis_model.capitalize()} ({idx + 1})…",
                 )
     finally:
         with suppress(Exception):

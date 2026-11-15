@@ -63,6 +63,12 @@ axis_neutral_offset = 0.0
 replay_step_history_seconds = 5.0
 replay_joint_interpolation = "linear"
 replay_joint_max_gap = 3.0
+replay_recovery_auto = false
+replay_recovery_max_gap_s = 0.75
+replay_recovery_context_s = 0.5
+replay_pivot_interpolation_max_gap_s = 0.2
+replay_show_recovered_joints = true
+replay_recovery_budget_s = 12.0
 ollama_base_url = "http://127.0.0.1:11434"
 ollama_model = "llama3.2"
 ollama_timeout = 120.0
@@ -71,6 +77,32 @@ ollama_num_ctx = 16384
 ollama_num_predict = 2048
 ollama_max_report_chars = 40000
 ollama_instruction = "Explain the supported observations and suggest three focused practice exercises."
+
+[dancer_analysis]
+default_dancer_mode = "auto"
+auto_detection_window_s = 10.0
+primary_coverage_min = 0.60
+primary_duration_min_s = 2.0
+second_joint_coverage_min = 0.45
+second_sustained_min_s = 1.5
+brief_second_max_s = 0.5
+together_min_s = 0.4
+together_max_hip_separation_torso_lengths = 2.0
+together_direction_cosine_min = 0.5
+identity_max_innovation_torso_lengths = 0.75
+identity_margin_torso_lengths = 0.15
+max_observation_gap_s = 0.20
+display_interpolation_max_gap_s = 0.13
+velocity_filter_window_s = 0.15
+persistence_s = 0.15
+pairing_window_s = 0.50
+start_speed = 0.20
+stop_speed = 0.10
+slowing_fraction = 0.25
+transition_min_coverage = 0.75
+secondary_speed_rise = 0.12
+analyze_soundtrack = false
+auto_turn_suggestions = false
 
 [calibration_defaults]
 

@@ -62,6 +62,7 @@ class ClipAnalysisResult:
     session_id: str | None = None
     session_summary: dict[str, Any] | None = None
     session_events: list[dict[str, Any]] | None = None
+    pose_recovery: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -87,3 +88,4 @@ class ImportedClipResult:
     facebook_reel: FacebookReelSourceLink | None = None
     coach_path: Path | None = None
     coach_data: dict[str, Any] | None = None
+    pose_recovery: dict[str, Any] | None = None

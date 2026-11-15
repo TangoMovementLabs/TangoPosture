@@ -77,7 +77,7 @@ def test_empty_review_has_no_fake_playback_or_insights(screen):
     assert not screen.scrubber.isEnabled()
     assert not screen.compare_cb.isEnabled()
     assert not screen.analytics_btn.isEnabled()
-    assert not screen.stream_combo.isEnabled()
+    assert not hasattr(screen, "stream_combo")
     assert screen.report_view.toPlainText() == ""
     assert all(value.text() == "Not observed" for value in screen.metric_values.values())
     assert "when a frame is analyzed" in screen.alerts_text.text()
@@ -568,37 +568,27 @@ def test_reference_reanalysis_replaces_cached_results_and_survives_reload(
         assert "# Original reference report" not in saved_report
         assert f"`0` pivots, `{value - 1}` steps" in saved_report
         if value == 2:
-            assert screen.stream_combo.currentText() == "Full lines + messages"
             assert screen._playback.reader is not None
             assert screen._playback.reader.index == 2
-            assert screen._playback.reader.path.read_bytes() == lines
+            assert screen._playback.reader.path.name == "video_00.mp4"
         screen._on_segment_changed(0)
         assert screen._coach_data["frames"]["0"]["run_tag"] == value
         assert manifest["version"] in screen.report_view.toPlainText()
         if value == 1:
-            screen.stream_combo.setCurrentText("Full lines + messages")
-            assert screen.stream_combo.currentText() == "Full lines + messages"
             screen.scrubber.setValue(2)
     screen.load_archive(reference)
     assert screen._coach_data["frames"]["0"]["run_tag"] == 2
     assert screen._movement_data["tag"] == 2
     assert "Original reference report" not in screen.report_view.toPlainText()
     assert model_manifest("heavy")["version"] in screen.report_view.toPlainText()
-    streams = [screen.stream_combo.itemText(i) for i in range(screen.stream_combo.count())]
-    assert {"Overlay video", "Raw video", "Full lines + messages"}.issubset(streams)
-    screen.stream_combo.setCurrentText("Overlay video")
-    assert screen.stream_combo.currentText() == "Overlay video"
+    assert not hasattr(screen, "stream_combo")
+    assert list(screen._playback.variants) == ["Raw video"]
     assert screen._playback.reader is not None
-    assert screen._playback.reader.path.name == "overlay_00.mp4"
-    assert screen._playback.reader.path.read_bytes() == overlay
+    assert screen._playback.reader.path.name == "video_00.mp4"
     screen.refresh()
-    assert screen.stream_combo.currentText() == "Overlay video"
-    screen.stream_combo.setCurrentText("Full lines + messages")
-    assert screen.stream_combo.currentText() == "Full lines + messages"
     assert screen._playback.reader is not None
-    assert screen._playback.reader.path.read_bytes() == lines
+    assert screen._playback.reader.path.name == "video_00.mp4"
     screen.lines_only_cb.setChecked(True)
-    assert screen.stream_combo.currentText() == "Raw video"
     assert screen._playback.reader is not None
     assert screen._playback.reader.path.name == "video_00.mp4"
     cal_path = tmp_path / "calibrations" / "SwitchCheck.tpc"
@@ -628,12 +618,10 @@ def test_reference_reanalysis_replaces_cached_results_and_survives_reload(
             },
         ),
     )
-    screen.stream_combo.setCurrentText("Overlay video")
-    assert screen.stream_combo.currentText() == "Overlay video"
     screen.bridge.update_config(Config(data_dir=str(tmp_path)))
-    assert screen.stream_combo.currentText() == "Overlay video"
+    assert screen._playback.reader is not None
+    assert screen._playback.reader.path.name == "video_00.mp4"
     screen.reference_combo.setCurrentIndex(screen.reference_combo.findData(str(cal_path.resolve())))
-    assert screen.stream_combo.currentText() == "Raw video"
     assert screen._playback.reader is not None
     assert screen._playback.reader.path.name == "video_00.mp4"
 
@@ -882,10 +870,11 @@ def test_archive_comparison_uses_raw_video_without_stream_selector(screen, video
     path, _ = make_archive(tmp_path, video)
     screen.load_archive(path)
     screen._load_comparison(path)
+    assert not hasattr(screen, "stream_combo")
     assert not hasattr(screen, "comparison_stream_combo")
     assert screen._comparison.reader.path == screen._comparison.variants["Raw video"].resolve()
     screen.lines_only_cb.setChecked(True)
-    assert screen.stream_combo.currentText() == "Raw video"
+    assert screen._playback.reader.path == screen._playback.variants["Raw video"].resolve()
 
 
 @pytest.mark.parametrize("as_reference", [False, True])
@@ -1554,31 +1543,19 @@ def test_archive_recordings_variants_and_reports_are_real_and_owned(screen, vide
     folder = archive.folder
     assert folder.is_dir()
     assert screen.segment_combo.count() == 2
-    assert [screen.stream_combo.itemText(i) for i in range(screen.stream_combo.count())] == [
-        "Overlay video",
-        "Raw video",
-    ]
+    assert list(screen._playback.variants) == ["Raw video"]
     assert "Stored report" in screen.report_view.toPlainText()
     assert "Actual recorded findings." in screen.report_view.toPlainText()
-    assert screen.stream_combo.currentText() == "Raw video"
     assert raw_reader.path.name == "video_00.mp4"
-    screen.stream_combo.setCurrentText("Overlay video")
-    assert screen.stream_combo.currentText() == "Overlay video"
-    assert not raw_reader.cap.isOpened()
-    overlay_reader = screen._playback.reader
-    assert overlay_reader is not None
-    assert overlay_reader.path.name == "overlay_00.mp4"
     screen.show_torso_axis_cb.setChecked(True)
-    assert screen.stream_combo.currentText() == "Raw video"
-    assert not overlay_reader.cap.isOpened()
-    raw_reader = screen._playback.reader
-    assert raw_reader is not None
-    assert raw_reader.path.name == "video_00.mp4"
+    assert screen._playback.reader is raw_reader
+    assert screen._playback.reader.path.name == "video_00.mp4"
     screen.segment_combo.setCurrentIndex(1)
     assert not raw_reader.cap.isOpened()
-    assert screen.stream_combo.count() == 1
-    assert screen.stream_combo.currentText() == "Raw video"
-    assert "Unavailable in this recording: Overlay video." in screen.status_label.text()
+    assert list(screen._playback.variants) == ["Raw video"]
+    assert screen._playback.reader is not None
+    assert screen._playback.reader.path.name == "video_01.mp4"
+    assert "Unavailable in this recording: Overlay video." not in screen.status_label.text()
     assert "Second recording" in screen.report_view.toPlainText()
     assert "frame timestamps do not match" in screen.status_label.text()
     second_reader = screen._playback.reader
@@ -1654,9 +1631,8 @@ def test_report_only_recording_is_explicit_and_other_recordings_can_still_play(
     append_segment(path, report, None, None, [])
     append_segment(path, report, video, None, [])
     screen.load_archive(path)
-    assert "no raw or overlay video available" in screen.status_label.text()
+    assert "no raw video available" in screen.status_label.text()
     assert not screen.play_btn.isEnabled()
-    assert not screen.stream_combo.isEnabled()
     assert screen.primary_stage._image is None
     assert "Real report without media" in screen.report_view.toPlainText()
     screen.segment_combo.setCurrentIndex(1)
@@ -1676,18 +1652,12 @@ def test_bad_overlay_is_not_replaced_with_fake_content_and_raw_can_be_selected(
     overlay.write_bytes(b"broken video")
     append_segment(path, report, video, overlay, [])
     screen.load_archive(path)
-    assert screen.stream_combo.currentText() == "Raw video"
-    screen.stream_combo.setCurrentText("Overlay video")
-    assert screen.stream_combo.currentText() == "Overlay video"
-    assert "Replay unavailable:" in screen.status_label.text()
-    assert screen.primary_stage._image is None
-    assert not screen.play_btn.isEnabled()
-    assert screen.duration_sec == 0
-    screen.stream_combo.setCurrentText("Raw video")
-    assert screen.stream_combo.currentText() == "Raw video"
+    assert list(screen._playback.variants) == ["Raw video"]
     assert screen.play_btn.isEnabled()
     assert screen.duration_sec == pytest.approx(1.2)
+    assert screen._playback.reader is not None
     assert screen._playback.reader.path.name == "video_00.mp4"
+    assert screen.primary_stage._image is not None
 
 
 def test_archive_metadata_cannot_supply_external_unarchived_variants(screen, video, tmp_path):
@@ -1724,9 +1694,9 @@ def test_archive_metadata_cannot_supply_external_unarchived_variants(screen, vid
             ),
         )
     screen.load_archive(path)
-    assert "no raw or overlay video available" in screen.status_label.text()
+    assert "no raw video available" in screen.status_label.text()
     assert not screen.play_btn.isEnabled()
-    assert screen.stream_combo.count() == 0
+    assert not screen._playback.variants
 
 
 @pytest.mark.parametrize("operation", ["playback", "seek"])

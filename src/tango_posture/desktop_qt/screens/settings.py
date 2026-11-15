@@ -6,6 +6,7 @@ import re
 import tomllib
 from importlib.resources import files as package_files
 from pathlib import Path
+from typing import Any
 
 from pydantic import ValidationError
 from PySide6.QtWidgets import (
@@ -35,6 +36,7 @@ from ...config import (
     set_setting,
     setting_value,
 )
+from ..calibration.normalization_panel import MeasurementNormalizationPanel
 from ..router import Router
 from ..service_bridge import ServiceBridge
 from ..theme import COLOR_COPPER, COLOR_TEXT_MUTED
@@ -62,7 +64,32 @@ _FLOAT_RANGES = {
     "knee_min_segment_px": (0.0001, 10000.0),
     "knee_tiebreak_other_max_vis": (0.0, 1.0),
     "knee_tiebreak_min_advantage": (0.0, 1.0),
+    "replay_recovery_max_gap_s": (0.05, 2.00),
+    "replay_recovery_context_s": (0.10, 2.00),
+    "replay_pivot_interpolation_max_gap_s": (0.0, 1.00),
+    "replay_recovery_budget_s": (1.0, 60.0),
     "tango_bpm": (20.0, 240.0),
+    "dancer_analysis.auto_detection_window_s": (0.5, 600.0),
+    "dancer_analysis.primary_coverage_min": (0.01, 1.0),
+    "dancer_analysis.primary_duration_min_s": (0.1, 600.0),
+    "dancer_analysis.second_joint_coverage_min": (0.01, 1.0),
+    "dancer_analysis.second_sustained_min_s": (0.1, 600.0),
+    "dancer_analysis.brief_second_max_s": (0.0, 60.0),
+    "dancer_analysis.together_min_s": (0.1, 60.0),
+    "dancer_analysis.together_max_hip_separation_torso_lengths": (0.1, 10.0),
+    "dancer_analysis.together_direction_cosine_min": (-1.0, 1.0),
+    "dancer_analysis.identity_max_innovation_torso_lengths": (0.05, 5.0),
+    "dancer_analysis.identity_margin_torso_lengths": (0.0, 2.0),
+    "dancer_analysis.max_observation_gap_s": (0.02, 5.0),
+    "dancer_analysis.display_interpolation_max_gap_s": (0.0, 3.0),
+    "dancer_analysis.velocity_filter_window_s": (0.03, 2.0),
+    "dancer_analysis.persistence_s": (0.02, 2.0),
+    "dancer_analysis.pairing_window_s": (0.05, 5.0),
+    "dancer_analysis.start_speed": (0.02, 5.0),
+    "dancer_analysis.stop_speed": (0.0, 4.9),
+    "dancer_analysis.slowing_fraction": (0.01, 0.99),
+    "dancer_analysis.transition_min_coverage": (0.05, 1.0),
+    "dancer_analysis.secondary_speed_rise": (0.01, 5.0),
 }
 
 _INT_RANGES = {
@@ -159,6 +186,10 @@ _GROUP_HINTS = {
         "The BPM ceiling gates the ankle-lift cue, not video playback or footprint detection. "
         "It is compared with the fallback tempo in Music when no soundtrack BPM is available."
     ),
+    "Analysis": (
+        "Controls Single, Couple, and Auto opening-window scene detection, two-dancer tracking gates, "
+        "display-only gap interpolation, and couple movement/transition/turn analysis thresholds."
+    ),
 }
 
 
@@ -237,6 +268,25 @@ class SettingsScreen(QScrollArea):
                     fallback_summary=SETTING_DESCRIPTIONS.get(field, ""),
                 )
                 form.addRow(self._field_label(field), wrapped)
+            if group == "Review & Ollama":
+                self.normalization_panel = MeasurementNormalizationPanel(self.bridge, page)
+                self._parameter_guides.setdefault("measurement_normalization", {
+                    "meta": "Per calibration profile & recording pair · Additive Review offset",
+                    "explanation": (
+                        "Re-expresses Review metric observations on the approved calibration profile's scale "
+                        "before temporal evaluation, while leaving .tpc bounds unchanged. Use ONLY to remove "
+                        "a verified camera, costume, or teacher-vs-student anatomical neutral difference — never "
+                        "to hide genuine student posture habits."
+                    ),
+                    "example": (
+                        "Worked example (head pitch): reference fit hold reads 3.0° and practice fit hold "
+                        "reads 7.0° -> signed offset -4.0°. On separate Check holds (3.2° vs 7.4°), "
+                        "7.4° + (-4.0°) = 3.4° (error 0.2° <= 1.0° -> Verified). In Review, raw 8.0° maps to "
+                        "8.0° + (-4.0°) = 4.0°, inside 1.0°..5.0° (WITHIN_REFERENCE)."
+                    ),
+                })
+                wrapped_norm = self._wrap_with_guide("measurement_normalization", self.normalization_panel)
+                form.addRow("Measurement normalization", wrapped_norm)
             self.tabs.addTab(page, group)
         ranges_page = QWidget()
         ranges_form = QFormLayout(ranges_page)
@@ -273,11 +323,19 @@ class SettingsScreen(QScrollArea):
         self.tabs.addTab(ranges_page, "Calibration defaults")
         layout.addWidget(self.tabs, 1)
 
+        actions_row = QHBoxLayout()
+        actions_row.setContentsMargins(0, 0, 0, 0)
+        actions_row.setSpacing(8)
+        self.apply_btn = QPushButton("Apply Settings")
+        self.apply_btn.setFixedHeight(38)
+        self.apply_btn.clicked.connect(self._save_settings)
+        actions_row.addWidget(self.apply_btn)
         self.save_btn = QPushButton("Apply && Save settings.toml")
         self.save_btn.setProperty("class", "primary")
         self.save_btn.setFixedHeight(38)
         self.save_btn.clicked.connect(self._save_toml)
-        layout.addWidget(self.save_btn)
+        actions_row.addWidget(self.save_btn, 1)
+        layout.addLayout(actions_row)
         self.save_toml_btn = self.save_btn
 
         self._set_legacy_widget_aliases()
@@ -290,11 +348,22 @@ class SettingsScreen(QScrollArea):
             checkbox = QCheckBox("Enabled")
             checkbox.setChecked(value)
             editor = checkbox
-        elif field in {"side", "facing", "replay_joint_interpolation", "analysis_model"}:
+        elif field in {
+            "side",
+            "facing",
+            "replay_joint_interpolation",
+            "analysis_model",
+            "dancer_analysis.default_dancer_mode",
+        }:
             combo = QComboBox()
             combo.addItems(
-                ["lite", "full", "heavy"] if field == "analysis_model" else
-                ["linear", "quadratic"] if field == "replay_joint_interpolation" else ["left", "right"]
+                ["auto", "single", "couple"]
+                if field == "dancer_analysis.default_dancer_mode"
+                else ["lite", "full", "heavy"]
+                if field == "analysis_model"
+                else ["linear", "quadratic"]
+                if field == "replay_joint_interpolation"
+                else ["left", "right"]
             )
             combo.setCurrentText(str(value))
             editor = combo
@@ -309,8 +378,15 @@ class SettingsScreen(QScrollArea):
             float_spin.setSingleStep(
                 0.0001
                 if field == "min_filter_time_constant"
+                else 1.0
+                if field == "replay_recovery_budget_s"
                 else 0.05
                 if _FLOAT_RANGES.get(field) == (0.0, 1.0)
+                or field in {
+                    "replay_recovery_max_gap_s",
+                    "replay_recovery_context_s",
+                    "replay_pivot_interpolation_max_gap_s",
+                }
                 else 0.1
             )
             float_spin.setRange(
@@ -354,6 +430,12 @@ class SettingsScreen(QScrollArea):
             "min_filter_time_constant": "Minimum filter time constant (s)",
             "replay_joint_interpolation": "Review joint interpolation",
             "replay_joint_max_gap": "Maximum joint gap to fill (seconds; 0 disables)",
+            "replay_recovery_auto": "Recover short tracking gaps during analysis",
+            "replay_recovery_max_gap_s": "Maximum recoverable gap",
+            "replay_recovery_context_s": "Context on each side",
+            "replay_pivot_interpolation_max_gap_s": "Maximum interpolated leg gap during a pivot",
+            "replay_show_recovered_joints": "Show estimated joints",
+            "replay_recovery_budget_s": "Automatic recovery budget",
             "head_down_angle": "Head down angle limit (degrees)",
             "shoulder_raise_threshold": "Shoulder tension limit (%)",
             "shoulder_visibility_floor": "Shoulder helper visibility floor",
@@ -378,6 +460,34 @@ class SettingsScreen(QScrollArea):
             "knee_tiebreak_min_advantage": "Knee tie-break min vis advantage",
             "slow_tango_max_bpm": "Slow tango max BPM",
             "tango_bpm": "Fallback tempo (BPM)",
+            "dancer_analysis.default_dancer_mode": "Default dancer mode",
+            "dancer_analysis.auto_detection_window_s": "Auto detection window (seconds)",
+            "dancer_analysis.primary_coverage_min": "Primary coverage minimum",
+            "dancer_analysis.primary_duration_min_s": "Primary minimum duration (seconds)",
+            "dancer_analysis.second_joint_coverage_min": "Second dancer joint coverage minimum",
+            "dancer_analysis.second_sustained_min_s": "Second dancer sustained span (seconds)",
+            "dancer_analysis.brief_second_max_s": "Brief second coexistence max (seconds)",
+            "dancer_analysis.together_min_s": "Co-movement minimum span (seconds)",
+            "dancer_analysis.together_max_hip_separation_torso_lengths": (
+                "Co-movement max hip separation (torso lengths)"
+            ),
+            "dancer_analysis.together_direction_cosine_min": "Co-movement direction cosine min",
+            "dancer_analysis.identity_max_innovation_torso_lengths": (
+                "Identity max innovation (torso lengths)"
+            ),
+            "dancer_analysis.identity_margin_torso_lengths": "Identity assignment margin (torso lengths)",
+            "dancer_analysis.max_observation_gap_s": "Max observation gap (seconds)",
+            "dancer_analysis.display_interpolation_max_gap_s": "Display interpolation max gap (seconds)",
+            "dancer_analysis.velocity_filter_window_s": "Velocity regression half-window (seconds)",
+            "dancer_analysis.persistence_s": "State persistence (seconds)",
+            "dancer_analysis.pairing_window_s": "Event pairing window (seconds)",
+            "dancer_analysis.start_speed": "Travel start speed (torso lengths/s)",
+            "dancer_analysis.stop_speed": "Travel stop speed (torso lengths/s)",
+            "dancer_analysis.slowing_fraction": "Slowing drop fraction",
+            "dancer_analysis.transition_min_coverage": "Transition minimum coverage",
+            "dancer_analysis.secondary_speed_rise": "Secondary speed peak rise (pair torso lengths/s)",
+            "dancer_analysis.analyze_soundtrack": "Analyze soundtrack beats by default",
+            "dancer_analysis.auto_turn_suggestions": "Suggest turn markers automatically",
             "ollama_base_url": "Ollama server address",
             "ollama_num_ctx": "Model context size (tokens)",
             "ollama_num_predict": "Maximum response length (tokens)",
@@ -528,6 +638,10 @@ class SettingsScreen(QScrollArea):
             for key, (enabled, lower, upper, view) in self.range_widgets.items()
             if enabled.isChecked()
         }
+        if hasattr(self, "normalization_panel"):
+            data["measurement_normalization"] = (
+                self.normalization_panel.measurement_normalization_config().model_dump()
+            )
         return Config.model_validate(data)
 
     def _save_settings(self) -> bool:
@@ -564,6 +678,20 @@ class SettingsScreen(QScrollArea):
             view.setCurrentText(target.view if target else "side")
             for widget in (lower, upper, view):
                 widget.setEnabled(target is not None)
+        if hasattr(self, "normalization_panel"):
+            self.normalization_panel.set_config(cfg)
+
+    def refresh(self) -> None:
+        if hasattr(self, "normalization_panel"):
+            self.normalization_panel.refresh_library_choices()
+
+    def open_measurement_normalization(self, payload: dict[str, Any]) -> None:
+        for index in range(self.tabs.count()):
+            if self.tabs.tabText(index) == "Review & Ollama":
+                self.tabs.setCurrentIndex(index)
+                break
+        if hasattr(self, "normalization_panel"):
+            self.normalization_panel.select_context(payload)
 
     def _save_toml(self) -> None:
         from PySide6.QtWidgets import QMessageBox
@@ -601,7 +729,14 @@ class SettingsScreen(QScrollArea):
         if path:
             try:
                 self.bridge.import_settings_toml(Path(path))
-            except (OSError, UnicodeError, tomllib.TOMLDecodeError, ValidationError) as error:
+            except (
+                OSError,
+                UnicodeError,
+                tomllib.TOMLDecodeError,
+                ValidationError,
+                ValueError,
+                TypeError,
+            ) as error:
                 self.bridge.status_message.emit(f"Could not import settings: {error}")
                 return
             self._apply_config(self.bridge.config)

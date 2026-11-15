@@ -2,9 +2,11 @@ import json
 import tomllib
 from collections.abc import Callable
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from .normalization_models import MeasurementNormalizationConfig
 
 
 class Threshold(BaseModel):
@@ -30,6 +32,62 @@ class RangeDefault(BaseModel):
     def ordered(self) -> "RangeDefault":
         if self.lower > self.upper:
             raise ValueError("Range minimum must not exceed maximum")
+        return self
+
+
+class AnalysisRegion(BaseModel):
+    """Normalized [0, 1] image region restricting candidate dancer detection."""
+
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    x_min: float = Field(default=0.0, ge=0.0, le=1.0)
+    y_min: float = Field(default=0.0, ge=0.0, le=1.0)
+    x_max: float = Field(default=1.0, ge=0.0, le=1.0)
+    y_max: float = Field(default=1.0, ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def ordered(self) -> "AnalysisRegion":
+        if self.x_min >= self.x_max:
+            raise ValueError("analysis region x_min must be below x_max")
+        if self.y_min >= self.y_max:
+            raise ValueError("analysis region y_min must be below y_max")
+        return self
+
+
+class DancerAnalysisConfig(BaseModel):
+    """Configurable controls for Single, Couple, and Auto opening-window analysis."""
+
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    default_dancer_mode: Literal["auto", "single", "couple"] = "auto"
+    auto_detection_window_s: float = Field(default=10.0, gt=0.0)
+    primary_coverage_min: float = Field(default=0.60, gt=0.0, le=1.0)
+    primary_duration_min_s: float = Field(default=2.0, gt=0.0)
+    second_joint_coverage_min: float = Field(default=0.45, gt=0.0, le=1.0)
+    second_sustained_min_s: float = Field(default=1.5, gt=0.0)
+    brief_second_max_s: float = Field(default=0.5, ge=0.0)
+    together_min_s: float = Field(default=0.4, gt=0.0)
+    together_max_hip_separation_torso_lengths: float = Field(default=2.0, gt=0.0)
+    together_direction_cosine_min: float = Field(default=0.5, ge=-1.0, le=1.0)
+    identity_max_innovation_torso_lengths: float = Field(default=0.75, gt=0.0)
+    identity_margin_torso_lengths: float = Field(default=0.15, ge=0.0)
+    max_observation_gap_s: float = Field(default=0.20, gt=0.0)
+    display_interpolation_max_gap_s: float = Field(default=0.13, ge=0.0)
+    velocity_filter_window_s: float = Field(default=0.15, gt=0.0)
+    persistence_s: float = Field(default=0.15, gt=0.0)
+    pairing_window_s: float = Field(default=0.50, gt=0.0)
+    start_speed: float = Field(default=0.20, gt=0.0)
+    stop_speed: float = Field(default=0.10, ge=0.0)
+    slowing_fraction: float = Field(default=0.25, gt=0.0, lt=1.0)
+    transition_min_coverage: float = Field(default=0.75, gt=0.0, le=1.0)
+    secondary_speed_rise: float = Field(default=0.12, gt=0.0)
+    analyze_soundtrack: bool = False
+    auto_turn_suggestions: bool = False
+
+    @model_validator(mode="after")
+    def validated_thresholds(self) -> "DancerAnalysisConfig":
+        if self.brief_second_max_s >= self.second_sustained_min_s:
+            raise ValueError("brief_second_max_s must be below second_sustained_min_s")
+        if self.stop_speed >= self.start_speed:
+            raise ValueError("stop_speed must be below start_speed")
         return self
 
 
@@ -117,7 +175,17 @@ class Config(BaseModel):
     replay_step_history_seconds: float = Field(default=5.0, ge=0.5, le=30.0)
     replay_joint_interpolation: Literal["linear", "quadratic"] = "linear"
     replay_joint_max_gap: float = Field(default=3.0, ge=0)
+    replay_recovery_auto: bool = False
+    replay_recovery_max_gap_s: float = Field(default=0.75, ge=0.05, le=2.00)
+    replay_recovery_context_s: float = Field(default=0.50, ge=0.10, le=2.00)
+    replay_pivot_interpolation_max_gap_s: float = Field(default=0.20, ge=0.0, le=1.00)
+    replay_show_recovered_joints: bool = True
+    replay_recovery_budget_s: float = Field(default=12.0, ge=1.0, le=60.0)
     calibration_defaults: dict[str, RangeDefault] = Field(default_factory=dict)
+    measurement_normalization: MeasurementNormalizationConfig = Field(
+        default_factory=MeasurementNormalizationConfig
+    )
+    dancer_analysis: DancerAnalysisConfig = Field(default_factory=DancerAnalysisConfig)
     ollama_base_url: str = "http://127.0.0.1:11434"
     ollama_model: str = Field(default="llama3.2", min_length=1)
     ollama_timeout: float = Field(default=120.0, gt=0, le=1800)
@@ -247,6 +315,38 @@ SETTING_GROUPS = {
         "replay_step_history_seconds",
         "replay_joint_interpolation",
         "replay_joint_max_gap",
+        "replay_recovery_auto",
+        "replay_recovery_max_gap_s",
+        "replay_recovery_context_s",
+        "replay_pivot_interpolation_max_gap_s",
+        "replay_show_recovered_joints",
+        "replay_recovery_budget_s",
+    ),
+    "Analysis": (
+        "dancer_analysis.default_dancer_mode",
+        "dancer_analysis.auto_detection_window_s",
+        "dancer_analysis.primary_coverage_min",
+        "dancer_analysis.primary_duration_min_s",
+        "dancer_analysis.second_joint_coverage_min",
+        "dancer_analysis.second_sustained_min_s",
+        "dancer_analysis.brief_second_max_s",
+        "dancer_analysis.together_min_s",
+        "dancer_analysis.together_max_hip_separation_torso_lengths",
+        "dancer_analysis.together_direction_cosine_min",
+        "dancer_analysis.identity_max_innovation_torso_lengths",
+        "dancer_analysis.identity_margin_torso_lengths",
+        "dancer_analysis.max_observation_gap_s",
+        "dancer_analysis.display_interpolation_max_gap_s",
+        "dancer_analysis.velocity_filter_window_s",
+        "dancer_analysis.persistence_s",
+        "dancer_analysis.pairing_window_s",
+        "dancer_analysis.start_speed",
+        "dancer_analysis.stop_speed",
+        "dancer_analysis.slowing_fraction",
+        "dancer_analysis.transition_min_coverage",
+        "dancer_analysis.secondary_speed_rise",
+        "dancer_analysis.analyze_soundtrack",
+        "dancer_analysis.auto_turn_suggestions",
     ),
     "Review & Ollama": (
         "ollama_base_url",
@@ -264,7 +364,14 @@ SETTING_MAP: dict[str, tuple[str, Callable]] = {}
 
 
 def _setting_parser(field: str) -> Callable:
-    kind = float if "." in field else Config.model_fields[field].annotation
+    if "." in field:
+        root, sub = field.split(".", 1)
+        if root == "dancer_analysis":
+            kind = DancerAnalysisConfig.model_fields[sub].annotation
+        else:
+            kind = float
+    else:
+        kind = Config.model_fields[field].annotation
     if kind is bool:
         return parse_bool
     if kind is int:
@@ -357,6 +464,96 @@ SETTING_DESCRIPTIONS: dict[str, str] = {
         "Maximum bracketed joint gap filled in Review, in seconds; default 3.0, and 0 disables filling. "
         "Not the measurement tracking gap limit."
     ),
+    "replay_recovery_auto": (
+        "Run display-only backward pose recovery automatically on short lower-limb dropouts during analysis."
+    ),
+    "replay_recovery_max_gap_s": (
+        "Maximum lower-limb dropout duration in seconds eligible for backward tracking recovery."
+    ),
+    "replay_recovery_context_s": (
+        "Seconds of context included before and after each gap window for backward pose recovery."
+    ),
+    "replay_pivot_interpolation_max_gap_s": (
+        "Maximum leg-joint interpolation gap in seconds allowed during a pivot when forward and backward passes miss."
+    ),
+    "replay_show_recovered_joints": (
+        "Display recovered backward-pass and interpolated joints on Review skeletons without changing measurements."
+    ),
+    "replay_recovery_budget_s": (
+        "Maximum cumulative window seconds recovered automatically per clip."
+    ),
+    "dancer_analysis.default_dancer_mode": (
+        "Default dancer mode for new runs: auto (detect from opening window), single, or couple."
+    ),
+    "dancer_analysis.auto_detection_window_s": (
+        "Duration in seconds from clip_in inspected when resolving Auto dancer mode."
+    ),
+    "dancer_analysis.primary_coverage_min": (
+        "Minimum fraction of the opening window with eligible observations for the primary subject."
+    ),
+    "dancer_analysis.primary_duration_min_s": (
+        "Minimum eligible primary-subject seconds required in the opening window."
+    ),
+    "dancer_analysis.second_joint_coverage_min": (
+        "Minimum fraction of the opening window where both tracked dancers are jointly eligible for Couple."
+    ),
+    "dancer_analysis.second_sustained_min_s": (
+        "Minimum continuous paired tracking span (seconds) required to qualify as a Couple in Auto mode."
+    ),
+    "dancer_analysis.brief_second_max_s": (
+        "Maximum total second-person coexistence (seconds) still accepted as Single in Auto mode."
+    ),
+    "dancer_analysis.together_min_s": (
+        "Minimum co-movement span (seconds) where both tracked dancers move coherently in the same region."
+    ),
+    "dancer_analysis.together_max_hip_separation_torso_lengths": (
+        "Maximum inter-dancer hip midpoint distance in pair torso lengths for co-movement qualification."
+    ),
+    "dancer_analysis.together_direction_cosine_min": (
+        "Minimum cosine similarity of hip velocities required for two dancers to qualify as moving together."
+    ),
+    "dancer_analysis.identity_max_innovation_torso_lengths": (
+        "Gating distance ceiling in torso lengths between predicted and observed hip midpoints per step."
+    ),
+    "dancer_analysis.identity_margin_torso_lengths": (
+        "Minimum cost margin in torso lengths required over the second-best A/B assignment; otherwise unknown."
+    ),
+    "dancer_analysis.max_observation_gap_s": (
+        "Maximum observation gap in seconds before continuous tracking spans and velocity windows break."
+    ),
+    "dancer_analysis.display_interpolation_max_gap_s": (
+        "Maximum per-track gap in seconds for linear display-only 2D drawing interpolation."
+    ),
+    "dancer_analysis.velocity_filter_window_s": (
+        "Half-window in seconds for centred linear-regression travel velocity estimation."
+    ),
+    "dancer_analysis.persistence_s": (
+        "Minimum duration in seconds a start, slowing, or settled speed condition must persist."
+    ),
+    "dancer_analysis.pairing_window_s": (
+        "Maximum interval in seconds for pairing Dancer A and Dancer B coordination events in the same phase."
+    ),
+    "dancer_analysis.start_speed": (
+        "Travel speed threshold in normalized torso lengths per second for start or restart onset."
+    ),
+    "dancer_analysis.stop_speed": (
+        "Travel speed ceiling in normalized torso lengths per second below which a dancer is settled."
+    ),
+    "dancer_analysis.slowing_fraction": (
+        "Fractional speed drop from steady-phase median required to trigger a slowing event."
+    ),
+    "dancer_analysis.transition_min_coverage": (
+        "Minimum measured pair coverage required in a transition window to summarize smoothness."
+    ),
+    "dancer_analysis.secondary_speed_rise": (
+        "Minimum rebound speed rise in pair torso lengths per second during slowing to count a secondary peak."
+    ),
+    "dancer_analysis.analyze_soundtrack": (
+        "Extract optional soundtrack beat candidates for step timing alignment by default."
+    ),
+    "dancer_analysis.auto_turn_suggestions": (
+        "Generate optional estimated turn marker suggestions when supported by torso rotation cues."
+    ),
     "ollama_base_url": "Address of the local or reachable Ollama server.",
     "ollama_model": "Model name installed on that Ollama server.",
     "ollama_timeout": "Maximum wait for a local model request.",
@@ -389,21 +586,43 @@ def setting_value(cfg: Config, field: str):
 
 
 def export_toml(cfg: Config) -> str:
-    fields = {field.split(".")[0] for field in SETTING_MAP} | {"calibration_defaults"}
-    data = cfg.model_dump(include=fields)
+    fields = {field.split(".")[0] for field in SETTING_MAP} | {
+        "calibration_defaults",
+        "measurement_normalization",
+    }
+    data = cfg.model_dump(include=fields, exclude_none=True)
     lines: list[str] = []
 
-    def table(values: dict, path: tuple[str, ...] = ()) -> None:
-        for key, value in values.items():
-            if not isinstance(value, dict):
-                lines.append(f"{key} = {json.dumps(value)}")
-        for key, value in values.items():
-            if isinstance(value, dict):
-                child = (*path, key)
-                lines.extend(("", f"[{'.'.join(child)}]"))
-                table(value, child)
+    def _strip_none(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {k: _strip_none(v) for k, v in value.items() if v is not None}
+        if isinstance(value, list):
+            return [_strip_none(v) for v in value if v is not None]
+        return value
 
-    table(data)
+    def _is_table_list(value: Any) -> bool:
+        return isinstance(value, list) and bool(value) and all(isinstance(item, dict) for item in value)
+
+    def _emit_table(values: dict[str, Any], path: tuple[str, ...] = ()) -> None:
+        scalars = {
+            key: value for key, value in values.items()
+            if not isinstance(value, dict) and not _is_table_list(value)
+        }
+        dicts = {key: value for key, value in values.items() if isinstance(value, dict)}
+        table_lists = {key: value for key, value in values.items() if _is_table_list(value)}
+        for key, value in scalars.items():
+            lines.append(f"{key} = {json.dumps(value)}")
+        for key, value in dicts.items():
+            child = (*path, key)
+            lines.extend(("", f"[{'.'.join(child)}]"))
+            _emit_table(value, child)
+        for key, items in table_lists.items():
+            child = (*path, key)
+            for item in items:
+                lines.extend(("", f"[[{'.'.join(child)}]]"))
+                _emit_table(item, child)
+
+    _emit_table(_strip_none(data))
     return "\n".join(lines) + "\n"
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -16,6 +17,18 @@ from ..calibration.models import (
     ApprovedRange,
     RangeProfile,
     profile_from_calibration,
+)
+from ..calibration.normalization import (
+    HoldSourceIdentity,
+    MeasurementNormalizationConfig,
+    PairApplicability,
+    _matched_rule_passes_current_gates,
+    capture_identity_dict,
+    evaluate_pair_applicability,
+    extract_coach_observations,
+    frames_fingerprint,
+    normalize_metric_observation,
+    settings_fingerprint,
 )
 from ..config import Config, RangeDefault
 from ..domain import (
@@ -33,14 +46,19 @@ from ..overlay import (
     draw,
     draw_head_alignment,
     draw_head_posture,
+    draw_styled_bone,
     draw_torso_axis,
+    edge_provenance_style,
     screen_point,
 )
 from ..pose.constants import CONNECTIONS
 from ..pose.interpolation import interpolate_poses
+from ..pose.recovery import LOWER_LIMB_JOINTS, validate_pose_recovery_payload
 from ..quality import reliable
 from ..temporal import Evaluator
 from .constants import SOUNDTRACK_SOURCE_LABEL
+
+logger = logging.getLogger(__name__)
 
 
 def range_feedback(
@@ -105,8 +123,57 @@ def _coach_observation(
     return FrameObservation(float(entry.get("timestamp", 0.0)), width, height, poses)
 
 
+def _data_media_sha256(data: Mapping[str, Any]) -> str | None:
+    provenance = data.get("source_provenance")
+    for container in (data, provenance):
+        if isinstance(container, Mapping):
+            for key in ("raw_media_sha256", "media_sha256", "video_sha256"):
+                val = container.get(key)
+                if isinstance(val, str) and val.strip():
+                    return val.strip()
+    return None
+
+
+def _build_coach_practice_identity(
+    data: Mapping[str, Any],
+    comparison_cfg: Config,
+    practice_identity: HoldSourceIdentity | None,
+) -> HoldSourceIdentity:
+    observations = extract_coach_observations(data)
+    computed_frames_fp = frames_fingerprint(observations) if observations else None
+    computed_settings_fp = settings_fingerprint(comparison_cfg)
+    computed_capture = capture_identity_dict(
+        data.get("capture_profile") if isinstance(data.get("capture_profile"), Mapping) else {}
+    )
+    computed_media = _data_media_sha256(data)
+    if practice_identity is None:
+        raw_seg = data.get("segment_index")
+        return HoldSourceIdentity(
+            archive_path=str(data["archive_path"]) if data.get("archive_path") else None,
+            archive_name=str(data["archive_name"]) if data.get("archive_name") else None,
+            segment_index=int(raw_seg) if isinstance(raw_seg, int) and raw_seg >= 0 else 0,
+            raw_media_sha256=computed_media,
+            media_sha256=computed_media,
+            capture_identity=computed_capture,
+            settings_fingerprint=computed_settings_fp,
+            frames_fingerprint=computed_frames_fp,
+        )
+    return practice_identity.model_copy(update={
+        "raw_media_sha256": practice_identity.raw_media_sha256 or computed_media,
+        "media_sha256": practice_identity.media_sha256 or practice_identity.raw_media_sha256 or computed_media,
+        "capture_identity": practice_identity.capture_identity or computed_capture,
+        "settings_fingerprint": practice_identity.settings_fingerprint or computed_settings_fp,
+        "frames_fingerprint": practice_identity.frames_fingerprint or computed_frames_fp,
+    })
+
+
 def compare_coach_data(
-    data: dict[str, Any], cfg: Config, reference: Calibration,
+    data: dict[str, Any],
+    cfg: Config,
+    reference: Calibration,
+    *,
+    practice_identity: HoldSourceIdentity | None = None,
+    bypass_normalization: bool = False,
 ) -> dict[str, Any]:
     """Compare raw cached landmarks with approved ranges, without rerunning inference."""
     profile = profile_from_calibration(reference)
@@ -122,9 +189,25 @@ def compare_coach_data(
     comparison_cfg = cfg.model_copy(update={
         "side": profile.capture_profile["side"], "facing": profile.capture_profile["facing"],
     })
-    return _compare_targets(data, comparison_cfg, profile.metrics, profile.name, {
-        "calibration_id": profile.id, "calibration_name": profile.name,
-    })
+    identity = _build_coach_practice_identity(data, comparison_cfg, practice_identity)
+    applicability = evaluate_pair_applicability(comparison_cfg, profile, identity)
+    if bypass_normalization:
+        applicability = PairApplicability(
+            False,
+            "disabled",
+            "Using original calibration scale for this comparison.",
+            applicability.pair,
+        )
+    return _compare_targets(
+        data,
+        comparison_cfg,
+        profile.metrics,
+        profile.name,
+        {"calibration_id": profile.id, "calibration_name": profile.name},
+        applicability=applicability,
+        norm_cfg=comparison_cfg.measurement_normalization,
+        bypass_normalization=bypass_normalization,
+    )
 
 
 def compare_default_coach_data(data: dict[str, Any], cfg: Config) -> dict[str, Any]:
@@ -146,9 +229,71 @@ def compare_approved_coach_data(
     return _compare_targets(data, cfg, targets, "Approved calibration", {})
 
 
+def _summarize_comparison_normalization(
+    targets: Mapping[str, RangeDefault | ApprovedRange],
+    applicability: PairApplicability,
+    norm_cfg: MeasurementNormalizationConfig,
+    *,
+    bypass_normalization: bool,
+) -> dict[str, Any]:
+    metrics_meta: dict[str, dict[str, Any]] = {}
+    pair = applicability.pair
+    for key in targets:
+        rule = pair.metrics.get(key) if pair is not None else None
+        if applicability.status in ("no_pair", "disabled"):
+            metric_status = "direct_comparison" if (pair is not None and rule is not None and not rule.enabled) else "unadjusted"
+            detail = applicability.reason
+        elif applicability.status == "needs_recheck":
+            metric_status = "needs_recheck"
+            detail = applicability.reason
+        elif rule is None or not rule.enabled:
+            metric_status = "direct_comparison"
+            detail = ""
+        elif rule.method == "matched_holds":
+            ok, detail = _matched_rule_passes_current_gates(rule, norm_cfg)
+            metric_status = "applied" if ok else "needs_recheck"
+        else:
+            metric_status = "applied"
+            detail = rule.status_message
+        metrics_meta[key] = {
+            "status": metric_status,
+            "detail": detail,
+            "method": rule.method if rule is not None else None,
+            "offset": rule.offset if (rule is not None and metric_status == "applied") else None,
+            "verified": rule.verified if rule is not None else False,
+            "verification_error": rule.verification_error if rule is not None else None,
+            "show_calculation_in_review": rule.show_calculation_in_review if rule is not None else False,
+        }
+    if applicability.status == "needs_recheck" or any(
+        m["status"] == "needs_recheck" for m in metrics_meta.values()
+    ):
+        overall_status = "needs_recheck"
+        first_detail = next((m["detail"] for m in metrics_meta.values() if m["status"] == "needs_recheck" and m["detail"]), "")
+        reason = applicability.reason or first_detail or "Normalization needs recheck before applying."
+    elif applicability.status == "applied" and any(m["status"] == "applied" for m in metrics_meta.values()):
+        overall_status = "applied"
+        reason = ""
+    else:
+        overall_status = applicability.status
+        reason = applicability.reason
+    return {
+        "enabled": bool(norm_cfg.enabled),
+        "status": overall_status,
+        "reason": reason,
+        "rule_id": pair.id if pair is not None else None,
+        "pair_name": pair.name if pair is not None else "",
+        "bypass_normalization": bypass_normalization,
+        "metrics": metrics_meta,
+    }
+
+
 def _compare_targets(
     data: dict[str, Any], cfg: Config, targets: Mapping[str, RangeDefault | ApprovedRange],
     name: str, metadata: dict[str, Any],
+    *,
+    applicability: PairApplicability | None = None,
+    norm_cfg: MeasurementNormalizationConfig | None = None,
+    bypass_normalization: bool = False,
 ) -> dict[str, Any]:
     frames = data.get("frames")
     if not isinstance(frames, dict):
@@ -163,52 +308,296 @@ def _compare_targets(
         for key, target in targets.items()
     }
     compared = {}
+    rule_map = applicability.pair.metrics if (applicability is not None and applicability.pair is not None) else {}
+    rule_id = applicability.pair.id if (applicability is not None and applicability.pair is not None) else None
     for index in sorted(frames, key=int):
         entry = frames[index]
         if not isinstance(entry, dict):
             raise TypeError("Invalid cached posture frame")
         observation = _coach_observation(entry, width, height, require_measurements=True)
+        if entry.get("interpolated") is True:
+            observation = FrameObservation(observation.timestamp, observation.width, observation.height, [])
         measured = measure_targets(observation, cfg, targets)
-        rows = [
-            {"metric": key, "unit": targets[key].unit,
-             "reason": measured.quality[key].reason, **evaluator.update(
-                observation.timestamp,
-                measured.values[key] if measured.quality[key].valid else None,
-            )}
-            for key, evaluator in evaluators.items()
-        ]
+        rows = []
+        for key, evaluator in evaluators.items():
+            raw_val = measured.values[key]
+            q_valid = measured.quality[key].valid
+            if applicability is not None and norm_cfg is not None:
+                metric_rule = rule_map.get(key)
+                norm = normalize_metric_observation(
+                    metric=key,
+                    observed_raw=raw_val,
+                    quality_valid=q_valid,
+                    rule=metric_rule,
+                    applicability=applicability,
+                    norm_cfg=norm_cfg,
+                )
+                row = {
+                    "metric": key,
+                    "unit": targets[key].unit,
+                    "reason": measured.quality[key].reason,
+                    **evaluator.update(observation.timestamp, norm.evaluator_input),
+                    "observed_raw": norm.observed_raw,
+                    "normalization_offset": norm.normalization_offset,
+                    "reference_scale_raw": norm.reference_scale_raw,
+                    "normalization_status": norm.normalization_status,
+                    "normalization_detail": norm.status_detail,
+                    "rule_id": rule_id,
+                    "normalization_method": metric_rule.method if metric_rule is not None else None,
+                    "verification_error": metric_rule.verification_error if metric_rule is not None else None,
+                    "show_calculation_in_review": (
+                        metric_rule.show_calculation_in_review if metric_rule is not None else False
+                    ),
+                }
+            else:
+                row = {
+                    "metric": key,
+                    "unit": targets[key].unit,
+                    "reason": measured.quality[key].reason,
+                    **evaluator.update(observation.timestamp, raw_val if q_valid else None),
+                }
+            rows.append(row)
         message, lines = target_feedback(rows, targets)
         compared[index] = {
             **entry, "message": message, "lines": lines,
             "notes": [name, *lines],
             "calibration_rows": rows,
         }
+    extra_meta = dict(metadata)
+    if applicability is not None and norm_cfg is not None:
+        extra_meta["normalization"] = _summarize_comparison_normalization(
+            targets, applicability, norm_cfg, bypass_normalization=bypass_normalization,
+        )
     return {
         **data, "frames": compared, "settings_coaching": False,
-        **metadata,
+        **extra_meta,
     }
 
 
-def interpolate_coach_data(data: dict[str, Any], cfg: Config) -> dict[str, Any]:
+def _deserialise_pose_list(raw_poses: Any) -> list[dict[str, Landmark]]:
+    if not isinstance(raw_poses, list):
+        return []
+    poses: list[dict[str, Landmark]] = []
+    for raw_pose in raw_poses:
+        if not isinstance(raw_pose, dict) or not raw_pose:
+            continue
+        pose: dict[str, Landmark] = {}
+        for name, coords in raw_pose.items():
+            if isinstance(coords, list | tuple) and len(coords) >= 3:
+                pose[str(name)] = Landmark(
+                    x=float(coords[0]),
+                    y=float(coords[1]),
+                    z=float(coords[2]) if coords[2] is not None else None,
+                    visibility=float(coords[3]) if len(coords) >= 4 and coords[3] is not None else None,
+                    presence=float(coords[4]) if len(coords) >= 5 and coords[4] is not None else None,
+                )
+        if pose:
+            poses.append(pose)
+    return poses
+
+
+def _pivot_intervals_from_metadata(
+    indices: list[str],
+    frames: Mapping[str, Any],
+    movement_data: Mapping[str, Any] | None,
+    recovery: Mapping[str, Any] | None,
+) -> list[tuple[float, float]]:
+    time_by_frame = {
+        int(idx): float(frames[idx].get("timestamp", int(idx) * 0.1))
+        for idx in indices
+        if str(idx).isdigit()
+    }
+    intervals: list[tuple[float, float]] = []
+    if isinstance(movement_data, Mapping):
+        for pivot in movement_data.get("pivots") or ():
+            if not isinstance(pivot, Mapping):
+                continue
+            st = pivot.get("start_time")
+            et = pivot.get("end_time")
+            if isinstance(st, int | float) and isinstance(et, int | float) and float(et) > float(st):
+                intervals.append((float(st), float(et)))
+                continue
+            sf = pivot.get("start_frame")
+            ef = pivot.get("end_frame")
+            if isinstance(sf, int) and isinstance(ef, int):
+                t0 = time_by_frame.get(sf)
+                t1 = time_by_frame.get(max(sf, ef - 1))
+                if t0 is not None and t1 is not None:
+                    intervals.append((t0, max(t0, t1)))
+    if isinstance(recovery, Mapping):
+        for win in recovery.get("windows") or ():
+            if not isinstance(win, Mapping) or not win.get("intersects_pivot"):
+                continue
+            st = win.get("window_start_time", win.get("gap_start_time"))
+            et = win.get("window_end_time", win.get("gap_end_time"))
+            if isinstance(st, int | float) and isinstance(et, int | float):
+                intervals.append((float(st), float(et)))
+    return intervals
+
+
+def interpolate_coach_data(
+    data: dict[str, Any],
+    cfg: Config,
+    *,
+    pose_recovery: Mapping[str, Any] | None = None,
+    movement_data: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     """Prepare a separate display layer, leaving raw evidence and coaching untouched."""
     frames = data.get("frames")
-    if cfg.replay_joint_max_gap <= 0 or not isinstance(frames, dict) or not frames:
+    if not isinstance(frames, dict) or not frames:
         return data
-    width, height = int(data.get("width", 0)), int(data.get("height", 0))
+
     indices = sorted(frames, key=int)
+    raw_recovery = pose_recovery if pose_recovery is not None else data.get("pose_recovery")
+    valid_recovery: Mapping[str, Any] | None = None
+    if isinstance(raw_recovery, Mapping):
+        try:
+            dancer_sel = (
+                data.get("dancer_selection")
+                if isinstance(data.get("dancer_selection"), Mapping)
+                else None
+            )
+            valid_recovery = validate_pose_recovery_payload(
+                raw_recovery,
+                frame_count=len(indices),
+                valid_frame_indices={int(k) for k in indices if str(k).isdigit()},
+                timestamps=[float(frames[k].get("timestamp", 0.0)) for k in indices],
+                source_sha256=data.get("source_sha256"),
+                model_sha256=data.get("model_hash"),
+                source_width=int(data.get("width") or 0) or None,
+                source_height=int(data.get("height") or 0) or None,
+                dancer_selection=dancer_sel,
+            )
+        except ValueError as exc:
+            logger.warning("Ignoring invalid or stale pose_recovery payload: %s", exc)
+            valid_recovery = None
+
+    if cfg.replay_joint_max_gap <= 0 and valid_recovery is None:
+        return data
+
+    width, height = int(data.get("width", 0)), int(data.get("height", 0))
     observations = [_coach_observation(frames[index], width, height) for index in indices]
+    working: list[FrameObservation] = []
+    origins_out: list[dict[str, str]] = []
+    diagnostics_per_pos: list[dict[str, str]] = []
+    status_per_pos: list[str] = []
+
+    rec_frames = valid_recovery.get("frames", {}) if valid_recovery is not None else {}
+    for pos, (index, obs) in enumerate(zip(indices, observations, strict=True)):
+        origins: dict[str, str] = {}
+        poses_copy = [dict(p) for p in obs.poses]
+        if len(poses_copy) == 1:
+            for jname, lm in poses_copy[0].items():
+                if reliable(lm, cfg.confidence):
+                    origins[jname] = "forward"
+
+        rec_entry = rec_frames.get(str(index)) if isinstance(rec_frames, Mapping) else None
+        diag: dict[str, str] = {}
+        status_txt = ""
+        if isinstance(rec_entry, Mapping):
+            raw_diag = rec_entry.get("diagnostics")
+            if isinstance(raw_diag, Mapping):
+                diag = {str(k): str(v) for k, v in raw_diag.items()}
+            status_txt = str(rec_entry.get("status_summary") or "")
+            rec_lms = rec_entry.get("landmarks")
+            if isinstance(rec_lms, Mapping) and rec_lms and len(poses_copy) <= 1:
+                pose_dict = dict(poses_copy[0]) if poses_copy else {}
+                for jname, lm_map in rec_lms.items():
+                    if not isinstance(lm_map, Mapping):
+                        continue
+                    existing_lm = pose_dict.get(str(jname))
+                    if reliable(existing_lm, cfg.confidence):
+                        continue
+                    origin = str(lm_map.get("origin") or "backward")
+                    if origin == "backward":
+                        pose_dict[str(jname)] = Landmark(
+                            x=float(lm_map["x"]),
+                            y=float(lm_map["y"]),
+                            visibility=float(lm_map.get("visibility", 1.0)),
+                            presence=float(lm_map.get("presence", 1.0)),
+                            z=float(lm_map.get("z", 0.0)),
+                        )
+                        origins[str(jname)] = "backward"
+                if pose_dict:
+                    poses_copy = [pose_dict]
+        working.append(FrameObservation(obs.timestamp, obs.width, obs.height, poses_copy))
+        origins_out.append(origins)
+        diagnostics_per_pos.append(diag)
+        status_per_pos.append(status_txt)
+
+    pivot_intervals = _pivot_intervals_from_metadata(indices, frames, movement_data, valid_recovery)
+    cut_positions: set[int] = set()
+    if isinstance(movement_data, Mapping):
+        cut_set = {int(c) for c in movement_data.get("cut_frames") or () if isinstance(c, int)}
+        if cut_set:
+            for pos, index in enumerate(indices):
+                if pos > 0 and int(index) in cut_set:
+                    cut_positions.add(pos)
+
+    track_keys = [
+        str(
+            frames[index].get("track_key")
+            or (
+                f"dancer_{frames[index]['dancer_index']}"
+                if isinstance(frames[index].get("dancer_index"), int)
+                else "single"
+            )
+        )
+        for index in indices
+    ]
+
     interpolated = interpolate_poses(
-        observations, method=cfg.replay_joint_interpolation,
-        max_gap=cfg.replay_joint_max_gap, confidence=cfg.confidence,
+        working,
+        method=cfg.replay_joint_interpolation,
+        max_gap=cfg.replay_joint_max_gap,
+        confidence=cfg.confidence,
+        pivot_intervals=pivot_intervals,
+        pivot_max_gap=cfg.replay_pivot_interpolation_max_gap_s,
+        cut_positions=cut_positions,
+        track_keys=track_keys,
+        origins_out=origins_out,
     )
+
+    any_changed = valid_recovery is not None or any(
+        origin in ("backward", "interpolated")
+        for origins in origins_out
+        for origin in origins.values()
+    )
+    if not any_changed:
+        return data
+
+    new_frames: dict[str, Any] = {}
+    for pos, (index, obs) in enumerate(zip(indices, interpolated, strict=True)):
+        orig_entry = frames[index]
+        origins = origins_out[pos]
+        diag = dict(diagnostics_per_pos[pos])
+        status_txt = status_per_pos[pos]
+        if not status_txt:
+            interp_lower = [
+                j
+                for j, o in origins.items()
+                if o == "interpolated" and j in LOWER_LIMB_JOINTS
+            ]
+            if interp_lower:
+                focus = next(
+                    (j for j in interp_lower if j.endswith("_ankle") or j.endswith("_knee")),
+                    interp_lower[0],
+                )
+                status_txt = f"{focus.replace('_', ' ').capitalize()} interpolated"
+                for j in interp_lower:
+                    diag.setdefault(j, "Recovered for display")
+        forward_raw = orig_entry.get("poses") or orig_entry.get("measurement_poses") or []
+        new_frames[index] = {
+            **orig_entry,
+            "display_poses": [_serialise_pose(pose) for pose in obs.poses],
+            "display_forward_poses": forward_raw,
+            "display_joint_origins": origins,
+            "display_diagnostics": diag,
+            "display_status_summary": status_txt,
+        }
     return {
-        **data, "frames": {
-            index: {
-                **frames[index],
-                "display_poses": [_serialise_pose(pose) for pose in observation.poses],
-            }
-            for index, observation in zip(indices, interpolated, strict=True)
-        },
+        **data,
+        "frames": new_frames,
     }
 
 
@@ -297,6 +686,8 @@ def render_coach_frame_overlay(
     show_vertical_axis: bool = True,
     show_footer: bool = False,
     lines_only: bool = False,
+    show_estimates: bool = True,
+    forward_only: bool = False,
 ) -> np.ndarray:
     """Render the Open Practice Coach HUD (axis lines, skeleton, alerts, role, beats) on a frame.
 
@@ -317,7 +708,25 @@ def render_coach_frame_overlay(
         return image
 
     observation = _coach_observation(entry, width, height)
-    poses = _coach_observation(entry, width, height, use_display_poses=True).poses
+    use_estimates = bool(show_estimates and not forward_only)
+    raw_origins = entry.get("display_joint_origins")
+    joint_origins: Mapping[str, str] | None = (
+        raw_origins if use_estimates and isinstance(raw_origins, Mapping) else None
+    )
+    if use_estimates:
+        poses = _coach_observation(entry, width, height, use_display_poses=True).poses
+    else:
+        raw_fwd = entry.get("display_forward_poses")
+        poses = _deserialise_pose_list(raw_fwd) if isinstance(raw_fwd, list) else observation.poses
+        if isinstance(raw_origins, Mapping):
+            poses = [
+                {
+                    k: v
+                    for k, v in pose.items()
+                    if raw_origins.get(k, "forward") == "forward"
+                }
+                for pose in poses
+            ]
 
     if lines_only:
         canvas = image.copy()
@@ -327,13 +736,13 @@ def render_coach_frame_overlay(
                     pose.get(b), cfg.confidence
                 ):
                     pa, pb = pose[a], pose[b]
-                    cv2.line(
+                    draw_styled_bone(
                         canvas,
                         screen_point(pa.x, pa.y, width, height, False),
                         screen_point(pb.x, pb.y, width, height, False),
                         (80, 220, 80),
                         2,
-                        cv2.LINE_AA,
+                        style=edge_provenance_style(a, b, joint_origins),
                     )
         return canvas
 
@@ -393,6 +802,7 @@ def render_coach_frame_overlay(
             show_footer=show_footer,
             settings_coaching=bool(coach_data.get("settings_coaching", True)),
             skeleton_poses=poses,
+            skeleton_joint_origins=joint_origins,
             shoulder_geometry=shoulder_geometry_kwargs(cfg),
             knee_geometry=knee_geometry_kwargs(cfg),
         ),
