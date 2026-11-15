@@ -238,6 +238,23 @@ class MainWindow(QMainWindow):
                         screen.load_archive(
                             archive_path, segment_index=segment_index, timestamp=timestamp
                         )
+            if route is Route.ANALYTICS and isinstance(screen, AnalyticsScreen):
+                if isinstance(payload, Path):
+                    screen.load_archive(payload)
+                elif isinstance(payload, dict):
+                    archive_path = payload.get("archive_path")
+                    segment_index = payload.get("segment_index", 0)
+                    calibration_path = payload.get("calibration_path")
+                    if (
+                        isinstance(archive_path, Path)
+                        and isinstance(segment_index, int)
+                        and (calibration_path is None or isinstance(calibration_path, Path))
+                    ):
+                        screen.load_archive(
+                            archive_path,
+                            segment_index=segment_index,
+                            calibration_path=calibration_path,
+                        )
             if (
                 route is Route.COACH
                 and isinstance(screen, CoachScreen)
