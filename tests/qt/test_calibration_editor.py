@@ -646,3 +646,117 @@ def test_guided_holds_require_a_repeatable_change_before_continuing(qapp, tmp_pa
     assert dialog._review_requested
     assert dialog._holds["Walking"][0].start == 25
     dialog.reject()
+
+
+def test_editing_existing_tpc_profile_preserves_and_adds_metrics(qapp, tmp_path):
+    from tango_posture.desktop_qt.screens.library import LibraryScreen, ProfileDetailsDialog
+
+    ref_dir = tmp_path / "references"
+    ref_dir.mkdir(parents=True, exist_ok=True)
+    video, report, practice = (tmp_path / name for name in ("v.mp4", "r.md", "p.tp"))
+    writer = cv2.VideoWriter(str(video), cv2.VideoWriter.fourcc(*"mp4v"), 10, (640, 480))
+    assert writer.isOpened()
+    entries = []
+    for index in range(25):
+        writer.write(np.zeros((480, 640, 3), dtype=np.uint8))
+        pose = dict(frame(index / 10).poses[0])
+        pose["left_knee"] = Landmark(0.52 + 0.005 * (index % 3), 385 / 480, 0.99, 0.99)
+        pose["right_knee"] = Landmark(0.53 + 0.005 * (index % 3), 385 / 480, 0.99, 0.99)
+        entries.append({"poses": [
+            {name: [p.x, p.y, p.z, p.visibility, p.presence] for name, p in pose.items()}
+        ]})
+    writer.release()
+    report.write_text("# Source\n")
+    append_segment(practice, report, video, None, [i / 10 for i in range(25)], analytics={
+        "model_hash": MANIFEST["sha256"],
+        "capture_profile": profile(Config(), 640, 480, "video"),
+        "frames": entries, "max_gap": 0.5,
+    })
+    reference = ref_dir / "Teacher.tpr"
+    promote_reference(practice, reference, "Teacher")
+
+    cfg = Config(data_dir=str(tmp_path))
+    creator = CalibrationEditor(reference, cfg)
+    creator.name_input.setText("Editable Profile")
+    creator._approve()  # head_pitch
+    creator._save()
+    saved_path = creator.saved_path
+    assert saved_path is not None
+    initial = read_range_profile(saved_path)
+    assert set(initial.metrics) == {"head_pitch"}
+
+    # Reopen the .tpc file directly and add knee_flexion while keeping head_pitch.
+    editor = CalibrationEditor(saved_path, cfg)
+    try:
+        assert set(editor.approved) == {"head_pitch"}
+        assert "Edit approved" in editor.windowTitle()
+        editor.step_combo.setCurrentText("Knees")
+        assert editor.metric_combo.currentData() == "knee_flexion"
+        editor._approve()
+        editor._save()
+    finally:
+        if editor.isVisible():
+            editor.reject()
+
+    updated = read_range_profile(saved_path)
+    assert updated.id == initial.id
+    assert set(updated.metrics) == {"head_pitch", "knee_flexion"}
+
+    # Library row has "Edit calibration" and ProfileDetailsDialog has "Edit calibration…".
+    screen = LibraryScreen(ServiceBridge(cfg), Router())
+    try:
+        row = next(i for i in range(screen.table.rowCount()) if screen.table.item(i, 4).text() == ".tpc")
+        buttons = screen.table.cellWidget(row, 3).findChildren(QPushButton)
+        assert any(btn.text() == "Edit calibration" for btn in buttons)
+        called = []
+        dlg = ProfileDetailsDialog(
+            updated,
+            saved_path,
+            screen,
+            on_edit_calibration=lambda: called.append(True),
+        )
+        dlg.edit_calibration_btn.click()
+        assert called == [True]
+    finally:
+        screen.close()
+
+
+def test_settings_screen_has_expandable_guides_and_worked_examples(qapp, tmp_path):
+    from PySide6.QtWidgets import QLabel
+
+    from tango_posture.config import SETTING_MAP
+
+    cfg = Config(data_dir=str(tmp_path))
+    screen = SettingsScreen(ServiceBridge(cfg), Router())
+    try:
+        expected_keys = set(SETTING_MAP) | set(METRIC_DETAILS)
+        assert expected_keys <= set(screen.help_toggles)
+        assert expected_keys <= set(screen.help_panels)
+
+        # Collapsed by default.
+        assert all(not btn.isChecked() for btn in screen.help_toggles.values())
+        assert all(panel.isHidden() for panel in screen.help_panels.values())
+
+        # Expand single parameter guide and verify worked example is shown.
+        screen.help_toggles["knee_visibility_floor"].click()
+        qapp.processEvents()
+        assert screen.help_toggles["knee_visibility_floor"].isChecked()
+        assert not screen.help_panels["knee_visibility_floor"].isHidden()
+        panel_text = "\n".join(
+            lbl.text() for lbl in screen.help_panels["knee_visibility_floor"].findChildren(QLabel)
+        )
+        assert "Example:" in panel_text
+
+        # Collapse it back.
+        screen.help_toggles["knee_visibility_floor"].click()
+        assert screen.help_panels["knee_visibility_floor"].isHidden()
+
+        # Expand All / Collapse All works for every parameter and Calibration default.
+        screen.toggle_all_guides_btn.click()
+        assert all(btn.isChecked() for btn in screen.help_toggles.values())
+        assert all(not panel.isHidden() for panel in screen.help_panels.values())
+        screen.toggle_all_guides_btn.click()
+        assert all(not btn.isChecked() for btn in screen.help_toggles.values())
+        assert all(panel.isHidden() for panel in screen.help_panels.values())
+    finally:
+        screen.close()

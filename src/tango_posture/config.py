@@ -49,9 +49,13 @@ class Config(BaseModel):
     min_torso: float = Field(default=0.12, gt=0)
     min_head: float = Field(default=0.04, gt=0)
     max_view_width: float = Field(default=0.45, gt=0)
+    calibration_suggest_lower_pct: float = Field(default=10.0, ge=0.0, lt=100.0)
+    calibration_suggest_upper_pct: float = Field(default=90.0, gt=0.0, le=100.0)
+    calibration_min_usable_samples: int = Field(default=2, ge=2)
     view_change_tolerance: float = Field(default=0.15, gt=0)
     smoothing: float = Field(default=0.25, gt=0)
     overlay_smoothing: float = Field(default=0.20, ge=0)
+    min_filter_time_constant: float = Field(default=0.0001, gt=0.0)
     entry_duration: float = Field(default=1.5, gt=0)
     clear_duration: float = Field(default=0.75, gt=0)
     max_gap: float = Field(default=0.5, gt=0)
@@ -74,11 +78,31 @@ class Config(BaseModel):
     shoulder_tension_duration: float = Field(default=1.0, gt=0)
     shoulder_raise_threshold: float = Field(default=10.0, gt=0)
     shoulder_neutral_clearance: float = Field(default=1.05, gt=0)
+    shoulder_visibility_floor: float = Field(default=0.50, ge=0.0, le=1.0)
+    shoulder_ear_hip_scale_factor: float = Field(default=0.26, gt=0.0)
+    shoulder_min_ear_hip_px: float = Field(default=20.0, gt=0.0)
+    shoulder_nose_ear_scale_factor: float = Field(default=0.68, gt=0.0)
+    shoulder_ear_ear_scale_factor: float = Field(default=0.65, gt=0.0)
+    shoulder_width_scale_factor: float = Field(default=0.28, gt=0.0)
+    shoulder_min_ref_scale_px: float = Field(default=8.0, gt=0.0)
+    shoulder_baseline_clamp_floor: float = Field(default=0.20, gt=0.0)
+    shoulder_adaptive_max_samples: int = Field(default=600, ge=1)
+    shoulder_adaptive_min_samples: int = Field(default=15, ge=1)
+    shoulder_adaptive_min_clearance: float = Field(default=0.65, gt=0.0)
+    shoulder_adaptive_max_clearance: float = Field(default=1.50, gt=0.0)
+    shoulder_adaptive_percentile: float = Field(default=75.0, gt=0.0, le=100.0)
+    shoulder_recovery_min_pct: float = Field(default=4.0, ge=0.0)
+    shoulder_recovery_ratio: float = Field(default=0.65, gt=0.0, le=1.0)
     allow_all_angles: bool = False
     embrace_closed_threshold: float = Field(default=0.72, gt=0, le=1.0)
     embrace_hysteresis_seconds: float = Field(default=1.0, ge=0)
     closed_embrace_min_knee_bend: float = Field(default=8.0, ge=0)
     knee_straight_duration: float = Field(default=1.0, gt=0)
+    knee_recovery_margin: float = Field(default=2.5, ge=0.0)
+    knee_visibility_floor: float = Field(default=0.35, ge=0.0, le=1.0)
+    knee_min_segment_px: float = Field(default=10.0, gt=0.0)
+    knee_tiebreak_other_max_vis: float = Field(default=0.60, ge=0.0, le=1.0)
+    knee_tiebreak_min_advantage: float = Field(default=0.15, ge=0.0, le=1.0)
     slow_tango_max_bpm: float = Field(default=115.0, gt=0, le=240)
     ankle_high_lift_ratio: float = Field(default=0.06, gt=0, le=1.0)
     max_consecutive_high_ankle_steps: int = Field(default=2, ge=1)
@@ -119,6 +143,12 @@ class Config(BaseModel):
                     raise ValueError(f"Unknown default metric or incompatible unit: {key}")
         if self.calibration_valid_duration > self.calibration_duration:
             raise ValueError("valid calibration duration exceeds capture window")
+        if self.calibration_suggest_lower_pct >= self.calibration_suggest_upper_pct:
+            raise ValueError("calibration_suggest_lower_pct must be below calibration_suggest_upper_pct")
+        if self.shoulder_adaptive_min_samples > self.shoulder_adaptive_max_samples:
+            raise ValueError("shoulder_adaptive_min_samples must not exceed shoulder_adaptive_max_samples")
+        if self.shoulder_adaptive_min_clearance >= self.shoulder_adaptive_max_clearance:
+            raise ValueError("shoulder_adaptive_min_clearance must be below shoulder_adaptive_max_clearance")
         if self.axis_curve is not None:
             if "axis_curve_entry" not in self.model_fields_set:
                 self.axis_curve_entry = self.axis_curve.entry
@@ -150,10 +180,14 @@ SETTING_GROUPS = {
         "min_torso",
         "min_head",
         "max_view_width",
+        "calibration_suggest_lower_pct",
+        "calibration_suggest_upper_pct",
+        "calibration_min_usable_samples",
     ),
     "Tracking": (
         "smoothing",
         "overlay_smoothing",
+        "min_filter_time_constant",
         "entry_duration",
         "clear_duration",
         "max_gap",
@@ -165,6 +199,21 @@ SETTING_GROUPS = {
         "shoulder_tension_duration",
         "shoulder_raise_threshold",
         "shoulder_neutral_clearance",
+        "shoulder_visibility_floor",
+        "shoulder_ear_hip_scale_factor",
+        "shoulder_min_ear_hip_px",
+        "shoulder_nose_ear_scale_factor",
+        "shoulder_ear_ear_scale_factor",
+        "shoulder_width_scale_factor",
+        "shoulder_min_ref_scale_px",
+        "shoulder_baseline_clamp_floor",
+        "shoulder_adaptive_max_samples",
+        "shoulder_adaptive_min_samples",
+        "shoulder_adaptive_min_clearance",
+        "shoulder_adaptive_max_clearance",
+        "shoulder_adaptive_percentile",
+        "shoulder_recovery_min_pct",
+        "shoulder_recovery_ratio",
     ),
     "Embrace & knees": (
         "role_assign_ms",
@@ -173,6 +222,11 @@ SETTING_GROUPS = {
         "embrace_hysteresis_seconds",
         "closed_embrace_min_knee_bend",
         "knee_straight_duration",
+        "knee_recovery_margin",
+        "knee_visibility_floor",
+        "knee_min_segment_px",
+        "knee_tiebreak_other_max_vis",
+        "knee_tiebreak_min_advantage",
     ),
     "Torso & hip offset": (
         "axis_curve_entry",
@@ -239,8 +293,12 @@ SETTING_DESCRIPTIONS: dict[str, str] = {
     "min_torso": "Minimum visible torso length as a fraction of image height.",
     "min_head": "Minimum visible shoulder-to-ear segment as a fraction of image height.",
     "max_view_width": "Maximum body-width-to-torso ratio accepted for a side view.",
+    "calibration_suggest_lower_pct": "Lower percentile used by the calibration editor's middle-range suggestion.",
+    "calibration_suggest_upper_pct": "Upper percentile used by the calibration editor's middle-range suggestion.",
+    "calibration_min_usable_samples": "Minimum usable frames required to summarize and approve a calibration passage.",
     "smoothing": "Time constant for smoothing measurements over time.",
     "overlay_smoothing": "Smoothing time constant for rendered landmark lines and segments.",
+    "min_filter_time_constant": "Minimum filter time constant floor (seconds) for descriptive knee/shoulder smoothing.",
     "entry_duration": "Time a threshold must be crossed before confirming a deviation.",
     "clear_duration": "Time a value must remain below its clear threshold before closing an event.",
     "max_gap": "Maximum observation gap treated as continuous tracking.",
@@ -250,12 +308,32 @@ SETTING_DESCRIPTIONS: dict[str, str] = {
     "shoulder_tension_duration": "Duration required before showing the shoulder cue.",
     "shoulder_raise_threshold": "Shoulder-elevation threshold above the relaxed baseline.",
     "shoulder_neutral_clearance": "Fallback clearance used when no captured shoulder baseline is available.",
+    "shoulder_visibility_floor": "Helper landmark visibility floor checked in shoulder clearance geometry.",
+    "shoulder_ear_hip_scale_factor": "Primary anatomical scale multiplier applied to vertical ear-to-hip separation.",
+    "shoulder_min_ear_hip_px": "Minimum vertical ear-to-hip pixel separation required for the primary scale candidate.",
+    "shoulder_nose_ear_scale_factor": "Fallback scale multiplier applied to 2D nose-to-ear pixel distance.",
+    "shoulder_ear_ear_scale_factor": "Fallback scale multiplier applied to horizontal ear-to-ear pixel distance.",
+    "shoulder_width_scale_factor": "Fallback scale multiplier applied to horizontal shoulder-to-shoulder pixel distance.",
+    "shoulder_min_ref_scale_px": "Minimum shoulder reference scale S in pixels; smaller values mark clearance unavailable.",
+    "shoulder_baseline_clamp_floor": "Minimum floor for effective neutral shoulder clearance B in fallback elevation percentages.",
+    "shoulder_adaptive_max_samples": "Maximum qualifying relaxed-clearance samples collected for the adaptive shoulder baseline window.",
+    "shoulder_adaptive_min_samples": "Minimum qualifying samples required before the adaptive shoulder baseline takes effect.",
+    "shoulder_adaptive_min_clearance": "Lower raw clearance ratio bound for samples admitted into the adaptive baseline window.",
+    "shoulder_adaptive_max_clearance": "Upper raw clearance ratio bound for samples admitted into the adaptive baseline window.",
+    "shoulder_adaptive_percentile": "Percentile of adaptive baseline samples compared against the starting neutral clearance.",
+    "shoulder_recovery_min_pct": "Minimum percentage floor for the fallback shoulder tension recovery hysteresis boundary.",
+    "shoulder_recovery_ratio": "Fraction of shoulder_raise_threshold used for the fallback shoulder recovery boundary.",
     "role_assign_ms": "Time an arm pattern must persist before assigning a role label.",
     "role_hold_ms": "Time to retain a role label after the pattern disappears.",
     "embrace_closed_threshold": "Boundary for the heuristic open/closed embrace label.",
     "embrace_hysteresis_seconds": "Hysteresis duration used to stabilize embrace classification.",
     "closed_embrace_min_knee_bend": "Minimum knee flexion used by the straight-knee cue in closed embrace.",
     "knee_straight_duration": "Duration required before showing the knee cue.",
+    "knee_recovery_margin": "Degrees above closed_embrace_min_knee_bend required for fallback knee recovery hysteresis.",
+    "knee_visibility_floor": "Helper landmark visibility floor checked for hip, knee, and ankle in knee flexion geometry.",
+    "knee_min_segment_px": "Minimum pixel length required for both hip-to-knee and ankle-to-knee leg segments.",
+    "knee_tiebreak_other_max_vis": "Other-leg visibility ceiling below which the preferred-side knee tie-break can trigger.",
+    "knee_tiebreak_min_advantage": "Minimum visibility advantage required for the preferred leg to win the knee tie-break.",
     "axis_curve_entry": "Posterior hip offset that starts a pending axis event.",
     "axis_curve_clear": "Lower offset at which a confirmed axis event can clear.",
     "axis_curve_duration": "Time above the entry threshold required to confirm an axis event.",

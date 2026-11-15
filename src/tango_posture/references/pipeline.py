@@ -35,7 +35,9 @@ from ..geometry import (
     detect_role,
     head_horizontal_alignment,
     knee_bend_alignment,
+    knee_geometry_kwargs,
     pixel,
+    shoulder_geometry_kwargs,
     shoulder_tension_alignment,
     torso_axis_alignment,
 )
@@ -211,6 +213,7 @@ def analyze_clip(
                         frame_obs.width,
                         frame_obs.height,
                         neutral_clearance=cfg.shoulder_neutral_clearance,
+                        **shoulder_geometry_kwargs(cfg),
                     )
                     if sh_info is not None:
                         cal_shoulder_clearances.append(sh_info[1])
@@ -350,17 +353,26 @@ def analyze_clip(
         upper_body = None
         raw_role = "NONE"
         sh_neutral = (
-            max(sh_neutral_base, float(np.percentile(relaxed_clearances, 75)))
-            if len(relaxed_clearances) >= 15
+            max(
+                sh_neutral_base,
+                float(np.percentile(relaxed_clearances, cfg.shoulder_adaptive_percentile)),
+            )
+            if len(relaxed_clearances) >= cfg.shoulder_adaptive_min_samples
             else sh_neutral_base
         )
 
         if len(frame_obs.poses) == 1:
             pose = frame_obs.poses[0]
             raw_role = detect_role(pose)
-            metric_tau = max(1e-4, cfg.overlay_smoothing or cfg.smoothing)
+            metric_tau = max(
+                cfg.min_filter_time_constant, cfg.overlay_smoothing or cfg.smoothing
+            )
             knee_info = knee_bend_alignment(
-                pose, frame_obs.width, frame_obs.height, side=cfg.side
+                pose,
+                frame_obs.width,
+                frame_obs.height,
+                side=cfg.side,
+                **knee_geometry_kwargs(cfg),
             )
             if knee_info is not None:
                 raw_knee_deg = knee_info[0]
@@ -408,11 +420,21 @@ def analyze_clip(
                 head_angle = head_smoothed
 
             sh_info = shoulder_tension_alignment(
-                pose, frame_obs.width, frame_obs.height, neutral_clearance=sh_neutral
+                pose,
+                frame_obs.width,
+                frame_obs.height,
+                neutral_clearance=sh_neutral,
+                **shoulder_geometry_kwargs(cfg),
             )
             if sh_info is not None:
                 raw_elev_pct, raw_clear = sh_info[0], sh_info[1]
-                if not in_cal and len(relaxed_clearances) < 600 and 0.65 <= raw_clear <= 1.50:
+                if (
+                    not in_cal
+                    and len(relaxed_clearances) < cfg.shoulder_adaptive_max_samples
+                    and cfg.shoulder_adaptive_min_clearance
+                    <= raw_clear
+                    <= cfg.shoulder_adaptive_max_clearance
+                ):
                     relaxed_clearances.append(raw_clear)
                 if (
                     shoulder_smoothed is None

@@ -16,6 +16,8 @@ from ..geometry import (
     axis_curve_alignment,
     head_horizontal_alignment,
     knee_bend_alignment,
+    knee_geometry_kwargs,
+    shoulder_geometry_kwargs,
     shoulder_tension_alignment,
     torso_axis_alignment,
     wrapped,
@@ -41,11 +43,23 @@ def measure_ranges(frame: FrameObservation, cfg: Config) -> MetricObservation:
     pose = {name: point for name, point in frame.poses[0].items() if reliable(point, cfg.confidence)}
     for key, result, component in (
         ("head_pitch", head_horizontal_alignment(pose, frame.width, frame.height), 0),
-        ("shoulder_clearance", shoulder_tension_alignment(pose, frame.width, frame.height), 1),
+        (
+            "shoulder_clearance",
+            shoulder_tension_alignment(
+                pose, frame.width, frame.height, **shoulder_geometry_kwargs(cfg)
+            ),
+            1,
+        ),
         ("hip_offset", axis_curve_alignment(
             pose, frame.width, frame.height, cfg.facing, cfg.side,
         ), 1),
-        ("knee_flexion", knee_bend_alignment(pose, frame.width, frame.height, cfg.side), 0),
+        (
+            "knee_flexion",
+            knee_bend_alignment(
+                pose, frame.width, frame.height, cfg.side, **knee_geometry_kwargs(cfg)
+            ),
+            0,
+        ),
         ("torso_axis_tilt", torso_axis_alignment(
             pose, frame.width, frame.height, cfg.confidence,
         ), 0),

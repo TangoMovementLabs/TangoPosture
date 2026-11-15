@@ -183,3 +183,47 @@ def test_invalid_settings_are_rejected(tmp_path, line):
     settings.write_text(line)
     with pytest.raises(ValueError):
         load(settings, {})
+
+
+@pytest.mark.parametrize("bad", [
+    {"calibration_suggest_lower_pct": 90.0, "calibration_suggest_upper_pct": 80.0},
+    {"calibration_min_usable_samples": 1},
+    {"shoulder_adaptive_min_samples": 100, "shoulder_adaptive_max_samples": 50},
+    {"shoulder_adaptive_min_clearance": 1.5, "shoulder_adaptive_max_clearance": 1.2},
+    {"knee_visibility_floor": 1.2},
+    {"shoulder_visibility_floor": -0.1},
+    {"min_filter_time_constant": 0.0},
+])
+def test_invalid_algorithmic_settings_are_rejected(bad):
+    with pytest.raises(ValueError):
+        Config.model_validate(bad)
+
+
+def test_custom_algorithmic_settings_round_trip_through_toml():
+    cfg = Config(
+        knee_visibility_floor=0.45,
+        knee_min_segment_px=12.0,
+        knee_tiebreak_other_max_vis=0.55,
+        knee_tiebreak_min_advantage=0.20,
+        shoulder_visibility_floor=0.60,
+        shoulder_ear_hip_scale_factor=0.30,
+        shoulder_min_ear_hip_px=25.0,
+        shoulder_nose_ear_scale_factor=0.72,
+        shoulder_ear_ear_scale_factor=0.62,
+        shoulder_width_scale_factor=0.31,
+        shoulder_min_ref_scale_px=10.0,
+        shoulder_baseline_clamp_floor=0.25,
+        shoulder_adaptive_max_samples=400,
+        shoulder_adaptive_min_samples=20,
+        shoulder_adaptive_min_clearance=0.70,
+        shoulder_adaptive_max_clearance=1.40,
+        shoulder_adaptive_percentile=80.0,
+        shoulder_recovery_min_pct=5.0,
+        shoulder_recovery_ratio=0.70,
+        knee_recovery_margin=3.0,
+        min_filter_time_constant=0.005,
+        calibration_suggest_lower_pct=15.0,
+        calibration_suggest_upper_pct=85.0,
+        calibration_min_usable_samples=5,
+    )
+    assert Config.model_validate(tomllib.loads(export_toml(cfg))) == cfg

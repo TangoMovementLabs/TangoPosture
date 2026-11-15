@@ -24,6 +24,8 @@ from ..domain import (
     Landmark,
 )
 from ..geometry import (
+    knee_geometry_kwargs,
+    shoulder_geometry_kwargs,
     torso_axis_alignment,
 )
 from ..overlay import MESSAGES, draw, draw_torso_axis, screen_point
@@ -327,6 +329,8 @@ def render_coach_frame_overlay(
             show_footer=show_footer,
             settings_coaching=bool(coach_data.get("settings_coaching", True)),
             skeleton_poses=poses,
+            shoulder_geometry=shoulder_geometry_kwargs(cfg),
+            knee_geometry=knee_geometry_kwargs(cfg),
         ),
     )
 
@@ -415,7 +419,10 @@ def _build_coach_frame_entry(
     bad_head = head_down_elapsed >= cfg.head_down_duration
 
     # Shoulder tension with hysteresis.
-    sh_clear = max(4.0, cfg.shoulder_raise_threshold * 0.65)
+    sh_clear = max(
+        cfg.shoulder_recovery_min_pct,
+        cfg.shoulder_raise_threshold * cfg.shoulder_recovery_ratio,
+    )
     if shoulder_elev_pct is not None:
         timers.shoulder_last_valid = source_time
         if shoulder_elev_pct >= cfg.shoulder_raise_threshold:
@@ -440,7 +447,7 @@ def _build_coach_frame_entry(
     bad_shoulders = shoulder_tension_elapsed >= cfg.shoulder_tension_duration
 
     # Knee bend with hysteresis.
-    knee_clear = cfg.closed_embrace_min_knee_bend + 2.5
+    knee_clear = cfg.closed_embrace_min_knee_bend + cfg.knee_recovery_margin
     if knee_bend_deg is not None:
         timers.knee_last_valid = source_time
         if knee_bend_deg < cfg.closed_embrace_min_knee_bend:

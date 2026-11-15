@@ -130,6 +130,8 @@ def draw(
     show_footer: bool = True,
     settings_coaching: bool = True,
     skeleton_poses: list[dict[str, Landmark]] | None = None,
+    shoulder_geometry: dict[str, float] | None = None,
+    knee_geometry: dict[str, float] | None = None,
 ) -> Any:
     image = cv2.flip(image, 1) if mirror else image.copy()
     disp_w = max(960, observation.width)
@@ -239,6 +241,7 @@ def draw(
             observation.width,
             observation.height,
             neutral_clearance=shoulder_neutral_clearance,
+            **(shoulder_geometry or {}),
         )
         if settings_coaching and sh_info is not None:
             raw_elev_pct, raw_clear, sh_ear, sh_lm = sh_info
@@ -284,7 +287,7 @@ def draw(
                 cv2.LINE_AA,
             )
         knee_info = knee_bend_alignment(
-            pose, observation.width, observation.height, side=side
+            pose, observation.width, observation.height, side=side, **(knee_geometry or {})
         )
         if settings_coaching and knee_info is not None:
             raw_knee_bend_deg, vis_legs = knee_info

@@ -1,6 +1,6 @@
 # TangoPosture Settings: practical examples for beginners
 
-This guide follows the current desktop Settings screen: **48 editable settings
+This guide follows the current desktop Settings screen: **72 editable settings
 and eight Calibration defaults rows**. Each parameter is explained once, with a
 worked example. Examples illustrate software behaviour, not medical limits or
 universal tango technique.
@@ -209,6 +209,40 @@ not landmark-quality checks.
 but can pass that view gate at `0.50`. The same change can make it fail a
 front-approved metric. Check the actual viewpoint before changing this boundary.
 
+### Suggested lower percentile (%) - `calibration_suggest_lower_pct`
+
+**Default:** `10%`; from `0` up to below the upper suggested percentile.
+
+Lower percentile proposed when clicking the suggestion button in the Calibration
+editor. It does not restrict manually entered bounds.
+
+**Example:** across 100 sorted samples from a balanced standing passage, `10%`
+proposes the 10th sample as the minimum limit instead of the single lowest
+outlier. Setting `5%` widens the suggested lower bound to cover 95% at the bottom.
+
+### Suggested upper percentile (%) - `calibration_suggest_upper_pct`
+
+**Default:** `90%`; above the lower suggested percentile up to `100%`.
+
+Upper percentile proposed when clicking the suggestion button in the Calibration
+editor. Pair it with `calibration_suggest_lower_pct` (default 10th to 90th =
+middle 80%).
+
+**Example:** with `10%` lower and `90%` upper on a steady walking clip, the
+editor proposes the middle 80% of eligible values; setting `20%` and `80%`
+narrows the suggested proposal to the middle 60%.
+
+### Minimum usable calibration samples - `calibration_min_usable_samples`
+
+**Default:** `2`; integer `2` or greater.
+
+Minimum finite, reliable samples required inside selected passages before the
+Calibration editor summarizes a metric for approval.
+
+**Example:** in a short 30 FPS clip where only `4` frames pass quality checks,
+a minimum of `2` allows summarizing and approving the passage, whereas raising
+it to `10` rejects that sparse clip and asks for more reliable frames.
+
 ## 4. Tracking
 
 These controls smooth numbers and time events. Set acceptable posture ranges
@@ -236,6 +270,18 @@ Some descriptive filters use Measurement smoothing when this is zero.
 **Example:** changing `0.20` to `0.10` makes applicable descriptive values
 follow a change faster, with more possible jitter. Setting zero does not remove
 every filter. Reanalyze to regenerate stored descriptive results.
+
+### Minimum filter time constant (seconds) - `min_filter_time_constant`
+
+**Default:** `0.0001` seconds; positive.
+
+Safety floor clamped onto the exponential smoothing time constant for
+descriptive knee and shoulder filters (`max(min_filter_time_constant, overlay_smoothing or smoothing)`),
+preventing division by zero when smoothing is very small or zero.
+
+**Example:** with default `0.0001`, if both Overlay smoothing and Measurement
+smoothing were set near `0.00005`, the descriptive knee/shoulder filter uses
+`0.0001` seconds. Raising it to `0.05` guarantees at least `50 ms` smoothing.
 
 ### Entry duration - `entry_duration`
 
@@ -340,6 +386,168 @@ can also adapt it from qualifying observations.
 while `1.10` gives about `13.6%`. Raising the baseline can therefore make warning
 more likely without moving any dot. It does not change raw approved clearance.
 
+### Shoulder helper visibility floor - `shoulder_visibility_floor`
+
+**Default:** `0.50`; from `0` to `1`.
+
+Minimum landmark visibility checked inside the shoulder clearance geometry helper
+for ear, shoulder, hip, and nose points, alongside any stricter approval mask.
+
+**Example:** if an occluded ear has visibility `0.45`, it is excluded at `0.50`;
+lowering the helper floor to `0.40` lets fallback/descriptive shoulder estimates
+read that point (unless the stricter approval `confidence` mask rejects it).
+
+### Shoulder ear-to-hip scale factor - `shoulder_ear_hip_scale_factor`
+
+**Default:** `0.26`; positive multiplier.
+
+Primary normalization factor multiplying vertical ear-to-hip pixel height to
+compute the reference scale `S = factor * ear_hip_dy` for shoulder clearance.
+
+**Example:** when vertical ear-to-hip distance is `200` pixels, `0.26` produces a
+`52`-pixel reference scale `S`; a `52`-pixel shoulder/ear gap gives raw clearance
+`1.0`. Setting `0.25` gives `S = 50` px and ratio `1.04` for the same pixel gap.
+
+### Shoulder min ear-to-hip height (px) - `shoulder_min_ear_hip_px`
+
+**Default:** `20.0` pixels; positive.
+
+Minimum vertical ear-to-hip pixel separation required for a side's primary torso
+scale candidate to qualify before falling back to head/shoulder-width scales.
+
+**Example:** in a very small distant crop where vertical ear-to-hip distance is
+only `18` pixels, `20.0` skips the primary torso scale and uses head/shoulder
+fallbacks instead; setting `15.0` keeps the primary torso scale active there.
+
+### Shoulder fallback nose-ear scale factor - `shoulder_nose_ear_scale_factor`
+
+**Default:** `0.68`; positive multiplier.
+
+Fallback reference scale multiplier applied to the 2D pixel distance between
+nose and ear when no primary ear-to-hip candidate qualifies.
+
+**Example:** with hips out of frame and nose-to-ear distance `50` pixels, `0.68`
+yields fallback reference scale `S = 34` pixels. Adjusting to `0.70` gives `35`
+pixels to calibrate head-scale continuity for that camera angle.
+
+### Shoulder fallback ear-ear scale factor - `shoulder_ear_ear_scale_factor`
+
+**Default:** `0.65`; positive multiplier.
+
+Fallback reference scale multiplier applied to horizontal pixel distance between
+left and right ears when both ears are usable and no primary torso scale qualifies.
+
+**Example:** if horizontal ear-to-ear width is `60` pixels in a tight upper-body
+shot, `0.65` gives candidate scale `39` pixels (competing with the other fallback
+candidates, largest wins). Changing to `0.60` yields `36` pixels.
+
+### Shoulder fallback width scale factor - `shoulder_width_scale_factor`
+
+**Default:** `0.28`; positive multiplier.
+
+Fallback reference scale multiplier applied to horizontal pixel distance between
+left and right shoulders when no primary torso scale qualifies.
+
+**Example:** if shoulder-to-shoulder width is `140` pixels with hips cropped out,
+`0.28` yields `39.2` pixels as a fallback scale candidate; `0.30` yields `42.0` px.
+
+### Shoulder min reference scale (px) - `shoulder_min_ref_scale_px`
+
+**Default:** `8.0` pixels; positive.
+
+Minimum selected reference scale `S` in pixels required to compute normalized
+shoulder clearance (`ear_to_shoulder_dy / S`); smaller scales return unavailable.
+
+**Example:** if the subject is far away and `S` drops to `6.5` pixels, clearance
+is reported unavailable at `8.0` rather than dividing by near-zero noise. Lowering
+to `5.0` permits small distant shots at higher sensitivity to pixel jitter.
+
+### Shoulder baseline clamp floor - `shoulder_baseline_clamp_floor`
+
+**Default:** `0.20`; positive ratio.
+
+Minimum floor applied to the effective neutral clearance `B = max(floor, neutral_clearance)`
+when computing fallback shoulder elevation percentage `100 * (B - C) / B`.
+
+**Example:** even if neutral clearance is set very low (say `0.15`), `0.20`
+prevents division by near-zero by clamping `B = 0.20`. Keeping defaults near `1.05`
+never hits this floor unless configured lower.
+
+### Adaptive baseline max samples - `shoulder_adaptive_max_samples`
+
+**Default:** `600`; integer `1` or greater.
+
+Maximum number of qualifying relaxed-clearance samples stored for the adaptive
+neutral shoulder baseline window during fallback analysis/coaching.
+
+**Example:** at 30 FPS, `600` samples equals about 20 seconds of qualifying frames
+before the window stops appending new samples. Raising to `900` collects over 30s.
+
+### Adaptive baseline min samples - `shoulder_adaptive_min_samples`
+
+**Default:** `15`; integer from `1` up to `shoulder_adaptive_max_samples`.
+
+Minimum qualifying relaxed-clearance samples required before the adaptive
+percentile replaces/raises the starting neutral shoulder clearance baseline.
+
+**Example:** for the first `14` qualifying frames at default `15`, fallback
+elevation uses `shoulder_neutral_clearance` (`1.05`). On frame `15`, the `75th`
+percentile enters (`max(start, percentile)`). Setting `30` waits twice as long.
+
+### Adaptive baseline min clearance - `shoulder_adaptive_min_clearance`
+
+**Default:** `0.65`; positive ratio below `shoulder_adaptive_max_clearance`.
+
+Lowest raw clearance ratio `C` admitted into the adaptive relaxed-clearance
+sample window, filtering out already-tense/shrugged frames from the baseline.
+
+**Example:** a shrugged frame with raw clearance `0.55` is rejected from the
+baseline window at `0.65`, avoiding teaching the baseline that tense shoulders
+are "neutral". Lowering to `0.55` would admit tighter anatomy frames.
+
+### Adaptive baseline max clearance - `shoulder_adaptive_max_clearance`
+
+**Default:** `1.50`; positive ratio above `shoulder_adaptive_min_clearance`.
+
+Highest raw clearance ratio `C` admitted into the adaptive baseline window,
+rejecting outlier/elongated landmark spikes from raising the neutral baseline too high.
+
+**Example:** an anatomical outlier spike of `1.65` is skipped at `1.50` so it
+does not inflate the baseline. Raising to `1.80` accommodates dancers with unusually
+long measured ear-to-shoulder clearance.
+
+### Adaptive baseline percentile (%) - `shoulder_adaptive_percentile`
+
+**Default:** `75%`; above `0` up to `100%`.
+
+Percentile of collected qualifying relaxed-clearance samples compared against
+the starting neutral clearance (`max(start, percentile)`).
+
+**Example:** given 20 qualifying samples between `0.90` and `1.30`, `75%` takes
+the 75th percentile (~`1.20`) so a naturally relaxed baseline wins over `1.05`.
+Lowering to `50%` uses the median instead of the upper quartile.
+
+### Shoulder recovery min floor (%) - `shoulder_recovery_min_pct`
+
+**Default:** `4.0%`; zero or greater.
+
+Minimum percentage floor used in the fallback shoulder tension hysteresis
+recovery boundary `max(floor, shoulder_recovery_ratio * shoulder_raise_threshold)`.
+
+**Example:** if `shoulder_raise_threshold` is reduced to `5%` with `0.65` ratio
+(`3.25%`), the `4.0%` floor keeps the clear boundary at `4.0%` unless lowered.
+
+### Shoulder recovery threshold ratio - `shoulder_recovery_ratio`
+
+**Default:** `0.65`; above `0` up to `1.0`.
+
+Fraction of `shoulder_raise_threshold` used as the fallback shoulder recovery
+boundary (hysteresis band) once a shoulder warning has started.
+
+**Example:** at default `10%` raise threshold and `0.65` ratio, the warning starts
+at `10%` and clears once elevation drops below `max(4.0, 6.5) = 6.5%`. Setting
+`0.80` narrows the hysteresis band so recovery occurs at `8.0%`.
+
 ## 6. Embrace & knees
 
 Role/embrace recognition runs independently of the source of posture limits.
@@ -408,6 +616,61 @@ Persistence required for the fallback straight-knee banner.
 **Example:** a qualifying straight-looking interval of `0.7` seconds does not
 confirm at `1.0`, but can at `0.5`. A selected/default approved knee range uses
 Tracking's event timing instead.
+
+### Knee recovery margin (degrees) - `knee_recovery_margin`
+
+**Default:** `2.5` degrees; zero or greater.
+
+Hysteresis margin added above `closed_embrace_min_knee_bend` to form the
+fallback straight-knee clear boundary (`min_knee_bend + margin`).
+
+**Example:** with `closed_embrace_min_knee_bend = 8.0` and margin `2.5`, a
+straight-knee warning starts below `8.0°` and only clears once knee bend exceeds
+`10.5°`. Raising margin to `4.0` requires `12.0°` bend before clearing.
+
+### Knee helper visibility floor - `knee_visibility_floor`
+
+**Default:** `0.35`; from `0` to `1`.
+
+Minimum landmark visibility checked inside the knee flexion geometry helper for
+hip, knee, and ankle joints, alongside any stricter approval `confidence` mask.
+
+**Example:** if a dancer's trailing ankle dips to visibility `0.40`, it qualifies
+at `0.35` in descriptive knee overlays (when approval mask isn't stricter);
+raising this floor to `0.55` drops noisy low-visibility legs sooner.
+
+### Knee min segment length (px) - `knee_min_segment_px`
+
+**Default:** `10.0` pixels; positive.
+
+Minimum pixel length required for both the hip-to-knee (`u`) and ankle-to-knee (`v`)
+segments before computing the knee interior angle.
+
+**Example:** if foreshortening or a tiny subject shrinks the shin segment to `8`
+pixels, `10.0` rejects that leg rather than outputting unstable `atan/acos` angles.
+Lowering to `6.0` accepts smaller distant subjects at higher angular noise risk.
+
+### Knee tie-break other-leg max visibility - `knee_tiebreak_other_max_vis`
+
+**Default:** `0.60`; from `0` to `1`.
+
+Maximum visibility of the occluded/far leg below which the preferred-side knee
+tie-break rule can override `min(near_bend, far_bend)`.
+
+**Example:** when both legs qualify (`left` `0.90` vis at `14°` bend; `right`
+`0.50` vis at `3°`), `right < 0.60` permits selecting `left` (`14°`) instead of
+being misled by the noisy occluded leg. Lowering to `0.45` keeps `min(...)` active.
+
+### Knee tie-break min visibility advantage - `knee_tiebreak_min_advantage`
+
+**Default:** `0.15`; from `0` to `1`.
+
+Minimum visibility advantage (`preferred_vis - other_vis >= advantage`) required
+for the preferred camera-facing side to win the knee tie-break.
+
+**Example:** with preferred leg vis `0.72` and other leg `0.55` (difference `0.17`),
+`0.15` triggers preferring the camera-facing leg (provided other < `0.60`), whereas
+`0.25` keeps reporting the smaller bend across both legs.
 
 ## 7. Torso & hip offset
 
@@ -760,15 +1023,16 @@ controls. An interior angle of 170 degrees gives 10 degrees of projected flexion
 
 Normally the least-bent usable knee wins: 20 degrees on one side and 6 on the
 other gives 6, not their average. This does not identify a weight-bearing leg.
-If both legs qualify but the other leg's minimum visibility is below 0.60 and
-the preferred side is at least 0.15 more visible, the preferred side is used.
-The configurable strict confidence mask normally removes such a weak leg first.
+If both legs qualify but the other leg's minimum visibility is below
+`knee_tiebreak_other_max_vis` (default `0.60`) and the preferred side is at least
+`knee_tiebreak_min_advantage` (default `0.15`) more visible, the preferred side is
+used. The configurable strict confidence mask normally removes such a weak leg first.
 
 Required hip/knee/ankle points must pass the approval confidence/presence mask.
-The helper also has a fixed visibility floor of 0.35 and requires both leg
-segments to be at least 10 pixels. If neither leg qualifies, the sample is
-missing, not zero degrees. The unsigned image angle is not a 3D diagnosis of
-joint locking or hyperextension.
+The helper also checks `knee_visibility_floor` (default `0.35`) and requires both
+leg segments to be at least `knee_min_segment_px` (default `10` pixels). If neither
+leg qualifies, the sample is missing, not zero degrees. The unsigned image angle
+is not a 3D diagnosis of joint locking or hyperextension.
 
 ### Shoulder geometry
 
@@ -783,19 +1047,22 @@ Image y increases downward. A shoulder rising toward its ear reduces the gap.
 The smallest usable gap selects the more elevated-looking side, not an average
 and not the difference between the two shoulder heights.
 
-The reference scale is chosen as follows:
+The reference scale is chosen as follows (all multipliers and pixel floors are
+configurable under **Head & shoulders** in Settings):
 
-1. For each usable ear/hip pair with vertical separation greater than 20 pixels,
-   calculate `0.26 * vertical ear-to-hip separation`. Prefer the largest candidate.
+1. For each usable ear/hip pair with vertical separation greater than
+   `shoulder_min_ear_hip_px` (default `20` px), calculate
+   `shoulder_ear_hip_scale_factor * vertical ear-to-hip separation` (default `0.26`).
+   Prefer the largest candidate.
 2. Without such a candidate, take the largest available fallback:
-   - `0.68 * two-dimensional nose-to-paired-ear pixel distance`;
-   - `0.65 * horizontal distance between ears`;
-   - `0.28 * horizontal distance between shoulders`.
-3. If the selected scale is smaller than 8 pixels, the result is unavailable.
+   - `shoulder_nose_ear_scale_factor * two-dimensional nose-to-paired-ear pixel distance` (default `0.68`);
+   - `shoulder_ear_ear_scale_factor * horizontal distance between ears` (default `0.65`);
+   - `shoulder_width_scale_factor * horizontal distance between shoulders` (default `0.28`).
+3. If the selected scale is smaller than `shoulder_min_ref_scale_px` (default `8` px),
+   the result is unavailable.
 
-These constants are not Settings parameters. The helper requires visibility
-of at least 0.50; approval first applies the configurable confidence/presence
-mask and image-boundary checks.
+The helper checks `shoulder_visibility_floor` (default `0.50`); approval first
+applies the configurable confidence/presence mask and image-boundary checks.
 
 At ear-to-hip separation 200 pixels, S is `0.26 * 200 = 52` pixels.
 A selected shoulder/ear gap of 52 pixels gives C = 1.0; a gap of 41.6 gives 0.8.
@@ -807,7 +1074,7 @@ motion, perspective and model errors still matter.
 Fallback shoulder coaching converts clearance C to:
 
 ```text
-B = max(0.20, effective neutral clearance)
+B = max(shoulder_baseline_clamp_floor, effective neutral clearance)   # default floor 0.20
 elevation percent = 100 * (B - C) / B
 ```
 
@@ -816,21 +1083,24 @@ C greater than B can give a negative percentage. This does not measure muscle
 contraction.
 
 Current Library movement import starts from configured neutral clearance.
-It collects up to 600 raw clearances between 0.65 and 1.50. After at least 15
-qualifying samples, the baseline is the greater of its starting value and those
-samples' 75th percentile. A fixed raw gap can therefore acquire a different
-descriptive percentage as that baseline develops.
+It collects up to `shoulder_adaptive_max_samples` (default `600`) raw clearances
+between `shoulder_adaptive_min_clearance` (`0.65`) and `shoulder_adaptive_max_clearance`
+(`1.50`). After at least `shoulder_adaptive_min_samples` (`15`) qualifying samples,
+the baseline is the greater of its starting value and those samples'
+`shoulder_adaptive_percentile` (`75th`) percentile. A fixed raw gap can therefore
+acquire a different descriptive percentage as that baseline develops.
 
 For the fallback shoulder warning, recovery uses
-`max(4, 0.65 * shoulder_raise_threshold)` percent: 6.5% at the default.
-The fallback knee recovery boundary is its configured minimum plus 2.5 degrees:
-10.5 degrees at the default.
+`max(shoulder_recovery_min_pct, shoulder_recovery_ratio * shoulder_raise_threshold)`
+percent: `max(4.0, 0.65 * 10.0) = 6.5%` at defaults.
+The fallback knee recovery boundary is `closed_embrace_min_knee_bend + knee_recovery_margin`:
+`8.0 + 2.5 = 10.5` degrees at defaults.
 
 Applicable descriptive knee/shoulder filters use Overlay smoothing when nonzero,
-otherwise Measurement smoothing, with a minimum time constant of 0.0001 seconds.
-A gap above Max gap resets those filters. These raw descriptive helpers use their
-own visibility floors; a displayed descriptive number does not prove that the
-stricter approval checks passed.
+otherwise Measurement smoothing, clamped to at least `min_filter_time_constant`
+(default `0.0001` seconds). A gap above Max gap resets those filters. These raw
+descriptive helpers use their configured visibility floors; a displayed descriptive
+number does not prove that the stricter approval checks passed.
 
 **Approved knee/shoulder ranges do not use that adaptive percentage or
 descriptive smoothing as their raw calibration samples.** After approval,
@@ -843,11 +1113,12 @@ passages. Lost identity, missing landmarks and wrong views do not become zeros.
 Side/front eligibility uses the per-metric view and Max view width; `all` skips
 that split, not missing evidence.
 
-**Suggest middle 80% of examples** proposes the 10th and 90th percentiles,
-not the observed extremes or a universal technique standard. At least two
-usable samples and a positive reliable time interval are needed. Reliable
-duration excludes invalid intervals and uses the gap policy saved with the
-reference.
+**Suggest middle 80% of examples** proposes the configured
+`calibration_suggest_lower_pct` (`10th`) and `calibration_suggest_upper_pct`
+(`90th`) percentiles, not the observed extremes or a universal technique standard.
+At least `calibration_min_usable_samples` (default `2`) usable samples and a positive
+reliable time interval are needed. Reliable duration excludes invalid intervals
+and uses the gap policy saved with the reference.
 
 Inspect low/high examples and explicitly approve the acceptable minimum and
 maximum. Standing and walking distributions can differ. These measurements

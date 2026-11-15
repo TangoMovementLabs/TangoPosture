@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import tomllib
 from pathlib import Path
 
@@ -25,14 +26,100 @@ from PySide6.QtWidgets import (
 )
 
 from ...calibration.models import METRIC_DETAILS
-from ...config import SETTING_GROUPS, Config, RangeDefault, set_setting, setting_value
+from ...config import (
+    SETTING_DESCRIPTIONS,
+    SETTING_GROUPS,
+    Config,
+    RangeDefault,
+    set_setting,
+    setting_value,
+)
 from ..router import Router
 from ..service_bridge import ServiceBridge
+from ..theme import COLOR_COPPER, COLOR_TEXT_MUTED
 
 _FLOAT_RANGES = {
     "confidence": (0.0, 1.0),
+    "calibration_suggest_lower_pct": (0.0, 99.9999),
+    "calibration_suggest_upper_pct": (0.0001, 100.0),
+    "min_filter_time_constant": (0.000001, 10.0),
+    "shoulder_visibility_floor": (0.0, 1.0),
+    "shoulder_ear_hip_scale_factor": (0.0001, 10.0),
+    "shoulder_min_ear_hip_px": (0.0001, 10000.0),
+    "shoulder_nose_ear_scale_factor": (0.0001, 10.0),
+    "shoulder_ear_ear_scale_factor": (0.0001, 10.0),
+    "shoulder_width_scale_factor": (0.0001, 10.0),
+    "shoulder_min_ref_scale_px": (0.0001, 10000.0),
+    "shoulder_baseline_clamp_floor": (0.0001, 10.0),
+    "shoulder_adaptive_min_clearance": (0.0001, 100.0),
+    "shoulder_adaptive_max_clearance": (0.0002, 100.0),
+    "shoulder_adaptive_percentile": (0.0001, 100.0),
+    "shoulder_recovery_min_pct": (0.0, 1000.0),
+    "shoulder_recovery_ratio": (0.0001, 1.0),
+    "knee_recovery_margin": (0.0, 180.0),
+    "knee_visibility_floor": (0.0, 1.0),
+    "knee_min_segment_px": (0.0001, 10000.0),
+    "knee_tiebreak_other_max_vis": (0.0, 1.0),
+    "knee_tiebreak_min_advantage": (0.0, 1.0),
     "tango_bpm": (20.0, 240.0),
 }
+
+_INT_RANGES = {
+    "calibration_min_usable_samples": (2, 1_000_000),
+    "shoulder_adaptive_max_samples": (1, 1_000_000),
+    "shoulder_adaptive_min_samples": (1, 1_000_000),
+    "max_consecutive_high_ankle_steps": (1, 1_000),
+}
+
+
+def _guide_markdown_path() -> Path:
+    return Path(__file__).resolve().parents[4] / "docs" / "SETTINGS_BEGINNERS_GUIDE.md"
+
+
+def load_parameter_guides() -> dict[str, dict[str, str]]:
+    """Parse per-parameter explanations and worked examples from SETTINGS_BEGINNERS_GUIDE.md."""
+    guides: dict[str, dict[str, str]] = {}
+    guide_path = _guide_markdown_path()
+    if guide_path.is_file():
+        text = guide_path.read_text(encoding="utf-8")
+        sections = re.findall(
+            r"^### ([^\n]+) - `([^`]+)`\n(.*?)(?=^### |^## |\Z)",
+            text,
+            re.MULTILINE | re.DOTALL,
+        )
+        for title, key, raw_body in sections:
+            body = raw_body.strip()
+            # Drop trailing overview notes after the final calibration-default item.
+            if key == "knee_flexion" and "\n\nUse **Use as Settings defaults**" in body:
+                body = body.split("\n\nUse **Use as Settings defaults**", 1)[0].strip()
+            meta_line = ""
+            example_text = ""
+            body_for_explanation = body
+            meta_match = re.match(r"^\*\*(Default|Unit):\*\*\s*([^\n]+)", body_for_explanation)
+            if meta_match:
+                meta_line = f"{meta_match.group(1)}: {meta_match.group(2).strip()}"
+                body_for_explanation = body_for_explanation[meta_match.end():].strip()
+            example_idx = body_for_explanation.find("**Example:**")
+            if example_idx >= 0:
+                explanation_text = body_for_explanation[:example_idx].strip()
+                example_raw = body_for_explanation[example_idx + len("**Example:**"):].strip()
+                example_text = " ".join(example_raw.splitlines()).strip()
+            else:
+                explanation_text = " ".join(body_for_explanation.splitlines()).strip()
+            explanation_text = " ".join(explanation_text.splitlines()).strip()
+            if not explanation_text:
+                if key in SETTING_DESCRIPTIONS:
+                    explanation_text = SETTING_DESCRIPTIONS[key]
+                elif key in METRIC_DETAILS:
+                    group, label, unit = METRIC_DETAILS[key]
+                    explanation_text = f"{group} metric '{label}' measured in {unit}."
+            guides[key] = {
+                "title": title.strip(),
+                "meta": meta_line.replace("**", ""),
+                "explanation": explanation_text,
+                "example": example_text,
+            }
+    return guides
 
 _GROUP_HINTS = {
     "Quality & calibration": (
@@ -71,6 +158,9 @@ class SettingsScreen(QScrollArea):
         self.router = router
         self.field_widgets: dict[str, QWidget] = {}
         self.range_widgets: dict[str, tuple[QCheckBox, QDoubleSpinBox, QDoubleSpinBox, QComboBox]] = {}
+        self.help_toggles: dict[str, QPushButton] = {}
+        self.help_panels: dict[str, QFrame] = {}
+        self._parameter_guides = load_parameter_guides()
         self.setWidgetResizable(True)
         self.setFrameShape(QFrame.Shape.NoFrame)
 
@@ -85,7 +175,7 @@ class SettingsScreen(QScrollArea):
         title = QLabel("Application Settings")
         title.setProperty("class", "title")
         subtitle = QLabel(
-            "Configure video analysis, reference comparison, review, and Ollama options."
+            "Configure video analysis, algorithmic geometry parameters, reference comparison, review, and Ollama options."
         )
         subtitle.setProperty("class", "subtitle")
         title_box.addWidget(title)
@@ -93,12 +183,16 @@ class SettingsScreen(QScrollArea):
         header.addLayout(title_box)
         header.addStretch()
 
+        self.toggle_all_guides_btn = QPushButton("Expand All Guides")
+        self.toggle_all_guides_btn.setCheckable(True)
+        self.toggle_all_guides_btn.clicked.connect(self._toggle_all_guides)
         self.export_btn = QPushButton("Export TOML…")
         self.export_btn.clicked.connect(self._export_toml)
         self.import_btn = QPushButton("Import TOML…")
         self.import_btn.clicked.connect(self._import_toml)
         self.reset_btn = QPushButton("Reset Defaults")
         self.reset_btn.clicked.connect(self._reset_defaults)
+        header.addWidget(self.toggle_all_guides_btn)
         header.addWidget(self.export_btn)
         header.addWidget(self.import_btn)
         header.addWidget(self.reset_btn)
@@ -126,7 +220,12 @@ class SettingsScreen(QScrollArea):
             for field in fields:
                 editor, row_widget = self._create_editor(field, setting_value(cfg, field))
                 self.field_widgets[field] = editor
-                form.addRow(self._field_label(field), row_widget)
+                wrapped = self._wrap_with_guide(
+                    field,
+                    row_widget,
+                    fallback_summary=SETTING_DESCRIPTIONS.get(field, ""),
+                )
+                form.addRow(self._field_label(field), wrapped)
             self.tabs.addTab(page, group)
         ranges_page = QWidget()
         ranges_form = QFormLayout(ranges_page)
@@ -137,7 +236,7 @@ class SettingsScreen(QScrollArea):
         )
         ranges_hint.setWordWrap(True)
         ranges_form.addRow(ranges_hint)
-        for key, (_group, label, unit) in METRIC_DETAILS.items():
+        for key, (metric_group, label, unit) in METRIC_DETAILS.items():
             row = QWidget()
             row_layout = QHBoxLayout(row)
             row_layout.setContentsMargins(0, 0, 0, 0)
@@ -153,7 +252,12 @@ class SettingsScreen(QScrollArea):
             enabled.toggled.connect(view.setEnabled)
             for widget in (enabled, lower, upper, view):
                 row_layout.addWidget(widget)
-            ranges_form.addRow(f"{label} ({unit})", row)
+            wrapped_range = self._wrap_with_guide(
+                key,
+                row,
+                fallback_summary=f"{metric_group} metric ({unit}).",
+            )
+            ranges_form.addRow(f"{label} ({unit})", wrapped_range)
             self.range_widgets[key] = (enabled, lower, upper, view)
         self.tabs.addTab(ranges_page, "Calibration defaults")
         layout.addWidget(self.tabs, 1)
@@ -185,13 +289,19 @@ class SettingsScreen(QScrollArea):
             editor = combo
         elif isinstance(value, int):
             int_spin = QSpinBox()
-            int_spin.setRange(0, 2_147_483_647)
+            int_spin.setRange(*_INT_RANGES.get(field, (0, 2_147_483_647)))
             int_spin.setValue(value)
             editor = int_spin
         elif isinstance(value, float):
             float_spin = QDoubleSpinBox()
             float_spin.setDecimals(12)
-            float_spin.setSingleStep(0.1)
+            float_spin.setSingleStep(
+                0.0001
+                if field == "min_filter_time_constant"
+                else 0.05
+                if _FLOAT_RANGES.get(field) == (0.0, 1.0)
+                else 0.1
+            )
             float_spin.setRange(
                 *_FLOAT_RANGES.get(field, (-1_000_000_000.0, 1_000_000_000.0))
             )
@@ -225,11 +335,36 @@ class SettingsScreen(QScrollArea):
             "analysis_model": "Offline analysis model",
             "data_dir": "Data folder",
             "confidence": "Minimum landmark confidence",
+            "calibration_suggest_lower_pct": "Suggested lower percentile (%)",
+            "calibration_suggest_upper_pct": "Suggested upper percentile (%)",
+            "calibration_min_usable_samples": "Min usable calibration samples",
             "smoothing": "Measurement smoothing (seconds)",
+            "overlay_smoothing": "Overlay smoothing (seconds)",
+            "min_filter_time_constant": "Minimum filter time constant (s)",
             "replay_joint_interpolation": "Review joint interpolation",
             "replay_joint_max_gap": "Maximum joint gap to fill (seconds; 0 disables)",
             "head_down_angle": "Head down angle limit (degrees)",
             "shoulder_raise_threshold": "Shoulder tension limit (%)",
+            "shoulder_visibility_floor": "Shoulder helper visibility floor",
+            "shoulder_ear_hip_scale_factor": "Shoulder ear-hip scale factor",
+            "shoulder_min_ear_hip_px": "Shoulder min ear-hip height (px)",
+            "shoulder_nose_ear_scale_factor": "Shoulder nose-ear scale factor",
+            "shoulder_ear_ear_scale_factor": "Shoulder ear-ear scale factor",
+            "shoulder_width_scale_factor": "Shoulder width scale factor",
+            "shoulder_min_ref_scale_px": "Shoulder min reference scale (px)",
+            "shoulder_baseline_clamp_floor": "Shoulder baseline clamp floor",
+            "shoulder_adaptive_max_samples": "Adaptive baseline max samples",
+            "shoulder_adaptive_min_samples": "Adaptive baseline min samples",
+            "shoulder_adaptive_min_clearance": "Adaptive baseline min clearance",
+            "shoulder_adaptive_max_clearance": "Adaptive baseline max clearance",
+            "shoulder_adaptive_percentile": "Adaptive baseline percentile (%)",
+            "shoulder_recovery_min_pct": "Shoulder recovery min floor (%)",
+            "shoulder_recovery_ratio": "Shoulder recovery threshold ratio",
+            "knee_recovery_margin": "Knee recovery margin (degrees)",
+            "knee_visibility_floor": "Knee helper visibility floor",
+            "knee_min_segment_px": "Knee min segment length (px)",
+            "knee_tiebreak_other_max_vis": "Knee tie-break other max visibility",
+            "knee_tiebreak_min_advantage": "Knee tie-break min vis advantage",
             "slow_tango_max_bpm": "Slow tango max BPM",
             "tango_bpm": "Fallback tempo (BPM)",
             "ollama_base_url": "Ollama server address",
@@ -240,6 +375,86 @@ class SettingsScreen(QScrollArea):
             "ollama_temperature": "Response variation",
         }
         return labels.get(field, field.replace(".", " / ").replace("_", " ").capitalize())
+
+    def _wrap_with_guide(
+        self,
+        key: str,
+        control_widget: QWidget,
+        *,
+        fallback_summary: str = "",
+    ) -> QWidget:
+        wrapper = QWidget()
+        wrapper_layout = QVBoxLayout(wrapper)
+        wrapper_layout.setContentsMargins(0, 0, 0, 4)
+        wrapper_layout.setSpacing(4)
+
+        top_row = QHBoxLayout()
+        top_row.setContentsMargins(0, 0, 0, 0)
+        top_row.setSpacing(8)
+        top_row.addWidget(control_widget, 1)
+
+        toggle_btn = QPushButton("▸ Explanation && example")
+        toggle_btn.setCheckable(True)
+        toggle_btn.setStyleSheet("padding: 4px 10px; font-size: 12px;")
+        top_row.addWidget(toggle_btn)
+        wrapper_layout.addLayout(top_row)
+
+        guide = self._parameter_guides.get(key, {})
+        meta_text = guide.get("meta", "").strip()
+        explanation_text = (guide.get("explanation") or fallback_summary).strip()
+        example_text = guide.get("example", "").strip()
+
+        panel = QFrame()
+        panel.setProperty("class", "card")
+        panel.setVisible(False)
+        panel_layout = QVBoxLayout(panel)
+        panel_layout.setContentsMargins(12, 8, 12, 8)
+        panel_layout.setSpacing(4)
+
+        if meta_text:
+            meta_lbl = QLabel(meta_text)
+            meta_lbl.setWordWrap(True)
+            meta_lbl.setStyleSheet(f"color: {COLOR_COPPER}; font-size: 12px; font-weight: 600;")
+            panel_layout.addWidget(meta_lbl)
+        if explanation_text:
+            exp_lbl = QLabel(explanation_text)
+            exp_lbl.setWordWrap(True)
+            exp_lbl.setStyleSheet("font-size: 12px;")
+            panel_layout.addWidget(exp_lbl)
+        if example_text:
+            ex_lbl = QLabel(f"Example: {example_text}")
+            ex_lbl.setWordWrap(True)
+            ex_lbl.setStyleSheet(f"color: {COLOR_TEXT_MUTED}; font-size: 12px;")
+            panel_layout.addWidget(ex_lbl)
+        key_lbl = QLabel(f"Setting key: {key}")
+        key_lbl.setStyleSheet(f"color: {COLOR_TEXT_MUTED}; font-size: 11px;")
+        panel_layout.addWidget(key_lbl)
+
+        wrapper_layout.addWidget(panel)
+
+        def _on_toggle(checked: bool) -> None:
+            panel.setVisible(checked)
+            toggle_btn.setText("▾ Hide explanation" if checked else "▸ Explanation && example")
+            self._sync_toggle_all_button()
+
+        toggle_btn.toggled.connect(_on_toggle)
+        self.help_toggles[key] = toggle_btn
+        self.help_panels[key] = panel
+        return wrapper
+
+    def _toggle_all_guides(self, checked: bool) -> None:
+        for btn in self.help_toggles.values():
+            btn.setChecked(checked)
+        self.toggle_all_guides_btn.setText("Collapse All Guides" if checked else "Expand All Guides")
+
+    def _sync_toggle_all_button(self) -> None:
+        if not self.help_toggles:
+            return
+        all_open = all(btn.isChecked() for btn in self.help_toggles.values())
+        self.toggle_all_guides_btn.blockSignals(True)
+        self.toggle_all_guides_btn.setChecked(all_open)
+        self.toggle_all_guides_btn.setText("Collapse All Guides" if all_open else "Expand All Guides")
+        self.toggle_all_guides_btn.blockSignals(False)
 
     def _browse_path(self, field: str, editor: QLineEdit) -> None:
         if field == "data_dir":

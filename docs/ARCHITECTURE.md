@@ -19,6 +19,9 @@ For user-facing instructions, see:
 - [Settings guide](SETTINGS_BEGINNERS_GUIDE.md).
 - [Tracking-engine guide](TRACKING_ENGINE_BEGINNERS_GUIDE.md).
 
+For proposed cleanup and future refactoring on top of this baseline, see the
+[Technical debt and redesign proposal](TECHNICAL_DEBT_AND_REDESIGN.md).
+
 Some companion guides describe retained camera workflows. Use the reachability
 table below and the actual shell/router as the authority for current desktop
 entry points.

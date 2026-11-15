@@ -15,6 +15,8 @@ from ...geometry import (
     axis_curve_alignment,
     head_horizontal_alignment,
     knee_bend_alignment,
+    knee_geometry_kwargs,
+    shoulder_geometry_kwargs,
     shoulder_tension_alignment,
     torso_axis_alignment,
 )
@@ -111,7 +113,9 @@ def render_approved_feedback(
                          (round(ex + direction * length * math.cos(rad)),
                           round(ey - length * math.sin(rad))), color, 3, cv2.LINE_AA)
         elif key == "shoulder_clearance":
-            shoulder_info = shoulder_tension_alignment(pose, frame.width, frame.height)
+            shoulder_info = shoulder_tension_alignment(
+                pose, frame.width, frame.height, **shoulder_geometry_kwargs(cfg)
+            )
             if shoulder_info is not None:
                 _, _, shoulder_ear, joint = shoulder_info
                 line(shoulder_ear, joint, color)
@@ -146,7 +150,9 @@ def render_approved_feedback(
                 leg = {name: value for name, value in pose.items() if name in {
                     f"{side}_hip", f"{side}_knee", f"{side}_ankle",
                 }}
-                knee_info = knee_bend_alignment(leg, frame.width, frame.height, side)
+                knee_info = knee_bend_alignment(
+                    leg, frame.width, frame.height, side, **knee_geometry_kwargs(cfg)
+                )
                 if knee_info is not None and row.get("raw") is not None:
                     candidates.append((abs(knee_info[0] - row["raw"]), knee_info[1][0]))
             if candidates:

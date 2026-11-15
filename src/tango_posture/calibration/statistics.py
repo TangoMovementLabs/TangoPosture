@@ -14,9 +14,15 @@ from .models import Passage
 def summarize_examples(
     samples: list[tuple[float, float | None]], passages: list[Passage],
     max_gap: float, lower: float | None = None, upper: float | None = None,
+    *,
+    suggest_lower_pct: float = 10.0,
+    suggest_upper_pct: float = 90.0,
+    min_usable_samples: int = 2,
 ) -> dict[str, Any]:
     if not math.isfinite(max_gap) or max_gap <= 0:
         raise ValueError("Maximum tracking gap must be finite and positive")
+    if not (0.0 <= suggest_lower_pct < suggest_upper_pct <= 100.0):
+        raise ValueError("Suggested percentiles must satisfy 0 <= lower < upper <= 100")
     if any(not math.isfinite(t) for t, _ in samples) or any(
         b[0] <= a[0] for a, b in pairwise(samples)
     ):
@@ -26,10 +32,12 @@ def summarize_examples(
         raise ValueError("Example passages must not overlap")
     selected = [(t, value) for t, value in samples if any(p.start <= t < p.end for p in ordered)]
     valid = [(t, value) for t, value in selected if value is not None and math.isfinite(value)]
-    if len(valid) < 2:
+    if len(valid) < max(2, int(min_usable_samples)):
         raise ValueError("Not enough reliable samples; choose another passage or skip this metric")
     values = [value for _, value in valid]
-    p10, median, p90 = map(float, np.quantile(values, [0.1, 0.5, 0.9]))
+    p10, median, p90 = map(
+        float, np.quantile(values, [suggest_lower_pct / 100.0, 0.5, suggest_upper_pct / 100.0])
+    )
     lo, hi = p10 if lower is None else lower, p90 if upper is None else upper
     if not math.isfinite(lo) or not math.isfinite(hi) or lo > hi:
         raise ValueError("Acceptable range must have finite, ordered limits")

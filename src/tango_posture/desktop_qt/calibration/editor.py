@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDoubleSpinBox,
+    QFileDialog,
     QFormLayout,
     QHBoxLayout,
     QLabel,
@@ -37,7 +38,7 @@ from ...archive import (
     read_analytics,
     read_movement_analysis,
 )
-from ...calibration.archives import save_range_profile
+from ...calibration.archives import read_range_profile, save_range_profile
 from ...calibration.evidence import cached_evidence, dancer_frames
 from ...calibration.measurements import metric_samples
 from ...calibration.models import (
@@ -53,6 +54,7 @@ from ...config import Config
 from ...domain import FrameObservation
 from ...movement import render_movement_overlay, validate_movement_analysis
 from ...quality import reliable
+from ...references.archives import reference_directory
 from ...references.coach import (
     compare_approved_coach_data,
     interpolate_coach_data,
@@ -66,28 +68,101 @@ from ..service_bridge import ServiceBridge, numpy_to_qimage
 from .preview import render_approved_feedback
 
 
+def _resolve_reference_for_profile(profile: RangeProfile, profile_path: Path, cfg: Config) -> Path:
+    archive_name = str(profile.source.get("archive") or "").strip()
+    archive_hash = str(profile.source.get("archive_sha256") or "").strip()
+    search_dirs: list[Path] = []
+    for directory in (reference_directory(cfg.data_dir), profile_path.parent.parent / "references"):
+        if directory not in search_dirs:
+            search_dirs.append(directory)
+    if archive_name:
+        for directory in search_dirs:
+            candidate = directory / archive_name
+            if candidate.is_file() and (not archive_hash or file_sha256(candidate) == archive_hash):
+                return candidate
+    if archive_hash:
+        for directory in search_dirs:
+            if not directory.is_dir():
+                continue
+            for candidate in sorted(directory.glob("*.tpr")):
+                if file_sha256(candidate) == archive_hash:
+                    return candidate
+    raise FileNotFoundError(
+        f"Source reference '{archive_name or 'unknown'}' was not found in "
+        f"{reference_directory(cfg.data_dir)}. Keep the source .tpr reference in Library "
+        "to edit this calibration."
+    )
+
+
+def open_profile_calibration_editor(
+    path: Path,
+    cfg: Config,
+    parent: QWidget,
+    *,
+    bridge: ServiceBridge | None = None,
+) -> Path | None:
+    """Open CalibrationEditor for an existing .tpc profile, prompting if its .tpr moved."""
+    source_reference: Path | None = None
+    while True:
+        try:
+            editor = CalibrationEditor(
+                path,
+                cfg,
+                parent,
+                bridge=bridge,
+                source_reference=source_reference,
+            )
+            if editor.exec() == QDialog.DialogCode.Accepted:
+                return editor.saved_path
+            return None
+        except FileNotFoundError:
+            chosen, _ = QFileDialog.getOpenFileName(
+                parent,
+                "Locate Source Reference (.tpr)",
+                str(reference_directory(cfg.data_dir)),
+                "Reference archives (*.tpr);;All files (*)",
+            )
+            if not chosen:
+                raise
+            source_reference = Path(chosen)
+
+
 class CalibrationEditor(QDialog):
     def __init__(
         self, path: Path, cfg: Config, parent: QWidget | None = None, *,
         holds: dict[str, list[Passage]] | None = None,
         base_profile: RangeProfile | None = None,
         bridge: ServiceBridge | None = None,
+        source_reference: Path | None = None,
     ) -> None:
         super().__init__(parent)
-        if path.suffix.lower() != ".tpr":
+        suffix = path.suffix.lower()
+        if suffix == ".tpc":
+            self._editing_profile_path: Path | None = path
+            base_profile = base_profile or read_range_profile(path)
+            tpr_path = source_reference or _resolve_reference_for_profile(base_profile, path, cfg)
+            self.setWindowTitle("Edit approved range calibration")
+        elif suffix == ".tpr":
+            self._editing_profile_path = None
+            tpr_path = path
+            self.setWindowTitle("Review evidence & approve calibration ranges")
+        else:
             raise ValueError("Create a .tpr reference before approving calibration ranges")
-        self.setWindowTitle("Review evidence & approve calibration ranges")
         self.resize(1180, 800)
         self.cfg = cfg.model_copy(deep=True)
         self.bridge = bridge
-        self.evidence = cached_evidence(path)
+        self.evidence = cached_evidence(tpr_path)
         self._source_hash = self.evidence.source["archive_sha256"]
         self.holds = holds or {}
         self.base_profile = base_profile
         if base_profile is not None and base_profile.model_hash != self.evidence.model_hash:
             raise ValueError("Reference and camera measurement models differ; reanalyze the reference")
         self.saved_path: Path | None = None
-        self.approved: dict[str, ApprovedRange] = {}
+        self.approved: dict[str, ApprovedRange] = (
+            dict(base_profile.metrics)
+            if self._editing_profile_path is not None and base_profile is not None
+            else {}
+        )
         self._approved_coach_data: dict[str, Any] | None = None
         self._selected_frames: list[FrameObservation] = []
         self._stats: dict[str, Any] | None = None
@@ -100,9 +175,9 @@ class CalibrationEditor(QDialog):
             **self.cfg.model_dump(),
             **{key: capture[key] for key in ("side", "facing", "width", "height", "capture_profile")},
         })
-        self._archive = PracticeArchive(path)
+        self._archive = PracticeArchive(tpr_path)
         try:
-            if file_sha256(path) != self._source_hash:
+            if file_sha256(tpr_path) != self._source_hash:
                 raise ValueError("Reference changed while loading evidence; reopen it")
             segment = self._archive.manifest["segments"][0]
             descriptor = json.loads((self._archive.folder / "reference.json").read_text())
@@ -120,6 +195,25 @@ class CalibrationEditor(QDialog):
                     ):
                         raise ValueError("Saved dancer selection does not match the cached poses")
                     self._anchors[anchor["frame"]] = anchor["dancer"]
+            if self._editing_profile_path is not None and base_profile is not None:
+                profile_anchors = base_profile.source.get("dancer_anchors")
+                if isinstance(profile_anchors, list) and profile_anchors:
+                    restored: dict[int, int] = {}
+                    valid = True
+                    for anchor in profile_anchors:
+                        if (
+                            not isinstance(anchor, dict) or type(anchor.get("frame")) is not int
+                            or type(anchor.get("dancer")) is not int
+                            or not 0 <= anchor["frame"] < len(self.evidence.frames)
+                            or not 0 <= anchor["dancer"] < len(
+                                self.evidence.frames[anchor["frame"]].poses
+                            )
+                        ):
+                            valid = False
+                            break
+                        restored[anchor["frame"]] = anchor["dancer"]
+                    if valid and restored:
+                        self._anchors = restored
             self._reader = VideoReader(self._archive.folder / segment["video"])
             if self._reader.count != len(self.evidence.frames):
                 self._reader.close()
@@ -160,9 +254,14 @@ class CalibrationEditor(QDialog):
 
         layout = QVBoxLayout(self)
         form = QHBoxLayout()
-        self.name_input = QLineEdit(
-            f"{path.stem} calibration" if base_profile is None else f"{base_profile.name} camera check"
+        default_name = (
+            base_profile.name
+            if self._editing_profile_path is not None and base_profile is not None
+            else f"{base_profile.name} camera check"
+            if base_profile is not None
+            else f"{tpr_path.stem} calibration"
         )
+        self.name_input = QLineEdit(default_name)
         self.context_combo = QComboBox()
         self.context_combo.addItems(PRACTICE_CONTEXTS)
         self.context_combo.setToolTip(
@@ -333,9 +432,14 @@ class CalibrationEditor(QDialog):
         self.passages_input.editingFinished.connect(lambda: self._update_stats())
         self.lower_spin.valueChanged.connect(lambda: self._update_stats())
         self.upper_spin.valueChanged.connect(lambda: self._update_stats())
-        self.view_combo.currentIndexChanged.connect(self._recompute)
+        self.view_combo.currentIndexChanged.connect(lambda: self._recompute())
         self._samples: dict[str, list[tuple[float, float | None]]] = {}
         self._recompute()
+        if self.approved:
+            self._approved_coach_data = self._evaluate_approved(self.approved)
+            self.approved_label.setText(
+                "Approved: " + ", ".join(METRIC_DETAILS[k][1] for k in self.approved)
+            )
         self._change_step(STEPS[0])
         self._seek_frame(0)
         self.finished.connect(self._release)
@@ -355,7 +459,7 @@ class CalibrationEditor(QDialog):
         self._recompute()
         self._seek_frame(self.scrubber.value())
 
-    def _recompute(self, *_args: object) -> None:
+    def _recompute(self, *_args: object, suggest: bool = True) -> None:
         from ...calibration.evidence import Evidence
 
         anchors = sorted(self._anchors.items())
@@ -378,7 +482,7 @@ class CalibrationEditor(QDialog):
         cfg = self.cfg.model_copy(update={"allow_all_angles": view_mode != "side"})
         self._samples = metric_samples(frames, cfg, view=view_mode)  # type: ignore[arg-type]
         if self.metric_combo.currentData():
-            self._update_stats(suggest=True)
+            self._update_stats(suggest=suggest)
 
     def _change_step(self, step: str) -> None:
         self.metric_combo.blockSignals(True)
@@ -410,12 +514,21 @@ class CalibrationEditor(QDialog):
         if approved is not None:
             passages = approved.passages
         self.passages_input.setText("; ".join(f"{p.start:.6f}-{p.end:.6f}" for p in passages))
-        self._update_stats(suggest=target is None)
         if target is not None:
+            view_changed = self.view_combo.currentText() != target.view
+            self.view_combo.blockSignals(True)
             self.view_combo.setCurrentText(target.view)
-            self.lower_spin.setValue(target.lower)
-            self.upper_spin.setValue(target.upper)
-        self.live_check.setChecked(False)
+            self.view_combo.blockSignals(False)
+            if view_changed:
+                self._recompute(suggest=False)
+            for field, val in ((self.lower_spin, target.lower), (self.upper_spin, target.upper)):
+                field.blockSignals(True)
+                field.setValue(val)
+                field.blockSignals(False)
+            self._update_stats(suggest=False)
+        else:
+            self._update_stats(suggest=True)
+        self.live_check.setChecked(bool(target.camera_check_passed) if target is not None else False)
 
     def _select_hold(self, index: int) -> None:
         holds = (
@@ -450,6 +563,9 @@ class CalibrationEditor(QDialog):
                 self._samples[key], self._passages(), self.evidence.max_gap,
                 None if suggest else self.lower_spin.value(),
                 None if suggest else self.upper_spin.value(),
+                suggest_lower_pct=self.cfg.calibration_suggest_lower_pct,
+                suggest_upper_pct=self.cfg.calibration_suggest_upper_pct,
+                min_usable_samples=self.cfg.calibration_min_usable_samples,
             )
             self._stats = stats
             if suggest:
@@ -457,9 +573,16 @@ class CalibrationEditor(QDialog):
                     field.blockSignals(True)
                     field.setValue(value)
                     field.blockSignals(False)
+            lo_pct = self.cfg.calibration_suggest_lower_pct
+            hi_pct = self.cfg.calibration_suggest_upper_pct
+            pct_label = (
+                "Observed middle 80%"
+                if (lo_pct, hi_pct) == (10.0, 90.0)
+                else f"Observed {lo_pct:g}th–{hi_pct:g}th%"
+            )
             self.stats_label.setText(
                 f"Median: {stats['median']:.4g} {METRIC_DETAILS[key][2]}\n"
-                f"Observed middle 80%: {stats['p10']:.4g} … {stats['p90']:.4g}\n"
+                f"{pct_label}: {stats['p10']:.4g} … {stats['p90']:.4g}\n"
                 f"Usable: {stats['valid_duration']:.2f} / {stats['selected_duration']:.2f}s "
                 f"({stats['samples']} samples)\nInside edited range: {stats['inside_fraction']:.1%}"
             )
@@ -598,17 +721,28 @@ class CalibrationEditor(QDialog):
             raise ValueError("Confirm that manually linked passages follow the same dancer")
         if not self.approved:
             raise ValueError("Approve at least one metric; skipped metrics will remain unavailable")
+        name = self.name_input.text().strip()
+        source: dict[str, Any] = {
+            **self.evidence.source, "dancer_at_track_start": self.dancer_spin.value() - 1,
+            "track_start_frame": self._track_start,
+            "dancer_anchors": [
+                {"frame": frame, "dancer": dancer} for frame, dancer in sorted(self._anchors.items())
+            ],
+        }
+        extra: dict[str, Any] = {}
+        if self._editing_profile_path is not None and self.base_profile is not None:
+            if "target_reference" in self.base_profile.source:
+                source["target_reference"] = self.base_profile.source["target_reference"]
+            if name == self.base_profile.name:
+                extra["id"] = self.base_profile.id
+                extra["created_at_utc"] = self.base_profile.created_at_utc
+        elif self.base_profile is not None:
+            source["target_reference"] = self.base_profile.source
         return RangeProfile(
-            name=self.name_input.text().strip(), context=self.context_combo.currentText(),
+            **extra,
+            name=name, context=self.context_combo.currentText(),
             model_hash=self.evidence.model_hash, capture_profile=self.evidence.capture_profile,
-            source={
-                **self.evidence.source, "dancer_at_track_start": self.dancer_spin.value() - 1,
-                "track_start_frame": self._track_start,
-                "dancer_anchors": [
-                    {"frame": frame, "dancer": dancer} for frame, dancer in sorted(self._anchors.items())
-                ],
-                **({"target_reference": self.base_profile.source} if self.base_profile else {}),
-            },
+            source=source,
             metrics=self.approved,
             camera_checks={"holds": {
                 key: [hold.model_dump() for hold in holds] for key, holds in self.holds.items()
@@ -628,8 +762,20 @@ class CalibrationEditor(QDialog):
     def _save(self) -> None:
         try:
             result = self._approved_profile()
-            path = calibration_path(calibration_directory(self.cfg.data_dir), result.name)
-            save_range_profile(path, result)
+            if (
+                self._editing_profile_path is not None
+                and self.base_profile is not None
+                and result.name == self.base_profile.name
+            ):
+                path = self._editing_profile_path
+                overwrite = True
+            else:
+                path = calibration_path(calibration_directory(self.cfg.data_dir), result.name)
+                overwrite = (
+                    self._editing_profile_path is not None
+                    and path.resolve() == self._editing_profile_path.resolve()
+                )
+            save_range_profile(path, result, overwrite=overwrite)
             self.saved_path = path
             self.accept()
         except (OSError, ValueError, TypeError) as error:

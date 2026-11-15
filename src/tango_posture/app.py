@@ -44,7 +44,9 @@ from .geometry import (
     detect_role,
     head_horizontal_alignment,
     knee_bend_alignment,
+    knee_geometry_kwargs,
     pixel,
+    shoulder_geometry_kwargs,
     shoulder_tension_alignment,
 )
 from .metrics import measure
@@ -842,8 +844,15 @@ class Application:
                     else self.cfg.shoulder_neutral_clearance
                 )
                 sh_neutral = (
-                    max(sh_neutral_base, float(np.percentile(self.relaxed_clearances, 75)))
-                    if len(self.relaxed_clearances) >= 15
+                    max(
+                        sh_neutral_base,
+                        float(
+                            np.percentile(
+                                self.relaxed_clearances, self.cfg.shoulder_adaptive_percentile
+                            )
+                        ),
+                    )
+                    if len(self.relaxed_clearances) >= self.cfg.shoulder_adaptive_min_samples
                     else sh_neutral_base
                 )
                 axis_neutral = (
@@ -854,9 +863,16 @@ class Application:
                 if len(frame.poses) == 1:
                     pose = frame.poses[0]
                     raw_role = detect_role(pose)
-                    metric_tau = max(1e-4, self.cfg.overlay_smoothing or self.cfg.smoothing)
+                    metric_tau = max(
+                        self.cfg.min_filter_time_constant,
+                        self.cfg.overlay_smoothing or self.cfg.smoothing,
+                    )
                     knee_info = knee_bend_alignment(
-                        pose, frame.width, frame.height, side=self.cfg.side
+                        pose,
+                        frame.width,
+                        frame.height,
+                        side=self.cfg.side,
+                        **knee_geometry_kwargs(self.cfg),
                     )
                     if knee_info is not None:
                         raw_knee_deg = knee_info[0]
@@ -922,7 +938,11 @@ class Application:
                         self.head_last_ts = timestamp
                         head_angle = self.head_smoothed
                     sh_info = shoulder_tension_alignment(
-                        pose, frame.width, frame.height, neutral_clearance=sh_neutral
+                        pose,
+                        frame.width,
+                        frame.height,
+                        neutral_clearance=sh_neutral,
+                        **shoulder_geometry_kwargs(self.cfg),
                     )
                     if sh_info is not None:
                         raw_elev_pct = sh_info[0]
@@ -933,7 +953,12 @@ class Application:
                             and timestamp >= self.cal_start
                         ):
                             self.cal_shoulder_clearances.append(raw_clear)
-                        elif len(self.relaxed_clearances) < 600 and 0.65 <= raw_clear <= 1.50:
+                        elif (
+                            len(self.relaxed_clearances) < self.cfg.shoulder_adaptive_max_samples
+                            and self.cfg.shoulder_adaptive_min_clearance
+                            <= raw_clear
+                            <= self.cfg.shoulder_adaptive_max_clearance
+                        ):
                             self.relaxed_clearances.append(raw_clear)
                         if (
                             self.shoulder_smoothed is None
@@ -1054,7 +1079,10 @@ class Application:
                     head_down_elapsed = 0.0
                 bad_head = head_down_elapsed >= self.cfg.head_down_duration
 
-                sh_clear_threshold = max(4.0, self.cfg.shoulder_raise_threshold * 0.65)
+                sh_clear_threshold = max(
+                    self.cfg.shoulder_recovery_min_pct,
+                    self.cfg.shoulder_raise_threshold * self.cfg.shoulder_recovery_ratio,
+                )
                 if shoulder_elev_pct is not None:
                     if shoulder_elev_pct >= self.cfg.shoulder_raise_threshold:
                         if self.shoulder_tension_since is None:
@@ -1081,7 +1109,9 @@ class Application:
                         shoulder_tension_elapsed = 0.0
                 bad_shoulders = shoulder_tension_elapsed >= self.cfg.shoulder_tension_duration
 
-                knee_clear_deg = self.cfg.closed_embrace_min_knee_bend + 2.5
+                knee_clear_deg = (
+                    self.cfg.closed_embrace_min_knee_bend + self.cfg.knee_recovery_margin
+                )
                 if knee_bend_deg is not None:
                     if knee_bend_deg < self.cfg.closed_embrace_min_knee_bend:
                         if self.knee_straight_since is None:
@@ -1381,6 +1411,8 @@ class Application:
                         show_vertical_axis=self.show_vertical_axis,
                         show_footer=self.display is None,
                         settings_coaching=settings_coaching,
+                        shoulder_geometry=shoulder_geometry_kwargs(self.cfg),
+                        knee_geometry=knee_geometry_kwargs(self.cfg),
                     )
                     if self.record_overlay and (not self.calibration_only or calibration_frame):
                         if self.overlay_writer is None:
@@ -1403,6 +1435,8 @@ class Application:
                                 show_vertical_axis=True,
                                 show_footer=False,
                                 settings_coaching=settings_coaching,
+                                shoulder_geometry=shoulder_geometry_kwargs(self.cfg),
+                                knee_geometry=knee_geometry_kwargs(self.cfg),
                             )
                             if self.overlay_lines_writer is None:
                                 lines_path = self.record_overlay.with_name(

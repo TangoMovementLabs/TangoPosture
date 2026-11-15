@@ -74,6 +74,7 @@ class ProfileDetailsDialog(QDialog):
         parent: QWidget | None = None,
         *,
         on_use_defaults: Callable[[], None] | None = None,
+        on_edit_calibration: Callable[[], None] | None = None,
     ) -> None:
         super().__init__(parent)
         self.profile = profile
@@ -214,6 +215,16 @@ class ProfileDetailsDialog(QDialog):
         footer_note.setWordWrap(True)
         footer.addWidget(footer_note, 1)
 
+        if on_edit_calibration is not None:
+            self.edit_calibration_btn = QPushButton("Edit calibration…")
+            self.edit_calibration_btn.setProperty("class", "accent")
+
+            def _edit() -> None:
+                self.accept()
+                on_edit_calibration()
+
+            self.edit_calibration_btn.clicked.connect(_edit)
+            footer.addWidget(self.edit_calibration_btn)
         if on_use_defaults is not None:
             defaults_btn = QPushButton("Use as Settings defaults")
             defaults_btn.clicked.connect(on_use_defaults)
@@ -434,10 +445,26 @@ class LibraryScreen(QWidget):
                 promote_btn.clicked.connect(lambda _, path=p["path"]: self._promote(path))
                 actions_layout.addWidget(promote_btn)
             elif profile_only:
+                edit_btn = QPushButton("Edit calibration")
+                edit_btn.clicked.connect(lambda _, path=p["path"]: self._edit_calibration(path))
+                actions_layout.addWidget(edit_btn)
                 defaults_btn = QPushButton("Use as Settings defaults")
                 defaults_btn.clicked.connect(lambda _, path=p["path"]: self._use_defaults(path))
                 actions_layout.addWidget(defaults_btn)
             self.table.setCellWidget(row_idx, 3, actions)
+
+    def _edit_calibration(self, path: Path) -> None:
+        from ..calibration.editor import open_profile_calibration_editor
+
+        try:
+            saved = open_profile_calibration_editor(
+                path, self.bridge.config, self, bridge=self.bridge
+            )
+            if saved is not None:
+                self.refresh()
+                self.import_status.setText(f"Approved calibration saved: {saved}")
+        except (OSError, ValueError, TypeError, KeyError, RuntimeError) as error:
+            self.import_status.setText(f"Cannot edit calibration: {error}")
 
     def _calibrate_reference(self, path: Path) -> None:
         from ..calibration.editor import CalibrationEditor
@@ -464,6 +491,7 @@ class LibraryScreen(QWidget):
                 path,
                 self,
                 on_use_defaults=lambda: self._use_defaults(path),
+                on_edit_calibration=lambda: self._edit_calibration(path),
             )
             self._profile_dialog = dialog
             dialog.exec()

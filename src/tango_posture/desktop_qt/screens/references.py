@@ -105,6 +105,11 @@ class ReferencesScreen(QWidget):
 
         self.confirm_camera_cb = QCheckBox("I confirm the physical camera placement is unchanged")
 
+        self.edit_btn = QPushButton("Edit Calibration…")
+        self.edit_btn.setProperty("class", "primary")
+        self.edit_btn.setEnabled(False)
+        self.edit_btn.clicked.connect(self._edit_calibration)
+
         self.match_btn = QPushButton("Match Camera Settings")
         self.match_btn.setProperty("class", "accent")
         self.match_btn.setEnabled(False)
@@ -115,6 +120,7 @@ class ReferencesScreen(QWidget):
         df_layout.addWidget(self.detail_meta)
         df_layout.addWidget(self.confirm_camera_cb)
         df_layout.addStretch()
+        df_layout.addWidget(self.edit_btn)
         df_layout.addWidget(self.match_btn)
         splitter.addWidget(detail_frame)
         splitter.setSizes([600, 360])
@@ -151,6 +157,7 @@ class ReferencesScreen(QWidget):
             self.bridge.status_message.emit("The selected reference entry is invalid.")
             return
         self.selected_ref = ref
+        self.edit_btn.setEnabled(ref.is_archive)
         self.match_btn.setEnabled(True)
         self.confirm_camera_cb.setEnabled(True)
         self.detail_name.setText(ref.name)
@@ -166,10 +173,27 @@ class ReferencesScreen(QWidget):
 
     def _clear_selection(self) -> None:
         self.selected_ref = None
+        self.edit_btn.setEnabled(False)
         self.match_btn.setEnabled(False)
         self.confirm_camera_cb.setEnabled(False)
         self.detail_name.setText("No reference selected")
         self.detail_meta.setText("Select a reference from the table to view details.")
+
+    def _edit_calibration(self) -> None:
+        if not self.selected_ref or not self.selected_ref.is_archive:
+            self.bridge.status_message.emit("Select a .tpc calibration profile first.")
+            return
+        from ..calibration.editor import open_profile_calibration_editor
+
+        try:
+            saved = open_profile_calibration_editor(
+                self.selected_ref.path, self.bridge.config, self, bridge=self.bridge
+            )
+            if saved is not None:
+                self.refresh()
+                self.bridge.status_message.emit(f"Approved calibration saved: {saved}")
+        except (OSError, ValueError, TypeError, KeyError, RuntimeError) as error:
+            self.bridge.status_message.emit(f"Cannot edit calibration: {error}")
 
     def _match_camera_settings(self) -> None:
         if not self.selected_ref:

@@ -10,14 +10,14 @@ from zipfile import ZIP_DEFLATED, BadZipFile, ZipFile
 from .models import RangeProfile
 
 
-def save_range_profile(path: Path, profile: RangeProfile) -> None:
+def save_range_profile(path: Path, profile: RangeProfile, *, overwrite: bool = False) -> None:
     from ..archive import _archive_lock, _replace_archive
 
     if path.suffix.lower() != ".tpc":
         raise ValueError("Calibration profiles must use the .tpc extension")
     path.parent.mkdir(parents=True, exist_ok=True)
     with _archive_lock(path):
-        if path.exists():
+        if path.exists() and not overwrite:
             raise FileExistsError("Choose a new profile name; existing profiles are not overwritten")
         with NamedTemporaryFile(dir=path.parent, suffix=".tpc.tmp", delete=False) as stream:
             temporary = Path(stream.name)
