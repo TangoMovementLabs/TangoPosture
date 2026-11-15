@@ -15,6 +15,7 @@ from .models import (
     CandidatePreview,
     DancerAnchor,
     PairedFrameSample,
+    SampleQualityStatus,
     TrackedDancerSample,
 )
 
@@ -54,17 +55,17 @@ class PoseCandidate:
 
 
 def _core_confidence(pose: dict[str, Landmark]) -> float:
-    vis = [
-        float(pose[name].visibility)
-        for name in CORE_LANDMARKS
-        if name in pose and pose[name].visibility is not None and math.isfinite(pose[name].visibility)
-    ]
+    vis: list[float] = []
+    for name in CORE_LANDMARKS:
+        if name in pose:
+            v = pose[name].visibility
+            if v is not None and math.isfinite(v):
+                vis.append(float(v))
     if not vis:
-        vis = [
-            float(lm.visibility)
-            for lm in pose.values()
-            if lm.visibility is not None and math.isfinite(lm.visibility)
-        ]
+        for lm in pose.values():
+            v = lm.visibility
+            if v is not None and math.isfinite(v):
+                vis.append(float(v))
     return float(sum(vis) / len(vis)) if vis else 0.0
 
 
@@ -303,7 +304,9 @@ def _make_sample(
     innovation: float | None = None,
     margin: float | None = None,
 ) -> TrackedDancerSample:
-    status = "measured" if cand.torso_eligible else ("estimated" if cand.hip_eligible else "unavailable")
+    status: SampleQualityStatus = (
+        "measured" if cand.torso_eligible else ("estimated" if cand.hip_eligible else "unavailable")
+    )
     return TrackedDancerSample(
         timestamp=timestamp,
         frame_index=frame_index,
@@ -395,7 +398,7 @@ def track_couple_frames(
     shot_cut_min_disp = max(1.5, 2.0 * max_innov)
     shot_cut_frac = 0.6
 
-    pending_anchors = sorted(list(anchors or []), key=lambda a: a.timestamp)
+    pending_anchors = sorted(anchors or [], key=lambda a: a.timestamp)
     consumed_anchors: set[int] = set()
 
     track_a = _TrackMemory("A")
@@ -740,18 +743,20 @@ def extract_single_target_observations(
         pose_index=anchor.pose_index,
     )] if anchor is not None else None
 
-    if anchors is None:
-        # Check whether the clip is strictly single-pose throughout; if so preserve untouched
-        if all(len(filter_and_deduplicate_poses(obs, cfg, analysis_region)) <= 1 for _, obs in observations):
-            filtered: list[tuple[int, FrameObservation]] = []
-            for idx, obs in observations:
-                cands = filter_and_deduplicate_poses(obs, cfg, analysis_region)
-                if len(cands) == 1:
-                    w = [cands[0].world_pose] if cands[0].world_pose is not None else []
-                    filtered.append((idx, FrameObservation(obs.timestamp, obs.width, obs.height, [cands[0].pose], w)))
-                else:
-                    filtered.append((idx, FrameObservation(obs.timestamp, obs.width, obs.height, [], [])))
-            return filtered
+    if anchors is None and all(
+        len(filter_and_deduplicate_poses(obs, cfg, analysis_region)) <= 1
+        for _, obs in observations
+    ):
+        # Preserve strictly single-pose clips untouched when no manual anchors were given.
+        filtered: list[tuple[int, FrameObservation]] = []
+        for idx, obs in observations:
+            cands = filter_and_deduplicate_poses(obs, cfg, analysis_region)
+            if len(cands) == 1:
+                w = [cands[0].world_pose] if cands[0].world_pose is not None else []
+                filtered.append((idx, FrameObservation(obs.timestamp, obs.width, obs.height, [cands[0].pose], w)))
+            else:
+                filtered.append((idx, FrameObservation(obs.timestamp, obs.width, obs.height, [], [])))
+        return filtered
 
     tracked = track_couple_frames(observations, cfg, analysis_region=analysis_region, anchors=anchors)
     use_b = False

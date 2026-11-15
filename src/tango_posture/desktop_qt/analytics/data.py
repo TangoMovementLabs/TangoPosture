@@ -570,7 +570,8 @@ def load_archive_dataset(path: Path, index: int, cfg: Config | None = None) -> S
     auto_decision: dict[str, Any] | None = None
     if isinstance(raw_da, dict):
         dancer_mode = str(raw_da.get("active_mode") or "single")
-        runs = raw_da.get("runs") if isinstance(raw_da.get("runs"), dict) else {}
+        raw_runs = raw_da.get("runs")
+        runs: dict[str, Any] = raw_runs if isinstance(raw_runs, dict) else {}
         for m_key in ("single", "couple"):
             if isinstance(runs.get(m_key), dict):
                 available_modes.append(m_key)

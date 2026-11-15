@@ -7,7 +7,6 @@ import io
 import socket
 import time
 from pathlib import Path
-from zipfile import ZipFile
 
 import cv2
 import numpy as np
@@ -259,20 +258,24 @@ def test_analysis_screen_needs_selection_override_and_cancel_leaves_archive_unto
     def _fake_result(resolved: str, *, selection_req: bool, couple_dict: dict | None = None) -> ClipAnalysisResult:
         return ClipAnalysisResult(
             manifest=RunManifest(
-                title="Studio",
-                source_filename="raw.avi",
-                source_sha256=vsha,
-                clip_in=0.0,
-                clip_out=2.0,
-                analysis_mode="movement",
                 model_variant="lite",
                 model_hash="qt-couple-test",
-                capture_profile="default",
-                requested_dancer_mode="auto",
-                resolved_dancer_mode=resolved,
+                metric_version="v1",
+                capture_profile={},
+                source_sha256=vsha,
+                source_filename="raw.avi",
+                width=160,
+                height=120,
+                fps=10.0,
+                selected_in=0.0,
+                selected_out=2.0,
+                clip_duration=2.0,
+                analysis_mode="movement",
+                requested_dancer_mode="auto" if selection_req else "couple",
+                resolved_dancer_mode="needs_selection" if selection_req else resolved,
             ),
-            title="Studio",
             video_path=arch,
+            title="Studio",
             source_sha256=vsha,
             selected_in=0.0,
             selected_out=2.0,
@@ -280,8 +283,9 @@ def test_analysis_screen_needs_selection_override_and_cancel_leaves_archive_unto
             analysis_mode="movement",
             readiness=CalibrationReadiness(True, "movement", "Ready"),
             reference=None,
-            movement_data={"steps": [], "pivots": []},
+            calibration_window=None,
             coach_data={"width": 160, "height": 120, "frames": {}},
+            movement_data={"steps": [], "pivots": []},
             soundtrack=SoundtrackAnalysisSummary(False, "none", 0.0, 0, []),
             coverage={},
             frame_log=[{"timestamp": t} for t in timestamps],
@@ -299,9 +303,9 @@ def test_analysis_screen_needs_selection_override_and_cancel_leaves_archive_unto
     couple_dict = _build_couple_result(vsha, cfg, run_id="couple-override-run")
 
     def fake_analyze_clip(**kwargs):
-        req_dict = kwargs.get("dancer_request") or {}
-        calls.append(req_dict)
-        if not req_dict.get("forced_override"):
+        req = CoupleAnalysisRequest.from_dict(kwargs.get("dancer_request"))
+        calls.append(req.to_dict())
+        if not req.forced_override:
             return _fake_result("needs_selection", selection_req=True)
         return _fake_result("couple", selection_req=False, couple_dict=couple_dict)
 
@@ -331,12 +335,18 @@ def test_analysis_screen_needs_selection_override_and_cancel_leaves_archive_unto
     monkeypatch.setattr("tango_posture.desktop_qt.screens.analysis.NeedsSelectionDialog", _AcceptCoupleDialog)
     screen._on_run_clicked()
     deadline = time.monotonic() + 5.0
-    while (screen.has_active_jobs() or not screen.open_analytics_btn.isEnabled()) and time.monotonic() < deadline:
+    while (
+        screen.has_active_jobs()
+        or len(calls) < 2
+        or screen._last_result is None
+        or screen._last_result.resolved_dancer_mode != "couple"
+    ) and time.monotonic() < deadline:
         qapp.processEvents()
         time.sleep(0.02)
     qapp.processEvents()
 
     assert len(calls) >= 2 and calls[-1].get("forced_override") is True
+    assert "Saved Couple" in screen.status_label.text()
     saved = read_analytics(arch, 0)
     assert saved is not None and "couple" in saved["dancer_analysis"]["runs"]
     assert "single" in saved["dancer_analysis"]["runs"]
@@ -349,7 +359,7 @@ def test_library_badges_and_analyze_routing(qapp, tmp_path):
     dual_arch, _, _ = _make_archive_with_runs(
         practice_dir / "Dual.tp", cfg, include_single=True, include_couple=True
     )
-    couple_only, _, _ = _make_archive_with_runs(
+    _couple_only, _, _ = _make_archive_with_runs(
         practice_dir / "DuoOnly.tp", cfg, include_single=False, include_couple=True, couple_run_id="duo-only-1"
     )
 
@@ -452,15 +462,32 @@ def test_analytics_mode_filter_five_panes_seek_and_csv(qapp, tmp_path):
     analytics = window.screens[Route.ANALYTICS]
 
     # Mode filter: "All" shows both, "Couple" shows only MixDual
-    all_labels = [analytics.session_combo.itemText(i) for i in range(analytics.session_combo.count())]
+    all_labels = [
+        analytics.session_combo.itemText(i)
+        for i in range(analytics.session_combo.count())
+        if analytics.session_combo.itemData(i) is not None
+    ]
     assert len(all_labels) == 2
 
     idx_couple = analytics.mode_filter_combo.findData("couple")
     analytics.mode_filter_combo.setCurrentIndex(idx_couple)
     qapp.processEvents()
-    couple_labels = [analytics.session_combo.itemText(i) for i in range(analytics.session_combo.count())]
+    couple_labels = [
+        analytics.session_combo.itemText(i)
+        for i in range(analytics.session_combo.count())
+        if analytics.session_combo.itemData(i) is not None
+    ]
     assert len(couple_labels) == 1
     assert "MixDual" in couple_labels[0]
+
+    mix_idx = next(
+        i
+        for i in range(analytics.session_combo.count())
+        if "MixDual" in analytics.session_combo.itemText(i)
+    )
+    if analytics.session_combo.currentIndex() != mix_idx:
+        analytics.session_combo.setCurrentIndex(mix_idx)
+        qapp.processEvents()
 
     # Verify all 5 panes exist and hold Couple summary / event rows
     assert analytics.couple_panes.count() == 5

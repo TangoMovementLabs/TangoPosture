@@ -228,26 +228,30 @@ def _detect_motion_events_for_track(
 
         for pos, (t, sp) in enumerate(seg):
             if state == "IDLE":
-                if sp > start_speed and pos > 0 and seg[pos - 1][1] <= start_speed:
-                    if _stays_above(seg, pos, start_speed, persistence_s):
-                        t_prev, sp_prev = seg[pos - 1]
-                        t_cross = _interpolate_crossing(t_prev, sp_prev, t, sp, start_speed)
-                        events.append(
-                            CoupleEvent(
-                                event_id=f"cand_{subject}_start_{len(events)}",
-                                event_type="start",
-                                subject=subject,
-                                timestamp=round(t_cross, 6),
-                                bracket_start=float(t_prev),
-                                bracket_end=float(t),
-                                value=round(start_speed, 4),
-                                unit="torso_lengths/s",
-                                status="measured",
-                            )
+                if (
+                    sp > start_speed
+                    and pos > 0
+                    and seg[pos - 1][1] <= start_speed
+                    and _stays_above(seg, pos, start_speed, persistence_s)
+                ):
+                    t_prev, sp_prev = seg[pos - 1]
+                    t_cross = _interpolate_crossing(t_prev, sp_prev, t, sp, start_speed)
+                    events.append(
+                        CoupleEvent(
+                            event_id=f"cand_{subject}_start_{len(events)}",
+                            event_type="start",
+                            subject=subject,
+                            timestamp=round(t_cross, 6),
+                            bracket_start=float(t_prev),
+                            bracket_end=float(t),
+                            value=round(start_speed, 4),
+                            unit="torso_lengths/s",
+                            status="measured",
                         )
-                        state = "TRAVELLING"
-                        active_speeds = [sp]
-                        slowing_emitted = False
+                    )
+                    state = "TRAVELLING"
+                    active_speeds = [sp]
+                    slowing_emitted = False
             elif state == "TRAVELLING":
                 if sp >= start_speed:
                     active_speeds.append(sp)
@@ -281,26 +285,30 @@ def _detect_motion_events_for_track(
                         slowing_emitted = True
 
                 # Detect settle
-                if pos > 0 and sp < stop_speed and seg[pos - 1][1] >= stop_speed:
-                    if _stays_below(seg, pos, stop_speed, persistence_s):
-                        t_prev, sp_prev = seg[pos - 1]
-                        t_cross = _interpolate_crossing(t_prev, sp_prev, t, sp, stop_speed)
-                        events.append(
-                            CoupleEvent(
-                                event_id=f"cand_{subject}_settle_{len(events)}",
-                                event_type="settle",
-                                subject=subject,
-                                timestamp=round(t_cross, 6),
-                                bracket_start=float(t_prev),
-                                bracket_end=float(t),
-                                value=round(stop_speed, 4),
-                                unit="torso_lengths/s",
-                                status="measured",
-                            )
+                if (
+                    pos > 0
+                    and sp < stop_speed
+                    and seg[pos - 1][1] >= stop_speed
+                    and _stays_below(seg, pos, stop_speed, persistence_s)
+                ):
+                    t_prev, sp_prev = seg[pos - 1]
+                    t_cross = _interpolate_crossing(t_prev, sp_prev, t, sp, stop_speed)
+                    events.append(
+                        CoupleEvent(
+                            event_id=f"cand_{subject}_settle_{len(events)}",
+                            event_type="settle",
+                            subject=subject,
+                            timestamp=round(t_cross, 6),
+                            bracket_start=float(t_prev),
+                            bracket_end=float(t),
+                            value=round(stop_speed, 4),
+                            unit="torso_lengths/s",
+                            status="measured",
                         )
-                        state = "IDLE"
-                        active_speeds = []
-                        slowing_emitted = False
+                    )
+                    state = "IDLE"
+                    active_speeds = []
+                    slowing_emitted = False
     return events
 
 

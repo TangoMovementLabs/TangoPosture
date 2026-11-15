@@ -65,7 +65,6 @@ from ...couple.models import (
     CoupleAnalysisRequest,
     CoupleAnnotationItem,
     CoupleAnnotations,
-    DancerAnchor,
     PlannedTransitionMark,
 )
 from ...couple.overlay import render_couple_frame_overlay
@@ -90,6 +89,7 @@ from ...references.companions import (
 from ...references.constants import MAX_IMPORT_RANGE_SECONDS
 from ...replay import VideoReader, time_label
 from ...reports import latest_analysis_model_section
+from ..calibration import editor as calibration_editor
 from ..components.analysis_options import NeedsSelectionDialog
 from ..components.video_stage import VideoStage
 from ..review.analysis import (
@@ -463,6 +463,13 @@ class ReviewScreen(QWidget):
         self.reference_combo.setMinimumContentsLength(12)
         self.reference_combo.currentIndexChanged.connect(self._on_reference_combo_changed)
         it_layout.addWidget(self.reference_combo)
+        self.edit_calibration_btn = QPushButton("Edit calibration…")
+        self.edit_calibration_btn.setToolTip(
+            "Open the calibration editor to view or edit the currently selected .tpc calibration file."
+        )
+        self.edit_calibration_btn.setEnabled(False)
+        self.edit_calibration_btn.clicked.connect(self._edit_current_calibration)
+        it_layout.addWidget(self.edit_calibration_btn)
         self.normalization_settings_btn = QPushButton("Measurement normalization settings…")
         self.normalization_settings_btn.setToolTip(
             "Configure optional offsets mapping this recording onto the selected calibration's scale."
@@ -744,12 +751,41 @@ class ReviewScreen(QWidget):
             index = self.reference_combo.count() - 1
         self.reference_combo.setCurrentIndex(max(0, index))
         self.reference_combo.blockSignals(False)
+        self._sync_edit_calibration_button()
         calibration_changed = self.reference_combo.currentData() != selected
         dynamic_stream = self._is_dynamic_stream()
         self._calibration_changed(refresh_overlay=calibration_changed or dynamic_stream)
 
+    def _sync_edit_calibration_button(self) -> None:
+        self.edit_calibration_btn.setEnabled(
+            calibration_editor.selected_tpc_calibration_path(self.reference_combo.currentData())
+            is not None
+        )
+
+    def _edit_current_calibration(self) -> None:
+        cal_path = calibration_editor.selected_tpc_calibration_path(self.reference_combo.currentData())
+        if cal_path is None:
+            self.bridge.status_message.emit("Select a .tpc calibration profile first.")
+            return
+        try:
+            saved = calibration_editor.open_profile_calibration_editor(
+                cal_path, self.bridge.config, self, bridge=self.bridge
+            )
+            if saved is not None:
+                self.refresh()
+                idx = self.reference_combo.findData(str(saved))
+                if idx < 0:
+                    idx = self.reference_combo.findData(str(saved.resolve()))
+                if idx >= 0:
+                    self.reference_combo.setCurrentIndex(idx)
+                self._calibration_changed()
+                self.bridge.status_message.emit(f"Approved calibration saved: {saved.name}")
+        except (OSError, ValueError, TypeError, KeyError, RuntimeError) as error:
+            self.bridge.status_message.emit(f"Cannot edit calibration: {error}")
+
     def _on_reference_combo_changed(self, *_args: object) -> None:
         self._bypass_normalization_for_current = False
+        self._sync_edit_calibration_button()
         self._calibration_changed()
 
     def _practice_identity_for_comparison(self, data: Mapping[str, Any]) -> HoldSourceIdentity | None:
@@ -1647,15 +1683,13 @@ class ReviewScreen(QWidget):
         entry = frames.get(str(idx)) if isinstance(frames, dict) else None
         if isinstance(entry, Mapping):
             summary = str(entry.get("display_status_summary") or "").strip()
-            origins = (
-                entry.get("display_joint_origins")
-                if isinstance(entry.get("display_joint_origins"), Mapping)
-                else {}
+            raw_origins = entry.get("display_joint_origins")
+            origins: Mapping[str, Any] = (
+                raw_origins if isinstance(raw_origins, Mapping) else {}
             )
-            diagnostics = (
-                entry.get("display_diagnostics")
-                if isinstance(entry.get("display_diagnostics"), Mapping)
-                else {}
+            raw_diagnostics = entry.get("display_diagnostics")
+            diagnostics: Mapping[str, Any] = (
+                raw_diagnostics if isinstance(raw_diagnostics, Mapping) else {}
             )
             if not self.show_estimates_cb.isChecked():
                 if summary:
@@ -1803,9 +1837,9 @@ class ReviewScreen(QWidget):
                     and archive_path.suffix.lower() in (".tp", ".tpr")
                     and segment_index is not None
                 ):
-                    if getattr(coach_data, "result", None) is None:
+                    result = getattr(coach_data, "result", None)
+                    if result is None:
                         raise ValueError("Analysis did not produce the data required for a report")
-                    result = coach_data.result
                     if result.source_sha256 != video_sha256:
                         raise ValueError("Source video changed during analysis; archive was not changed")
                     timestamps = [float(frame["timestamp"]) for frame in result.frame_log]
@@ -2813,7 +2847,8 @@ class ReviewScreen(QWidget):
 
     def _apply_run_selection(self, mode_key: str) -> None:
         da = self._dancer_analysis
-        runs = da.get("runs") if isinstance(da, dict) and isinstance(da.get("runs"), dict) else {}
+        raw_runs = da.get("runs") if isinstance(da, dict) else None
+        runs: dict[str, Any] = raw_runs if isinstance(raw_runs, dict) else {}
         entry = runs.get(mode_key)
         self._active_dancer_view_mode = mode_key if isinstance(entry, dict) else "single"
         if mode_key == "couple" and isinstance(entry, dict) and isinstance(entry.get("couple_result"), dict):
@@ -2831,7 +2866,8 @@ class ReviewScreen(QWidget):
 
     def _select_run_by_id(self, run_id: str) -> None:
         da = self._dancer_analysis
-        runs = da.get("runs") if isinstance(da, dict) and isinstance(da.get("runs"), dict) else {}
+        raw_runs = da.get("runs") if isinstance(da, dict) else None
+        runs: dict[str, Any] = raw_runs if isinstance(raw_runs, dict) else {}
         for m_key, entry in runs.items():
             if not isinstance(entry, dict):
                 continue

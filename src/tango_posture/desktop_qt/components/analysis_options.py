@@ -221,6 +221,7 @@ def _draw_candidate_thumbnail(
     candidate: dict[str, Any],
     pin_label: str | None = None,
 ) -> QPixmap:
+    canvas: np.ndarray
     if frame_bgr is None or frame_bgr.size == 0:
         canvas = np.full((180, 260, 3), 26, dtype=np.uint8)
         w, h = 260, 180

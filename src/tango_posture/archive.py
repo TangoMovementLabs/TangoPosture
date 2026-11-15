@@ -409,10 +409,10 @@ def update_couple_annotations(
             raise ValueError("No saved analytics found for recording")
         da = previous.get("dancer_analysis")
         if not isinstance(da, dict) or not isinstance(da.get("runs"), dict):
-            raise ValueError("No saved Couple run found in archive analytics")
+            raise ValueError("No saved Couple run found in archive analytics")  # noqa: TRY004
         couple_entry = da["runs"].get("couple")
         if not isinstance(couple_entry, dict) or not isinstance(couple_entry.get("couple_result"), dict):
-            raise ValueError("No saved Couple analysis result found in archive analytics")
+            raise ValueError("No saved Couple analysis result found in archive analytics")  # noqa: TRY004
         stored_run_id = str(
             couple_entry.get("run_id") or couple_entry["couple_result"].get("run_id") or ""
         )
@@ -459,7 +459,7 @@ def set_active_dancer_run(path: Path, index: int, mode: str) -> dict[str, Any]:
             raise ValueError("No saved analytics found for recording")
         da = previous.get("dancer_analysis")
         if not isinstance(da, dict) or not isinstance(da.get("runs"), dict):
-            raise ValueError("No saved dancer analysis runs found in archive analytics")
+            raise ValueError("No saved dancer analysis runs found in archive analytics")  # noqa: TRY004
         if mode_clean not in da["runs"] or not isinstance(da["runs"][mode_clean], dict):
             raise ValueError(f"No saved {mode_clean!r} run found for segment {index}")
         active_run_id = str(da["runs"][mode_clean].get("run_id") or "")

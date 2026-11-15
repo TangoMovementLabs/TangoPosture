@@ -163,11 +163,11 @@ def archive_report(
             indexed_couple = copy.deepcopy(couple_data)
             indexed_couple["video_sha256"] = raw_sha
             indexed_couple["segment_index"] = 0
-            overlay = indexed_couple.get("overlay")
-            if isinstance(overlay, dict) and isinstance(overlay.get("by_frame"), dict):
-                overlay["by_frame"] = {
+            couple_overlay = indexed_couple.get("overlay")
+            if isinstance(couple_overlay, dict) and isinstance(couple_overlay.get("by_frame"), dict):
+                couple_overlay["by_frame"] = {
                     str(int(k) - start): entry
-                    for k, entry in overlay["by_frame"].items()
+                    for k, entry in couple_overlay["by_frame"].items()
                     if str(k).lstrip("-").isdigit() and start <= int(k) <= end
                 }
             if isinstance(indexed_couple.get("samples"), list):

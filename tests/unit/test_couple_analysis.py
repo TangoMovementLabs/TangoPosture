@@ -6,7 +6,6 @@ import csv
 import io
 import math
 from pathlib import Path
-from zipfile import ZipFile
 
 import cv2
 import numpy as np

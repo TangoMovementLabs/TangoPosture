@@ -1,5 +1,6 @@
 import json
 import tomllib
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -969,4 +970,77 @@ def test_calibration_editor_trims_trailing_static_outro_and_zooms_chart(qapp, tm
     finally:
         if editor.isVisible():
             editor.reject()
+
+
+def test_edit_calibration_resolves_renamed_reference_and_works_in_review_and_analytics(
+    qapp, tmp_path, cached_reference, monkeypatch
+):
+    from tango_posture.archive import rename_archive
+    from tango_posture.desktop_qt.calibration import editor as editor_mod
+    from tango_posture.desktop_qt.screens.analytics import AnalyticsScreen
+    from tango_posture.desktop_qt.screens.review import ReviewScreen
+
+    ref_dir = tmp_path / "references"
+    ref_dir.mkdir(parents=True, exist_ok=True)
+    tpr_copy = ref_dir / cached_reference.name
+    tpr_copy.write_bytes(cached_reference.read_bytes())
+
+    cfg = Config(data_dir=str(tmp_path))
+    creator = CalibrationEditor(tpr_copy, cfg)
+    try:
+        creator.name_input.setText("Giro baseline")
+        creator._approve()
+        creator._save()
+        tpc_path = creator.saved_path
+        assert tpc_path is not None
+    finally:
+        if creator.isVisible():
+            creator.reject()
+
+    # Renaming the .tpr changes its outer ZIP SHA-256; Edit calibration still opens it directly.
+    rename_archive(tpr_copy, "Renamed Teacher Reference")
+    reopened = CalibrationEditor(tpc_path, cfg)
+    try:
+        assert "Edit approved" in reopened.windowTitle()
+        assert set(reopened.approved) == {"head_pitch"}
+    finally:
+        if reopened.isVisible():
+            reopened.reject()
+
+    opened_paths: list[Path] = []
+
+    def fake_open_editor(path: Path, _cfg: Config, _parent, **_kwargs) -> Path | None:
+        opened_paths.append(path)
+        return path
+
+    monkeypatch.setattr(editor_mod, "open_profile_calibration_editor", fake_open_editor)
+
+    review = ReviewScreen(ServiceBridge(cfg), Router())
+    analytics = AnalyticsScreen(ServiceBridge(cfg), Router())
+    try:
+        assert not review.edit_calibration_btn.isEnabled()
+        rev_idx = review.reference_combo.findData(str(tpc_path.resolve()))
+        if rev_idx < 0:
+            rev_idx = review.reference_combo.findData(str(tpc_path))
+        assert rev_idx > 0
+        review.reference_combo.setCurrentIndex(rev_idx)
+        assert review.edit_calibration_btn.isEnabled()
+        review.edit_calibration_btn.click()
+        assert opened_paths[-1].resolve() == tpc_path.resolve()
+
+        assert not analytics.edit_calibration_btn.isEnabled()
+        def_idx = analytics.calibration_combo.findData("__defaults__")
+        analytics.calibration_combo.setCurrentIndex(def_idx)
+        assert not analytics.edit_calibration_btn.isEnabled()
+        ana_idx = analytics.calibration_combo.findData(str(tpc_path.resolve()))
+        assert ana_idx > 0
+        analytics.calibration_combo.setCurrentIndex(ana_idx)
+        assert analytics.edit_calibration_btn.isEnabled()
+        analytics.edit_calibration_btn.click()
+        assert len(opened_paths) == 2
+        assert opened_paths[-1].resolve() == tpc_path.resolve()
+    finally:
+        review.close()
+        analytics.close()
+
 

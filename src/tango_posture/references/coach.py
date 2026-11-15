@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -45,14 +46,19 @@ from ..overlay import (
     draw,
     draw_head_alignment,
     draw_head_posture,
+    draw_styled_bone,
     draw_torso_axis,
+    edge_provenance_style,
     screen_point,
 )
 from ..pose.constants import CONNECTIONS
 from ..pose.interpolation import interpolate_poses
+from ..pose.recovery import LOWER_LIMB_JOINTS, validate_pose_recovery_payload
 from ..quality import reliable
 from ..temporal import Evaluator
 from .constants import SOUNDTRACK_SOURCE_LABEL
+
+logger = logging.getLogger(__name__)
 
 
 def range_feedback(
@@ -368,26 +374,230 @@ def _compare_targets(
     }
 
 
-def interpolate_coach_data(data: dict[str, Any], cfg: Config) -> dict[str, Any]:
+def _deserialise_pose_list(raw_poses: Any) -> list[dict[str, Landmark]]:
+    if not isinstance(raw_poses, list):
+        return []
+    poses: list[dict[str, Landmark]] = []
+    for raw_pose in raw_poses:
+        if not isinstance(raw_pose, dict) or not raw_pose:
+            continue
+        pose: dict[str, Landmark] = {}
+        for name, coords in raw_pose.items():
+            if isinstance(coords, list | tuple) and len(coords) >= 3:
+                pose[str(name)] = Landmark(
+                    x=float(coords[0]),
+                    y=float(coords[1]),
+                    z=float(coords[2]) if coords[2] is not None else None,
+                    visibility=float(coords[3]) if len(coords) >= 4 and coords[3] is not None else None,
+                    presence=float(coords[4]) if len(coords) >= 5 and coords[4] is not None else None,
+                )
+        if pose:
+            poses.append(pose)
+    return poses
+
+
+def _pivot_intervals_from_metadata(
+    indices: list[str],
+    frames: Mapping[str, Any],
+    movement_data: Mapping[str, Any] | None,
+    recovery: Mapping[str, Any] | None,
+) -> list[tuple[float, float]]:
+    time_by_frame = {
+        int(idx): float(frames[idx].get("timestamp", int(idx) * 0.1))
+        for idx in indices
+        if str(idx).isdigit()
+    }
+    intervals: list[tuple[float, float]] = []
+    if isinstance(movement_data, Mapping):
+        for pivot in movement_data.get("pivots") or ():
+            if not isinstance(pivot, Mapping):
+                continue
+            st = pivot.get("start_time")
+            et = pivot.get("end_time")
+            if isinstance(st, int | float) and isinstance(et, int | float) and float(et) > float(st):
+                intervals.append((float(st), float(et)))
+                continue
+            sf = pivot.get("start_frame")
+            ef = pivot.get("end_frame")
+            if isinstance(sf, int) and isinstance(ef, int):
+                t0 = time_by_frame.get(sf)
+                t1 = time_by_frame.get(max(sf, ef - 1))
+                if t0 is not None and t1 is not None:
+                    intervals.append((t0, max(t0, t1)))
+    if isinstance(recovery, Mapping):
+        for win in recovery.get("windows") or ():
+            if not isinstance(win, Mapping) or not win.get("intersects_pivot"):
+                continue
+            st = win.get("window_start_time", win.get("gap_start_time"))
+            et = win.get("window_end_time", win.get("gap_end_time"))
+            if isinstance(st, int | float) and isinstance(et, int | float):
+                intervals.append((float(st), float(et)))
+    return intervals
+
+
+def interpolate_coach_data(
+    data: dict[str, Any],
+    cfg: Config,
+    *,
+    pose_recovery: Mapping[str, Any] | None = None,
+    movement_data: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     """Prepare a separate display layer, leaving raw evidence and coaching untouched."""
     frames = data.get("frames")
-    if cfg.replay_joint_max_gap <= 0 or not isinstance(frames, dict) or not frames:
+    if not isinstance(frames, dict) or not frames:
         return data
-    width, height = int(data.get("width", 0)), int(data.get("height", 0))
+
     indices = sorted(frames, key=int)
+    raw_recovery = pose_recovery if pose_recovery is not None else data.get("pose_recovery")
+    valid_recovery: Mapping[str, Any] | None = None
+    if isinstance(raw_recovery, Mapping):
+        try:
+            dancer_sel = (
+                data.get("dancer_selection")
+                if isinstance(data.get("dancer_selection"), Mapping)
+                else None
+            )
+            valid_recovery = validate_pose_recovery_payload(
+                raw_recovery,
+                frame_count=len(indices),
+                valid_frame_indices={int(k) for k in indices if str(k).isdigit()},
+                timestamps=[float(frames[k].get("timestamp", 0.0)) for k in indices],
+                source_sha256=data.get("source_sha256"),
+                model_sha256=data.get("model_hash"),
+                source_width=int(data.get("width") or 0) or None,
+                source_height=int(data.get("height") or 0) or None,
+                dancer_selection=dancer_sel,
+            )
+        except ValueError as exc:
+            logger.warning("Ignoring invalid or stale pose_recovery payload: %s", exc)
+            valid_recovery = None
+
+    if cfg.replay_joint_max_gap <= 0 and valid_recovery is None:
+        return data
+
+    width, height = int(data.get("width", 0)), int(data.get("height", 0))
     observations = [_coach_observation(frames[index], width, height) for index in indices]
+    working: list[FrameObservation] = []
+    origins_out: list[dict[str, str]] = []
+    diagnostics_per_pos: list[dict[str, str]] = []
+    status_per_pos: list[str] = []
+
+    rec_frames = valid_recovery.get("frames", {}) if valid_recovery is not None else {}
+    for pos, (index, obs) in enumerate(zip(indices, observations, strict=True)):
+        origins: dict[str, str] = {}
+        poses_copy = [dict(p) for p in obs.poses]
+        if len(poses_copy) == 1:
+            for jname, lm in poses_copy[0].items():
+                if reliable(lm, cfg.confidence):
+                    origins[jname] = "forward"
+
+        rec_entry = rec_frames.get(str(index)) if isinstance(rec_frames, Mapping) else None
+        diag: dict[str, str] = {}
+        status_txt = ""
+        if isinstance(rec_entry, Mapping):
+            raw_diag = rec_entry.get("diagnostics")
+            if isinstance(raw_diag, Mapping):
+                diag = {str(k): str(v) for k, v in raw_diag.items()}
+            status_txt = str(rec_entry.get("status_summary") or "")
+            rec_lms = rec_entry.get("landmarks")
+            if isinstance(rec_lms, Mapping) and rec_lms and len(poses_copy) <= 1:
+                pose_dict = dict(poses_copy[0]) if poses_copy else {}
+                for jname, lm_map in rec_lms.items():
+                    if not isinstance(lm_map, Mapping):
+                        continue
+                    existing_lm = pose_dict.get(str(jname))
+                    if reliable(existing_lm, cfg.confidence):
+                        continue
+                    origin = str(lm_map.get("origin") or "backward")
+                    if origin == "backward":
+                        pose_dict[str(jname)] = Landmark(
+                            x=float(lm_map["x"]),
+                            y=float(lm_map["y"]),
+                            visibility=float(lm_map.get("visibility", 1.0)),
+                            presence=float(lm_map.get("presence", 1.0)),
+                            z=float(lm_map.get("z", 0.0)),
+                        )
+                        origins[str(jname)] = "backward"
+                if pose_dict:
+                    poses_copy = [pose_dict]
+        working.append(FrameObservation(obs.timestamp, obs.width, obs.height, poses_copy))
+        origins_out.append(origins)
+        diagnostics_per_pos.append(diag)
+        status_per_pos.append(status_txt)
+
+    pivot_intervals = _pivot_intervals_from_metadata(indices, frames, movement_data, valid_recovery)
+    cut_positions: set[int] = set()
+    if isinstance(movement_data, Mapping):
+        cut_set = {int(c) for c in movement_data.get("cut_frames") or () if isinstance(c, int)}
+        if cut_set:
+            for pos, index in enumerate(indices):
+                if pos > 0 and int(index) in cut_set:
+                    cut_positions.add(pos)
+
+    track_keys = [
+        str(
+            frames[index].get("track_key")
+            or (
+                f"dancer_{frames[index]['dancer_index']}"
+                if isinstance(frames[index].get("dancer_index"), int)
+                else "single"
+            )
+        )
+        for index in indices
+    ]
+
     interpolated = interpolate_poses(
-        observations, method=cfg.replay_joint_interpolation,
-        max_gap=cfg.replay_joint_max_gap, confidence=cfg.confidence,
+        working,
+        method=cfg.replay_joint_interpolation,
+        max_gap=cfg.replay_joint_max_gap,
+        confidence=cfg.confidence,
+        pivot_intervals=pivot_intervals,
+        pivot_max_gap=cfg.replay_pivot_interpolation_max_gap_s,
+        cut_positions=cut_positions,
+        track_keys=track_keys,
+        origins_out=origins_out,
     )
+
+    any_changed = valid_recovery is not None or any(
+        origin in ("backward", "interpolated")
+        for origins in origins_out
+        for origin in origins.values()
+    )
+    if not any_changed:
+        return data
+
+    new_frames: dict[str, Any] = {}
+    for pos, (index, obs) in enumerate(zip(indices, interpolated, strict=True)):
+        orig_entry = frames[index]
+        origins = origins_out[pos]
+        diag = dict(diagnostics_per_pos[pos])
+        status_txt = status_per_pos[pos]
+        if not status_txt:
+            interp_lower = [
+                j
+                for j, o in origins.items()
+                if o == "interpolated" and j in LOWER_LIMB_JOINTS
+            ]
+            if interp_lower:
+                focus = next(
+                    (j for j in interp_lower if j.endswith("_ankle") or j.endswith("_knee")),
+                    interp_lower[0],
+                )
+                status_txt = f"{focus.replace('_', ' ').capitalize()} interpolated"
+                for j in interp_lower:
+                    diag.setdefault(j, "Recovered for display")
+        forward_raw = orig_entry.get("poses") or orig_entry.get("measurement_poses") or []
+        new_frames[index] = {
+            **orig_entry,
+            "display_poses": [_serialise_pose(pose) for pose in obs.poses],
+            "display_forward_poses": forward_raw,
+            "display_joint_origins": origins,
+            "display_diagnostics": diag,
+            "display_status_summary": status_txt,
+        }
     return {
-        **data, "frames": {
-            index: {
-                **frames[index],
-                "display_poses": [_serialise_pose(pose) for pose in observation.poses],
-            }
-            for index, observation in zip(indices, interpolated, strict=True)
-        },
+        **data,
+        "frames": new_frames,
     }
 
 
@@ -476,6 +686,8 @@ def render_coach_frame_overlay(
     show_vertical_axis: bool = True,
     show_footer: bool = False,
     lines_only: bool = False,
+    show_estimates: bool = True,
+    forward_only: bool = False,
 ) -> np.ndarray:
     """Render the Open Practice Coach HUD (axis lines, skeleton, alerts, role, beats) on a frame.
 
@@ -496,7 +708,25 @@ def render_coach_frame_overlay(
         return image
 
     observation = _coach_observation(entry, width, height)
-    poses = _coach_observation(entry, width, height, use_display_poses=True).poses
+    use_estimates = bool(show_estimates and not forward_only)
+    raw_origins = entry.get("display_joint_origins")
+    joint_origins: Mapping[str, str] | None = (
+        raw_origins if use_estimates and isinstance(raw_origins, Mapping) else None
+    )
+    if use_estimates:
+        poses = _coach_observation(entry, width, height, use_display_poses=True).poses
+    else:
+        raw_fwd = entry.get("display_forward_poses")
+        poses = _deserialise_pose_list(raw_fwd) if isinstance(raw_fwd, list) else observation.poses
+        if isinstance(raw_origins, Mapping):
+            poses = [
+                {
+                    k: v
+                    for k, v in pose.items()
+                    if raw_origins.get(k, "forward") == "forward"
+                }
+                for pose in poses
+            ]
 
     if lines_only:
         canvas = image.copy()
@@ -506,13 +736,13 @@ def render_coach_frame_overlay(
                     pose.get(b), cfg.confidence
                 ):
                     pa, pb = pose[a], pose[b]
-                    cv2.line(
+                    draw_styled_bone(
                         canvas,
                         screen_point(pa.x, pa.y, width, height, False),
                         screen_point(pb.x, pb.y, width, height, False),
                         (80, 220, 80),
                         2,
-                        cv2.LINE_AA,
+                        style=edge_provenance_style(a, b, joint_origins),
                     )
         return canvas
 
@@ -572,6 +802,7 @@ def render_coach_frame_overlay(
             show_footer=show_footer,
             settings_coaching=bool(coach_data.get("settings_coaching", True)),
             skeleton_poses=poses,
+            skeleton_joint_origins=joint_origins,
             shoulder_geometry=shoulder_geometry_kwargs(cfg),
             knee_geometry=knee_geometry_kwargs(cfg),
         ),

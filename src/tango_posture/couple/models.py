@@ -237,7 +237,7 @@ class CoupleAnalysisRequest:
     def from_dict(cls, data: dict[str, Any] | CoupleAnalysisRequest | None) -> CoupleAnalysisRequest:
         if isinstance(data, cls):
             return data
-        if not data:
+        if not isinstance(data, dict) or not data:
             return cls()
         raw_mode = str(data.get("requested_mode", "auto")).lower()
         mode: DancerMode = (

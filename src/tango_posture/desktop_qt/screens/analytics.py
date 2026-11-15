@@ -43,6 +43,7 @@ from ..analytics.data import (
     finite_number,
     load_archive_dataset,
 )
+from ..calibration import editor as calibration_editor
 from ..components.metric_chart import MetricChart
 from ..router import Route, Router
 from ..service_bridge import (
@@ -154,6 +155,13 @@ class AnalyticsScreen(QWidget):
         self.open_calibration_btn = QPushButton("Open .tpc…")
         self.open_calibration_btn.clicked.connect(self._browse_calibration)
         ref_toolbar.addWidget(self.open_calibration_btn)
+        self.edit_calibration_btn = QPushButton("Edit calibration…")
+        self.edit_calibration_btn.setToolTip(
+            "Open the calibration editor to view or edit the currently selected .tpc calibration file."
+        )
+        self.edit_calibration_btn.setEnabled(False)
+        self.edit_calibration_btn.clicked.connect(self._edit_current_calibration)
+        ref_toolbar.addWidget(self.edit_calibration_btn)
         self.export_charts_btn = QPushButton("Export All Charts…")
         self.export_charts_btn.setEnabled(False)
         self.export_charts_btn.clicked.connect(lambda: self.export_all_charts())
@@ -277,6 +285,33 @@ class AnalyticsScreen(QWidget):
         index = _find_combo_data(self.calibration_combo, preserve) if preserve is not None else 0
         self.calibration_combo.setCurrentIndex(max(0, index))
         self.calibration_combo.blockSignals(False)
+        self._sync_edit_calibration_button()
+
+    def _sync_edit_calibration_button(self) -> None:
+        self.edit_calibration_btn.setEnabled(
+            calibration_editor.selected_tpc_calibration_path(self.calibration_combo.currentData())
+            is not None
+        )
+
+    def _edit_current_calibration(self) -> None:
+        cal_path = calibration_editor.selected_tpc_calibration_path(self.calibration_combo.currentData())
+        if cal_path is None:
+            self.bridge.status_message.emit("Select a .tpc calibration profile first.")
+            return
+        try:
+            saved = calibration_editor.open_profile_calibration_editor(
+                cal_path, self.bridge.config, self, bridge=self.bridge
+            )
+            if saved is not None:
+                resolved = saved.resolve()
+                cal = load_calibration_file(str(resolved), _default_calibration_directory(self.bridge))
+                if cal is not None:
+                    self._external_calibrations[str(resolved)] = cal
+                self._populate_calibrations(str(resolved))
+                self._apply_calibration_reference()
+                self.bridge.status_message.emit(f"Approved calibration saved: {saved.name}")
+        except (OSError, ValueError, TypeError, KeyError, RuntimeError) as error:
+            self.bridge.status_message.emit(f"Cannot edit calibration: {error}")
 
     def refresh(self) -> None:
         selected = self.session_combo.currentData()
@@ -464,6 +499,7 @@ class AnalyticsScreen(QWidget):
         self._apply_calibration_reference()
 
     def _apply_calibration_reference(self) -> None:
+        self._sync_edit_calibration_button()
         dataset = self.dataset
         source = self._current_source
         if dataset is None or source is None:
@@ -861,7 +897,8 @@ class AnalyticsScreen(QWidget):
             self.tracking_recovery_label.clear()
             self.tracking_recovery_label.setVisible(False)
             return
-        summary = recovery.get("summary") if isinstance(recovery.get("summary"), dict) else {}
+        raw_summary = recovery.get("summary")
+        summary: dict[str, Any] = raw_summary if isinstance(raw_summary, dict) else {}
         detected = int(summary.get("windows_detected", len(recovery.get("windows") or [])) or 0)
         recovered_win = int(summary.get("windows_recovered", 0) or 0)
         unresolved = int(summary.get("windows_unresolved", 0) or 0)

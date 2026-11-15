@@ -116,11 +116,41 @@ def _resolve_reference_for_profile(profile: RangeProfile, profile_path: Path, cf
             for candidate in sorted(directory.glob("*.tpr")):
                 if file_sha256(candidate) == archive_hash:
                     return candidate
+    # Fallback when the .tpr archive was updated in place (e.g. Library rename or dancer selection).
+    if archive_name:
+        for directory in search_dirs:
+            candidate = directory / archive_name
+            if candidate.is_file():
+                return candidate
+    prov = profile.source.get("provenance")
+    prov_sha = str(prov.get("sha256") or "").strip() if isinstance(prov, dict) else ""
+    if prov_sha:
+        for directory in search_dirs:
+            if not directory.is_dir():
+                continue
+            for candidate in sorted(directory.glob("*.tpr")):
+                try:
+                    analytics = read_analytics(candidate, 0) or {}
+                    src_prov = analytics.get("source_provenance")
+                    if isinstance(src_prov, dict) and str(src_prov.get("sha256") or "").strip() == prov_sha:
+                        return candidate
+                except (OSError, ValueError, KeyError, TypeError):
+                    continue
     raise FileNotFoundError(
         f"Source reference '{archive_name or 'unknown'}' was not found in "
         f"{reference_directory(cfg.data_dir)}. Keep the source .tpr reference in Library "
         "to edit this calibration."
     )
+
+
+def selected_tpc_calibration_path(selected: object) -> Path | None:
+    """Return the existing `.tpc` file path when a combo selection points to one."""
+    if not isinstance(selected, str) or not selected or selected == "__defaults__":
+        return None
+    candidate = Path(selected)
+    if candidate.suffix.lower() != ".tpc" or not candidate.is_file():
+        return None
+    return candidate
 
 
 def open_profile_calibration_editor(

@@ -115,8 +115,7 @@ def _longest_continuous_span(
         else:
             cur += weights[i]
         last_true_t = timestamps[i]
-        if cur > best:
-            best = cur
+        best = max(best, cur)
     return float(best)
 
 

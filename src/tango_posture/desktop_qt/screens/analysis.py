@@ -377,20 +377,30 @@ class AnalysisScreen(QWidget):
             path = Path(item["path"])
             label = f"{item['name']} ({item.get('segments_count', 0)} segs)"
             self.archive_combo.addItem(label, path)
-        if current_path is not None:
-            idx = self.archive_combo.findData(current_path)
+        if isinstance(current_path, Path):
+            idx = self._find_archive_combo_index(current_path)
             if idx >= 0:
                 self.archive_combo.setCurrentIndex(idx)
         self.archive_combo.blockSignals(False)
         self._on_archive_changed()
 
+    def _find_archive_combo_index(self, target: Path) -> int:
+        resolved = target.expanduser().resolve()
+        for i in range(self.archive_combo.count()):
+            item_path = self.archive_combo.itemData(i)
+            if isinstance(item_path, Path) and item_path.expanduser().resolve() == resolved:
+                return i
+        return -1
+
     def load_source(self, payload: object) -> None:
         """Accept an archive Path or dict payload from Library or Review navigation."""
+        if isinstance(payload, str) and payload.strip():
+            payload = Path(payload)
         if isinstance(payload, Path):
             if payload.suffix.lower() in (".tp", ".tpr"):
                 self.archive_radio.setChecked(True)
                 self.refresh()
-                idx = self.archive_combo.findData(payload.resolve())
+                idx = self._find_archive_combo_index(payload)
                 if idx >= 0:
                     self.archive_combo.setCurrentIndex(idx)
             else:
@@ -400,10 +410,12 @@ class AnalysisScreen(QWidget):
             arch = payload.get("archive_path")
             seg = payload.get("segment_index", 0)
             vpath = payload.get("video_path")
+            if isinstance(arch, str) and arch.strip():
+                arch = Path(arch)
             if isinstance(arch, Path):
                 self.archive_radio.setChecked(True)
                 self.refresh()
-                idx = self.archive_combo.findData(arch.resolve())
+                idx = self._find_archive_combo_index(arch)
                 if idx >= 0:
                     self.archive_combo.setCurrentIndex(idx)
                 if isinstance(seg, int) and 0 <= seg < self.segment_combo.count():
@@ -837,14 +849,18 @@ class AnalysisScreen(QWidget):
             rows = [
                 (
                     "Opening window",
-                    f"{float(decision.get('effective_window_in', 0.0)):.1f}s – "
-                    f"{float(decision.get('effective_window_out', 0.0)):.1f}s "
-                    f"({float(decision.get('effective_duration_s', 0.0)):.1f}s)",
+                    (
+                        f"{float(decision.get('effective_window_in', 0.0)):.1f}s – "
+                        f"{float(decision.get('effective_window_out', 0.0)):.1f}s "
+                        f"({float(decision.get('effective_duration_s', 0.0)):.1f}s)"
+                    ),
                 ),
                 (
                     "Primary eligible coverage",
-                    f"{float(decision.get('primary_coverage', 0.0)) * 100:.1f}% "
-                    f"({float(decision.get('primary_eligible_duration_s', 0.0)):.2f}s)",
+                    (
+                        f"{float(decision.get('primary_coverage', 0.0)) * 100:.1f}% "
+                        f"({float(decision.get('primary_eligible_duration_s', 0.0)):.2f}s)"
+                    ),
                 ),
                 (
                     "Second coexistence duration",
@@ -880,9 +896,13 @@ class AnalysisScreen(QWidget):
             for key, item in summary.items():
                 if not isinstance(item, dict):
                     continue
-                val = item.get("value")
+                metric_val = item.get("value")
                 unit = str(item.get("unit") or "")
-                val_text = f"{val:.3f} {unit}".strip() if isinstance(val, (int, float)) else "Unavailable"
+                val_text = (
+                    f"{metric_val:.3f} {unit}".strip()
+                    if isinstance(metric_val, (int, float))
+                    else "Unavailable"
+                )
                 r = self.results_table.rowCount()
                 self.results_table.insertRow(r)
                 self.results_table.setItem(r, 0, QTableWidgetItem(key.replace("_", " ")))

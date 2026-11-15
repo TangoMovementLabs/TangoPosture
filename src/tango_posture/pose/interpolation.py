@@ -6,7 +6,7 @@ import math
 from collections.abc import Callable, Sequence
 from dataclasses import replace
 from itertools import pairwise
-from typing import Literal
+from typing import Any, Literal
 
 from ..domain import FrameObservation, Landmark
 from ..quality import reliable
