@@ -6,10 +6,12 @@ import cv2
 from .domain import FrameObservation, Landmark
 from .geometry import (
     ankle_lift_alignment,
+    calculate,
     detect_embrace_type,
     detect_role,
     head_horizontal_alignment,
     knee_bend_alignment,
+    pixel,
     shoulder_tension_alignment,
     torso_axis_alignment,
 )
@@ -83,6 +85,211 @@ def draw_torso_axis(
             2,
             cv2.LINE_AA,
         )
+
+
+def _draw_dashed_line(
+    image: Any,
+    start: tuple[int, int],
+    end: tuple[int, int],
+    color: tuple[int, int, int],
+    thickness: int = 2,
+    dash: int = 10,
+    gap: int = 8,
+) -> None:
+    dx = end[0] - start[0]
+    dy = end[1] - start[1]
+    length = math.hypot(dx, dy)
+    if length < 1.0:
+        return
+    ux, uy = dx / length, dy / length
+    step = dash + gap
+    pos = 0.0
+    while pos < length:
+        seg_end = min(pos + dash, length)
+        p0 = (round(start[0] + ux * pos), round(start[1] + uy * pos))
+        p1 = (round(start[0] + ux * seg_end), round(start[1] + uy * seg_end))
+        cv2.line(image, p0, p1, color, thickness, cv2.LINE_AA)
+        pos += step
+
+
+def draw_head_alignment(
+    image: Any,
+    pose: dict[str, Landmark],
+    mirror: bool,
+    confidence: float,
+    *,
+    neutral_offset: float = 0.0,
+    show_labels: bool = True,
+) -> None:
+    """Draw ear-to-nose head alignment lines relative to horizontal."""
+    height, width = image.shape[:2]
+    reliable_pose = {k: v for k, v in pose.items() if reliable(v, confidence)}
+    head_info = head_horizontal_alignment(
+        reliable_pose, width, height, neutral_offset=neutral_offset
+    )
+    if head_info is None:
+        return
+    angle, ear, nose = head_info
+    ex, ey = screen_point(ear.x, ear.y, width, height, mirror)
+    nx, ny = screen_point(nose.x, nose.y, width, height, mirror)
+    dir_x = 1 if nx >= ex else -1
+    seg_len = max(min(65.0, width * 0.45), math.hypot(nx - ex, ny - ey))
+    hx = round(ex + dir_x * seg_len)
+    rad = math.radians(angle)
+    vx = round(ex + dir_x * seg_len * math.cos(rad))
+    vy = round(ey - seg_len * math.sin(rad))
+    ref_color, vec_color = (255, 220, 0), (0, 220, 255)
+
+    cv2.line(image, (ex, ey), (hx, ey), ref_color, 2, cv2.LINE_AA)
+    cv2.line(image, (ex, ey), (vx, vy), vec_color, 3, cv2.LINE_AA)
+    for point in ((ex, ey), (nx, ny)):
+        cv2.circle(image, point, 4, vec_color, -1, cv2.LINE_AA)
+    arc_r = min(34, max(10, round(seg_len * 0.55)))
+    base_deg = 0.0 if dir_x > 0 else 180.0
+    end_deg = base_deg - angle if dir_x > 0 else base_deg + angle
+    cv2.ellipse(
+        image,
+        (ex, ey),
+        (arc_r, arc_r),
+        0.0,
+        min(base_deg, end_deg),
+        max(base_deg, end_deg),
+        vec_color,
+        2,
+        cv2.LINE_AA,
+    )
+    if not show_labels:
+        return
+    text = f"Head alignment: {angle:+.1f} deg"
+    (text_width, text_height), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 2)
+    tx = max(8, min(min(ex, nx) - 10, width - text_width - 8))
+    ty = max(text_height + 8, min(min(ey, ny) - 14, height - 12))
+    cv2.putText(
+        image,
+        text,
+        (tx, ty),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.52,
+        vec_color,
+        2,
+        cv2.LINE_AA,
+    )
+
+
+def draw_head_posture(
+    image: Any,
+    pose: dict[str, Landmark],
+    mirror: bool,
+    confidence: float,
+    *,
+    side: str = "left",
+    facing: str = "right",
+    show_labels: bool = True,
+) -> None:
+    """Draw shoulder-to-ear head posture lines and trunk/vertical reference."""
+    height, width = image.shape[:2]
+    reliable_pose = {k: v for k, v in pose.items() if reliable(v, confidence)}
+    other_side = "right" if side == "left" else "left"
+
+    def midpoint(a: Landmark, b: Landmark) -> Landmark:
+        return Landmark((a.x + b.x) / 2, (a.y + b.y) / 2)
+
+    def pair_center(joint: str) -> Landmark | None:
+        left, right = reliable_pose.get(f"left_{joint}"), reliable_pose.get(f"right_{joint}")
+        if left is not None and right is not None:
+            return midpoint(left, right)
+        return reliable_pose.get(f"{side}_{joint}") or reliable_pose.get(f"{other_side}_{joint}")
+
+    ls, rs = reliable_pose.get("left_shoulder"), reliable_pose.get("right_shoulder")
+    le, re = reliable_pose.get("left_ear"), reliable_pose.get("right_ear")
+    shoulder = pair_center("shoulder")
+    hip = pair_center("hip")
+
+    wide_shoulders = False
+    if ls is not None and rs is not None and shoulder is not None:
+        span_px = math.hypot((ls.x - rs.x) * width, (ls.y - rs.y) * height)
+        if hip is not None:
+            torso_px = math.hypot((shoulder.x - hip.x) * width, (shoulder.y - hip.y) * height)
+            wide_shoulders = torso_px > 0 and (span_px / torso_px) > 0.25
+        else:
+            wide_shoulders = abs(ls.x - rs.x) > 0.08
+
+    ear: Landmark | None = (
+        midpoint(le, re)
+        if le is not None and re is not None and wide_shoulders
+        else reliable_pose.get(f"{side}_ear") or reliable_pose.get(f"{other_side}_ear")
+    )
+
+    if ear is None or shoulder is None:
+        return
+
+    sx, sy = screen_point(shoulder.x, shoulder.y, width, height, mirror)
+    ex, ey = screen_point(ear.x, ear.y, width, height, mirror)
+    neck_len = math.hypot(ex - sx, ey - sy)
+    if neck_len < 1.0:
+        return
+
+    ref_color, head_color = (255, 220, 0), (255, 180, 0)
+    ref_len = max(neck_len * 1.25, min(40.0, height * 0.45))
+
+    label: str | None = None
+    if hip is not None:
+        ear_px = pixel(ear, width, height)
+        sh_px = pixel(shoulder, width, height)
+        hp_px = pixel(hip, width, height)
+        if (
+            float(math.hypot(*(sh_px - hp_px))) >= 1.0
+            and float(math.hypot(*(ear_px - sh_px))) >= 1.0
+        ):
+            metrics = calculate(ear_px, sh_px, hp_px, facing)
+            hx, hy = screen_point(hip.x, hip.y, width, height, mirror)
+            tdx, tdy = sx - hx, sy - hy
+            tlen = math.hypot(tdx, tdy)
+            if tlen >= 1.0:
+                ref_end = (
+                    max(0, min(width - 1, round(sx + ref_len * tdx / tlen))),
+                    max(0, min(height - 1, round(sy + ref_len * tdy / tlen))),
+                )
+                _draw_dashed_line(image, (sx, sy), ref_end, ref_color, 2)
+            label = (
+                f"Head posture: {metrics['head_inclination']:+.1f} deg "
+                f"({metrics['head_forward'] * 100:+.1f}%)"
+            )
+
+    if label is None:
+        ref_end = (sx, max(0, round(sy - ref_len)))
+        _draw_dashed_line(image, (sx, sy), ref_end, ref_color, 2)
+        f_sign = 1.0 if facing == "right" else -1.0
+        ear_px = pixel(ear, width, height)
+        sh_px = pixel(shoulder, width, height)
+        neck_angle = math.degrees(
+            math.atan2(f_sign * (ear_px[0] - sh_px[0]), ear_px[1] - sh_px[1])
+        )
+        label = f"Head posture: {neck_angle:+.1f} deg"
+
+    cv2.line(image, (sx, sy), (ex, ey), head_color, 3, cv2.LINE_AA)
+    nose = reliable_pose.get("nose")
+    if nose is not None:
+        nx, ny = screen_point(nose.x, nose.y, width, height, mirror)
+        cv2.line(image, (ex, ey), (nx, ny), head_color, 2, cv2.LINE_AA)
+    for point in ((sx, sy), (ex, ey)):
+        cv2.circle(image, point, 5, head_color, -1, cv2.LINE_AA)
+
+    if not show_labels:
+        return
+    (text_width, text_height), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 2)
+    tx = max(8, min(ex + 12, width - text_width - 8))
+    ty = max(text_height + 8, min(ey, height - 12))
+    cv2.putText(
+        image,
+        label,
+        (tx, ty),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.52,
+        head_color,
+        2,
+        cv2.LINE_AA,
+    )
 
 
 def draw(

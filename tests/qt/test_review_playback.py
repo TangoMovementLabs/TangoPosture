@@ -567,14 +567,75 @@ def test_reference_reanalysis_replaces_cached_results_and_survives_reload(
         assert f"| Pose Model SHA-256 | `{manifest['sha256']}` |" in saved_report
         assert "# Original reference report" not in saved_report
         assert f"`0` pivots, `{value - 1}` steps" in saved_report
+        if value == 2:
+            assert screen.stream_combo.currentText() == "Full lines + messages"
+            assert screen._playback.reader is not None
+            assert screen._playback.reader.index == 2
+            assert screen._playback.reader.path.read_bytes() == lines
         screen._on_segment_changed(0)
         assert screen._coach_data["frames"]["0"]["run_tag"] == value
         assert manifest["version"] in screen.report_view.toPlainText()
+        if value == 1:
+            screen.stream_combo.setCurrentText("Full lines + messages")
+            assert screen.stream_combo.currentText() == "Full lines + messages"
+            screen.scrubber.setValue(2)
     screen.load_archive(reference)
     assert screen._coach_data["frames"]["0"]["run_tag"] == 2
     assert screen._movement_data["tag"] == 2
     assert "Original reference report" not in screen.report_view.toPlainText()
     assert model_manifest("heavy")["version"] in screen.report_view.toPlainText()
+    streams = [screen.stream_combo.itemText(i) for i in range(screen.stream_combo.count())]
+    assert {"Overlay video", "Raw video", "Full lines + messages"}.issubset(streams)
+    screen.stream_combo.setCurrentText("Overlay video")
+    assert screen.stream_combo.currentText() == "Overlay video"
+    assert screen._playback.reader is not None
+    assert screen._playback.reader.path.name == "overlay_00.mp4"
+    assert screen._playback.reader.path.read_bytes() == overlay
+    screen.refresh()
+    assert screen.stream_combo.currentText() == "Overlay video"
+    screen.stream_combo.setCurrentText("Full lines + messages")
+    assert screen.stream_combo.currentText() == "Full lines + messages"
+    assert screen._playback.reader is not None
+    assert screen._playback.reader.path.read_bytes() == lines
+    screen.lines_only_cb.setChecked(True)
+    assert screen.stream_combo.currentText() == "Raw video"
+    assert screen._playback.reader is not None
+    assert screen._playback.reader.path.name == "video_00.mp4"
+    cal_path = tmp_path / "calibrations" / "SwitchCheck.tpc"
+    save_range_profile(
+        cal_path,
+        RangeProfile(
+            name="SwitchCheck",
+            context="Walking",
+            model_hash=model_manifest("heavy")["sha256"],
+            capture_profile=profile(Config(data_dir=str(tmp_path)), 64, 48, "video"),
+            source={"archive": "ref.tpr"},
+            metrics={
+                "head_pitch": ApprovedRange(
+                    lower=-20,
+                    upper=20,
+                    unit="degrees",
+                    view="all",
+                    passages=[Passage(start=0, end=1)],
+                    median=0,
+                    p10=-10,
+                    p90=10,
+                    valid_duration=1,
+                    selected_duration=1,
+                    samples=10,
+                    inside_fraction=1,
+                )
+            },
+        ),
+    )
+    screen.stream_combo.setCurrentText("Overlay video")
+    assert screen.stream_combo.currentText() == "Overlay video"
+    screen.bridge.update_config(Config(data_dir=str(tmp_path)))
+    assert screen.stream_combo.currentText() == "Overlay video"
+    screen.reference_combo.setCurrentIndex(screen.reference_combo.findData(str(cal_path.resolve())))
+    assert screen.stream_combo.currentText() == "Raw video"
+    assert screen._playback.reader is not None
+    assert screen._playback.reader.path.name == "video_00.mp4"
 
 
 @pytest.mark.parametrize("outcome", ["failed", "canceled"])
@@ -1000,16 +1061,357 @@ def test_synchronized_side_by_side_comparison(screen, video, monkeypatch):
     assert comparison.index == 3
 
 
-def test_export_copies_selected_video_without_modifying_source(screen, video, tmp_path, monkeypatch):
-    destination = tmp_path / "exported.avi"
-    screen.load_archive(video)
+def _write_solid_avi(
+    path,
+    *,
+    width: int = 320,
+    height: int = 240,
+    count: int = 3,
+    fps: float = 10.0,
+    color: tuple[int, int, int] = (40, 80, 120),
+):
+    import cv2
+    import numpy as np
+
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"MJPG"), fps, (width, height))
+    assert writer.isOpened()
+    frame = np.full((height, width, 3), color, dtype=np.uint8)
+    try:
+        for _ in range(count):
+            writer.write(frame)
+    finally:
+        writer.release()
+    return path
+
+
+def _sample_head_coach_data(
+    *,
+    count: int = 3,
+    include_measurements: bool = True,
+    calibrated_frames: set[int] | None = None,
+) -> dict[str, object]:
+    from tango_posture.pose.constants import NAMES
+    from tango_posture.references.coach import Landmark, _serialise_pose
+
+    points = {
+        "nose": (0.50, 0.20),
+        "left_ear": (0.30, 0.25),
+        "right_ear": (0.70, 0.25),
+        "left_shoulder": (0.35, 0.48),
+        "right_shoulder": (0.65, 0.48),
+        "left_hip": (0.40, 0.68),
+        "right_hip": (0.60, 0.68),
+        "left_knee": (0.40, 0.78),
+        "right_knee": (0.60, 0.78),
+        "left_ankle": (0.40, 0.88),
+        "right_ankle": (0.60, 0.88),
+    }
+    pose_lms = {
+        name: (
+            Landmark(
+                x=points[name][0], y=points[name][1], z=0.0, visibility=0.99, presence=0.99
+            )
+            if name in points
+            else Landmark(x=0.5, y=0.6, z=0.0, visibility=0.0, presence=0.0)
+        )
+        for name in NAMES
+    }
+    serial = _serialise_pose(pose_lms)
+    frames: dict[str, object] = {}
+    for index in range(count):
+        if calibrated_frames is not None and index not in calibrated_frames:
+            frames[str(index)] = {
+                "time_sec": index * 0.1,
+                "poses": [],
+                "dancer_index": None,
+                "state": "UNKNOWN",
+                "alerts": [],
+                "message": "",
+                "calibration_rows": [],
+            }
+            continue
+        entry: dict[str, object] = {
+            "time_sec": index * 0.1,
+            "poses": [serial],
+            "dancer_index": 0,
+            "state": "WITHIN_REFERENCE",
+            "alerts": [],
+            "message": "",
+            "head_angle": 3.5,
+            "shoulder_elev_pct": -2.0,
+            "axis_curve_smoothed": 0.04,
+            "torso_axis_tilt": 6.2,
+            "knee_bend_deg": 15.4,
+        }
+        if include_measurements:
+            entry["measurement_poses"] = [serial]
+        if calibrated_frames is not None:
+            entry["calibration_rows"] = [
+                {
+                    "metric": "head_pitch",
+                    "smoothed": 3.5,
+                    "unit": "degrees",
+                    "state": "WITHIN_REFERENCE",
+                    "reason": "",
+                },
+                {
+                    "metric": "torso_axis_tilt",
+                    "smoothed": 6.2,
+                    "unit": "degrees",
+                    "state": "WITHIN_REFERENCE",
+                    "reason": "",
+                },
+            ]
+        frames[str(index)] = entry
+    return {"video_fps": 10.0, "frames": frames}
+
+
+def _sample_movement_payload() -> dict[str, object]:
+    from tango_posture.movement import MOVEMENT_SCHEMA_VERSION
+
+    return {
+        "schema_version": MOVEMENT_SCHEMA_VERSION,
+        "source_width": 320,
+        "source_height": 240,
+        "video_fps": 10.0,
+        "steps": [
+            {
+                "frame": 0,
+                "time_sec": 0.0,
+                "hx": 90.0,
+                "hy": 100.0,
+                "tx": 105.0,
+                "ty": 120.0,
+                "side": "left",
+            }
+        ],
+        "pivots": [{"start_frame": 0, "end_frame": 3, "direction": "cw"}],
+        "hip_frames": [{"frame": 0, "lx": 120.0, "ly": 120.0, "rx": 160.0, "ry": 120.0, "scale": 70.0}],
+    }
+
+
+def _read_exported_frames(path):
+    from tango_posture.replay import VideoReader
+
+    reader = VideoReader(path)
+    try:
+        return [reader.frame(i) for i in range(reader.count)]
+    finally:
+        reader.close()
+
+
+def _export_and_read(screen, destination, monkeypatch):
     monkeypatch.setattr(
         "tango_posture.desktop_qt.screens.review.QFileDialog.getSaveFileName",
         lambda *args: (str(destination), "Video files"),
     )
     screen._export_video()
-    assert destination.read_bytes() == video.read_bytes()
-    assert video.is_file()
+    assert destination.is_file()
+    return _read_exported_frames(destination)
+
+
+def test_export_copies_selected_video_without_modifying_source(screen, video, tmp_path, monkeypatch):
+    import numpy as np
+
+    destination = tmp_path / "exported.avi"
+    original_bytes = video.read_bytes()
+    screen.load_archive(video)
+    frames = _export_and_read(screen, destination, monkeypatch)
+    assert video.read_bytes() == original_bytes
+    assert len(frames) == 12
+    assert frames[0].shape == (48, 64, 3)
+    lower_right = frames[0][20:, 30:]
+    assert bool(np.any(np.all(lower_right >= 220, axis=-1)))
+    assert bool(np.any(np.all(lower_right <= 120, axis=-1)))
+
+
+def test_skeleton_draws_ear_to_nose_and_head_checkboxes_toggle_overlays(screen, tmp_path):
+    import numpy as np
+
+    from tango_posture.movement import render_floor_guide
+    from tango_posture.pose.constants import CONNECTIONS
+
+    assert ("left_ear", "nose") in CONNECTIONS
+    assert ("right_ear", "nose") in CONNECTIONS
+    assert screen.show_head_alignment_cb.text() == "Head alignment"
+    assert not screen.show_head_alignment_cb.isChecked()
+    assert screen.show_head_posture_cb.text() == "Head posture"
+    assert not screen.show_head_posture_cb.isChecked()
+
+    source = _write_solid_avi(tmp_path / "head.avi", width=320, height=240, count=2)
+    screen.load_archive(source)
+    screen._coach_data = _sample_head_coach_data(count=2, include_measurements=True)
+    screen._update_calibration_comparison()
+
+    bg = np.full((240, 320, 3), (40, 80, 120), dtype=np.uint8)
+    for checkbox in (
+        screen.show_torso_axis_cb,
+        screen.show_head_alignment_cb,
+        screen.show_head_posture_cb,
+        screen.show_pivots_cb,
+        screen.show_steps_cb,
+        screen.lines_only_cb,
+    ):
+        checkbox.setChecked(False)
+    screen.show_coach_cb.setChecked(True)
+
+    skel_frame = screen._render_primary_frame(bg.copy(), 0, 0.0, fps=10.0)
+    # Midpoints between left_ear (96, 60) / right_ear (224, 60) and nose (160, 48).
+    assert np.count_nonzero(skel_frame[50:59, 123:133] != bg[50:59, 123:133]) > 0
+    assert np.count_nonzero(skel_frame[50:59, 187:197] != bg[50:59, 187:197]) > 0
+
+    screen.show_coach_cb.setChecked(False)
+    screen._show_frame(0)
+    floor_only = render_floor_guide(bg.copy())
+
+    for checkbox in (screen.show_head_alignment_cb, screen.show_head_posture_cb):
+        checkbox.setChecked(True)
+        with_labels = screen._render_primary_frame(bg.copy(), 0, 0.0, fps=10.0, update_status=True)
+        assert np.count_nonzero(with_labels != bg) > 0
+        assert not screen.axis_status.isVisibleTo(screen)
+
+        screen.lines_only_cb.setChecked(True)
+        without_labels = screen._render_primary_frame(bg.copy(), 0, 0.0, fps=10.0, update_status=True)
+        assert np.count_nonzero(without_labels != floor_only) > 0
+        assert np.count_nonzero(without_labels != floor_only) < np.count_nonzero(with_labels != bg)
+        screen.lines_only_cb.setChecked(False)
+        checkbox.setChecked(False)
+
+    screen._coach_data = _sample_head_coach_data(count=2, include_measurements=False)
+    screen._update_calibration_comparison()
+    screen.show_head_alignment_cb.setChecked(True)
+    screen._show_frame(0)
+    assert screen.axis_status.isVisibleTo(screen)
+    assert "head alignment landmarks" in screen.axis_status.text().lower()
+    screen.show_head_alignment_cb.setChecked(False)
+
+    screen.show_head_posture_cb.setChecked(True)
+    screen._show_frame(0)
+    assert screen.axis_status.isVisibleTo(screen)
+    assert "head posture landmarks" in screen.axis_status.text().lower()
+
+
+def test_export_video_matches_active_overlay_checkboxes(screen, tmp_path, monkeypatch):
+    import numpy as np
+
+    source = _write_solid_avi(tmp_path / "layers.avi", width=320, height=240, count=3)
+    screen.load_archive(source)
+    screen._coach_data = _sample_head_coach_data(count=3, include_measurements=True)
+    screen._movement_data = _sample_movement_payload()
+    screen._update_calibration_comparison()
+
+    all_cbs = (
+        screen.show_coach_cb,
+        screen.show_torso_axis_cb,
+        screen.show_head_alignment_cb,
+        screen.show_head_posture_cb,
+        screen.show_pivots_cb,
+        screen.show_steps_cb,
+        screen.lines_only_cb,
+    )
+    for checkbox in all_cbs:
+        checkbox.setChecked(False)
+    base_frames = _export_and_read(screen, tmp_path / "base.avi", monkeypatch)
+    base_upper = base_frames[0][:170, :].astype(int)
+
+    for index, checkbox in enumerate(all_cbs):
+        checkbox.setChecked(True)
+        if checkbox is screen.lines_only_cb:
+            screen.show_head_alignment_cb.setChecked(True)
+        exported = _export_and_read(screen, tmp_path / f"layer_{index}.avi", monkeypatch)
+        diff_pixels = np.count_nonzero(
+            np.abs(exported[0][:170, :].astype(int) - base_upper).max(axis=-1) > 25
+        )
+        assert diff_pixels > 30
+        if checkbox is screen.lines_only_cb:
+            corner_patch = exported[0][10:40, 10:80].astype(int)
+            assert float(np.abs(corner_patch[:, :, 2] - corner_patch[:, :, 0]).mean()) < 15.0
+            screen.show_head_alignment_cb.setChecked(False)
+        checkbox.setChecked(False)
+
+
+def test_export_video_combines_comparison_and_draws_insights_metrics_box(
+    screen, tmp_path, monkeypatch
+):
+    import numpy as np
+
+    primary = _write_solid_avi(
+        tmp_path / "primary.avi", width=320, height=240, count=3, color=(120, 40, 20)
+    )
+    comparison = _write_solid_avi(
+        tmp_path / "comparison.avi", width=160, height=120, count=3, color=(30, 170, 40)
+    )
+    screen.load_archive(primary)
+    screen._coach_data = _sample_head_coach_data(count=3, include_measurements=True)
+    screen._update_calibration_comparison()
+    screen._load_comparison(comparison)
+    assert screen._comparison.reader is not None
+    assert screen.compare_cb.isChecked()
+    screen._show_frame(0)
+
+    expected_lines = [
+        "Head alignment: +3.5 deg",
+        "Shoulder height: -2.0%",
+        "Torso / hip alignment: +4.0%",
+        "Torso axis: 6.2 deg",
+        "Knee bend: 15.4 deg",
+    ]
+    assert screen._frame_metrics_lines(0) == expected_lines
+
+    direct_patch_frame = screen._render_metrics_box(np.zeros((240, 640, 3), dtype=np.uint8), 0)
+    direct_box = direct_patch_frame[130:, 320:]
+    assert bool(np.any(np.all(direct_box == 255, axis=-1)))
+    assert bool(np.any(np.all(direct_box == 0, axis=-1)))
+
+    both_frames = _export_and_read(screen, tmp_path / "both.avi", monkeypatch)
+    assert len(both_frames) == 3
+    assert both_frames[0].shape == (240, 640, 3)
+    # Left half reflects primary background; upper-right reflects comparison background.
+    assert both_frames[0][40, 40, 0] > 90
+    assert both_frames[0][40, 580, 1] > 140
+    # Lower-right corner has white box background with dark text pixels.
+    exported_box = both_frames[0][130:, 360:]
+    assert bool(np.any(np.all(exported_box >= 240, axis=-1)))
+    assert bool(np.any(np.all(exported_box <= 60, axis=-1)))
+
+    screen.compare_cb.setChecked(False)
+    single_frames = _export_and_read(screen, tmp_path / "single.avi", monkeypatch)
+    assert len(single_frames) == 3
+    assert single_frames[0].shape == (240, 320, 3)
+
+
+def test_export_video_with_calibration_profile_keeps_uniform_frame_sizes(
+    screen, tmp_path, monkeypatch
+):
+    import numpy as np
+
+    source = _write_solid_avi(tmp_path / "calibrated.avi", width=320, height=240, count=3)
+    screen.load_archive(source)
+    # Include frame 0 with poses, frame 1 empty poses, and omit frame 2 completely.
+    coach_data = _sample_head_coach_data(count=2, include_measurements=True, calibrated_frames={0})
+    screen._coach_data = coach_data
+    screen._compared_coach_data = coach_data
+    screen._calibration_name = "Test Profile"
+    screen.reference_combo.blockSignals(True)
+    screen.reference_combo.addItem("Test Profile", "test-profile-key")
+    screen.reference_combo.setCurrentIndex(screen.reference_combo.count() - 1)
+    screen.reference_combo.blockSignals(False)
+    screen.show_coach_cb.setChecked(True)
+    screen.lines_only_cb.setChecked(False)
+    screen._show_frame(0)
+
+    lines = screen._frame_metrics_lines(0)
+    assert lines[0] == "Head alignment: 3.5 deg"
+    assert lines[1] == "Shoulder height: Not in profile"
+    assert lines[3] == "Torso axis: 6.2 deg"
+
+    exported_frames = _export_and_read(screen, tmp_path / "cal_export.avi", monkeypatch)
+    assert len(exported_frames) == 3
+    assert exported_frames[0].shape[1] >= 960
+    assert exported_frames[0].shape == exported_frames[1].shape == exported_frames[2].shape
+    exported_box = exported_frames[0][500:, 500:]
+    assert bool(np.any(np.all(exported_box >= 240, axis=-1)))
+    assert bool(np.any(np.all(exported_box <= 50, axis=-1)))
 
 
 def test_standalone_import_report_relinks_by_hash_and_seeks(screen, video, tmp_path, monkeypatch):
@@ -1159,8 +1561,18 @@ def test_archive_recordings_variants_and_reports_are_real_and_owned(screen, vide
     assert "Stored report" in screen.report_view.toPlainText()
     assert "Actual recorded findings." in screen.report_view.toPlainText()
     assert screen.stream_combo.currentText() == "Raw video"
+    assert raw_reader.path.name == "video_00.mp4"
     screen.stream_combo.setCurrentText("Overlay video")
+    assert screen.stream_combo.currentText() == "Overlay video"
+    assert not raw_reader.cap.isOpened()
+    overlay_reader = screen._playback.reader
+    assert overlay_reader is not None
+    assert overlay_reader.path.name == "overlay_00.mp4"
+    screen.show_torso_axis_cb.setChecked(True)
     assert screen.stream_combo.currentText() == "Raw video"
+    assert not overlay_reader.cap.isOpened()
+    raw_reader = screen._playback.reader
+    assert raw_reader is not None
     assert raw_reader.path.name == "video_00.mp4"
     screen.segment_combo.setCurrentIndex(1)
     assert not raw_reader.cap.isOpened()
@@ -1266,6 +1678,12 @@ def test_bad_overlay_is_not_replaced_with_fake_content_and_raw_can_be_selected(
     screen.load_archive(path)
     assert screen.stream_combo.currentText() == "Raw video"
     screen.stream_combo.setCurrentText("Overlay video")
+    assert screen.stream_combo.currentText() == "Overlay video"
+    assert "Replay unavailable:" in screen.status_label.text()
+    assert screen.primary_stage._image is None
+    assert not screen.play_btn.isEnabled()
+    assert screen.duration_sec == 0
+    screen.stream_combo.setCurrentText("Raw video")
     assert screen.stream_combo.currentText() == "Raw video"
     assert screen.play_btn.isEnabled()
     assert screen.duration_sec == pytest.approx(1.2)

@@ -10,7 +10,12 @@ from conftest import frame
 from tango_posture.archive import read_calibration_archive, read_manifest, rename_archive
 from tango_posture.calibration.archives import read_range_profile, save_range_profile
 from tango_posture.calibration.baseline import compatible, profile
-from tango_posture.calibration.evidence import Evidence, dancer_frames
+from tango_posture.calibration.evidence import (
+    Evidence,
+    dancer_frames,
+    is_static_pose_run,
+    single_dancer_anchors,
+)
 from tango_posture.calibration.measurements import (
     measure_profile,
     measure_ranges,
@@ -314,3 +319,65 @@ def test_front_view_calibration_and_evaluation_share_view_eligibility_gate():
 
     all_samples = metric_samples([sample], cfg, view="all")
     assert all_samples["head_pitch"][0][1] is not None
+
+
+def test_single_candidate_step_tolerance_and_auto_anchors():
+    f0 = frame(0.0)
+    f1 = frame(0.1)
+    f1.poses[0] = {
+        name: replace(point, x=point.x + 0.18) for name, point in f1.poses[0].items()
+    }
+    single_ev = Evidence([f0, f1], MANIFEST["sha256"], {}, {}, 0.5)
+    selected_single = dancer_frames(single_ev, 0, 0.7)
+    assert [bool(item.poses) for item in selected_single] == [True, True]
+
+    # When multiple poses are present, keep the conservative < 0.15 step limit.
+    f1_multi = frame(0.1)
+    f1_multi.poses[0] = dict(f1.poses[0])
+    f1_multi.poses.append({
+        name: replace(point, x=point.x + 0.30) for name, point in frame(0.1).poses[0].items()
+    })
+    multi_ev = Evidence([f0, f1_multi], MANIFEST["sha256"], {}, {}, 0.5)
+    selected_multi = dancer_frames(multi_ev, 0, 0.7)
+    assert [bool(item.poses) for item in selected_multi] == [True, False]
+
+    # Auto-link computes anchor frames across brief solo pose dropouts.
+    gap = frame(0.2)
+    gap.poses.clear()
+    resumed = frame(0.3)
+    resumed.poses[0] = dict(f1.poses[0])
+    dropout_ev = Evidence([f0, f1, gap, resumed], MANIFEST["sha256"], {}, {}, 0.5)
+    assert single_dancer_anchors(dropout_ev, 0.7) == {0: 0, 3: 0}
+
+    with pytest.raises(ValueError, match="single-dancer"):
+        single_dancer_anchors(multi_ev, 0.7)
+
+
+def test_single_dancer_anchors_skips_trailing_static_poster_frames():
+    frames = []
+    # Moving dancing frames 0..14 (step > 1e-3 so not a static slide).
+    for idx in range(15):
+        item = frame(idx * 0.1)
+        shift = 0.005 * idx
+        item.poses[0] = {
+            name: replace(point, x=point.x + shift) for name, point in item.poses[0].items()
+        }
+        frames.append(item)
+    # Brief empty dropout gap 15..17.
+    for idx in range(15, 18):
+        gap = frame(idx * 0.1)
+        gap.poses.clear()
+        frames.append(gap)
+    # Frozen promotional poster / title slide 18..29 (>= 10 identical static frames).
+    static_base = frame(1.8).poses[0]
+    static_pose = {name: replace(point, x=point.x + 0.25) for name, point in static_base.items()}
+    for idx in range(18, 30):
+        poster = frame(idx * 0.1)
+        poster.poses[0] = dict(static_pose)
+        frames.append(poster)
+
+    ev = Evidence(frames, MANIFEST["sha256"], {}, {}, 0.5)
+    assert is_static_pose_run(frames, 0) is False
+    assert is_static_pose_run(frames, 18) is True
+    assert single_dancer_anchors(ev, 0.7) == {0: 0}
+

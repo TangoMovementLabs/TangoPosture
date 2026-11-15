@@ -23,6 +23,7 @@ from tango_posture.calibration.models import (
 from tango_posture.config import Config, RangeDefault
 from tango_posture.desktop_qt.analytics.data import (
     FRAME_METRICS,
+    compare_archive_with_calibration,
     load_archive_dataset,
     load_session,
     session_payload,
@@ -491,3 +492,36 @@ def test_analytics_export_individual_and_all_charts_to_files(qapp, tmp_path):
     assert set(METRIC_DETAILS) <= set(all_payload["metrics"])
     assert set(FRAME_METRICS) <= set(all_payload["metrics"])
     screen.close()
+
+
+def test_analytics_defaults_and_tpc_include_head_forward_inclination_and_trunk(tmp_path):
+    cfg = Config(data_dir=str(tmp_path), smoothing=0.0001, max_gap=0.5)
+    capture_profile = profile(cfg, 640, 480, "video")
+    timestamps = [0.0, 0.2, 0.4, 0.6]
+    observations = [_full_pose_observation(ts, ear_dx=i * 8.0) for i, ts in enumerate(timestamps)]
+    tpr_path = reference_directory(str(tmp_path)) / "DefaultsRef.tpr"
+    _make_pose_archive(
+        tpr_path, tmp_path / "rep.md", timestamps, observations, capture_profile, is_reference=True
+    )
+    dataset = load_archive_dataset(tpr_path, 0, cfg)
+
+    defaults_comp = compare_archive_with_calibration(tpr_path, 0, dataset, cfg, "__defaults__")
+    assert defaults_comp.metrics["head_forward"].bounds == (-cfg.head_forward.entry, cfg.head_forward.entry)
+    assert defaults_comp.metrics["head_forward"].reference_line == 0.0
+    assert defaults_comp.metrics["head_inclination"].bounds == (
+        -cfg.head_inclination.entry,
+        cfg.head_inclination.entry,
+    )
+    assert defaults_comp.metrics["head_inclination"].reference_line == 0.0
+    assert defaults_comp.metrics["trunk_inclination"].bounds == (
+        -cfg.trunk_inclination.entry,
+        cfg.trunk_inclination.entry,
+    )
+    assert defaults_comp.metrics["trunk_inclination"].reference_line == 0.0
+
+    cal_profile = _full_range_profile(cfg, capture_profile, baseline_obs=observations[0])
+    profile_comp = compare_archive_with_calibration(tpr_path, 0, dataset, cfg, cal_profile)
+    for key in ("head_forward", "head_inclination", "trunk_inclination"):
+        target = cal_profile.metrics[key]
+        assert profile_comp.metrics[key].bounds == (target.lower, target.upper)
+        assert profile_comp.metrics[key].reference_line == pytest.approx(target.median)

@@ -12,6 +12,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox, QPushButton
 from tango_posture.archive import append_segment, read_analytics, read_manifest, store_analytics
 from tango_posture.calibration.archives import read_range_profile
 from tango_posture.calibration.baseline import profile
+from tango_posture.calibration.evidence import single_dancer_anchors
 from tango_posture.calibration.measurements import measure_ranges
 from tango_posture.calibration.models import METRIC_DETAILS, ApprovedRange, Passage
 from tango_posture.config import Config, export_toml
@@ -760,3 +761,212 @@ def test_settings_screen_has_expandable_guides_and_worked_examples(qapp, tmp_pat
         assert all(panel.isHidden() for panel in screen.help_panels.values())
     finally:
         screen.close()
+
+
+def test_editing_tpc_commits_draft_metrics_hints_approve_all_and_auto_links(qapp, tmp_path):
+    from tango_posture.desktop_qt.screens.references import ReferencesScreen
+
+    ref_dir = tmp_path / "references"
+    ref_dir.mkdir(parents=True, exist_ok=True)
+    video, report, practice = (tmp_path / name for name in ("v.mp4", "r.md", "p.tp"))
+    writer = cv2.VideoWriter(str(video), cv2.VideoWriter.fourcc(*"mp4v"), 10, (640, 480))
+    assert writer.isOpened()
+    entries = []
+    for index in range(30):
+        writer.write(np.zeros((480, 640, 3), dtype=np.uint8))
+        if index == 12:
+            entries.append({"poses": []})
+            continue
+        pose = dict(frame(index / 10).poses[0])
+        pose["left_knee"] = Landmark(0.52 + 0.005 * (index % 3), 385 / 480, 0.99, 0.99)
+        pose["right_knee"] = Landmark(0.53 + 0.005 * (index % 3), 385 / 480, 0.99, 0.99)
+        entries.append({"poses": [
+            {name: [p.x, p.y, p.z, p.visibility, p.presence] for name, p in pose.items()}
+        ]})
+    writer.release()
+    report.write_text("# Source\n")
+    append_segment(practice, report, video, None, [i / 10 for i in range(30)], analytics={
+        "model_hash": MANIFEST["sha256"],
+        "capture_profile": profile(Config(), 640, 480, "video"),
+        "frames": entries, "max_gap": 0.5,
+    })
+    reference = ref_dir / "SoloDrop.tpr"
+    promote_reference(practice, reference, "Solo Dropout")
+
+    cfg = Config(data_dir=str(tmp_path))
+    creator = CalibrationEditor(reference, cfg)
+    try:
+        creator.name_input.setText("Draft Auto Test")
+        creator.view_combo.setCurrentText("all")
+        creator._approve()  # head_pitch
+        creator._save()
+        tpc_path = creator.saved_path
+        assert tpc_path is not None
+    finally:
+        if creator.isVisible():
+            creator.reject()
+
+    editor = CalibrationEditor(tpc_path, cfg)
+    try:
+        assert editor.view_combo.currentText() == "all"
+        assert editor.auto_link_button.isEnabled()
+        editor.auto_link_button.click()
+        assert editor._anchors == {0: 0, 13: 0}
+        assert set(editor.approved) == {"head_pitch"}
+
+        # Restarting track while editing an existing .tpc preserves approved metrics.
+        editor.scrubber.setValue(13)
+        editor._restart_track()
+        assert "head_pitch" in editor.approved
+
+        # Interactively choosing head_forward and head_inclination without clicking Approve
+        # shows explanatory hints and commits both drafts on Save.
+        hf_idx = editor.metric_combo.findData("head_forward")
+        editor.metric_combo.setCurrentIndex(hf_idx)
+        editor.metric_combo.activated.emit(hf_idx)
+        assert "ear–shoulder" in editor.metric_hint.text()
+        editor.lower_spin.setValue(editor.lower_spin.value() - 0.01)
+
+        hi_idx = editor.metric_combo.findData("head_inclination")
+        editor.metric_combo.setCurrentIndex(hi_idx)
+        editor.metric_combo.activated.emit(hi_idx)
+        assert "degrees" in editor.metric_hint.text()
+        editor._save()
+    finally:
+        if editor.isVisible():
+            editor.reject()
+
+    saved = read_range_profile(tpc_path)
+    assert {"head_pitch", "head_forward", "head_inclination"} <= set(saved.metrics)
+
+    # Approve all remaining metrics via one click and verify ReferencesScreen lists them.
+    editor2 = CalibrationEditor(tpc_path, cfg)
+    try:
+        editor2.approve_all_button.click()
+        assert len(editor2.approved) == len(METRIC_DETAILS)
+        assert "✓" in editor2.metric_combo.currentText()
+        editor2._save()
+    finally:
+        if editor2.isVisible():
+            editor2.reject()
+
+    refs_screen = ReferencesScreen(ServiceBridge(cfg), Router())
+    try:
+        assert refs_screen.table.rowCount() >= 1
+        detail_text = refs_screen.detail_meta.text()
+        assert "Approved metrics" in detail_text
+        assert "Head-forward offset" in detail_text
+        assert "Head inclination" in detail_text
+    finally:
+        refs_screen.close()
+
+
+def test_calibration_editor_trims_trailing_static_outro_and_zooms_chart(qapp, tmp_path):
+    video, report, practice = (
+        tmp_path / name for name in ("outro.mp4", "outro.md", "outro.tp")
+    )
+    writer = cv2.VideoWriter(str(video), cv2.VideoWriter.fourcc(*"mp4v"), 10, (640, 480))
+    assert writer.isOpened()
+
+    entries = []
+    # Moving frames 0..24 (0.0s..2.4s), with a single-frame extreme knee bend outlier on frame 12.
+    for index in range(25):
+        writer.write(np.zeros((480, 640, 3), dtype=np.uint8))
+        shift = 0.004 * index
+        pose = dict(frame(index / 10).poses[0])
+        if index == 12:
+            pose["left_knee"] = Landmark(0.75, 0.55, 0.99, 0.99)
+        else:
+            pose["left_knee"] = Landmark(0.52 + 0.005 * (index % 3), 385 / 480, 0.99, 0.99)
+        pose["right_knee"] = Landmark(0.53 + 0.005 * (index % 3), 385 / 480, 0.99, 0.99)
+        entries.append({
+            "poses": [
+                {
+                    name: [p.x + shift, p.y, p.z, p.visibility, p.presence]
+                    for name, p in pose.items()
+                }
+            ]
+        })
+
+    # Empty dropout gap frames 25..27 (2.5s..2.7s).
+    for _ in range(25, 28):
+        writer.write(np.zeros((480, 640, 3), dtype=np.uint8))
+        entries.append({"poses": []})
+
+    # Frozen static poster outro frames 28..39 (2.8s..3.9s).
+    static_pose = {
+        name: [p.x + 0.25, p.y, p.z, p.visibility, p.presence]
+        for name, p in frame(2.8).poses[0].items()
+    }
+    for _ in range(28, 40):
+        writer.write(np.zeros((480, 640, 3), dtype=np.uint8))
+        entries.append({"poses": [dict(static_pose)]})
+
+    writer.release()
+    report.write_text("# Source\n")
+    append_segment(
+        practice,
+        report,
+        video,
+        None,
+        [i / 10 for i in range(40)],
+        analytics={
+            "model_hash": MANIFEST["sha256"],
+            "capture_profile": profile(Config(), 640, 480, "video"),
+            "frames": entries,
+            "max_gap": 0.5,
+        },
+    )
+    ref_dir = tmp_path / "references"
+    ref_dir.mkdir(parents=True, exist_ok=True)
+    reference = ref_dir / "OutroRef.tpr"
+    promote_reference(practice, reference, "OutroRef")
+
+    cfg = Config(data_dir=str(tmp_path))
+    editor = CalibrationEditor(reference, cfg)
+    try:
+        editor.resize(1100, 760)
+        editor.show()
+        qapp.processEvents()
+
+        assert single_dancer_anchors(editor.evidence, cfg.confidence) == {0: 0}
+        assert editor.chart.time_end == pytest.approx(2.4)
+        assert "Track stopped" not in editor.status_label.text()
+
+        # Switching to Knees exercises outlier-resistant Y-axis & distribution rendering.
+        editor.step_combo.setCurrentText("Knees")
+        assert editor.metric_combo.currentData() == "knee_flexion"
+        qapp.processEvents()
+        assert not editor.chart.grab().isNull()
+
+        # Zoom to 2x: view window halves and chart click seeks inside the zoomed window.
+        editor.chart_zoom_combo.setCurrentIndex(1)
+        qapp.processEvents()
+        assert editor.chart.x_zoom == pytest.approx(2.0)
+        start, end = editor.chart._view_window()
+        assert start == pytest.approx(0.0)
+        assert end == pytest.approx(1.2)
+
+        center = QPoint(editor.chart.width() // 2, editor.chart.height() // 2)
+        QTest.mouseClick(editor.chart, Qt.MouseButton.LeftButton, pos=center)
+        assert 0.3 <= editor.scrubber.value() / 10.0 <= 0.9
+
+        # Scrubbing into the second half auto-pans the zoomed window and seeks accurately.
+        editor.scrubber.setValue(20)
+        qapp.processEvents()
+        assert editor.chart.playhead_timestamp == pytest.approx(2.0)
+        start2, end2 = editor.chart._view_window()
+        assert end2 - start2 == pytest.approx(1.2)
+        assert end2 == pytest.approx(2.4)
+        QTest.mouseClick(editor.chart, Qt.MouseButton.LeftButton, pos=center)
+        assert 1.4 <= editor.scrubber.value() / 10.0 <= 2.1
+
+        # Reset zoom back to Fit (1x).
+        editor.chart_zoom_combo.setCurrentIndex(0)
+        qapp.processEvents()
+        assert editor.chart.x_zoom == pytest.approx(1.0)
+        assert editor.chart._view_window() == pytest.approx((0.0, 2.4))
+    finally:
+        if editor.isVisible():
+            editor.reject()
+

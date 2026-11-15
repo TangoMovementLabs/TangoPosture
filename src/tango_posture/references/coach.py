@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -28,7 +28,14 @@ from ..geometry import (
     shoulder_geometry_kwargs,
     torso_axis_alignment,
 )
-from ..overlay import MESSAGES, draw, draw_torso_axis, screen_point
+from ..overlay import (
+    MESSAGES,
+    draw,
+    draw_head_alignment,
+    draw_head_posture,
+    draw_torso_axis,
+    screen_point,
+)
 from ..pose.constants import CONNECTIONS
 from ..pose.interpolation import interpolate_poses
 from ..quality import reliable
@@ -205,11 +212,13 @@ def interpolate_coach_data(data: dict[str, Any], cfg: Config) -> dict[str, Any]:
     }
 
 
-def render_coach_torso_axis(
-    image: np.ndarray, coach_data: dict[str, Any], frame_index: int, cfg: Config, *,
-    show_labels: bool = True,
+def _render_coach_measurement_overlay(
+    image: np.ndarray,
+    coach_data: dict[str, Any],
+    frame_index: int,
+    draw_pose: Callable[[np.ndarray, dict[str, Landmark]], None],
 ) -> np.ndarray:
-    """Draw the axis from raw cached landmarks, independent of posture coaching."""
+    """Draw a per-pose measurement overlay from raw cached landmarks."""
     frames = coach_data.get("frames")
     entry = frames.get(str(frame_index)) if isinstance(frames, dict) else None
     if not isinstance(entry, dict):
@@ -219,8 +228,63 @@ def render_coach_torso_axis(
     observation = _coach_observation(entry, width, height, require_measurements=True)
     canvas = image.copy()
     for pose in observation.poses:
-        draw_torso_axis(canvas, pose, False, cfg.confidence, show_labels=show_labels)
+        draw_pose(canvas, pose)
     return canvas
+
+
+def render_coach_torso_axis(
+    image: np.ndarray, coach_data: dict[str, Any], frame_index: int, cfg: Config, *,
+    show_labels: bool = True,
+) -> np.ndarray:
+    """Draw the axis from raw cached landmarks, independent of posture coaching."""
+    return _render_coach_measurement_overlay(
+        image,
+        coach_data,
+        frame_index,
+        lambda canvas, pose: draw_torso_axis(
+            canvas, pose, False, cfg.confidence, show_labels=show_labels
+        ),
+    )
+
+
+def render_coach_head_alignment(
+    image: np.ndarray, coach_data: dict[str, Any], frame_index: int, cfg: Config, *,
+    show_labels: bool = True,
+) -> np.ndarray:
+    """Draw head alignment lines from raw cached landmarks, independent of posture coaching."""
+    return _render_coach_measurement_overlay(
+        image,
+        coach_data,
+        frame_index,
+        lambda canvas, pose: draw_head_alignment(
+            canvas, pose, False, cfg.confidence, show_labels=show_labels
+        ),
+    )
+
+
+def render_coach_head_posture(
+    image: np.ndarray, coach_data: dict[str, Any], frame_index: int, cfg: Config, *,
+    show_labels: bool = True,
+) -> np.ndarray:
+    """Draw head posture lines from raw cached landmarks, independent of posture coaching."""
+    capture = coach_data.get("capture_profile")
+    capture_map = capture if isinstance(capture, dict) else {}
+    side = str(capture_map.get("side") or cfg.side)
+    facing = str(capture_map.get("facing") or cfg.facing)
+    return _render_coach_measurement_overlay(
+        image,
+        coach_data,
+        frame_index,
+        lambda canvas, pose: draw_head_posture(
+            canvas,
+            pose,
+            False,
+            cfg.confidence,
+            side=side,
+            facing=facing,
+            show_labels=show_labels,
+        ),
+    )
 
 
 def render_coach_frame_overlay(

@@ -18,6 +18,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ...calibration.archives import read_range_profile
+from ...calibration.models import METRIC_DETAILS
 from ...config import Config
 from ...core.entities import ReferenceSummary
 from ..router import Route, Router
@@ -161,7 +163,7 @@ class ReferencesScreen(QWidget):
         self.match_btn.setEnabled(True)
         self.confirm_camera_cb.setEnabled(True)
         self.detail_name.setText(ref.name)
-        self.detail_meta.setText(
+        details = (
             f"ID: {ref.id[:8]}...\n"
             f"Created: {format_created_at(ref.created_at, ref.path)}\n"
             f"Measurement side: {ref.side.capitalize()}\n"
@@ -169,6 +171,22 @@ class ReferencesScreen(QWidget):
             f"Camera device: {ref.camera}\n"
             f"File: {ref.path.name}"
         )
+        if ref.is_archive:
+            try:
+                range_profile = read_range_profile(ref.path)
+                metric_lines = [
+                    f"• {METRIC_DETAILS.get(k, ('', k, ''))[1]}: "
+                    f"{t.lower:.3g} … {t.upper:.3g} {t.unit} ({t.view})"
+                    for k, t in range_profile.metrics.items()
+                ]
+                details += (
+                    f"\nContext: {range_profile.context}"
+                    f"\nApproved metrics ({len(metric_lines)}):\n"
+                    + "\n".join(metric_lines)
+                )
+            except (OSError, ValueError, TypeError, KeyError):
+                pass
+        self.detail_meta.setText(details)
         self.confirm_camera_cb.setChecked(False)
 
     def _clear_selection(self) -> None:

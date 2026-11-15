@@ -4,17 +4,17 @@ from __future__ import annotations
 
 import queue
 import re
-import shutil
 import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
-from tempfile import TemporaryDirectory
+from tempfile import NamedTemporaryFile, TemporaryDirectory
 from threading import Event, Thread
 from typing import Any
 from zipfile import BadZipFile, ZipFile
 
 import cv2
+import numpy as np
 from PySide6.QtCore import Qt, QTimer, QUrl
 from PySide6.QtGui import QCloseEvent, QHideEvent, QImage, QShowEvent
 from PySide6.QtWidgets import (
@@ -50,11 +50,13 @@ from ...references.coach import (
     compare_coach_data,
     interpolate_coach_data,
     render_coach_frame_overlay,
+    render_coach_head_alignment,
+    render_coach_head_posture,
     render_coach_torso_axis,
 )
 from ...references.companions import load_report_coach_data, load_report_movement_data
 from ...references.constants import MAX_IMPORT_RANGE_SECONDS
-from ...replay import time_label
+from ...replay import VideoReader, time_label
 from ...reports import latest_analysis_model_section
 from ..components.video_stage import VideoStage
 from ..review.analysis import (
@@ -98,6 +100,13 @@ _DISPLAY_METRICS = (
     ("axis_curve_smoothed", "hip_offset"),
     ("torso_axis_tilt", "torso_axis_tilt"),
     ("knee_bend_deg", "knee_flexion"),
+)
+_METRIC_TITLES = (
+    ("head_angle", "Head alignment"),
+    ("shoulder_elev_pct", "Shoulder height"),
+    ("axis_curve_smoothed", "Torso / hip alignment"),
+    ("torso_axis_tilt", "Torso axis"),
+    ("knee_bend_deg", "Knee bend"),
 )
 
 
@@ -359,6 +368,14 @@ class ReviewScreen(QWidget):
             "Show the pink shoulder-to-hip midpoint line and its angle from image vertical. "
             "This is a measurement, not an alert."
         )
+        self.show_head_alignment_cb = QCheckBox("Head alignment")
+        self.show_head_alignment_cb.setToolTip(
+            "Show the head alignment ear-to-ear reference line and tilt angle."
+        )
+        self.show_head_posture_cb = QCheckBox("Head posture")
+        self.show_head_posture_cb.setToolTip(
+            "Show the head posture reference line and angle from vertical."
+        )
         self.show_pivots_cb = QCheckBox("Pivot rings")
         self.show_steps_cb = QCheckBox("Step footprints")
         self.lines_only_cb = QCheckBox("Floor lines only")
@@ -369,8 +386,13 @@ class ReviewScreen(QWidget):
         layers.setHorizontalSpacing(12)
         layers.setVerticalSpacing(6)
         for position, checkbox in enumerate((
-            self.show_coach_cb, self.show_torso_axis_cb, self.show_pivots_cb,
-            self.show_steps_cb, self.lines_only_cb,
+            self.show_coach_cb,
+            self.show_torso_axis_cb,
+            self.show_head_alignment_cb,
+            self.show_head_posture_cb,
+            self.show_pivots_cb,
+            self.show_steps_cb,
+            self.lines_only_cb,
         )):
             checkbox.toggled.connect(self._refresh_overlay)
             layers.addWidget(checkbox, position // 2, position % 2)
@@ -401,13 +423,7 @@ class ReviewScreen(QWidget):
         self.metric_values: dict[str, QLabel] = {}
         self.metric_states: dict[str, QLabel] = {}
         self.metric_ranges: dict[str, QLabel] = {}
-        for row_index, (key, title) in enumerate((
-            ("head_angle", "Head alignment"),
-            ("shoulder_elev_pct", "Shoulder height"),
-            ("axis_curve_smoothed", "Torso / hip alignment"),
-            ("torso_axis_tilt", "Torso axis"),
-            ("knee_bend_deg", "Knee bend"),
-        )):
+        for row_index, (key, title) in enumerate(_METRIC_TITLES):
             state_dot = QLabel("●")
             state_dot.setFixedWidth(12)
             name_label = QLabel(title)
@@ -521,7 +537,11 @@ class ReviewScreen(QWidget):
             index = self.reference_combo.count() - 1
         self.reference_combo.setCurrentIndex(max(0, index))
         self.reference_combo.blockSignals(False)
-        self._calibration_changed()
+        calibration_changed = self.reference_combo.currentData() != selected
+        dynamic_stream = self.stream_combo.currentText() in (
+            "Raw video", "Local video", "Source video"
+        )
+        self._calibration_changed(refresh_overlay=calibration_changed or dynamic_stream)
 
     def _update_calibration_comparison(self) -> None:
         self._compared_coach_data = None
@@ -552,7 +572,7 @@ class ReviewScreen(QWidget):
             self.analysis_status.setText(self._calibration_error)
             self.bridge.status_message.emit(self._calibration_error)
 
-    def _calibration_changed(self, *_args: object) -> None:
+    def _calibration_changed(self, *_args: object, refresh_overlay: bool = True) -> None:
         self._update_calibration_comparison()
         if not self._calibration_error and self._coach_data is not None:
             self.analysis_status.setText(
@@ -560,7 +580,8 @@ class ReviewScreen(QWidget):
                 if self.reference_combo.currentData() is not None else
                 "No calibration selected; showing tracking and movement without posture alerts."
             )
-        self._refresh_overlay()
+        if refresh_overlay:
+            self._refresh_overlay()
 
     def _display_coach_data(self) -> dict[str, Any] | None:
         return self._compared_coach_data
@@ -655,6 +676,51 @@ class ReviewScreen(QWidget):
         self.load_archive(path)
         self.bridge.status_message.emit(outcome.message)
 
+    def _is_dynamic_stream(self) -> bool:
+        return self.stream_combo.currentText() in ("Raw video", "Local video", "Source video")
+
+    def _export_primary_size(self, export_reader: VideoReader) -> tuple[int, int]:
+        default_size = (export_reader.width, export_reader.height)
+        if not self._is_dynamic_stream():
+            return default_size
+        coach_data = self._display_coach_data()
+        lines_only = (
+            self.lines_only_cb.isChecked()
+            or not self._using_range_targets()
+            or bool(self._calibration_error)
+        )
+        if coach_data is None or not self.show_coach_cb.isChecked() or lines_only:
+            return default_size
+        frames = coach_data.get("frames")
+        if not isinstance(frames, dict) or not frames:
+            return default_size
+        sample_index: int | None = None
+        for key, entry in frames.items():
+            try:
+                candidate = int(key)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= candidate < export_reader.count:
+                if sample_index is None:
+                    sample_index = candidate
+                if isinstance(entry, dict) and (
+                    entry.get("poses") or entry.get("measurement_poses")
+                ):
+                    sample_index = candidate
+                    break
+        if sample_index is None:
+            return default_size
+        fps = export_reader.fps if export_reader.fps > 0 else 30.0
+        sample_time = self._playback.timestamp_for_frame(sample_index)
+        sample_frame = self._render_primary_frame(
+            export_reader.frame(sample_index),
+            sample_index,
+            sample_time,
+            fps=fps,
+            update_status=False,
+        )
+        return (sample_frame.shape[1], sample_frame.shape[0])
+
     def _export_video(self) -> None:
         reader = self._playback.reader
         if reader is None:
@@ -668,14 +734,91 @@ class ReviewScreen(QWidget):
         if not path:
             return
         destination = Path(path).expanduser().resolve()
-        if destination == reader.path:
+        comparison_reader = self._comparison.reader if self.compare_cb.isChecked() else None
+        source_paths = {reader.path.resolve()}
+        if comparison_reader is not None:
+            source_paths.add(comparison_reader.path.resolve())
+        if destination in source_paths:
             self.bridge.status_message.emit("The selected video is already at that location.")
             return
+
+        export_reader: VideoReader | None = None
+        comp_reader: VideoReader | None = None
+        writer: cv2.VideoWriter | None = None
+        temp_path: Path | None = None
         try:
-            shutil.copy2(reader.path, destination)
-        except OSError as error:
+            export_reader = VideoReader(reader.path)
+            if export_reader.count <= 0:
+                raise ValueError("Selected video has no decodable frames.")
+            if comparison_reader is not None:
+                comp_reader = VideoReader(comparison_reader.path)
+
+            primary_size = self._export_primary_size(export_reader)
+            primary_w, primary_h = primary_size
+            comp_size: tuple[int, int] | None = None
+            out_size = primary_size
+            if comp_reader is not None and comp_reader.count > 0:
+                comp_w = max(
+                    1,
+                    round(comp_reader.width * (primary_h / max(1, comp_reader.height))),
+                )
+                comp_size = (comp_w, primary_h)
+                out_size = (primary_w + comp_w, primary_h)
+
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            suffix = destination.suffix.lower() or ".mp4"
+            with NamedTemporaryFile(
+                dir=destination.parent,
+                prefix=f".{destination.stem}_",
+                suffix=suffix,
+                delete=False,
+            ) as handle:
+                temp_path = Path(handle.name)
+            fourcc = cv2.VideoWriter.fourcc(*("MJPG" if suffix == ".avi" else "mp4v"))
+            fps = export_reader.fps if export_reader.fps > 0 else 30.0
+            writer = cv2.VideoWriter(str(temp_path), fourcc, fps, out_size)
+            if not writer.isOpened():
+                raise OSError(f"Cannot create video writer for {destination}")
+
+            for frame_index in range(export_reader.count):
+                frame_time_sec = self._playback.timestamp_for_frame(frame_index)
+                rendered = self._render_primary_frame(
+                    export_reader.frame(frame_index),
+                    frame_index,
+                    frame_time_sec,
+                    fps=fps,
+                    update_status=False,
+                )
+                if (rendered.shape[1], rendered.shape[0]) != primary_size:
+                    rendered = cv2.resize(rendered, primary_size)
+                if comp_reader is not None and comp_size is not None:
+                    comp_index = min(
+                        max(self._comparison.frame_for_time(frame_time_sec), 0),
+                        comp_reader.count - 1,
+                    )
+                    comp_frame = comp_reader.frame(comp_index)
+                    if (comp_frame.shape[1], comp_frame.shape[0]) != comp_size:
+                        comp_frame = cv2.resize(comp_frame, comp_size)
+                    rendered = np.hstack((rendered, comp_frame))
+                rendered = self._render_metrics_box(rendered, frame_index)
+                writer.write(rendered)
+
+            writer.release()
+            writer = None
+            temp_path.replace(destination)
+            temp_path = None
+        except REPLAY_ERRORS as error:
             self.bridge.status_message.emit(f"Could not export video: {error}")
             return
+        finally:
+            if writer is not None:
+                writer.release()
+            if export_reader is not None:
+                export_reader.close()
+            if comp_reader is not None:
+                comp_reader.close()
+            if temp_path is not None:
+                temp_path.unlink(missing_ok=True)
         self.bridge.status_message.emit(f"Exported video to {destination}")
 
     def _on_segment_changed(self, index: int) -> None:
@@ -715,6 +858,10 @@ class ReviewScreen(QWidget):
         self.stream_combo.blockSignals(True)
         self.stream_combo.clear()
         self.stream_combo.addItems(list(self._playback.variants))
+        for raw in ("Raw video", "Local video", "Source video"):
+            if raw in self._playback.variants:
+                self.stream_combo.setCurrentText(raw)
+                break
         self.stream_combo.blockSignals(False)
         self.stream_combo.setEnabled(bool(self._playback.variants))
         if not self._playback.variants:
@@ -738,19 +885,6 @@ class ReviewScreen(QWidget):
 
     def _on_stream_changed(self, label: str) -> None:
         self._reset_transport()
-        if label not in (
-            "Raw video", "Local video", "Source video",
-        ):
-            for raw in ("Raw video", "Local video", "Source video"):
-                if raw in self._playback.variants:
-                    self.stream_combo.setCurrentText(raw)
-                    return
-            self.primary_stage.clear_frame()
-            self.analysis_status.setText(
-                "Tracking and calibration comparison require raw/source video; "
-                "baked warnings cannot be removed."
-            )
-            return
         if label not in ("Raw video", "Local video", "Source video"):
             self.lines_only_cb.blockSignals(True)
             self.lines_only_cb.setChecked(False)
@@ -956,61 +1090,106 @@ class ReviewScreen(QWidget):
 
         return time_pattern.sub(link_time, markdown)
 
+    def _render_primary_frame(
+        self,
+        frame: np.ndarray,
+        frame_index: int,
+        frame_time_sec: float,
+        *,
+        fps: float,
+        update_status: bool = False,
+    ) -> np.ndarray:
+        if not self._is_dynamic_stream():
+            if update_status:
+                self.axis_status.clear()
+                self.axis_status.setVisible(False)
+            return frame
+
+        rendered = frame.copy()
+        if self.lines_only_cb.isChecked():
+            rendered = render_floor_guide(rendered)
+        coach_data = self._display_coach_data()
+        if coach_data is not None and self.show_coach_cb.isChecked():
+            rendered = render_coach_frame_overlay(
+                rendered.copy(),
+                coach_data,
+                frame_index,
+                self.bridge.config,
+                verbose_skeleton=True,
+                show_vertical_axis=False,
+                show_footer=False,
+                lines_only=(
+                    self.lines_only_cb.isChecked()
+                    or not self._using_range_targets()
+                    or bool(self._calibration_error)
+                ),
+            )
+
+        status_messages: list[str] = []
+        measurement_layers = (
+            (self.show_torso_axis_cb, "Axis", render_coach_torso_axis),
+            (self.show_head_alignment_cb, "Head alignment", render_coach_head_alignment),
+            (self.show_head_posture_cb, "Head posture", render_coach_head_posture),
+        )
+        frames = coach_data.get("frames") if coach_data is not None else None
+        entry = frames.get(str(frame_index)) if isinstance(frames, dict) else None
+        for checkbox, label, renderer in measurement_layers:
+            if not checkbox.isChecked():
+                continue
+            if (
+                coach_data is None
+                or not isinstance(entry, dict)
+                or "measurement_poses" not in entry
+            ):
+                message = (
+                    f"Raw {label.lower()} landmarks are unavailable. "
+                    "Analyze the source video again."
+                )
+                if message not in status_messages:
+                    status_messages.append(message)
+                continue
+            try:
+                rendered = renderer(
+                    rendered,
+                    coach_data,
+                    frame_index,
+                    self.bridge.config,
+                    show_labels=not self.lines_only_cb.isChecked(),
+                )
+            except (TypeError, ValueError) as error:
+                message = f"{label} unavailable: {error}"
+                if message not in status_messages:
+                    status_messages.append(message)
+
+        if update_status:
+            self.axis_status.setText("\n".join(status_messages))
+            self.axis_status.setVisible(bool(status_messages))
+
+        return render_movement_overlay(
+            rendered,
+            self._movement_data,
+            frame_index,
+            fps,
+            frame_timestamp=frame_time_sec,
+            show_pivots=self.show_pivots_cb.isChecked(),
+            show_steps=self.show_steps_cb.isChecked(),
+            step_history_seconds=self.bridge.config.replay_step_history_seconds,
+        )
+
     def _show_frame(self, index: int) -> None:
         reader = self._playback.reader
         if reader is None:
             return
         frame = reader.frame(index)
         self._update_frame_insights(reader.index)
-        dynamic_stream = self.stream_combo.currentText() in (
-            "Raw video", "Local video", "Source video"
-        )
         self.current_time_sec = self._playback.timestamp_for_frame(reader.index)
-        if dynamic_stream:
-            if self.lines_only_cb.isChecked():
-                frame = render_floor_guide(frame)
-            coach_data = self._display_coach_data()
-            if coach_data is not None and self.show_coach_cb.isChecked():
-                frame = render_coach_frame_overlay(
-                    frame.copy(),
-                    coach_data,
-                    reader.index,
-                    self.bridge.config,
-                    verbose_skeleton=True,
-                    show_vertical_axis=False,
-                    show_footer=False,
-                    lines_only=(
-                        self.lines_only_cb.isChecked() or not self._using_range_targets()
-                        or bool(self._calibration_error)
-                    ),
-                )
-            self.axis_status.clear()
-            if self.show_torso_axis_cb.isChecked():
-                frames = coach_data.get("frames") if coach_data is not None else None
-                entry = frames.get(str(reader.index)) if isinstance(frames, dict) else None
-                if coach_data is None or not isinstance(entry, dict) or "measurement_poses" not in entry:
-                    self.axis_status.setText(
-                        "Raw axis landmarks are unavailable. Analyze the source video again."
-                    )
-                else:
-                    try:
-                        frame = render_coach_torso_axis(
-                            frame, coach_data, reader.index, self.bridge.config,
-                            show_labels=not self.lines_only_cb.isChecked(),
-                        )
-                    except (TypeError, ValueError) as error:
-                        self.axis_status.setText(f"Axis unavailable: {error}")
-            self.axis_status.setVisible(bool(self.axis_status.text()))
-            frame = render_movement_overlay(
-                frame,
-                self._movement_data,
-                reader.index,
-                reader.fps,
-                frame_timestamp=self.current_time_sec,
-                show_pivots=self.show_pivots_cb.isChecked(),
-                show_steps=self.show_steps_cb.isChecked(),
-                step_history_seconds=self.bridge.config.replay_step_history_seconds,
-            )
+        frame = self._render_primary_frame(
+            frame,
+            reader.index,
+            self.current_time_sec,
+            fps=reader.fps,
+            update_status=True,
+        )
         height, width = frame.shape[:2]
         image = QImage(
             frame.data, width, height, frame.strides[0], QImage.Format.Format_BGR888
@@ -1242,9 +1421,15 @@ class ReviewScreen(QWidget):
                         path = self._playback.archive.path
                         index = self._playback.selected_segment_index or 0
                         frame = self._playback.reader.index if self._playback.reader else 0
+                        selected_stream = self.stream_combo.currentText()
                         self._analysis_cancel = None
                         self._active_analysis_job = None
                         self.load_archive(path, segment_index=index)
+                        if (
+                            selected_stream in self._playback.variants
+                            and self.stream_combo.currentText() != selected_stream
+                        ):
+                            self.stream_combo.setCurrentText(selected_stream)
                         if self._playback.reader is not None:
                             self._show_frame(min(frame, self._playback.reader.count - 1))
                     else:
@@ -1321,30 +1506,44 @@ class ReviewScreen(QWidget):
             self.metric_ranges[key].setVisible(False)
             self._set_metric_state(key, None)
 
-    def _update_frame_insights(self, frame_index: int) -> None:
-        data = self._display_coach_data()
+    def _frame_insights_snapshot(self, frame_index: int) -> dict[str, Any]:
+        values = {key: "Not observed" for key, _ in _METRIC_TITLES}
+        ranges: dict[str, str | None] = {key: None for key, _ in _METRIC_TITLES}
+        states: dict[str, tuple[str | None, str, bool]] = {
+            key: (None, "", False) for key, _ in _METRIC_TITLES
+        }
         idle_note = (
             "Analyze the raw video to track the skeleton and measure posture. "
             "Existing full-lines recordings retain their original overlay."
         )
         if self._calibration_error:
-            self._reset_metrics()
-            self._set_alert(self._calibration_error, "warning")
-            self.insights_text.setText("Posture comparison is unavailable.")
-            return
+            return {
+                "values": values,
+                "ranges": ranges,
+                "states": states,
+                "alert": (self._calibration_error, "warning"),
+                "details": "Posture comparison is unavailable.",
+            }
+        data = self._display_coach_data()
         if data is None:
-            self._reset_metrics()
-            self._set_alert("No synchronized posture analysis is loaded.", "muted")
-            self.insights_text.setText(idle_note)
-            return
+            return {
+                "values": values,
+                "ranges": ranges,
+                "states": states,
+                "alert": ("No synchronized posture analysis is loaded.", "muted"),
+                "details": idle_note,
+            }
 
         frames = data.get("frames")
         entry = frames.get(str(frame_index)) if isinstance(frames, dict) else None
         if not isinstance(entry, dict):
-            self._reset_metrics()
-            self._set_alert("No pose data is available for this frame.", "muted")
-            self.insights_text.setText(idle_note)
-            return
+            return {
+                "values": values,
+                "ranges": ranges,
+                "states": states,
+                "alert": ("No pose data is available for this frame.", "muted"),
+                "details": idle_note,
+            }
 
         def metric(name: str, suffix: str, scale: float = 1.0, signed: bool = False) -> str:
             value = entry.get(name)
@@ -1354,62 +1553,66 @@ class ReviewScreen(QWidget):
             format_spec = "+.1f" if signed else ".1f"
             return f"{number:{format_spec}}{suffix}"
 
-        self._reset_metrics()
-        self.metric_values["head_angle"].setText(metric("head_angle", "°", signed=True))
-        self.metric_values["shoulder_elev_pct"].setText(
-            metric("shoulder_elev_pct", "%", signed=True)
-        )
-        self.metric_values["axis_curve_smoothed"].setText(
-            metric("axis_curve_smoothed", "%", scale=100.0, signed=True)
-        )
-        self.metric_values["knee_bend_deg"].setText(metric("knee_bend_deg", "°"))
-        self.metric_values["torso_axis_tilt"].setText(metric("torso_axis_tilt", "°"))
+        values = {
+            "head_angle": metric("head_angle", "°", signed=True),
+            "shoulder_elev_pct": metric("shoulder_elev_pct", "%", signed=True),
+            "axis_curve_smoothed": metric("axis_curve_smoothed", "%", scale=100.0, signed=True),
+            "torso_axis_tilt": metric("torso_axis_tilt", "°"),
+            "knee_bend_deg": metric("knee_bend_deg", "°"),
+        }
 
         if not self._using_range_targets():
-            self._set_alert("Select a calibration profile to see posture alerts.", "muted")
-            self.insights_text.setText("Tracking and movement are shown without posture coaching.")
-            return
+            return {
+                "values": values,
+                "ranges": ranges,
+                "states": states,
+                "alert": ("Select a calibration profile to see posture alerts.", "muted"),
+                "details": "Tracking and movement are shown without posture coaching.",
+            }
 
         rows = {row["metric"]: row for row in entry.get("calibration_rows", [])}
         for display_key, key in _DISPLAY_METRICS:
             row = rows.get(key)
             target = self._calibration_targets.get(key)
-            range_label = self.metric_ranges[display_key]
             if row is None:
-                self.metric_values[display_key].setText("Not in profile")
-                self._set_metric_state(display_key, None, "This calibration did not approve this metric.")
-                self.metric_values[display_key].setStyleSheet(f"color: {COLOR_TEXT_MUTED};")
+                values[display_key] = "Not in profile"
+                states[display_key] = (
+                    None,
+                    "This calibration did not approve this metric.",
+                    True,
+                )
                 continue
             unit = str(row.get("unit", ""))
             measured_value = row.get("smoothed")
-            self.metric_values[display_key].setText(
+            values[display_key] = (
                 _format_measure(float(measured_value), unit)
-                if isinstance(measured_value, int | float) else "Not measured"
+                if isinstance(measured_value, int | float) and not isinstance(measured_value, bool)
+                else "Not measured"
             )
             if target is not None:
-                range_label.setText(
+                ranges[display_key] = (
                     f"Approved {_format_measure(target.lower, unit)} to "
                     f"{_format_measure(target.upper, unit)}"
                 )
-                range_label.setVisible(True)
-            self._set_metric_state(display_key, str(row.get("state")), str(row.get("reason") or ""))
+            states[display_key] = (str(row.get("state")), str(row.get("reason") or ""), False)
 
         message = entry.get("message")
         poses = entry.get("measurement_poses", entry.get("poses"))
         unknown = [row for row in rows.values() if row.get("state") == "UNKNOWN"]
         if isinstance(message, str) and message.strip():
-            self._set_alert(
+            alert = (
                 "\n".join(f"• {part.strip()}" for part in message.split(";") if part.strip()),
                 "danger",
             )
         elif not poses:
-            self._set_alert("No dancer detected; posture alerts are unavailable.", "warning")
+            alert = ("No dancer detected; posture alerts are unavailable.", "warning")
         elif unknown:
-            self._set_alert(
-                "Some approved-range measurements are unavailable (tracking/view).", "warning",
+            alert = (
+                "Some approved-range measurements are unavailable (tracking/view).",
+                "warning",
             )
         else:
-            self._set_alert("No active posture alert on this frame.", "success")
+            alert = ("No active posture alert on this frame.", "success")
 
         details = [f"Compared with {self._calibration_name or self.reference_combo.currentText()}."]
         reasons: dict[str, list[str]] = {}
@@ -1418,7 +1621,71 @@ class ReviewScreen(QWidget):
             reasons.setdefault(str(row.get("reason") or "Not visible"), []).append(label)
         for reason, labels in reasons.items():
             details.append(f"Not measured — {', '.join(labels)}: {reason}.")
-        self.insights_text.setText("\n".join(details))
+
+        return {
+            "values": values,
+            "ranges": ranges,
+            "states": states,
+            "alert": alert,
+            "details": "\n".join(details),
+        }
+
+    def _frame_metrics_lines(self, frame_index: int) -> list[str]:
+        values = self._frame_insights_snapshot(frame_index)["values"]
+        return [
+            f"{title}: {str(values.get(key, 'Not observed')).replace('°', ' deg')}"
+            for key, title in _METRIC_TITLES
+        ]
+
+    def _render_metrics_box(self, image: np.ndarray, frame_index: int) -> np.ndarray:
+        output = image.copy()
+        height, width = output.shape[:2]
+        if height <= 0 or width <= 0:
+            return output
+        lines = self._frame_metrics_lines(frame_index)
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        scale = min(0.65, max(0.22, min(width, height) / 1400.0))
+        thickness = 1
+        sizes = [cv2.getTextSize(line, font, scale, thickness)[0] for line in lines]
+        text_w = max((size[0] for size in sizes), default=1)
+        text_h = max((size[1] for size in sizes), default=5)
+        pad_x = max(2, round(10 * scale))
+        pad_y = max(2, round(8 * scale))
+        line_gap = max(2, round(6 * scale))
+        line_step = text_h + line_gap
+        natural_w = text_w + 2 * pad_x
+        natural_h = len(lines) * text_h + max(0, len(lines) - 1) * line_gap + 2 * pad_y
+        box_w = min(natural_w, max(8, int(width * 0.48)))
+        box_h = min(natural_h, max(8, int(height * 0.48)))
+        patch = np.full((box_h, box_w, 3), 255, dtype=np.uint8)
+        for index, line in enumerate(lines):
+            y = pad_y + text_h + index * line_step
+            if y - text_h >= box_h - 1:
+                break
+            cv2.putText(patch, line, (pad_x, y), font, scale, (0, 0, 0), thickness, cv2.LINE_AA)
+        margin = max(2, min(12, width // 40, height // 40))
+        x0 = max(0, width - margin - box_w)
+        y0 = max(0, height - margin - box_h)
+        output[y0 : y0 + box_h, x0 : x0 + box_w] = patch
+        return output
+
+    def _update_frame_insights(self, frame_index: int) -> None:
+        self._reset_metrics()
+        snapshot = self._frame_insights_snapshot(frame_index)
+        for key, value_text in snapshot["values"].items():
+            self.metric_values[key].setText(value_text)
+        for key, range_text in snapshot["ranges"].items():
+            range_label = self.metric_ranges[key]
+            if range_text is not None:
+                range_label.setText(range_text)
+                range_label.setVisible(True)
+        for key, (state, detail, muted_value) in snapshot["states"].items():
+            self._set_metric_state(key, state, detail)
+            if muted_value:
+                self.metric_values[key].setStyleSheet(f"color: {COLOR_TEXT_MUTED};")
+        alert_text, alert_tone = snapshot["alert"]
+        self._set_alert(alert_text, alert_tone)
+        self.insights_text.setText(snapshot["details"])
 
     def _update_time_label(self) -> None:
         self.time_label.setText(

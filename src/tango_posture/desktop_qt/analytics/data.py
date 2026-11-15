@@ -724,6 +724,18 @@ def compare_archive_with_calibration(
             "shoulder_clearance": (None, base_clearance),
             "head_pitch": (None, cfg.head_neutral_offset),
             "head_angle": (None, cfg.head_neutral_offset),
+            "head_forward": (
+                (-cfg.head_forward.entry, cfg.head_forward.entry),
+                0.0,
+            ),
+            "head_inclination": (
+                (-cfg.head_inclination.entry, cfg.head_inclination.entry),
+                0.0,
+            ),
+            "trunk_inclination": (
+                (-cfg.trunk_inclination.entry, cfg.trunk_inclination.entry),
+                0.0,
+            ),
             "knee_flexion": (None, cfg.closed_embrace_min_knee_bend),
             "knee_bend_deg": (None, cfg.closed_embrace_min_knee_bend),
         }

@@ -43,6 +43,8 @@ class MetricChart(QWidget):
         self.intervals: list[tuple[float, float]] = []
         self.playhead_timestamp: float | None = None
         self.states: dict[float, str] = {}
+        self.x_zoom = 1.0
+        self.x_pan = 0.0
         self.setMinimumHeight(155)
         self.setEnabled(False)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -68,11 +70,49 @@ class MetricChart(QWidget):
         )
         self.intervals = intervals or []
         self.states = states or {}
+        if data is None or not data.segments or self.time_end <= 0:
+            self.x_zoom = 1.0
+            self.x_pan = 0.0
+        elif self.x_zoom > 1.001:
+            span = self.time_end / self.x_zoom
+            self.x_pan = max(0.0, min(max(0.0, self.time_end - span), self.x_pan))
+        else:
+            self.x_pan = 0.0
         self.setEnabled(data is not None and bool(data.segments))
+        self.update()
+
+    def _view_window(self) -> tuple[float, float]:
+        total = self.time_end or 1.0
+        if self.x_zoom <= 1.001 or total <= 0.0:
+            return 0.0, total
+        span = total / self.x_zoom
+        start = max(0.0, min(max(0.0, total - span), self.x_pan))
+        return start, min(total, start + span)
+
+    def set_x_zoom(self, zoom: float) -> None:
+        new_zoom = max(1.0, float(zoom))
+        total = self.time_end or 1.0
+        if new_zoom <= 1.001 or total <= 0.0:
+            self.x_zoom = 1.0
+            self.x_pan = 0.0
+        else:
+            span = total / new_zoom
+            if self.playhead_timestamp is not None:
+                center = max(0.0, min(total, self.playhead_timestamp - self.origin_timestamp))
+            else:
+                old_start, old_end = self._view_window()
+                center = 0.5 * (old_start + old_end)
+            self.x_zoom = new_zoom
+            self.x_pan = max(0.0, min(max(0.0, total - span), center - 0.5 * span))
         self.update()
 
     def set_playhead(self, timestamp: float | None) -> None:
         self.playhead_timestamp = timestamp
+        if timestamp is not None and self.x_zoom > 1.001 and self.time_end > 0.0:
+            span = self.time_end / self.x_zoom
+            elapsed = max(0.0, min(self.time_end, timestamp - self.origin_timestamp))
+            if elapsed < self.x_pan + 0.1 * span or elapsed > self.x_pan + 0.9 * span:
+                self.x_pan = max(0.0, min(max(0.0, self.time_end - span), elapsed - 0.5 * span))
         self.update()
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
@@ -83,14 +123,40 @@ class MetricChart(QWidget):
             and self.time_end > 0
             and left <= event.position().x() <= right
         ):
+            view_start, view_end = self._view_window()
             fraction = (event.position().x() - left) / (right - left)
-            self.seek_requested.emit(self.origin_timestamp + fraction * self.time_end)
+            self.seek_requested.emit(
+                self.origin_timestamp + view_start + fraction * (view_end - view_start)
+            )
         super().mousePressEvent(event)
 
     def _y_range(self) -> tuple[float, float] | None:
         if self.data is None or not self.data.segments:
             return None
-        values = [value for segment in self.data.segments for _, value in segment]
+        segment_values = [value for segment in self.data.segments for _, value in segment]
+        if len(segment_values) >= 30:
+            sorted_vals = sorted(segment_values)
+            count = len(sorted_vals)
+
+            def _pct(frac: float) -> float:
+                pos = frac * (count - 1)
+                lo_i = math.floor(pos)
+                hi_i = math.ceil(pos)
+                if lo_i == hi_i:
+                    return sorted_vals[lo_i]
+                weight = pos - lo_i
+                return sorted_vals[lo_i] * (1.0 - weight) + sorted_vals[hi_i] * weight
+
+            p2, p10, p90, p98 = _pct(0.02), _pct(0.10), _pct(0.90), _pct(0.98)
+            spread = p90 - p10
+            if spread > 1e-6 and (sorted_vals[-1] - sorted_vals[0]) > 3.0 * spread:
+                clip_lo = min(p2, p10 - 1.5 * spread)
+                clip_hi = max(p98, p90 + 1.5 * spread)
+                values = [min(clip_hi, max(clip_lo, val)) for val in segment_values]
+            else:
+                values = list(segment_values)
+        else:
+            values = list(segment_values)
         if self.bounds is not None:
             values.extend(value for value in self.bounds if math.isfinite(value))
         if self.reference_line is not None and math.isfinite(self.reference_line):
@@ -123,27 +189,33 @@ class MetricChart(QWidget):
             max(1.0, canvas_rect.width() - 82),
             max(1.0, canvas_rect.height() - 50),
         )
-        duration = self.time_end or 1.0
+        total_duration = self.time_end or 1.0
+        view_start, view_end = (
+            self._view_window() if include_playhead else (0.0, total_duration)
+        )
+        span = max(view_end - view_start, 1e-9)
 
         def point(timestamp: float, value: float) -> QPointF:
             return QPointF(
-                plot.left() + timestamp / duration * plot.width(),
+                plot.left() + (timestamp - view_start) / span * plot.width(),
                 plot.bottom() - (value - low) / (high - low) * plot.height(),
             )
 
         painter.save()
         painter.setClipRect(plot)
         for start, end in self.intervals:
-            left = plot.left() + max(0.0, start) / duration * plot.width()
-            right = plot.left() + min(duration, end) / duration * plot.width()
+            clipped_start = max(view_start, start)
+            clipped_end = min(view_end, end)
+            left = plot.left() + (clipped_start - view_start) / span * plot.width()
+            right = plot.left() + (clipped_end - view_start) / span * plot.width()
             if right > left:
                 painter.fillRect(
                     QRectF(left, plot.top(), right - left, plot.height()),
                     QColor(49, 87, 72, 90),
                 )
         if self.bounds is not None:
-            y_low = point(0, self.bounds[0]).y()
-            y_high = point(0, self.bounds[1]).y()
+            y_low = point(view_start, self.bounds[0]).y()
+            y_high = point(view_start, self.bounds[1]).y()
             band_top = min(y_low, y_high)
             band_height = max(1.0, abs(y_high - y_low))
             painter.fillRect(
@@ -152,7 +224,7 @@ class MetricChart(QWidget):
             )
             painter.setPen(QPen(QColor("#E3B66B"), 1.5, Qt.PenStyle.DashLine))
             for label, value in zip(("Min", "Max"), self.bounds, strict=True):
-                y = point(0, value).y()
+                y = point(view_start, value).y()
                 painter.drawLine(QPointF(plot.left(), y), QPointF(plot.right(), y))
                 text_y = max(plot.top() + 12.0, min(plot.bottom() - 3.0, y - 3.0))
                 painter.drawText(
@@ -160,7 +232,7 @@ class MetricChart(QWidget):
                     f"{label} {value:.3g}",
                 )
         if self.reference_line is not None:
-            y_ref = point(0, self.reference_line).y()
+            y_ref = point(view_start, self.reference_line).y()
             painter.setPen(QPen(QColor("#A3E635"), 1.5, Qt.PenStyle.DashDotLine))
             painter.drawLine(QPointF(plot.left(), y_ref), QPointF(plot.right(), y_ref))
             ref_y = max(plot.top() + 12.0, min(plot.bottom() - 3.0, y_ref - 4.0))
@@ -174,26 +246,73 @@ class MetricChart(QWidget):
         painter.setPen(QColor(COLOR_TEXT_MUTED))
         painter.drawText(int(canvas_rect.left()) + 2, int(plot.top()) + 8, f"{high:.3g}")
         painter.drawText(int(canvas_rect.left()) + 2, int(plot.bottom()), f"{low:.3g}")
-        painter.drawText(int(plot.left()), int(canvas_rect.bottom()) - 8, "0 s")
+        label_y = plot.bottom() + 6.0
+        label_h = max(16.0, canvas_rect.bottom() - label_y - 2.0)
+        start_label = "0 s" if abs(view_start) < 1e-6 else f"{view_start:.2f} s"
         painter.drawText(
-            int(plot.right()) - 90, int(canvas_rect.bottom()) - 8, f"{self.time_end:.2f} s"
+            QRectF(plot.left(), label_y, 80.0, label_h),
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+            start_label,
         )
+        painter.drawText(
+            QRectF(plot.right() - 90.0, label_y, 90.0, label_h),
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+            f"{view_end:.2f} s",
+        )
+        if plot.width() >= 320.0:
+            for frac in (0.25, 0.5, 0.75):
+                tick_x = plot.left() + frac * plot.width()
+                tick_t = view_start + frac * (view_end - view_start)
+                painter.setPen(QColor(COLOR_BORDER))
+                painter.drawLine(QPointF(tick_x, plot.bottom()), QPointF(tick_x, plot.bottom() + 4.0))
+                painter.setPen(QColor(COLOR_TEXT_MUTED))
+                painter.drawText(
+                    QRectF(tick_x - 32.0, label_y, 64.0, label_h),
+                    Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter,
+                    f"{tick_t:.2f} s",
+                )
+
+        visible_points = sum(
+            1 for seg in self.data.segments for ts, _ in seg if view_start <= ts <= view_end
+        )
+        px_per_point = plot.width() / max(1, visible_points)
+        dot_radius = 2.0 if px_per_point >= 4.0 else 1.2 if px_per_point >= 2.0 else 0.0
+
+        painter.save()
+        painter.setClipRect(plot)
         for segment in self.data.segments:
             previous: QPointF | None = None
+            prev_t: float | None = None
+            single_point = len(segment) == 1
             for timestamp, value in segment:
-                painter.setPen(QPen(QColor(STATE_COLORS.get(
-                    self.states.get(timestamp, ""), "#69B9CF",
-                )), 1.5))
                 current = point(timestamp, value)
-                if previous is not None:
-                    painter.drawLine(previous, current)
-                painter.drawEllipse(current, 2, 2)
+                if (
+                    prev_t is not None
+                    and previous is not None
+                    and not (
+                        (prev_t < view_start and timestamp < view_start)
+                        or (prev_t > view_end and timestamp > view_end)
+                    )
+                ):
+                        painter.setPen(QPen(QColor(STATE_COLORS.get(
+                            self.states.get(timestamp, ""), "#69B9CF",
+                        )), 1.5))
+                        painter.drawLine(previous, current)
+                if view_start <= timestamp <= view_end and (dot_radius > 0.0 or single_point):
+                    painter.setPen(QPen(QColor(STATE_COLORS.get(
+                        self.states.get(timestamp, ""), "#69B9CF",
+                    )), 1.5))
+                    radius = max(dot_radius, 1.5) if single_point else dot_radius
+                    painter.drawEllipse(current, radius, radius)
                 previous = current
+                prev_t = timestamp
+        painter.restore()
         if include_playhead and self.playhead_timestamp is not None and self.time_end > 0:
             elapsed = max(0.0, min(self.time_end, self.playhead_timestamp - self.origin_timestamp))
-            x = plot.left() + elapsed / duration * plot.width()
-            painter.setPen(QPen(QColor("#F06FD2"), 1.5))
-            painter.drawLine(QPointF(x, plot.top()), QPointF(x, plot.bottom()))
+            if view_start <= elapsed <= view_end:
+                x = plot.left() + (elapsed - view_start) / span * plot.width()
+                painter.setPen(QPen(QColor("#F06FD2"), 1.5))
+                painter.drawLine(QPointF(x, plot.top()), QPointF(x, plot.bottom()))
 
     def paintEvent(self, event: QPaintEvent) -> None:
         painter = QPainter(self)
@@ -372,8 +491,13 @@ class MetricChart(QWidget):
             f'font-size="10">{self.time_end:.2f} s</text>'
         )
 
+        total_points = sum(len(seg) for seg in self.data.segments)
+        px_per_point = plot_width / max(1, total_points)
+        dot_radius = 2.0 if px_per_point >= 4.0 else 1.2 if px_per_point >= 2.0 else 0.0
+
         for segment in self.data.segments:
             prev_xy: tuple[float, float] | None = None
+            single_point = len(segment) == 1
             for timestamp, value in segment:
                 color = STATE_COLORS.get(self.states.get(timestamp, ""), "#69B9CF")
                 cx, cy = px(timestamp), py(value)
@@ -382,7 +506,9 @@ class MetricChart(QWidget):
                         f'<line x1="{prev_xy[0]:.2f}" y1="{prev_xy[1]:.2f}" '
                         f'x2="{cx:.2f}" y2="{cy:.2f}" stroke="{color}" stroke-width="1.5"/>'
                     )
-                parts.append(f'<circle cx="{cx:.2f}" cy="{cy:.2f}" r="2" fill="{color}"/>')
+                if dot_radius > 0.0 or single_point:
+                    r = max(dot_radius, 1.5) if single_point else dot_radius
+                    parts.append(f'<circle cx="{cx:.2f}" cy="{cy:.2f}" r="{r:g}" fill="{color}"/>')
                 prev_xy = (cx, cy)
 
         parts.append("</g>")
