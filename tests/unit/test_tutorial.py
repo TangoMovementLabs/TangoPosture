@@ -38,7 +38,15 @@ def test_render_tutorial_derives_missing_settings_from_declared_registry():
 
 
 def test_settings_guide_explains_each_current_control_once_with_a_worked_example():
-    guide = Path(__file__).resolve().parents[2] / "docs" / "SETTINGS_BEGINNERS_GUIDE.md"
+    docs_dir = Path(__file__).resolve().parents[2] / "docs"
+    guide = docs_dir / "TANGO_POSTURE_GUIDE.md"
+    for removed in (
+        "ARCHITECTURE.md",
+        "CALIBRATION_BEGINNERS_GUIDE.md",
+        "SETTINGS_BEGINNERS_GUIDE.md",
+        "TRACKING_ENGINE_BEGINNERS_GUIDE.md",
+    ):
+        assert not (docs_dir / removed).exists()
     text = guide.read_text(encoding="utf-8")
     sections = re.findall(
         r"^### [^\n]+ - `([^`]+)`\n(.*?)(?=^### |^## |\Z)", text, re.MULTILINE | re.DOTALL,

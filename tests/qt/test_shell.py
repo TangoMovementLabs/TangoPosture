@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import QApplication, QMessageBox
 
@@ -162,7 +163,7 @@ def test_startup_splash_delays_main_window_for_three_seconds(qapp, monkeypatch):
     window.close()
 
 
-def test_help_renders_styled_manual_with_hierarchical_contents_and_search(qapp):
+def test_help_renders_styled_manual_with_hierarchical_contents_and_search(qapp, monkeypatch):
     window = MainWindow(Config())
     help_screen = window.screens[Route.HELP]
     assert isinstance(help_screen, HelpScreen)
@@ -178,6 +179,21 @@ def test_help_renders_styled_manual_with_hierarchical_contents_and_search(qapp):
     assert help_screen.search_matches
     assert "matches" in help_screen.search_status.text()
     help_screen._next_match()
+
+    assert 'id="setting-confidence"' in help_screen.manual_html
+    assert "Architecture, Storage, Troubleshooting" in help_screen.viewer.toPlainText()
+    scrolled = []
+    monkeypatch.setattr(
+        help_screen.viewer,
+        "scrollToAnchor",
+        lambda anchor: scrolled.append(anchor),
+    )
+    help_screen._on_anchor_clicked(QUrl("#settings-explained"))
+    assert scrolled == ["settings-explained"]
+    current = help_screen.toc_list.currentItem()
+    assert current is not None
+    assert current.data(0, Qt.ItemDataRole.UserRole) == "settings-explained"
+    window.close()
     assert "of" in help_screen.search_status.text()
 
     help_screen.search_input.setText("no such manual phrase")

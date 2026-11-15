@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import tomllib
+from importlib.resources import files as package_files
 from pathlib import Path
 
 from pydantic import ValidationError
@@ -73,15 +74,25 @@ _INT_RANGES = {
 
 
 def _guide_markdown_path() -> Path:
-    return Path(__file__).resolve().parents[4] / "docs" / "SETTINGS_BEGINNERS_GUIDE.md"
+    return Path(__file__).resolve().parents[4] / "docs" / "TANGO_POSTURE_GUIDE.md"
+
+
+def _load_guide_markdown() -> str:
+    guide_path = _guide_markdown_path()
+    if guide_path.is_file():
+        return guide_path.read_text(encoding="utf-8")
+    try:
+        packaged = package_files("tango_posture").joinpath("TANGO_POSTURE_MANUAL.md")
+        return packaged.read_text(encoding="utf-8")
+    except (OSError, ValueError, FileNotFoundError):
+        return ""
 
 
 def load_parameter_guides() -> dict[str, dict[str, str]]:
-    """Parse per-parameter explanations and worked examples from SETTINGS_BEGINNERS_GUIDE.md."""
+    """Parse per-parameter explanations and worked examples from the unified manual."""
     guides: dict[str, dict[str, str]] = {}
-    guide_path = _guide_markdown_path()
-    if guide_path.is_file():
-        text = guide_path.read_text(encoding="utf-8")
+    text = _load_guide_markdown()
+    if text:
         sections = re.findall(
             r"^### ([^\n]+) - `([^`]+)`\n(.*?)(?=^### |^## |\Z)",
             text,

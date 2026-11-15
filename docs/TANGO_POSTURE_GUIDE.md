@@ -1,1323 +1,1346 @@
 # Tango Posture Coach Manual
 
-**Stage 1 · application version 0.1.0 · 1 November 2026**
+**Offline-first Argentine Tango posture and movement analysis · Qt Desktop Edition**
 
-Tango Posture Coach is a local practice companion for observing how your head and trunk alignment changes relative to a reference position you deliberately record. It uses a computer webcam or an existing video file, estimates a small set of body landmarks, and reports sustained changes in three image-based measurements.
+Tango Posture Coach is a local Python desktop companion for observing posture alignment, movement placements, and turns in Argentine Tango practice videos. It runs MediaPipe Pose estimation locally on recorded video clips and compares confidence-qualified measurements against calibration ranges that you inspect and approve.
 
-The intended setting is **individual Argentine tango practice: one dancer, a fixed camera, and a side-on view during standing and simple solo walking**. The application gives you something specific to observe and discuss with a teacher. It does not decide what tango technique should look like, and it cannot replace a teacher's interpretation of movement.
+> **Experimental movement observation, not medical assessment or a judgement of artistic tango quality.** The software measures 2D image-plane projections of estimated body landmarks and heuristic movement cues. It cannot measure physical force, partner connection, anatomical joint torque, or artistic musicality, and it cannot replace a teacher's eye.
 
-**Scope note:** the main guide describes the reference-based Stage 1 pipeline. Additional features appeared in the workspace during documentation: beat tracking, recording, Markdown reports, and extra head/arm heuristics. [Section 23](#23-additional-features-in-the-current-workspace) describes their actual behaviour and limitations; they do not inherit validation from the three core metrics.
+## Quick Contents
 
-This guide covers the dancer's workflow, the meaning of the measurements, the software architecture, the individual components and technologies, and the evidence needed to judge the tool's usefulness.
+1. [Quick Start & Desktop Workspaces](#1-quick-start-desktop-workspaces)
+2. [Posture Metrics, Geometry & Mathematical Reference](#2-posture-metrics-geometry-mathematical-reference)
+3. [Calibration Workflow & Profile Editor Guide](#3-calibration-workflow-profile-editor-guide)
+4. [Tracking Engine, Temporal Smoothing & Movement Analysis](#4-tracking-engine-temporal-smoothing-movement-analysis)
+5. [Settings explained](#settings-explained)
+6. [Architecture, Storage, Troubleshooting & Glossary](#6-architecture-storage-troubleshooting-glossary)
 
-## Contents
+---
 
-1. [The practice question the tool addresses](#1-the-practice-question-the-tool-addresses)
-2. [What Stage 1 supports](#2-what-stage-1-supports)
-3. [What it measures—and the limits of those measurements](#3-what-it-measuresand-the-limits-of-those-measurements)
-4. [A first practice session](#4-a-first-practice-session)
-5. [Choosing and calibrating a reference](#5-choosing-and-calibrating-a-reference)
-6. [Understanding the screen and feedback](#6-understanding-the-screen-and-feedback)
-7. [Why the application sometimes cannot assess](#7-why-the-application-sometimes-cannot-assess)
-8. [Analysing recorded practice](#8-analysing-recorded-practice)
-9. [Reading a session summary](#9-reading-a-session-summary)
-10. [The overall architecture](#10-the-overall-architecture)
-11. [Technologies and why they are used](#11-technologies-and-why-they-are-used)
-12. [Components and responsibilities](#12-components-and-responsibilities)
-13. [The measurement mathematics](#13-the-measurement-mathematics)
-14. [Time, smoothing, and persistent events](#14-time-smoothing-and-persistent-events)
-15. [Configuration and reference compatibility](#15-configuration-and-reference-compatibility)
-16. [Storage, exports, and privacy](#16-storage-exports-and-privacy)
-17. [Offline operation and the model licence](#17-offline-operation-and-the-model-licence)
-18. [Testing and validation](#18-testing-and-validation)
-19. [Troubleshooting](#19-troubleshooting)
-20. [Extending the application](#20-extending-the-application)
-21. [A practical review worksheet](#21-a-practical-review-worksheet)
-22. [Glossary and further reading](#22-glossary-and-further-reading)
-23. [Additional features in the current workspace](#23-additional-features-in-the-current-workspace)
-24. [Settings explained](#settings-explained)
+## 1. Quick Start & Desktop Workspaces
 
-## 1. The practice question the tool addresses
+### What Tango Posture Coach Does
 
-A useful practice question is: **“During this exercise, does the alignment I can observe from this camera remain close to the reference I chose?”**
+A practical self-review question is:
 
-That is narrower than asking whether a dancer has good posture. A teacher may ask you to explore a particular organisation of the head and trunk for a particular exercise. You can record that intended position, practise while remaining in the same camera view, and investigate when the image-based measurements drift away from it.
+> *"During this dance passage, how do my head, shoulders, torso, hips, and knees behave relative to the reference ranges I approved for this view and dancer?"*
 
-For example, you might record a reference stance, then perform a simple solo walk while maintaining the same side-on orientation. If the selected ear moves persistently farther forward relative to the selected shoulder and trunk, the tool can display “Head farther forward than reference.” You can then decide whether that observation is relevant to the exercise, ideally with your teacher's input.
+Tango Posture Coach answers that question in three stages:
 
-The tool does not know your intention, your sensation, or the movement's meaning in a dance. A change may be intentional. A stable measurement may coexist with something important that this camera cannot see. Feedback is therefore an observation to investigate, not an instruction to force your body into a particular shape.
+1. **Import & Analyze Video (`.tpr` / `.tp`)**: Import a local video clip in **Library**. MediaPipe extracts pose landmarks per frame without mutating the original video, and packages a self-contained ZIP archive containing the raw clip, optional annotated layers, report metadata, and raw measurement observations.
+2. **Approve Calibration Ranges (`.tpc`)**: Open a replayable **Reference (`.tpr`)** in **Library**, select the dancer track and representative example passages, inspect the median and distribution, and save an approved **Calibration Profile (`.tpc`)** with explicit `Min` / `Max` bounds per metric and camera view.
+3. **Review, Inspect Insights, & Compare in Analytics**:
+   - In **Review**, play back synchronized video and overlays, pick any `.tpc` calibration profile, inspect frame-by-frame alignment banners and insights, compare two clips side by side, or re-run offline pose analysis with a different model or quality filter.
+   - In **Analytics**, plot all **12 posture metrics** over time for any `.tpr` reference or `.tp` recording, overlay a `.tpc` profile or Settings default range (`Min`, `Max`, `Ref`), inspect hysteresis states (`% in range`, `% pending`, `% out of range`), click any point to seek in Review, and export charts as `.png`, `.svg`, `.csv`, or `.json`.
 
-The reference-based design matters: **there is no universal ideal position encoded in the application**. Different references can be appropriate for different practice questions. The thresholds describe changes from a selected reference, not distance from an assumed ideal dancer.
+### Posture Limit Precedence
 
-## 2. What Stage 1 supports
+Where do limits come from when evaluating a recording?
 
-| Supported practice setting | Conditions |
-| --- | --- |
-| Standing in a reference position | One person, selected anatomical side visible, full body adequately framed |
-| Simple solo walking | Remain side-on and keep the selected facing direction |
-| Webcam observation | Fixed camera, native desktop window, explicit session controls |
-| Existing local video | Sequential analysis with source timestamps |
-| Comparing sessions | Compatible reference and capture setup; inspect coverage as well as events |
-| Teacher discussion | Use exported measurements alongside independently reviewed practice |
+| Context | Source of posture limits | Behavior for unapproved / missing metrics |
+| --- | --- | --- |
+| **Review** with a selected `.tpc` calibration profile | The selected profile's approved `min` and `max` bounds per metric | Metrics absent from the profile display **Not in profile**. Frames failing landmark/view quality show **Not measured** (`UNKNOWN`). Legacy threshold settings never fill gaps. |
+| **Review** with *No calibration (visuals only)* | None | Skeleton, pink torso axis, pivot rings, and fading step footprints render without deviation banners or posture alerts, even if *Calibration defaults* are populated in Settings. |
+| **Analytics** with a selected `.tpc` profile | The profile's approved bounds (`Min`, `Max`, `Ref` median) | Evaluates hysteresis states using `smoothing`, `entry_duration`, and `clear_duration`. Shows *All-angle fallback* if recording camera view differed from the profile's approved view. |
+| **Analytics** with *Settings default ranges* | Built-in or configured `calibration_defaults.<metric>` intervals | Compares time series against Settings ranges and reference midpoints. |
+| **CLI / Offline Fallback Analysis** without a profile | Legacy Settings thresholds (`head_down_angle`, `shoulder_raise_threshold`, `closed_embrace_min_knee_bend`, `axis_curve_entry`) | Evaluates descriptive fallback frame traces saved in `analytics_XX.json`. |
 
-Stage 1 deliberately excludes couples, embrace assessment, turns, ochos, pivots, and choreography classification. It does not support frontal-view scoring or tracking multiple dancers. It does not download online videos, train a custom model, provide voice coaching, or host a dashboard.
+### Desktop Navigation & Workspaces
 
-Some movement may remain visible to the pose model while being outside the supported exercise. A detected skeleton alone does not establish that the application can interpret that movement. In particular, a complete turn cannot be reliably identified or evaluated from these few monocular measurements.
+All desktop workflows run inside one Qt (`PySide6`) window with a left navigation rail:
 
-## 3. What it measures—and the limits of those measurements
+#### Home
 
-The three measurements use the selected-side **ear, shoulder, and hip**. Additional landmarks help assess framing and whether the view is sufficiently side-on.
+- Displays a quick overview of the offline analysis setup (active data directory, selected MediaPipe model variant, recent practice and reference archives) and shortcuts to **Library**, **Manage References (Calibration Profiles)**, and **Review**.
 
-| Measurement | In everyday terms | Unit | A potentially reportable deviation |
+#### Calibration Profiles (`References`)
+
+Opened from **Home → Manage References**:
+
+- Lists saved `.tpc` calibration profiles and legacy neutral baselines in a clean split table + card layout.
+- Displays profile provenance, creation date (`dd/mm/yyyy hh:mm`), model hash compatibility, approved metric ranges, and camera view tags (`side`, `front`, `all`).
+- **Match Camera Settings** copies the capture configuration (`side`, `facing`, `capture_profile`, `allow_all_angles`) from the selected profile into your active session config without altering saved archives.
+- **Open Library** jumps to **Library** to create or edit profiles from `.tpr` recordings.
+
+#### Library
+
+Manages your local `.tp` (practice recordings), `.tpr` (replayable references), and `.tpc` (calibration profiles):
+
+- **Search, Filter & Sort**: Filter by archive type (`All types`, `References (.tpr)`, `Calibrations (.tpc)`, `Practices (.tp)`) and sort by `Date created (newest/oldest)` (`dd/mm/yyyy hh:mm`) or `Name (A–Z / Z–A)`.
+- **Import & Analyze Video…**:
+  - Accepts local files (`.mp4`, `.mov`, `.m4v`, `.avi`, `.mkv`, `.webm`) up to **2 GB**, trimmed to a configurable clip range `[in, out)` up to **120 seconds**.
+  - Check **Import as reference** to package a `.tpr` reference archive (default), or uncheck it to create a `.tp` practice archive.
+  - Original media files are never overwritten or moved; clip timestamps are rebased consistently inside the archive.
+- **Archive Actions**:
+  - **Review**: Opens `.tp` or `.tpr` directly in **Review**.
+  - **Promote to Reference**: Copies a `.tp` practice segment into a standalone `.tpr` reference archive while preserving the original practice file.
+  - **Create calibration**: Launches the **Calibration Editor** on a `.tpr` archive to approve metrics into a new `.tpc` profile.
+  - **Profile details**: Opens a structured summary modal for a `.tpc` profile showing capture context, provenance, and all approved bounds. Includes **Edit calibration…** (re-opens the source `.tpr` in the Calibration Editor preloaded with the profile's existing bounds and selections so you can add missing metrics or adjust limits) and **Use as Settings defaults**.
+  - **Rename** / **Delete**: Rename updates the display name inside metadata; confirmed Delete moves the archive to the system Trash via `QFile.moveToTrash`.
+
+#### Review
+
+Detailed playback and frame inspection for any `.tp` or `.tpr` archive:
+
+- **Stream Selection**: Switch between **Raw video** (required for live dynamic overlays), **Annotated overlay**, or **Floor lines only**. Note that baked overlay pixels already rendered into an overlay video stream cannot be removed by layer toggles.
+- **Playback Transport**: Play/Pause, `-1 frame`, `+1 frame`, timeline scrubbing, and playback speed control.
+- **Dynamic Visual Layers**:
+  - **Skeleton**: Confidence-colored joint dots (green = reliable, orange = low confidence) with optional display-only gap interpolation.
+  - **Torso axis**: Solid pink shoulder-midpoint-to-hip-midpoint axis line plus dashed cyan image-vertical reference.
+  - **Pivot rings**: Perspective ellipse centered at the hip midpoint during detected turns, with a clockwise/anticlockwise directional arrow.
+  - **Step footprints**: Heel-to-toe left/right floor markers fading smoothly over `replay_step_history_seconds` (pauses when playback pauses).
+- **Calibration Comparison & `This frame` Insights**:
+  - Choose a `.tpc` profile from **Calibration profile** (or *No calibration (visuals only)*).
+  - The top banner summarizes frame status (**Green**: within approved bounds; **Amber**: `Not measured` / quality gate blocked; **Red**: confirmed deviation beyond `entry_duration`).
+  - Each row in `This frame` reports its numerical value, approved `[min, max]` interval, and a status indicator. **Why `Not measured` appears**: either a required landmark fell below confidence/visibility floors, the dancer rotated outside the metric's approved view (`side` vs `front`), multiple people were detected, or a segment was shorter than `min_torso` / `min_head`. **Why `Not in profile` appears**: that `.tpc` file did not approve that metric yet—use **Edit calibration…** in Library to add it.
+- **Analyze posture & movement**: Re-runs offline pose inference (`lite`, `full`, or `heavy` chosen in Settings) and movement detection on up to 120 seconds of the opened clip, atomically updating cached `analytics_XX.json`, reports, and overlay members while preserving the raw clip. Uses **Cancel analysis** to abort safely without losing prior archive data.
+- **Open Comparison…**: Opens a second replayable archive side by side, synchronized by elapsed clip time.
+- **Report Tab & AI Coach Link**: View the generated Markdown report; click archived timestamp links to jump straight to that frame, or click **Open Report in AI Coach**.
+
+#### Analytics
+
+Archive-driven quantitative charting and comparison across the entire clip:
+
+- **Pick Archive (`.tpr` or `.tp`)**: Choose any Library archive recording (or browse with **Open .tp / .tpr…**), regardless of whether a SQLite session entry exists.
+- **Calibration Line Reference**: Pick **No calibration reference**, **Settings default ranges**, a saved `.tpc` profile, a legacy calibration, or load an external `.tpc` via **Open .tpc…**.
+- **All 12 Metric Charts**:
+  - Displays all **8 Calibration Range Metrics** (`head_pitch`, `head_forward`, `head_inclination`, `shoulder_clearance`, `hip_offset`, `torso_axis_tilt`, `trunk_inclination`, `knee_flexion`) and all **4 Frame Coaching Metrics** (`head_angle`, `shoulder_elev_pct`, `knee_bend_deg`, `axis_curve_smoothed`).
+  - Overlays green dashed `Min` / `Max` calibration bounds and blue `Ref` midpoint lines on each chart and highlights hysteresis state coverage (`% in range`, `% pending`, `% out of range`).
+  - **Interactive Seeking**: Click any chart point to open **Review** directly at that timestamp.
+- **Export Charts to Files**:
+  - Click **Export Chart…** on an individual metric card to export `.png`, `.svg`, `.csv`, or `.json`.
+  - Click **Export All Charts…** in the toolbar to batch-export every populated metric chart in your chosen format into a destination folder.
+
+#### AI Coach (Optional Ollama Commentary)
+
+- Connects only when you click **Check Ollama** or **Analyze Selected Report** against your configured Ollama URL (default `http://127.0.0.1:11434`).
+- Sends only the sanitized Markdown report text (never raw video or images) up to `ollama_max_report_chars`.
+- Saves completed interpretations alongside the report inside the archive as `.analysis-*.json`, pinned to the report SHA-256 hash, model name, and prompt instructions.
+
+#### Settings & Database Maintenance
+
+- **Settings**: Organizes all **72 editable settings** and **8 Calibration defaults rows** across tabs. Click **▸ Explanation & example** beside any setting (or **Expand All Guides**) to read what the parameter controls and view a concrete numerical example. Changes apply when you save via **Apply & Save settings.toml**, **Export TOML…**, **Import TOML…**, or **Reset Defaults**.
+- **Database maintenance**: Performs explicit, user-confirmed cleanup of the local SQLite database (`tango.sqlite3`) without touching `.tp`, `.tpr`, or `.tpc` archives.
+
+---
+
+## 2. Posture Metrics, Geometry & Mathematical Reference
+
+### Retained MediaPipe Landmarks & Coordinate Systems
+
+MediaPipe Pose Landmarker detects 33 landmarks per person. Tango Posture Coach names and stores the **19 landmarks** relevant to posture, embrace, and footwork:
+
+| Group | Retained Landmarks | Primary Consumers |
+| --- | --- | --- |
+| **Head** | `nose`, `left_ear`, `right_ear` | Head pitch, head-forward offset, head inclination, shoulder scale fallbacks, hip-offset head endpoint |
+| **Torso & Arms** | `left_shoulder`, `right_shoulder`, `left_elbow`, `right_elbow`, `left_wrist`, `right_wrist` | Trunk inclination, pink torso axis (`torso_axis_tilt`), shoulder clearance, embrace ratio, Leader/Follower arm heuristics |
+| **Pelvis & Legs** | `left_hip`, `right_hip`, `left_knee`, `right_knee`, `left_ankle`, `right_ankle` | Core torso length (`min_torso`), hip midpoint, 3D hip yaw (pivots), knee flexion, hip offset, slow-tango lift |
+| **Feet** | `left_heel`, `right_heel`, `left_foot_index`, `right_foot_index` | Offline step placement (`movement.py`) and rendered floor footprints |
+
+**Coordinate transformation**: Normalized MediaPipe image coordinates `(x_norm, y_norm) in [0, 1]` are multiplied by the actual decoded video dimensions `(width, height)` before any angle or length computation so non-square aspect ratios never distort angles:
+
+```text
+p = (x_norm * image_width, -y_norm * image_height)    # x rightwards, y upwards (pixel units)
+```
+
+Separate MediaPipe **world coordinates** (`world_poses`) supply metric 3D estimates (`x, y, z`) used strictly for horizontal pelvis yaw heading during pivot analysis.
+
+### The 8 Range Calibration Metrics (`METRIC_DETAILS`)
+
+These eight metrics are approved in `.tpc` profiles, configurable under **Calibration defaults**, and plotted as primary cards in **Analytics**:
+
+| Metric Key | UI Label | Unit | Required Landmarks & Formula Summary |
 | --- | --- | --- | --- |
-| Head-forward offset | How far the ear lies toward the selected front, relative to the shoulder and trunk | Projected torso lengths | A positive increase from reference |
-| Head segment inclination | The angle of the shoulder-to-ear segment relative to the trunk | Degrees | A change in either direction from reference |
-| Trunk inclination | The angle of the hip-to-shoulder segment relative to image vertical | Degrees | A change in either direction from reference |
+| `head_pitch` | Head pitch (ear-to-nose) | `degrees` | Raw image-plane angle from ear to nose relative to horizontal (`atan2(dy, dx)`). Zero = level horizontal ear-to-nose vector. |
+| `head_forward` | Head-forward offset | `torso_lengths` | Forward projection of the shoulder-to-ear vector `h = E - S` onto trunk normal `n = f * (t_y, -t_x)`, divided by torso length `L = length(S - H)`: `dot(h, n) / L`. Positive values indicate the ear lies farther toward `facing`. |
+| `head_inclination` | Head inclination | `degrees` | Angle of shoulder-to-ear vector `h` relative to trunk vector `t = (S - H) / L`: `degrees(atan2(dot(h, n), dot(h, t)))`. |
+| `shoulder_clearance` | Ear-to-shoulder clearance | `normalized_clearance` | Minimum vertical gap `gap = (shoulder.y - ear.y) * H` across usable sides divided by anatomical reference scale `S`. Smaller values mean the shoulder sits closer to the ear. |
+| `hip_offset` | Hip offset from ankle-to-head axis | `axis_lengths` | Signed perpendicular displacement of the hip behind the straight line connecting ankle to back-of-head proxy, normalized by ankle-to-head length. |
+| `torso_axis_tilt` | Torso axis tilt (pink line) | `degrees` | Unsigned image-plane tilt magnitude from vertical of the line joining hip midpoint `(L_hip + R_hip)/2` to shoulder midpoint `(L_shoulder + R_shoulder)/2`. Requires both shoulders and both hips. |
+| `trunk_inclination` | Trunk inclination | `degrees` | Signed image-plane angle between hip-to-shoulder trunk vector `t` and vertical: `degrees(atan2(f * t_x, t_y))`. |
+| `knee_flexion` | Least-bent reliably visible knee | `degrees` | For each qualifying leg: `interior = degrees(acos(clamp(dot(u, v) / (|u| * |v|), -1, 1)))` with `u = hip - knee` and `v = ankle - knee`, converted to flexion `max(0, 180 - interior)`. Uses the smaller (straightest) bend unless tie-broken toward the camera-facing leg. |
 
-### Head-forward offset
+### The 4 Frame Coaching Traces (`FRAME_METRICS`)
 
-This measurement asks whether the selected ear is farther forward relative to the selected shoulder and the trunk's orientation. It divides the projected displacement by projected torso length so the result is a ratio, not a distance in centimetres.
+Offline analysis also records descriptive frame-level traces shown in **Review → Insights** and as the remaining 4 charts in **Analytics**:
 
-A delta of `+0.10` means a change of one tenth of the projected torso length along the defined forward direction. It does **not** mean that the head moved ten centimetres. The ratio remains an image-plane measurement and does not eliminate perspective or camera-view problems.
+| Trace Key | Label | Unit | Difference from Calibration Counterpart |
+| --- | --- | --- | --- |
+| `head_angle` | Head alignment | `degrees` | Subtracts `head_neutral_offset` (default `-12.0 deg`) from raw ear-to-nose pitch when comparing against legacy `head_down_angle` (`-15.0 deg`). Approved `head_pitch` uses raw degrees directly. |
+| `shoulder_elev_pct` | Shoulder height | `% raised` | Converts raw clearance `C` into elevation `%` relative to adaptive/neutral baseline `B = max(shoulder_baseline_clamp_floor, effective_neutral)`: `100 * (B - C) / B`. |
+| `knee_bend_deg` | Knee bend | `degrees` | Smoothed per-frame knee flexion using `overlay_smoothing` (falling back to `smoothing`, clamped to `min_filter_time_constant`). |
+| `axis_curve_smoothed` | Torso / hip offset | `%` | Percent expression (`100 * offset`) of posterior hip offset smoothed for legacy fallback `axis_curve_entry` / `axis_curve_clear` triggers. |
 
-Only positive increases trigger the head-forward event. A backward change can still appear in the observations and summary, but this metric does not generate a symmetric backward-deviation event.
+### Knee & Shoulder Calculation Details (Configurable Helper Rules)
 
-### Head segment inclination
+Unlike opaque black-box heuristics, all geometric helpers expose their thresholds directly in **Settings → Head & shoulders** and **Settings → Embrace & knees**:
 
-This is the angle of the line from shoulder to ear relative to the trunk. It is a convenient posture proxy because both endpoints can be estimated by the pose model.
+- **Knee visibility & segment guards**: Both hip-to-knee (`u`) and ankle-to-knee (`v`) must measure at least `knee_min_segment_px` (`10.0 px`), and hip/knee/ankle landmarks must meet both the strict `confidence` gate (in approved profiles) and `knee_visibility_floor` (`0.35`).
+- **Knee tie-break rule**: Normally the least-bent qualifying leg is reported (`min(left_bend, right_bend)`). However, if the opposite leg's minimum visibility drops below `knee_tiebreak_other_max_vis` (`0.60`) and the preferred `side` is at least `knee_tiebreak_min_advantage` (`0.15`) more visible, the preferred side wins instead of letting a noisy occluded back leg dominate.
+- **Shoulder reference scale hierarchy (`S`)**:
+  1. Primary candidate: largest `shoulder_ear_hip_scale_factor * vertical_ear_hip_px` (`0.26 * dy`) among usable sides with `ear_hip_dy > shoulder_min_ear_hip_px` (`20.0 px`).
+  2. Fallback candidates (used only when no primary candidate qualifies; largest wins):
+     - `shoulder_nose_ear_scale_factor * dist(nose, ear)` (`0.68`)
+     - `shoulder_ear_ear_scale_factor * |left_ear.x - right_ear.x|` (`0.65`)
+     - `shoulder_width_scale_factor * |left_shoulder.x - right_shoulder.x|` (`0.28`)
+  3. Scale floor: if `S < shoulder_min_ref_scale_px` (`8.0 px`), clearance is marked unavailable rather than dividing by near-zero noise.
+- **Adaptive fallback shoulder baseline**: During fallback movement/import runs without a `.tpc` profile, up to `shoulder_adaptive_max_samples` (`600`) relaxed clearances inside `[shoulder_adaptive_min_clearance, shoulder_adaptive_max_clearance]` (`[0.65, 1.50]`) are collected; once `shoulder_adaptive_min_samples` (`15`) qualify, baseline `B` adapts to `max(shoulder_neutral_clearance, percentile(samples, shoulder_adaptive_percentile))` (default `75th` percentile), never falling below `shoulder_baseline_clamp_floor` (`0.20`). Fallback hysteresis clears at `max(shoulder_recovery_min_pct, shoulder_recovery_ratio * shoulder_raise_threshold)`.
 
-It is not an anatomical neck-flexion angle. It is not a measurement of facial pitch, and it cannot establish where your eyes are directed or prove that you are looking at the floor. The appropriate interpretation is simply that the visible ear–shoulder relationship differs from the reference.
-
-### Trunk inclination
-
-This measurement compares the hip-to-shoulder segment with vertical in the image. Camera roll matters: if the camera is tilted, image vertical is not an independently measured gravitational vertical.
-
-The app does not reconstruct the spine. A line between hip and shoulder is not a measurement of spinal curvature, and it does not establish balance, weight distribution, or dance quality.
-
-### Why there is no combined score
-
-The head-forward offset and head segment inclination are related: both depend on the same ear–shoulder vector. Adding them into a score would risk counting related observations twice and would conceal their different meanings.
-
-The application therefore reports the measurements separately. It also keeps measurement coverage separate from deviation time. A session with many unknown frames must not appear successful simply because few events could be confirmed.
-
-## 4. A first practice session
-
-### Install from desktop binaries
-
-Download the macOS Apple Silicon `.dmg` or Windows x64 setup executable from
-[GitHub Releases](https://github.com/derruba2000/TangoPosture/releases) and
-verify it against that release's `SHA256SUMS.txt`. The installers include Python
-and the verified pose model; the source setup below is not needed.
-On macOS, drag TangoPosture into Applications. On Windows, run the installer
-and launch TangoPosture from the Start menu.
-
-These experimental builds are unsigned and the macOS app is not notarized.
-If macOS says **"Apple could not verify TangoPosture is free of malware"**,
-only proceed if you trust the download and have verified its checksum.
-After trying to open the installed app, use
-**System Settings > Privacy & Security > Open Anyway**, then confirm **Open**.
-This permits this app without disabling Gatekeeper globally; it does not prove
-the app is malware-free. See [Apple's instructions](https://support.apple.com/en-us/102445).
-Developer ID signing and Apple notarization are required to remove this warning
-for distributed builds.
-
-Recordings and data are stored under
-`~/Library/Application Support/TangoPosture` on macOS and
-`%LOCALAPPDATA%\TangoPosture` on Windows. Uninstalling the app does not delete
-these files.
-
-### Install the environment and model
-
-The initial compatibility target is Python 3.11. The implementation was checked on macOS on Apple Silicon. From the repository root:
-
-```bash
-uv python install 3.11
-uv sync --frozen
-uv run tango-posture models fetch
-uv run tango-posture --help
-```
-
-`uv sync --frozen` installs the dependency versions recorded in the lockfile. `models fetch` performs the explicit model download and checksum verification. After these setup steps, ordinary runs do not require a network connection.
-
-Run `uv run tango-posture`, `uv run tango-posture gui`, or
-`uv run tango-posture qt` to open the same PySide6 desktop interface.
-The packaged application also uses Qt. The former Tk interface has been removed;
-Tk/Tcl is not required. Existing data directories, `.tp`/`.tpc` archives, and TOML
-settings remain usable. `gui --qt` is retained only as a command compatibility alias.
-
-### Qt desktop workflows
-
-Qt shows the TangoPosture splash screen for three seconds at startup. Select
-**About** at the bottom of the navigation rail for version, license, repository
-and usage information. **Help & Guide** renders the styled offline manual
-with hierarchical contents and searchable, highlighted matches.
-
-The Library lists practice `.tp`, reference recording `.tpr`, and calibration
-profile `.tpc` files (including legacy neutral-baseline archives). Use **File type**
-to show all types or only `.tpr`, `.tpc` or `.tp`; it combines with name search,
-and both filters stay selected when you refresh. **Rename** saves
-the display name inside the archive without changing its filename. **Delete**
-asks for confirmation before moving the archive, including its recordings and
-analytics, to the operating system's Trash; original imported media and legacy
-reports are retained. **Import & Analyze Video…** packages a selected local clip
-into a portable `.tpr` by default without modifying the source video; uncheck
-**Import as reference** to produce a `.tp`. Imports are available
-only through Library. **Export Video…** in Review copies the currently selected
-stream to a destination you choose.
-
-Settings are organized into groups covering
-camera and view, calibration, tracking, movement, music, replay and Ollama.
-**Apply & Save settings.toml** validates and saves changes after confirmation,
-then applies them. Use **Export TOML…** to choose a different destination.
-The app automatically reloads `settings.toml` from its working directory on
-startup; `--config` selects a different file and command-line overrides take precedence.
-The factory template `configs/default.toml` is not overwritten.
-
-**Settings → Files → Offline analysis model** lets you select **Lite**, **Full**,
-or **Heavy** for Review and Library video analysis. Lite is the default; Full and
-Heavy generally cost more processing time. **Live Practice and guided camera
-capture always use Lite**, regardless of this choice. Missing analysis weights
-download with progress when you start analysis, then remain cached locally.
-Changing this setting does not reanalyze old recordings automatically: click
-**Analyze posture & movement** again to replace the cached evidence. Calibrations
-created with another model remain incompatible; model checking is not bypassed.
-
-In the calibration editor, **Use approved ranges as Settings defaults...** copies
-the exact approved minimum/maximum, units and views into **Settings → Calibration
-defaults** and saves `settings.toml` after confirmation. Existing `.tpc` profiles
-also have **Use as Settings defaults** in Library. This replaces the previous
-default ranges, not unrelated settings. Edit or disable individual metrics in
-Settings, then use **Apply & Save settings.toml** to persist your changes.
-In Live Practice with no calibration selected, enabled default ranges replace legacy posture
-thresholds; missing metrics have no fallback. Disable all default ranges to restore
-the legacy thresholds. A selected calibration takes priority, and copying defaults
-does not enable calibrated camera scoring. The saved file is loaded automatically
-at startup from the same working directory.
-
-Calibration and Live Practice use the shared pose pipeline: the video shows
-skeleton tracking and the inspector reports head, shoulder, torso/hip and knee
-measurements, with the configured timed posture alerts. Measurements that
-cannot be observed remain unavailable rather than being presented as good.
-
-Review supports raw, overlay and (when archived) full-lines video streams,
-timestamp seeking, speed/frame-step controls and side-by-side comparison with
-a practice or reference archive from Library. **Open Library Archive…** and
-**Open Comparison…** list only replayable Library `.tp`/`.tpr`/legacy `.tpc`
-entries, not loose media or profile-only files.
-Comparison follows the primary
-playhead's elapsed time; it does not calculate a biomechanical or musical
-alignment. For a raw or local video, click **Analyze posture & movement** to run a
-cancellable background analysis of up to the first two minutes. The resulting
-skeleton overlay and head/shoulder/torso-hip/knee measurements
-stay synchronized with the current frame. The analysis does not modify the raw
-video and saves results inside the
-selected `.tp` or `.tpr` recording so they return when reopened. Archived baked video
-streams remain unchanged.
-
-Newly generated analysis reports list the pose model, its pinned version and
-SHA-256 fingerprint. If the model cannot be identified, the report says
-**Unavailable** instead of guessing. Existing reports are not rewritten.
-
-Select a `.tpc` in Review's **Calibration profile** picker to compare the
-recording with its approved ranges. In both Live Practice and Review, selecting
-a calibration disables the Settings-based head, shoulder, knee and torso/hip
-warnings: only metrics with approved ranges can produce calibrated feedback.
-Missing metrics do not fall back to Settings. Review displays the saved units
-and limits; unreliable or incompatible measurements remain unavailable.
-Review comparison does not enable a profile for live camera scoring.
-Choose **No calibration (visuals only)** to show the skeleton, pivot rings and
-footprints without posture alerts. Settings default ranges do not generate Review
-alerts. Movement-only reference imports also do not create fallback alerts.
-Previously saved reports and baked videos are not rewritten; their historical
-text or painted overlays may still contain older warnings.
-Live Practice still requires the camera checks and placement confirmation for
-a camera-ready calibration; an unconfirmed selection is not silently discarded.
-
-For closer skeleton tracking, use the raw/source stream: Review draws the
-current frame's raw cached landmarks rather than lagging display-smoothed
-landmarks. Old display-only caches require **Analyze posture & movement** again
-for calibration comparison. Existing baked overlay streams cannot be corrected;
-Review uses raw/source video, and reports when it is unavailable.
-
-For joints that briefly disappear, **Settings → Replay movement** offers
-**Review joint interpolation** (`linear` by default, or `quadratic`) and
-**Maximum joint gap to fill** (default 3 seconds; 0 disables it). Review fills
-bracketed gaps using nearby reliable joints without delaying playback.
-Quadratic interpolation falls back to linear with insufficient nearby samples
-or an out-of-frame curve. Longer gaps, clip edges and ambiguous multi-dancer
-tracking remain unfilled. Interpolated joints are visual estimates only:
-measurements, alerts and calibration evidence still use the original raw data.
-This applies to analyzed raw/source Review streams, not live capture or baked overlays.
-
-Enable **Pivot rings** and **Step footprints** to display the same
-confidence-qualified movement evidence from the shared analysis pipeline. Existing archive movement
-data is loaded when available. Counts of zero mean no qualifying movement was
-detected, not that an overlay is hidden. **Floor lines only** switches to
-the raw/source stream and replaces the dancer pixels with a neutral floor,
-drawing only skeleton lines and the selected movement marks, without posture
-messages. **Open Comparison…** opens the selected Library archive's raw video
-(or an available archived stream when raw is absent) in the second pane.
-There is no comparison-stream selector; the primary stream selector and layer
-toggles let you compare overlays or lines against the comparison video.
-
-**Import YouTube / Facebook…** is available only in Library.
-Enter a supported HTTPS YouTube video or Facebook Reel URL, an optional title,
-and a clip range of up to 120 seconds. The shared background import worker downloads,
-analyzes and packages the clip, report and source provenance into a `.tpr`
-(or `.tp` when import-as-reference is unchecked), then
-opens the archive in Review.
-Imports require network access and `yt-dlp`; failures and cancellation are shown
-explicitly. Only import videos you have permission to use. Ordinary local review
-remains offline.
-
-Analytics selects a Library `.tp` recording and reads its stored analytics,
-not the session database. Each recording uses a matching index:
-`video_00.mp4`, `overlay_00.mp4`, `lines_00.mp4` (when available),
-`report_00.md` and `analytics_00.json`; subsequent recordings use `_01`, `_02`,
-and so on. Stored head, shoulder, knee and torso/hip measurements are shown
-separately from the three calibrated posture metric families. Uncalibrated clips
-do not acquire reference scores or fabricated coverage. Click a chart or
-double-click a persisted event to seek that archive recording; seeking is
-unavailable when no archived frame timestamp covers the observation. Unknown
-periods remain gaps. Portable archived analytics do not require the original
-database. Older full-lines archive names remain readable.
-
-AI Coach accepts a Markdown report or a `.tp`/`.tpr`/legacy `.tpc` archive report. It makes no
-Ollama request until **Analyze Selected Report** is explicitly clicked, streams
-the local model response, supports cancellation, and saves each result with the
-source report hash, model and endpoint. Results for a report changed during
-analysis are rejected. **Check Ollama** is also an explicit request to the
-configured Ollama endpoint.
-
-### Set up the camera
-
-Use a fixed, approximately level camera and leave enough space in the frame for the whole body. Choose adequate lighting and an uncluttered background. Fitted clothing may make landmark estimation easier, but the application must abstain if visibility is inadequate regardless of clothing.
-
-Select both the anatomical side visible to the camera and the direction you face in the original image:
-
-```bash
-uv run tango-posture run --camera 0 --side left --facing right
-```
-
-Here, `left` means your left anatomical side is the selected visible side. `right` means you face toward the right-hand side of the **unmirrored** image. These are separate choices.
-
-Camera device indices are explicit. The application does not silently switch to a different device if camera 0 is unavailable.
-
-### Record the reference and start
-
-Press C after preparing to adopt your intended reference. There is a three-second countdown, followed by a twelve-second capture. Review the result, then press A to accept or R to retry. Press S to begin the session.
-
-During practice, P pauses or resumes. E ends and saves the session. Q quits and saves an unfinished session with an explicit stopped status. Ctrl+C and closing the window also stop the run cleanly through the application lifecycle.
-
-With the current workspace beat-tracking extension enabled, a GUI webcam run also attempts to open the microphone. To run without that input, set `beat_tracking = false` in your TOML file; see Section 23.
-
-The default workflow is best understood as separate phases: setup, deliberate reference selection, practice, and review. Previewing yourself before a usable reference is accepted does not start an evaluation.
-
-### Display mirroring
-
-If you prefer a mirrored display, add `--mirror`. Setup remains unmirrored so the facing-direction choice is clear. V confirms setup and enables the requested mirror; C or S also confirms setup.
-
-Mirroring only transforms rendered pixels and overlay coordinates. It never changes the pose coordinates used for calculations or the measurements saved to storage.
-
-## 5. Choosing and calibrating a reference
-
-### Qt reference recordings and approved profiles
-
-| File | Meaning | Contents |
-| --- | --- | --- |
-| `.tp` | Practice session | Indexed original recordings, overlays, measurements and reports. **Promote to Reference** creates a separate `.tpr` from one recording or an excerpt. |
-| `.tpr` | Replayable reference recording | Video, source provenance, clip timestamps, cached landmarks/measurements where available, and optionally a saved numbered-dancer selection with explicit track anchors. |
-| `.tpc` | Calibration profile | Approved ranges per metric, units, views, practice context, example passages, reliable coverage, model/measurement versions and camera-check evidence. No video dependency. |
-
-Use **Create calibration** on a `.tpr` in Library. In the shared approval screen:
-
-1. Select the numbered dancer at the playhead. Ambiguous spatial tracking,
-   missing poses or long gaps end a track; it never silently switches people.
-   Add explicit restart anchors after excluded sections and confirm they show
-   the same dancer. **Save dancer selection** persists anchors in the reference.
-   This is conservative spatial association, not validated identity recognition.
-2. Review **Head → Shoulders → Hips → Torso → Knees** without rerunning inference.
-   An older reference with no trustworthy landmark/model cache must first be
-   reanalyzed in Review; legacy neutral baselines do not supply distributions.
-3. Enter example passages in the displayed timeline seconds, such as
-   `0-3; 5-9`. The histogram and timestamp chart show the cached evidence.
-   **Show low/high example** seeks to the relevant moment. The median, middle
-   80%, reliable duration and inside-range fraction describe those passages.
-4. Edit acceptable minimum/maximum independently from which moments count as
-   examples. The middle 80% is only a starting suggestion, not a normative
-   target. Separate standing/walking passages when their distributions differ.
-5. Explicitly approve or skip each metric, name the context and save a new
-   `.tpc`. Save different names for several profiles from the same reference.
-   Unapproved or unobservable metrics never become reassuring scores.
-
-The initial metric set is ear-to-nose head pitch, existing head-forward and
-head-inclination measurements, normalized ear-to-shoulder clearance, hip offset
-from the ankle-to-head axis, pink torso-axis tilt, existing trunk inclination and the least-bent
-reliably visible knee. Clearance is not left/right shoulder level; hip offset
-is not pelvic rotation. Head yaw/lateral tilt, separate shoulder/hip-level
-angles and support-leg ranges are not implemented or represented as validated.
-
-In **Torso**, choose **Torso axis tilt (pink line)** to calibrate the angle shown
-on the overlay. It measures the absolute shoulder-midpoint to hip-midpoint tilt
-from image vertical in degrees: zero is upright, and either tilt direction has
-the same magnitude. Keep the camera level; both shoulders and both hips must be
-reliably visible. Select the applicable view and example passages, then approve
-the acceptable minimum/maximum. These bounds are available to Live Practice,
-Review and **Use as Settings defaults**. Missing joints yield unavailable
-measurements, not interpolated scoring evidence. The separate **Trunk inclination**
-metric and existing profiles keep their original definitions; this projected
-angle is not a balance or 3-D posture diagnosis.
-
-For **Guided camera calibration**, preview first, then explicitly begin a spoken
-and visible countdown. Each group captures comfortable neutral, changed,
-returned and freshly repeated holds with settling time. A repeat check requires
-at least 60% reliable hold coverage (and at least 0.5 seconds), both changes
-larger than twice the largest within-hold middle-80% spread, consistent change
-direction, and a return within twice that spread or 25% of the first change.
-These are engineering repeatability heuristics, not technique validation.
-Failures provide framing advice and **Retry / Skip**. A solo-walking context
-also records a walking drill. Both sources end in the same range approval screen;
-choose which hold or drill supplies target examples, independently of limits.
-
-A video-derived profile can be selected in Practice for measured-value/range
-comparison before live scoring is enabled. **Check camera** on that profile
-records fresh holds; explicitly approve camera use per responsive metric and
-confirm the applicable view is comparable. A repeat check alone does not prove
-cross-camera accuracy. The resulting profile records the checked capture setup
-and uses exact source/resolution/side/facing/profile and model compatibility for
-scoring. Loss of confidence or the approved view remains unknown. Profiles work
-offline without the source `.tpr`; source names and hashes are provenance only.
-
-The following legacy baseline and CLI workflow remains supported. Version-1
-`.tpc` archives are neutral baselines, not range profiles, and remain readable
-without conversion to `.tpr`.
-
-A reference is a saved description of the measurements observed during a deliberately selected stable interval. It is not a pretrained ideal pose or an automatically chosen teacher judgement.
-
-By default, references are labelled **self-selected**. To record an explicit teacher review statement:
-
-```bash
-uv run tango-posture run --camera 0 --side left --facing right \
-  --reference-name 'Solo walk reference' \
-  --teacher-reviewed 'Reference reviewed for this exercise'
-```
-
-The review note is user-provided metadata. The software has no way to verify the review or infer it from the image.
-
-### What calibration checks
-
-Within the twelve-second capture window, the default requirements are:
-
-- At least nine seconds of valid observations, measured using timestamps.
-- At least sixty valid samples.
-- All three metric quality checks pass for accepted samples.
-- Median absolute deviation is at most `0.03` torso lengths for offset and `4°` for each angle.
-
-A high sample count alone is insufficient. Sixty frames collected over a very short interval cannot substitute for the required valid duration. Likewise, a long recording with unreliable landmarks does not become a valid reference just because time passed.
-
-The baseline for each metric is the median of the accepted measurements. The reference also retains dispersion, coverage, sample count, expected view-width range, image dimensions, anatomical side, facing direction, capture profile, model checksum, metric version, and review metadata.
-
-### Why stability and coverage are different
-
-Stability describes how much accepted measurements vary. Coverage describes how much of the capture window supplies acceptable evidence. A person can remain still while the model sees too little to measure reliably; such a capture may be stable in the few available samples but still fail coverage.
-
-These checks are engineering safeguards, not proof of suitability for tango. A stable and well-observed reference can still be inappropriate for your intended exercise.
-
-### Reusing a reference
-
-List references with:
-
-```bash
-uv run tango-posture calibrations list
-```
-
-When reusing one, the application checks stored metadata and requires confirmation that physical camera placement has not changed. The confirmation is necessary because a camera can move while retaining exactly the same resolution and device index.
-
-Recalibration is recommended at every new setup. Do not interpret metadata compatibility as evidence that the physical view is unchanged.
-
-## 6. Understanding the screen and feedback
-
-There are two distinct kinds of state: **application state** and **measurement state**.
-
-| Application state | Meaning |
+### Role & Embrace Heuristics
+
+- **Leader / Follower arm pattern (`detect_role`)**: Examines wrist, elbow, and shoulder geometry to classify `LEADER`, `FOLLOWER`, or `NONE`, gated by `role_assign_ms` (`300 ms`) persistence to assign and `role_hold_ms` (`5000 ms`) retention across turns.
+- **Closed / Open embrace (`embrace_closed_threshold`)**: Computes a normalized arm-compactness ratio (`<= 0.72` -> `CLOSED EMBRACE`, `> 0.72` -> `OPEN EMBRACE`), stabilized with a `0.15s` exponential filter, a `±0.025` deadband, and `embrace_hysteresis_seconds` (`1.0s`).
+
+---
+
+## 3. Calibration Workflow & Profile Editor Guide
+
+Creating or editing a `.tpc` profile separates **example evidence selection** from **range approval**:
+
+1. **Create a replayable reference (`.tpr`)**:
+   - In **Library**, import a local video with **Import as reference** checked, or select an existing `.tp` practice recording and click **Promote to Reference**.
+   - Ensure the reference clip contains raw `measurement_poses` (if missing from an older file, open it in **Review** and run **Analyze posture & movement** first).
+2. **Launch the Calibration Editor**:
+   - From **Library**, click **Create calibration** on a `.tpr` archive — or open an existing `.tpc` profile's **Profile details** dialog and click **Edit calibration…** to add additional metrics or refine existing ranges.
+3. **Select and verify the dancer track**:
+   - Click on the target dancer in the preview. Spatial association links frames using reliable hip centers (requiring distance `< 0.15` normalized coordinates, separation from any second candidate `> 0.03`, and gaps `<= max_gap`).
+   - Ambiguity, occluded hips, or long gaps end the active track cleanly so the editor never silently jumps to a partner or bystander. Use **Select dancer / restart track here** to confirm identity after an occlusion, then click **Save dancer selection in reference (.tpr)**.
+4. **Work through metrics step by step (`Head → Shoulders → Hips → Torso → Knees`)**:
+   - **Select camera view policy**: Choose `side` (`view_width <= max_view_width`, default `0.45`), `front` (`view_width > max_view_width`), or `all`. Note that even in `all` mode, strict landmark quality checks (`confidence`, `min_torso`, `min_head`) still apply, and `torso_axis_tilt` always requires both shoulders and both hips.
+   - **Mark example passages**: Drag or scrub passages representative of the movement you want to model (e.g., quiet standing vs solo walking).
+   - **Inspect statistics & extremes**: Click **Suggest middle 80% of examples** (uses configurable `calibration_suggest_lower_pct = 10%` and `calibration_suggest_upper_pct = 90%`, requiring at least `calibration_min_usable_samples = 2` finite samples and positive reliable duration). Inspect the shaded timeline, median (`Ref`), and extreme frames.
+   - **Approve or skip**: Edit `Lower` and `Upper` explicitly and click **Approve metric** (or **Skip / remove metric** to exclude it).
+5. **Save & optionally copy to Settings defaults**:
+   - Click **Save approved .tpc profile** with a unique profile name (saving creates a distinct profile rather than overwriting unrelated ones).
+   - Optionally click **Use approved ranges as Settings defaults…** if you want the same `[min, max, view]` limits pre-loaded under *Settings default ranges* in **Analytics** and Settings.
+
+> **Why did Review report `Not measured` vs `Not in profile`?**
+> - **Not in profile**: That metric was skipped or not yet approved when the `.tpc` file was created. Open the profile details in **Library** and click **Edit calibration…** to approve and save that metric.
+> - **Not measured**: The metric IS in the profile, so Review checks quality and camera-view gates frame by frame. A transient hidden ear, a side-vs-front camera view mismatch (`max_view_width`), two people entering the frame, or short limb projections can mark individual frames `UNKNOWN` (*Not measured*). Importantly, Review also applies temporal persistence (`entry_duration` default `1.5s`, `clear_duration` default `0.75s`) so momentary frame boundary crossings stay amber/muted rather than flashing false red alerts.
+
+---
+
+## 4. Tracking Engine, Temporal Smoothing & Movement Analysis
+
+### Models, Verification & Offline Cache
+
+Three MediaPipe Pose Landmarker `.task` variants are selectable in **Settings → Files → Offline analysis model** (`analysis_model`):
+
+- **`lite`** (default): Fastest processing (`models/pose_landmarker_lite.task`, pinned and SHA-256 verified against `models/manifest.json`).
+- **`full`** and **`heavy`**: Higher capacity landmark estimators cached under `<data_dir>/models/` (or reused if already present in `models/`). Missing variants download once with progress and atomic SHA-256 verification before local offline execution.
+- Changing `analysis_model` does **not** alter existing `.tp` or `.tpr` archives until you explicitly re-run **Analyze posture & movement** in Review. Comparison profiles check model hash compatibility.
+
+### Strict Quality Gates vs Helper Visibility Floors
+
+A frame observation must satisfy multiple gates before producing an approved range sample:
+
+1. **Single-person check**: Exactly 1 pose returned by MediaPipe (unless multi-pose tracking is resolved via saved dancer selection in `.tpr` analysis).
+2. **Landmark reliability (`quality.py`)**: Finite coordinates inside `[0, 1]` and both visibility and presence `>= confidence` (default `0.70`).
+3. **Framing geometry**: Projected torso height `>= min_torso` (`0.12` of image height), shoulder-to-ear height `>= min_head` (`0.04`), plus nose and at least one ankle visible for core pipeline metrics.
+4. **View width (`max_view_width`)**: Ratio `max(shoulder_width, hip_width) / torso_length` distinguishes `side` (`<= 0.45`) from `front` (`> 0.45`) view policies.
+
+Helper traces (`knee_bend_deg`, `shoulder_elev_pct`) also expose configurable helper floors (`knee_visibility_floor = 0.35`, `shoulder_visibility_floor = 0.50`) for descriptive overlays when strict approval checks aren't gating them.
+
+### Temporal Smoothing, Gaps & Display Interpolation
+
+To separate stable posture trends from single-frame detector jitter without hiding missing evidence:
+
+- **Exponential Moving Average (EMA)**:
+  ```text
+  alpha = 1 - exp(-dt / tau)
+  filtered_t = filtered_{t-1} + alpha * wrapped_diff(raw_t, filtered_{t-1})
+  ```
+  - Approved-range evaluation and **Analytics** use `tau = smoothing` (default `0.25s`).
+  - Descriptive frame traces use `tau = max(min_filter_time_constant, overlay_smoothing or smoothing)` (default floor `0.0001s`).
+  - Any timestamp gap larger than `max_gap` (default `0.5s`) resets filter continuity cleanly.
+- **Display-Only Joint Interpolation (`replay_joint_interpolation`, `replay_joint_max_gap`)**:
+  - Fills visual skeleton gaps between reliable bracketing frames (`linear` or `quadratic` with linear fallback up to `3.0s`; `0` disables filling).
+  - **Strict separation invariant**: Interpolated joints populate *only* Review drawing (`display_poses`). Raw `measurement_poses`, calibration statistics, `Not measured` status, and Analytics charts **never** read synthetic interpolated points.
+
+### Hysteresis State Machine (`Evaluator`)
+
+Every evaluated metric transitions across four explicit states in `temporal.py`:
+
+| State | Meaning |
 | --- | --- |
-| READY | Previewing or ready to begin; no active practice session |
-| CALIBRATING | Countdown or reference capture |
-| RUNNING | Session observations are evaluated and recorded |
-| PAUSED | Practice time and evaluation are suspended |
-| FINISHED | Session saved; the summary is available |
-
-| Measurement state | Meaning |
-| --- | --- |
-| WITHIN_REFERENCE | No sustained deviation is active under the configured rules |
-| PENDING | Entry threshold exceeded, but persistence time not yet satisfied |
-| DEVIATION | A persistent event has been confirmed |
-| UNKNOWN | There is insufficient evidence for this metric |
-
-“Within reference” does not mean medically or technically correct. “Unknown” does not mean within reference.
-
-During a running session, the overlay shows active elapsed time, processed FPS, selected side and facing direction, reference identity, current smoothed metric values, reference deltas, and measurement states. The core Stage 1 feedback policy limits prominent feedback to one message at a time:
-
-1. A quality or view problem takes priority.
-2. Otherwise, an active head-forward deviation is shown first.
-3. Next comes head inclination.
-4. Then trunk inclination.
-
-The current workspace also has an independent head-angle warning that can take priority over these messages; it does not use the same gates or reference logic. See Section 23 before treating that warning as an assessed Stage 1 deviation.
-
-All metric events are still logged even when another message has display priority. This prevents the screen from becoming a list of simultaneous coaching prompts while preserving the underlying observations for review.
-
-## 7. Why the application sometimes cannot assess
-
-Abstention is part of the measurement design. It means the current image does not support the requested observation with the configured safeguards.
-
-### Person count
-
-MediaPipe is configured to detect up to two poses. If it returns zero or more than one, the application suspends evaluation. With two detected poses, the prominent message is “One-person mode only.”
-
-The guard cannot guarantee that every person in the background will be detected. It is not multiple-person tracking or couple support.
-
-### Landmark reliability
-
-Required landmarks must have finite coordinates, be within the image, and meet visibility and presence thresholds. The default minimum is `0.70` for both confidence values. Missing confidence is not silently replaced with a perfect score.
-
-If the selected ear is unreliable, the head metrics become unknown. The trunk metric may remain available if the overall view and its required landmarks remain valid.
-
-### Framing and segment sizes
-
-The nose and at least one confidently visible ankle must be in frame. The far ankle may be occluded, so both ankles are not required.
-
-The projected torso must be at least 12% of image height. The shoulder-to-ear segment must be at least 4%. Zero-length and nonfinite geometry is invalid. These checks avoid calculating apparently precise angles from unusably small or degenerate segments.
-
-### Side-on view evidence
-
-When both shoulders and hips are reliable, the application compares projected shoulder and hip widths with torso length. The default rule is:
-
-```text
-max(projected shoulder width, projected hip width) / torso length <= 0.45
-```
-
-This is an adjustable heuristic, not a dependable orientation classifier. If the required pair landmarks are unreliable, view quality is unknown and evaluation abstains. Calibration also records an expected width range to help detect obvious changes in view.
-
-A significant practical limitation is that the far shoulder or hip may be difficult to estimate in a real side-on image. The resulting coverage must be measured during validation. Relaxing the gate just to obtain more feedback can trade away the evidence the feedback depends on.
-
-## 8. Analysing recorded practice
-
-Video-file mode provides a repeatable way to develop and investigate the pipeline without a webcam. It uses the same pose adapter, quality checks, geometry, calibration, temporal rules, and storage as live observation.
-
-To explicitly select the first twelve seconds as a reference interval and analyse the following movement:
-
-```bash
-uv run tango-posture run --video ./practice.mp4 \
-  --side left --facing right \
-  --reference-interval 0 12 \
-  --reference-name 'Video practice reference' \
-  --headless
-```
-
-The interval must match the configured calibration duration. In headless mode, supplying it is an explicit choice to accept the reference if its checks pass. A rejected calibration stops the run with an explanation; there is no hidden prompt.
-
-The reference interval and preceding preview time are excluded from practice statistics. A later interval, such as `5 17`, therefore starts practice after that interval, not at the start of the file.
-
-To reuse a saved compatible reference:
-
-```bash
-uv run tango-posture run --video ./practice.mp4 \
-  --calibration REF_ID --confirm-camera-unchanged --headless
-```
-
-Replace `REF_ID` with the UUID printed when the reference was accepted or shown by `calibrations list`.
-
-Omit `--headless` for the native OpenCV window. GUI file analysis runs at processing speed rather than real-time playback. Source timestamps, rather than wall-clock playback speed, still govern smoothing and persistence.
-
-A standalone inference report is also available:
-
-```bash
-uv run python scripts/smoke_video.py ./practice.mp4 \
-  --side left --facing right \
-  --output ./data/real-video-smoke.json
-```
-
-This script reports quality coverage and runtime measurements without requiring successful reference calibration. It does not generate reference-relative coaching events and does not save video frames.
-
-## 9. Reading a session summary
-
-The application automatically saves each ended session and prints its export location. You can also list and export stored sessions:
-
-```bash
-uv run tango-posture sessions list
-uv run tango-posture sessions export SESSION_ID --output ./exports
-```
-
-For each metric, the summary includes:
-
-| Field | Interpretation |
-| --- | --- |
-| Valid duration | Active time supported by acceptable consecutive observations |
-| Unknown duration | Active time not supported by those observations |
-| Valid coverage | Valid duration divided by active duration |
-| Time above entry | Valid time above that metric's entry threshold |
-| Confirmed-event duration | Time belonging to persistent events, restricted to valid intervals |
-| Event count and longest event | Number and length of confirmed episodes |
-| Median delta | Median of available sampled deltas |
-| Peak absolute delta | Largest observed magnitude of change |
-| Peak positive delta | Additional forward-only peak for head-forward offset |
-| Percentage denominator | Valid seconds used to calculate event percentages |
-
-Consider a hypothetical sixty-second active session. Suppose a metric has forty-five valid seconds, fifteen unknown seconds, and nine seconds within confirmed events. The confirmed-event percentage is `9 / 45 = 20% of valid time`. Coverage is `45 / 60 = 75%`. Both figures matter.
-
-A zero-valid-data session has no meaningful percentage: the JSON uses null, and the displayed percentage is N/A. Missing CSV values are blank, never manufactured zeros.
-
-Events for different metrics can overlap. Do not add head-forward, head-inclination, and trunk-inclination durations and describe the result as unique session time.
-
-### Onset versus detection
-
-An event has an onset timestamp and a detection timestamp. Onset is the first threshold-exceeding observation in the qualifying continuous run. Detection is when enough persistence has elapsed to confirm the event.
-
-That distinction lets you review when a deviation began without pretending that the application could have confirmed it immediately.
-
-## 10. The overall architecture
-
-The architecture separates input and display from the mathematical and temporal pipeline. This separation makes the core behaviour testable with synthetic landmarks and allows webcam and video-file runs to share the same logic.
-
-```mermaid
-flowchart TD
-    CLI[CLI and validated TOML] --> App[Application controller]
-    Camera[Webcam producer: latest frame only] --> Capture[Frame and source timestamp]
-    Video[Video decoder: sequential frames] --> Capture
-    Capture --> Pose[PoseEstimator interface]
-    Pose --> MP[MediaPipe Tasks VIDEO adapter]
-    MP --> Landmarks[FrameObservation: original image coordinates]
-    Landmarks --> Quality[Framing, confidence, person count, view checks]
-    Quality --> Geometry[Pixel geometry and three metrics]
-    Geometry --> Calibration[Reference capture and compatibility]
-    Geometry --> Temporal[Smoothing, deltas, persistence, hysteresis]
-    Calibration --> Temporal
-    App --> Calibration
-    App --> Temporal
-    Temporal --> Overlay[OpenCV overlay and one priority message]
-    Temporal --> Session[Session lifecycle and observations]
-    Session --> DB[(Local SQLite)]
-    DB --> Exports[JSON summary and CSV exports]
-```
-
-The learned component is MediaPipe's landmark estimator. The remaining decisions—quality gates, geometry, reference statistics, temporal rules, and summary accounting—are explicit application code.
-
-There is no language model in the runtime. The phrase “AI agent” in the implementation specification describes the agent implementing the application; it does not mean the shipped tool contains a conversational agent, autonomous coach, or cloud service.
-
-## 11. Technologies and why they are used
-
-| Technology | Responsibility | Important boundary |
-| --- | --- | --- |
-| Python 3.11 | Application language and standard-library services | Initial tested compatibility target |
-| uv and `uv.lock` | Dependency resolution and repeatable installation | Network may be needed during setup |
-| MediaPipe Tasks Pose Landmarker | Estimate body landmarks from RGB images | Local inference; image-based estimates remain uncertain |
-| OpenCV | Camera/file capture, colour conversion, drawing, desktop display | No web server or browser required |
-| NumPy | Vector geometry, medians, dispersion, runtime percentiles | No physical calibration inferred from pixel values |
-| Pydantic | Typed configuration and validation | Rejects invalid values and inconsistent thresholds |
-| `tomllib` | Parse TOML configuration | Python standard library |
-| `argparse` | Command-line interface | Explicit sources, reference choices, and setup commands |
-| `sqlite3` | Local transactional storage | No cloud database |
-| `threading`, queues, and a single worker | Fresh webcam frames and responsive GUI quit | No concurrent inference calls on the same detector |
-| pytest | Behavioural and integration tests | Synthetic tests do not establish dancer accuracy |
-| Ruff | Code linting and formatting | Static quality checks |
-| mypy | Static type checking | Complements runtime and behavioural tests |
-| Hatchling | Build the package and CLI distribution | Setup/build tooling |
-
-The initial implementation does not need pandas, SciPy, a web framework, or a separately installed deep-learning framework. MediaPipe supplies the local inference runtime required by the selected model.
-
-The specific selected versions are recorded in [pyproject.toml](../pyproject.toml) and [uv.lock](../uv.lock). MediaPipe is pinned to 0.10.31 to fix Windows Tasks initialization (`function 'free' not found` in 0.10.30). This release does not require `opencv-contrib-python`, avoiding overlap with the requested `opencv-python` installation.
-
-## 12. Components and responsibilities
-
-### Entry, configuration, and shared records
-
-| Module | Responsibility |
-| --- | --- |
-| `cli.py` | Parse commands, merge overrides, enforce reference/setup requirements, report actionable errors |
-| `config.py` | Define validated configuration, threshold relationships, confidence bounds, durations, and TOML loading |
-| `domain.py` | Define records and the `PoseEstimator` protocol shared across layers |
-
-The shared records include `Landmark`, `FrameObservation`, `QualityResult`, `MetricObservation`, `Calibration`, `DeviationEvent`, and `SessionSummary`. Keeping these records independent of camera and window APIs reduces coupling between measurement logic and infrastructure.
-
-### Capture and pose estimation
-
-| Module | Responsibility |
-| --- | --- |
-| `capture.py` | Decode files sequentially or collect the latest webcam frame; establish source timestamps and record fallback/drops |
-| `pose/mediapipe_backend.py` | Verify the model, create the Tasks detector, convert BGR to RGB, adapt landmark output |
-| `pose/constants.py` | Central named landmark-index mapping and skeleton connections |
-| `models.py` | Load the model manifest, verify SHA-256, perform the explicit setup fetch |
-
-The `PoseEstimator` protocol provides a small replacement point. Tests can inject known landmark observations without invoking the real model. An alternative local pose backend would need to produce equivalent named landmarks and preserve the confidence semantics.
-
-Both input modes use MediaPipe VIDEO mode. Source timestamps remain separate from MediaPipe's strictly increasing integer-millisecond inference timestamps. If two source frames round to the same millisecond, the adapter advances the inference timestamp without rewriting the source timeline used by statistics.
-
-For webcams, a producer thread holds at most one queued frame. When newer frames arrive, stale ones are discarded. This favours freshness over building a delayed backlog. File mode instead processes every decodable frame in order for reproducibility.
-
-### Measurement and reference
-
-| Module | Responsibility |
-| --- | --- |
-| `quality.py` | Determine whether an individual landmark is finite, in bounds, and sufficiently confident |
-| `geometry.py` | Pixel conversion, wrapped angles, and the pure metric formulas |
-| `metrics.py` | Apply overall and per-metric gates before calculating available values |
-| `calibration/baseline.py` | Validate reference coverage/stability, calculate baselines, save capture identity, check compatibility |
-| `calibration/models.py`, `archives.py` | Define approved metric ranges and serialize portable, video-independent `.tpc` profiles |
-| `calibration/evidence.py`, `measurements.py`, `statistics.py` | Read cached raw landmarks, select dancer evidence, measure passages and check repeatability |
-| `references/` | Import/reference archives, source provenance, downloads, video decoding, cached analysis and comparison |
-
-These modules do not open a camera or display a GUI. Their inputs can be hand-authored landmark records, which is central to testing non-square images, sign conventions, missing data, and geometric invariance.
-
-### Feedback, lifecycle, and output
-
-| Module | Responsibility |
-| --- | --- |
-| `temporal.py` | Per-metric filtering, delta calculation, pending/active events, hysteresis, and closure reasons |
-| `session.py` | Active spans, pause accounting, batched observations, final event collection and summaries |
-| `reports.py` | Conservative duration accounting and per-metric statistics |
-| `storage.py` | SQLite schema/version, reference/session persistence, and JSON/CSV export |
-| `overlay.py` | Skeleton drawing, display-coordinate mirroring, text panel, coaching-message text |
-| `app.py` | Coordinate the capture loop, controls, calibration acceptance, session states, worker lifecycle, and cleanup |
-
-A separate `scripts/smoke_video.py` exercises real inference and coverage on a user-supplied clip. It is a validation utility, not a second implementation of the session feedback logic.
-
-### Qt feature packages
-
-Qt workspace screens, including About and Splash, live in `desktop_qt/screens/`.
-The shared approval editor and camera guidance live in `desktop_qt/calibration/`.
-Practice workers, Review services, Library packaging and Analytics projections
-live in their respective feature subfolders. Reusable controls and charts live
-in `desktop_qt/components/`; shared engines do not depend on Qt.
-
-For source-checkout development, the [architecture and workflow guide](ARCHITECTURE.md)
-maps each use case to its modules and includes class, state and sequence diagrams.
-
-## 13. The measurement mathematics
-
-This section makes the calculations inspectable. A dancer can use the tool without following the formulas, but the formulas define exactly what each reported number means.
-
-### Coordinates
-
-MediaPipe supplies normalised image coordinates. Before calculation, a landmark becomes:
-
-```text
-p = (normalised_x × image_width, −normalised_y × image_height)
-```
-
-The resulting coordinate system has x increasing rightwards and y increasing upwards.
-
-Multiplying each coordinate by its corresponding image dimension is essential. Calculating directly on independently normalised x and y would distort angles in a non-square image. A horizontal and a vertical displacement with the same normalised magnitude need not represent the same pixel length.
-
-### Trunk and forward directions
-
-Let E be the selected ear, S the selected shoulder, and H the selected hip:
-
-```text
-L = length(S − H)
-t = (S − H) / L
-f = +1 when facing screen-right, −1 when facing screen-left
-n = f × (t_y, −t_x)
-h = E − S
-```
-
-Here, L is projected torso length, t is the upwards trunk unit vector, n is the trunk-perpendicular direction toward the selected front, and h is the shoulder-to-ear vector.
-
-### Metrics
-
-```text
-head_forward     = dot(h, n) / L
-head_inclination = degrees(atan2(dot(h, n), dot(h, t)))
-trunk_inclination = degrees(atan2(f × t_x, t_y))
-```
-
-The forward definition follows the selected facing direction. It is not simply increasing image x. If the dancer faces screen-left, the sign must reverse appropriately.
-
-The trunk-perpendicular construction makes head-forward offset relative to the trunk's orientation. A trunk angle change is also reported separately, so the geometry does not collapse both observations into a single displacement.
-
-All calculations require valid geometry first. Normalising a zero-length torso or calculating an angle from a degenerate shoulder-to-ear vector would produce meaningless output, so those cases are rejected.
-
-### Reference deltas and wrapping
-
-A delta is the current smoothed value minus the stored reference baseline. Angular deltas are wrapped around ±180°. For example, 179° and −179° differ by about 2°, not 358°.
-
-Translation and uniform image-plane scaling preserve the metric construction. That property does not guarantee invariance to a changed camera angle, perspective, cropping, or out-of-plane body rotation. Those remain reasons to maintain the setup and recalibrate when it changes.
-
-## 14. Time, smoothing, and persistent events
-
-### Time-aware smoothing
-
-Each valid metric uses an exponential filter:
-
-```text
-alpha = 1 − exp(−dt / 0.25)
-filtered = previous_filtered + alpha × change
-```
-
-The default time constant is 0.25 seconds. `dt` comes from actual timestamps, so the filter behaves consistently across different frame rates. Angular changes use wrapped differences.
-
-The first valid observation initialises the filter. A gap longer than 0.5 seconds resets it. Short invalid gaps still break event persistence, even when the filter can retain its previous value for subsequent smoothing.
-
-### Approved ranges and event timing
-
-The selected calibration profile, or enabled Calibration defaults when no
-profile is selected, supplies an acceptable minimum and maximum for each metric.
-An evaluated value is inside when it lies between those bounds, including the
-endpoints. A value outside either end can start a pending deviation.
-
-The outside condition must persist continuously for **Entry duration**, default
-1.5 seconds, before confirmation. An active deviation clears after recovery
-inside the approved interval persists for **Clear duration**, default 0.75 seconds.
-Returning inside before confirmation resets the pending timer.
-
-For illustration, suppose an already-smoothed pink-axis value first leaves its
-approved interval at source time 10.0 seconds and stays outside. At the first
-qualifying observation at or after 11.5 seconds, an event can confirm. Its onset
-is 10.0; its detection is that later observation. A one-second excursion does
-not qualify at the default entry duration.
-
-Bounds are deliberately approved, not universal tango or clinical cut-offs.
-Changing persistence times does not change those bounds.
-
-### Missing data and gaps
-
-An invalid observation immediately makes the affected metric unknown, resets pending timers, and closes any active event at the last valid timestamp with `tracking_lost`. The system does not connect events across an occluded ear, absent person, or invalid view.
-
-An inter-frame gap above 0.5 seconds has the same continuity-breaking effect, even if the next detected pose is valid. Otherwise, dropped frames could incorrectly manufacture the appearance of continuous persistence.
-
-Pausing closes active events with `paused` and resets temporal state. Ending closes remaining events with `session_ended`. Sustained recovery records `cleared`.
-
-### Duration accounting
-
-A time interval counts as valid only when both bounding observations are valid and the interval is no longer than the maximum continuity gap. Other active time is unknown, including unobserved portions at the beginning or end of a session.
-
-For each metric:
-
-```text
-valid duration + unknown duration = active session duration
-```
-
-Paused time is recorded separately. Calibration is not active practice time. Above-entry duration uses the left endpoint of each valid interval; no interpolated threshold-crossing precision is claimed.
-
-## 15. Configuration and reference compatibility
-
-The complete default configuration is in [configs/default.toml](../configs/default.toml). To use a copy:
-
-```bash
-uv run tango-posture --config ./my-practice.toml --data-dir ./practice-data run --camera 0
-```
-
-Global flags precede the subcommand. CLI overrides replace corresponding TOML values. When TOML supplies the anatomical side and facing direction instead of CLI flags, specify both explicitly.
-
-Configuration includes capture resolution, camera index, model path, data directory, mirror preference, confidence and geometric thresholds, view-change tolerance, smoothing, persistence, calibration criteria, and per-metric enter/clear thresholds.
-
-The validator rejects invalid confidence bounds, nonfinite values, inappropriate durations, unknown configuration keys, and clear thresholds that are not below their entry thresholds. Resolved configuration is stored with the session so the interpretation does not depend on whether a TOML file was edited later.
-
-A reused reference must match model hash, metric version, side, facing, capture profile, source kind/device, and exact resolution/aspect ratio. This implementation conservatively rejects resolution changes rather than claiming unvalidated compatibility at a matching aspect ratio.
-
-A profile name is an identity label, not an automatic calibration of physical camera geometry. Reusing a profile name does not prove that camera placement stayed unchanged.
-
-## 16. Storage, exports, and privacy
-
-### Clearing database records
-
-Open **Database maintenance** in the navigation rail to see the configured
-`tango.sqlite3` location and the row counts for **calibrations**, **sessions**,
-**events** and **observations**. **Refresh row counts** updates this snapshot.
-A missing database is not created by this screen.
-
-To empty all four tables:
-
-1. Finish imports, packaging, promotions and Review analysis. Stop any other
-   TangoPosture processes, including CLI sessions.
-2. Verify the displayed database path. This clears every record, not just a
-   selected session or date range.
-3. Tick the acknowledgement and type exactly `DELETE ALL DATA`.
-4. Click **Clear all four tables...**, then **Yes** in the final confirmation.
-   The default is **No**.
-5. Wait for completion. Once started, cleanup cannot be cancelled. The screen
-   reports the deleted row count and refreshes the table counts.
-
-**There is no Undo and no automatic backup.** Deletions run as one transaction:
-if an operation fails, the transaction rolls back and the error is displayed.
-Tables, indexes and the database file are kept so the app can save new data later.
-
-This is **not** a file or Library reset. `.tp` practices, `.tpr` replayable references,
-`.tpc` calibration profiles, videos and reports are untouched. File-based profiles
-and archived history can still appear in Library and archive Analytics afterward.
-Cleanup is unavailable while in-app import/packaging/analysis jobs are active;
-external processes are the user's responsibility.
-
-### SQLite structure
-
-The default database is `data/tango.sqlite3`, using schema version 1 and foreign keys.
-
-```mermaid
-erDiagram
-    CALIBRATIONS ||--o{ SESSIONS : reference
-    SESSIONS ||--o{ OBSERVATIONS : contains
-    SESSIONS ||--o{ EVENTS : contains
-    CALIBRATIONS {
-        string id
-        string created_at_utc
-        string name
-        json profile
-        json baseline
-        json quality
-        string model_hash
-        string metric_version
-        json review
-    }
-    SESSIONS {
-        string id
-        string calibration_id
-        string source_type
-        string status
-        float active_duration
-        json config
-        json versions
-        json summary
-    }
-    OBSERVATIONS {
-        string session_id
-        float timestamp
-        string metric
-        float raw
-        float smoothed
-        float delta
-        string quality_state
-        string reason
-        string state
-    }
-    EVENTS {
-        string id
-        string session_id
-        string metric
-        float onset
-        float detection
-        float end
-        float peak_deviation
-        string end_reason
-    }
-```
-
-Session records also retain UTC start/end times. Observation and event times use the source timeline. The observation table has a composite session/time index for retrieving a session's sequence.
-
-### Export files
-
-`summary.json` carries the interpretation context: export schema, units, reference identity and metadata, model/runtime versions, resolved configuration, and summary statistics. `observations.csv` contains individual metric observations. `events.csv` contains persistent episodes and closure reasons.
-
-Read the CSV files together with the summary JSON so that a numeric value is not separated from its units, reference, or thresholds.
-
-### What is not stored
-
-The core pipeline does not save raw video, audio, images, or full landmark streams. The current workspace adds explicit `--record-video` and `--record-overlay` options; supplying them saves local video. Existing input videos remain where the user placed them. The beat-tracking extension may read microphone audio without storing an audio recording. Additional Markdown reports can include the input video path. See Section 23 for these privacy-relevant additions.
-
-User-provided reference names and teacher notes are saved because they are part of the reference record. The data directory remains local; there are no accounts or remote database connections.
-
-### Saving and failures
-
-Observations are committed in batches of 180 metric rows. Normal exit and handled interruptions flush pending data and attempt to save the final summary. Resource cleanup covers capture, detector, window, and database.
-
-This is not a guarantee against power loss, forced process termination, or an unwritable disk. A forced kill may leave a session marked running and lose the last pending batch. Automatic crash recovery is outside this implementation. If a write fails, the application reports the error rather than claiming a successful export.
-
-## 17. Offline operation and the model licence
-
-Live Practice uses Google's Pose Landmarker Lite, float16, version 1. Offline
-analysis can select Lite, Full or Heavy, all pinned to their float16 version-1
-bundles in [models/manifest.json](../models/manifest.json). Each installed model
-is verified against its own exact SHA-256 before use.
-
-Live capture stays offline after setup. Analysis can download a missing selected
-model on first use:
-
-```text
-Setup:    install dependencies → explicitly fetch Lite → verify checksum
-Practice: verify local Lite → local capture/inference → local storage
-Analysis: download selected model if missing → verify → local inference/storage
-```
-
-The official Pose Landmarker guide links the BlazePose GHUM model card for its model bundles. That card identifies Apache-2.0 terms. The repository records that weights evidence separately from the MediaPipe source-code licence.
-
-The model's training images and complete individual-image provenance are not supplied by this application. No claim is made that the application licence covers those images or separate GHUM assets. Weights are not bundled in source control.
-
-Full and Heavy are cached in `<data_dir>/models/`; Lite uses `model_path`.
-Before downloading, analysis checks those locations, the folder alongside your
-configured Lite model, and the local `models/` folder. Put the selected variant's
-manifest-named `.task` file in one of these folders to reuse it without a download.
-Found files are checksum verified and used directly; no whole-disk scan is performed.
-For offline analysis installation, transfer the selected manifest's exact model
-to that location. Cancelled/failed downloads remove temporary files and do not
-install unverified weights. Cached corruption raises an error rather than falling
-back to Lite. `--model-path` remains a Lite installation convenience for practice,
-not a way to substitute arbitrary weights. Calibration comparisons require the
-same model hash; a Full/Heavy calibration does not silently become valid for Lite
-live scoring.
-
-See [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) and the preserved wheel notices in `docs/licenses/` for dependency terms, including native libraries shipped within upstream wheels.
-
-## 18. Testing and validation
-
-### Automated software checks
-
-Run:
-
-```bash
-uv run pytest
-uv run ruff check .
-uv run mypy src
-uv build
-```
-
-The tests cover geometry/sign conventions, non-square frames, translation and scaling, display mirroring, missing confidence, invalid views, calibration coverage/stability, persistence at different frame rates, hysteresis, tracking loss, pauses, duration accounting, database/export agreement, CLI requirements, and resource cleanup.
-
-Synthetic landmarks are useful because their intended geometry and timestamps are known. They let the tests ask precise questions such as whether a two-second excursion produces the correct onset/detection relationship, or whether a gap incorrectly bridges an event.
-
-A real-backend integration test uses the actual model and an encoded blank local video, blocking Python socket/URL access during the run. It checks the offline execution path and expected abstention. Python-level blocking is not an operating-system firewall audit of every native dependency.
-
-### What has actually been established
-
-The software checks, local model loading, blank-video inference, and clean-environment CLI installation have been exercised on the tested Mac. The [implementation report](implementation_report.md) maps acceptance criteria to evidence.
-
-The recorded blank-video runtime result is **not a dancer benchmark**. A model processing empty images can have different behaviour and cost from detecting and tracking a person. File decode-to-measurement timing is also different from webcam capture-to-overlay latency.
-
-### What remains pending
-
-Real side-on dancer coverage, webcam usability/performance, false alerts, missed visible deviations, loose-clothing effects, and teacher assessment remain to be measured. No human-pose accuracy, teacher approval, or successful physical webcam run is claimed.
-
-The [manual validation protocol](manual_validation.md) provides a reproducible user-supplied fixture command and a scenario worksheet. It includes deliberately changing each measured relationship, short transient movement, turning toward the camera, leaving the frame, obscuring the ear, poor lighting, a second person, camera movement, both anatomical sides, and both facing directions.
-
-The most important outcome is not merely whether an overlay appears. It is whether useful observations are available often enough, whether abstention is appropriate, and whether a teacher finds the reference-relative feedback meaningful for the selected exercise.
-
-## 19. Troubleshooting
-
-| Symptom | Likely explanation | Next step |
-| --- | --- | --- |
-| Model missing | Setup fetch has not been run or path is wrong | Fetch explicitly during setup or supply the exact model via `--model-path` |
-| Checksum mismatch | Corrupt or different model file | Obtain the manifest's exact model; do not bypass verification |
-| Camera unavailable | Wrong device, permission denial, or another application using it | Check explicit device index and OS camera permission |
-| Ear not visible | Occlusion, low confidence, or out-of-bounds landmark | Adjust the supported view and record the resulting coverage |
-| Side-on view UNKNOWN | Required shoulder/hip pair evidence is unreliable | Improve framing/view/light; do not assume the hidden side is measured |
-| Return to side-on view | Width heuristic or reference view range no longer matches | Restore the selected view or recalibrate after a setup change |
-| Calibration rejected | Too little valid duration/sample count or excessive dispersion | Inspect the explanation and retry a deliberately stable capture |
-| Incompatible reference | Model, metric version, source/profile, side/facing, or resolution differs | Recalibrate for this setup |
-| Headless confirmation error | Reuse was requested without camera-placement confirmation | Confirm only if true, using `--confirm-camera-unchanged`, or recalibrate |
-| Video timing error | Neither presentation timestamps nor declared FPS is usable | Use a file with reliable timing metadata |
-| Interrupted session | Capture/decoding/runtime error | Inspect the error and saved partial summary before restarting |
-| Export/write error | Data destination unavailable or unwritable | Check the destination and available storage; do not assume the session saved |
-| Few events but poor coverage | The app could not assess much of the session | Review unknown time before interpreting event percentages |
-
-## 20. Extending the application
-
-The code has small extension points rather than a general plugin platform.
-
-A new pose backend should implement `PoseEstimator`, return the shared observation records, preserve original image coordinates and source timestamps, and explicitly represent missing confidence. It also needs independent model licence/provenance checks and tests of its landmark mapping. A changed model invalidates earlier references.
-
-A new metric should start as a pure geometric function with documented units, required landmarks, sign convention, and interpretation. It would then need quality rules, baseline handling, threshold direction, configuration, temporal behaviour, overlay text, storage/report integration, and synthetic tests. The current implementation centrally names three metrics and treats offset differently from angular deltas; adding an arbitrary measurement requires reviewing those assumptions rather than merely adding a label.
-
-Adding couple analysis, frontal scoring, turns, or teacher-labelled reference libraries would require a new scope and validation effort. They should not be enabled by weakening the existing side-view gates.
-
-## 21. A practical review worksheet
-
-Use this worksheet to organise a reference-relative practice experiment. It is a way to evaluate the tool, not a prescribed tango technique exercise.
-
-| Question | Notes to record |
-| --- | --- |
-| What am I trying to observe? | A specific head/trunk relationship agreed for the exercise |
-| What is my reference? | Reference UUID, name, self-selected or explicit teacher review |
-| What is the setup? | Side, facing direction, camera position, profile, actual resolution |
-| What movement is included? | Supported standing or side-on solo walking |
-| How much could be assessed? | Valid/unknown duration per metric and main abstention reasons |
-| What events occurred? | Source-time onset/detection/end, metric and magnitude |
-| Were changes intentional? | Dancer's own notes, kept separate from the measured values |
-| What did a teacher observe? | Independent annotations, including disagreement and uncertainty |
-| What should change in the next experiment? | Setup, reference, or narrowly documented threshold hypothesis |
-
-Compare sessions only with their references, configurations, and coverage in view. Changing thresholds and then comparing event counts without acknowledging that change can make results look better or worse for reasons unrelated to the movement.
-
-## 22. Glossary and further reading
-
-| Term | Meaning in this application |
-| --- | --- |
-| Landmark | A model-estimated body point in the image |
-| Visibility / presence | Backend confidence information used as a measurement gate |
-| Projected | Measured in the camera image plane, not calibrated three-dimensional space |
-| Reference | Deliberately captured baseline and its setup/quality metadata |
-| Delta | Smoothed measurement minus reference baseline, wrapped for angles |
-| MAD | Median absolute deviation, a dispersion statistic used in calibration |
-| Hysteresis | Separate entry and clearing thresholds to reduce switching |
-| Persistence | Required uninterrupted duration above or below a threshold |
-| Coverage | Fraction of active time supported by valid observations |
-| UNKNOWN | The metric cannot be assessed from the available evidence |
-| Headless | Runs without a GUI and without blocking interactive prompts |
-| Model checksum | SHA-256 identity check for the exact expected model bytes |
-| Capture profile | Stored setup identity used for compatibility checking, not a physical camera calibration |
-
-Repository references:
-
-- [Quick-start README](../README.md)
-- [Stage 1 specification](../requirements/Tango_Posture_Stage_1_AI_Agent_Spec.md)
-- [Default configuration](../configs/default.toml)
-- [Implementation and acceptance report](implementation_report.md)
-- [Manual validation protocol](manual_validation.md)
-- [Clearly labelled synthetic exports](../samples/README.md)
-- [Dependency notices](../THIRD_PARTY_NOTICES.md)
-- [Model manifest](../models/manifest.json)
-
-Primary upstream references:
-
-- [MediaPipe Pose Landmarker overview](https://developers.google.com/edge/mediapipe/solutions/vision/pose_landmarker)
-- [MediaPipe Tasks Python guide](https://developers.google.com/edge/mediapipe/solutions/vision/pose_landmarker/python)
-- [BlazePose GHUM model card](https://storage.googleapis.com/mediapipe-assets/Model%20Card%20BlazePose%20GHUM%203D.pdf)
-
-The useful question remains specific: what changed relative to the reference, how reliably could the camera observe it, and what does that observation mean for the Argentine tango exercise you chose?
-
-
-## 23. Additional features in the current workspace
-
-The following additions were present when the guide was checked against the workspace. They extend the original Stage 1 specification and should be understood separately from its three confidence-gated, reference-relative measurements. Their presence does not establish empirical accuracy or teacher validation.
-
-### Beat counter and microphone input
-
-`beat.py` contains `BeatTracker`, which displays a repeating count from 1 to 8, a counter labelled “phrase,” estimated BPM, and the timing source. The eight-count grouping is a software convention; it is not a verified identification of the music's actual phrasing.
-
-The tracker supports three sources:
-
-| Source shown | Actual mechanism |
-| --- | --- |
-| `clock` | Advance from a nominal tempo and elapsed time |
-| `tap-sync` | B-key taps reset beat 1 and estimate tempo from tap intervals |
-| `mic-pll` | Microphone onset detection adjusts the running tempo and phase |
-
-In GUI webcam mode, enabled beat tracking attempts to open a local microphone stream through `sounddevice`. Video-file and headless runs do not use the microphone through this path. File mode does not extract or analyse the video's soundtrack.
-
-The current microphone implementation uses mono audio at 16 kHz, blocks of 1,024 samples, a Hann window, a real FFT, and positive spectral changes in a 45–450 Hz band. It detects unusually strong changes relative to recent history and nudges the running beat clock. This is an onset/tempo heuristic, not a validated tango musical-structure recogniser. Other sounds and missed onsets can affect it. Microphone startup failure falls back without a raised application error, so the displayed source matters.
-
-The code default is `beat_tracking = true`. To disable microphone beat processing explicitly, use these top-level TOML entries **before** any calibration-default or other table header:
-
-```toml
-side = "left"
-facing = "right"
-beat_tracking = false
-tango_bpm = 120.0
-```
-
-Configuration values come from TOML and applicable CLI overrides. `.env` files and process environment variables are ignored.
-
-Microphone samples are processed locally; this implementation does not save an audio recording. This is audio input, distinct from the voice coaching excluded by Stage 1.
-
-### Optional video recording
-
-The CLI now includes:
-
-```bash
-uv run tango-posture run --camera 0 --side left --facing right \
-  --record-video videos/practice.mp4 \
-  --record-overlay videos/overlay.mp4
-```
-
-`--record-video` saves processed original unmirrored frames. `--record-overlay` saves annotated rendered frames. Omitting a path uses `videos/practice.mp4` or `videos/overlay.mp4`, respectively. Relative paths outside `videos/` are placed under that directory; absolute paths are honoured.
-
-These are explicit recording requests. They change the privacy properties of that run because images of the dancer are retained. They are not an audio recording or an automatic copy of the original input file.
-
-The writers use a fixed output frame rate from capture metadata, falling back to 15 FPS when needed. Webcam frames may have been dropped before processing; the resulting recording should not be assumed to preserve exact capture-time spacing. Use source timestamps in the observation exports for quantitative timing. Select a fresh output filename when retaining previous recordings.
-
-### Extra head-horizontal angle
-
-The workspace adds an ear-to-nose angle relative to image horizontal, separate from the selected-side ear–shoulder inclination used by Stage 1. It chooses a usable ear, compares its vertical location with the nose, and produces an image-plane angle. The current default warning threshold is −15° sustained for three seconds, with configuration fields `head_down_angle` and `head_down_duration`.
-
-Environment mappings are `HEAD_DOWN_ANGLE_DEGREES` and `HEAD_DOWN_DURATION_SECONDS`. These names identify implementation settings; they are not evidence that the measurement determines actual gaze or anatomical neck flexion.
-
-The current overlay labels this condition “BAD HEAD ALIGNMENT” and “head pointing down.” Those labels are stronger than the measurement supports and depart from the original Stage 1 wording requirements. Interpret the underlying result only as an ear–nose image relationship. It is not a teacher judgement or proof that someone is looking at the floor.
-
-This extra path uses different landmark checks and can operate outside the accepted-reference session pipeline. It should not be confused with the confidence-gated metric states or event timing guarantees described earlier. The current workspace needs separate review of quality priority, calibration independence, and continuity handling for this feature before it can claim the same safeguards.
-
-### Full-body axis curvature (ankle, hip, and back-of-head line) with hysteresis
-
-`geometry.py` includes `axis_curve_alignment` and `AxisCurveTracker` to measure and visualise whether the hip/pelvis (“bump”) protrudes behind the straight line connecting the ankle to the back of the head:
-
-1. **Back-of-head proxy and axis line**: Using the visible side's `ankle`, `hip`, and `ear` (plus `nose` when visible to estimate the posterior head point behind the ear along the facing direction), it constructs the image-plane line from `ankle` to `head_back`.
-2. **Signed posterior offset**: It projects the `hip` orthogonally onto the `ankle → head_back` line and measures the signed perpendicular distance toward the dancer's posterior side (opposite to `facing`), normalised by the `ankle → head_back` segment length. When a reference calibration is captured, the median offset during calibration is stored as `axis_neutral_offset` so the metric can evaluate relative changes as well as uncalibrated runs.
-3. **Smoothing, entry/clear thresholds, and hysteresis (`AxisCurveTracker`)**:
-   - **Smoothing**: Exponential smoothing with time constant `smoothing` (default `0.25s`).
-   - **Entry threshold & persistence**: Smoothed posterior offset must exceed `axis_curve_entry` (default `0.06`, i.e. `+6.0%` of the ankle-to-head axis length) continuously for `axis_curve_duration` (default `1.5s`) to transition from `WITHIN_LIMIT` → `PENDING` → `DEVIATION`.
-   - **Hysteresis clearing**: Once in `DEVIATION`, the alert does not clear merely by dropping below `0.06`. The smoothed offset must fall below a lower clearing threshold `axis_curve_clear` (default `0.035`, i.e. `+3.5%`) continuously for `axis_curve_clear_duration` (default `0.75s`) before returning to `WITHIN_LIMIT`.
-  - Configuration supports `[axis_curve]` (`entry`, `clear`) in TOML and explicit settings/CLI values. `.env` files and process environment variables are ignored. `overlay_smoothing` smooths rendered landmark lines and segments on the overlay.
-4. **Overlay visualization, interactive toggles, and report**: The torso drawing uses a solid magenta line from the hip midpoint to the shoulder midpoint, extended slightly at both ends, and a dashed cyan image-vertical through the hip midpoint. The displayed tilt magnitude is calculated in pixels and works with display mirroring. Both lines hide when any required shoulder/hip landmark is unreliable. Keep the camera level; the drawing shows projected torso orientation, not centre of mass or weight-bearing support. Press **`Y`** to toggle these two lines and **`V`** to toggle verbose skeleton rendering independently. The existing ankle-to-head hip-offset calculation remains separate in the status panel and `HIP OFFSET: PAST ANKLE-HEAD LINE` alert. Section 3.2b and Section 4.2c of the Markdown report still summarise its coverage, median/peak offset, and confirmed curvature intervals.
-
-Like the other workspace extensions, this is a 2D image-plane proxy of landmark alignment rather than a clinical reconstruction of lumbar lordosis or pelvic tilt.
-
-### Arm-pattern labels
-
-`geometry.py` also contains a heuristic named `detect_role`. It checks wrist, elbow, and shoulder arrangements and maps certain patterns to `LEADER`, `FOLLOWER`, or `NONE`.
-
-These are code-assigned labels for visible arm patterns. They do not establish a dancer's actual role, whether an embrace is suitable, or how a partner interaction works. This remains a one-person application; detecting a familiar-looking arm arrangement does not add couple analysis. The heuristic has not been validated against independently labelled tango practice.
-
-### Additional Markdown reports
-
-`reports.py` includes a Markdown report writer that summarises per-frame head-angle, arm-label, and beat information alongside session information where available. It writes a timestamped report and a `latest_report.md` copy. The report is an additional human-readable output, distinct from the SQLite-backed Stage 1 JSON and CSV exports.
-
-The extra report can describe preview or other frame-log information than only confidence-qualified active session time. Do not assume its counts or spans use the same denominators as the core per-metric summaries. It also receives the input video path, which can appear in the report; inspect that metadata before sharing it.
-
-### Replay movement analysis (estimated pivots and observed step placements)
-
-In **Review**, an offline analysis layer can inspect the unmirrored **Raw video**
-stream of a single dancer filmed from a fixed, approximately level camera:
-
-- **Controls**:
-  - **Analyze posture & movement**: Runs (or re-runs) the offline pose pass on the entire selected recording, up to 120 seconds. Successful archived re-analysis replaces the cached results, both overlay videos and the complete report, including the actual pose model, version and SHA-256. The raw video remains unchanged. The saved overlays show tracking and movement without calibration alerts; select a calibration in Review for those alerts. **Cancel analysis** stops a running job; cancellation or failure preserves the previous archive.
-  - **Torso axis** (pink line): Optionally shows the shoulder-midpoint to hip-midpoint line and its angle from image vertical, independently of the skeleton. Both shoulders and hips must be reliably observed; interpolation does not supply missing measurement landmarks. This visual cue alone does not produce an alert.
-  - **Pivot rings**: Draws a perspective ellipse ring centered on the hip midpoint and aligned with the projected hip line only during an observed pivot interval, with a tangent directional arrow indicating **clockwise** or **anticlockwise** top-down rotation.
-  - **Step footprints**: Draws left and right heel-to-toe footprint markers at their observed floor positions. Each marker fades in over a short ramp (`min(0.15s, 0.15 × T)`) and fades linearly to zero at `T = replay_step_history_seconds` (default `5.0s`) of replay media time. Pausing playback pauses the fade.
-  - Select **Raw video** for dynamic layers; baked overlay pixels cannot be removed by toggling layers. **Floor lines only** switches to a raw stream when available.
-  - Import new clips through **Library**. Qt saves posture and movement evidence in the recording's `analytics_XX.json`; older `movement_XX.v1.json` members remain readable.
-  - **This frame**: A coloured banner summarises the current frame (green no alert, amber unavailable measurement, red outside an approved range). Each metric row shows its value and, with a calibration selected, the approved range and a status dot. **Not in profile** means that calibration did not approve the metric; **Not measured** means it could not be measured on this frame.
-- **Scope and filming guidance**:
-  - Outputs represent **estimated pivots** and **observed step placements**, not biomechanical weight-transfer measurements.
-  - Keep the camera fixed and level with the dancer's full body (including both feet and ankles) clearly visible against the floor. Pair tracking, moving-camera compensation, and live coaching cues are outside this feature's scope.
-
-### Video import, source provenance, and comparison
-
-In **Library**, use **Import & Analyze Video…** for local clips or
-**Import YouTube / Facebook…** for permitted YouTube videos and Facebook Reels:
-
-- **Entry point and file limits**:
-  - Choose a local video file (`.mp4`, `.mov`, `.m4v`, `.avi`, `.mkv`, `.webm`) up to **2 GB** and select a half-open range `[in, out)` up to **120 seconds**.
-  - Online imports validate the provider URL, then use `yt-dlp` to download before analysis. Network access is required only for these explicit downloads and configured Ollama requests, not ordinary local review.
-- **Analysis and storage**:
-  - Imports produce confidence-qualified posture observations plus pivot and step evidence without requiring a reference calibration. These are not reference-relative scores.
-  - The selected range is copied into a portable `.tpr` by default, or `.tp` when import-as-reference is unchecked, with indexed raw, overlay, lines, report and analytics members. Original media remains unchanged; frame indices are rebased consistently to the packaged clip.
-  - Source SHA-256, selected bounds and online provenance are retained. The archive's playback no longer depends on the original loose video path.
-- **Comparison**:
-  - **Open Comparison…** in Review chooses a replayable `.tp`, `.tpr` or legacy `.tpc` from Library and synchronizes its video by elapsed playback time; profile-only `.tpc` files are not offered as videos.
-  - Musical/biomechanical alignment, manual comparison anchors, and soundtrack analysis are not exposed in the Qt interface. Legacy metadata for those shared-engine capabilities remains compatible.
-
-### Architecture additions
-
-The main architecture remains capture → pose → quality/geometry → reference/temporal evaluation → storage/display. The extensions add parallel branches:
-
-```mermaid
-flowchart LR
-    Mic[Microphone, when enabled] --> Beat[BeatTracker in beat.py]
-    Tap[B-key taps / source clock] --> Beat
-    Pose[Pose landmarks] --> Extra[Extra ear-nose and arm-pattern heuristics]
-    Core[Stage 1 reference-relative pipeline] --> Overlay[Overlay]
-    Beat --> Overlay
-    Extra --> Overlay
-    Extra --> Log[Additional frame log]
-    Beat --> Log
-    Log --> Markdown[Markdown report]
-    Frames[Processed frames] --> Recording[Opt-in OpenCV video writers]
-    Overlay --> Recording
-```
-
-This separation explains why successful tests of the original three metrics do not validate the additional musical, head-direction, or role interpretations. Review the actual data source and quality rules of each displayed feature.
+| `WITHIN_REFERENCE` | Smoothed observation lies inside `[lower, upper]` (or recovered for `clear_duration`). |
+| `PENDING` | Smoothed observation left `[lower, upper]`, accumulating time toward `entry_duration` (`1.5s`). Returning inside resets the pending timer without raising a red alert. |
+| `DEVIATION` | Out-of-range excursion persisted continuously for `entry_duration`. Stays active until an in-range recovery persists continuously for `clear_duration` (`0.75s`). Recorded onset timestamp backdates to when `PENDING` began. |
+| `UNKNOWN` | Quality, view, or landmark gate failed on this frame. Missing frames immediately close/suspend pending or active continuity rather than fabricating inside/outside scores. |
+
+### Offline Movement Engine (`movement.py`): Steps & Pivots
+
+When analyzing a clip in Library or Review, `movement.py` detects **step placements** and **pivots** in pure Python/NumPy using normalized body-scale units:
+
+- **Body Scale & Scene-Cut Guards**: Estimates median projected body scale (at least `max(20 px, 8% image height)` smoothed over a 9-frame median). Scale jumps `> 0.65` or hip displacements `> max(55% width, 3.2 body scales)` reset foot trackers cleanly at camera cuts.
+- **Step Placement State Machine (`INITIAL -> ANCHORED -> MOVING -> SETTLING -> ANCHORED`)**:
+  - Requires ankle, heel, and foot-index landmarks (`heel` + `foot_index` center formula `0.45 * heel + 0.45 * toe + 0.10 * ankle`).
+  - A moving foot must slow down and cluster within `0.045` body scales for `>= 0.10s`, travel at least `0.075` body scales at center (`>= 0.065` at both heel and toe unless exceeding `0.20` swivel override), show leg extension `>= 0.78` of standing length, stay within `0.14` relative airborne lift of the opposite foot, and clear `0.25s` debounce.
+  - Confirmed footprints render on the floor in Review and fade out linearly over `replay_step_history_seconds` (default `5.0s`) of replay media time.
+- **Pivot Detection (3D Hip Yaw + Stable Support Anchor)**:
+  - Computes pelvis yaw from `world_poses` in the horizontal X/Z plane: `heading = atan2(right_hip.z - left_hip.z, right_hip.x - left_hip.x)`, unwraps across `±180°`, and smooths (`0.10s`).
+  - Enters a pivot inside windows of `0.35s–0.80s` showing `>= 20 deg` net rotation, mean entry rate `>= 30 deg/s`, limited opposite motion (`<= 0.22`), and a stable support foot within `0.18` body scales.
+  - Exits/trims below `14 deg/s` / `12 deg/s` and draws a perspective ellipse around the hip midpoint with a clockwise/anticlockwise directional tangent arrow.
+
+---
 
 ## Settings explained
 
-Settings are editable in the desktop app and can be imported from or exported to TOML. The values in `configs/default.toml` are experimental software defaults, not tango technique standards or clinical guidance. `.env` files and process environment variables are ignored.
+All **72 settings** in `SETTING_MAP` and all **8 Calibration defaults rows** are editable in **Settings** (`settings.toml`) and exportable/importable as TOML preset files.
 
-### Camera & view
-
-| Setting | Meaning |
+| Action | Behavior |
 | --- | --- |
-| `side` | Anatomical side selected for side-view measurements. |
-| `facing` | Direction faced in the original, unmirrored image. |
-| `capture_profile` | Name identifying the camera and capture setup. |
-| `allow_all_angles` | Enables the experimental measurement path for additional view angles. |
+| **Apply & Save settings.toml** | Validates all inputs, confirms overwrite of `settings.toml` in the current working directory, writes it atomically, and notifies active screens. |
+| **Export TOML…** | Applies valid edits and saves a standalone preset TOML containing current settings and `[calibration_defaults]`. |
+| **Import TOML…** | Loads and validates a TOML preset file into the UI. Switching `analysis_model` or pose filters still requires clicking **Analyze posture & movement** in Review to regenerate cached results. |
+| **Reset Defaults** | Restores factory defaults from `Config()` and disables `[calibration_defaults]` without deleting `.tp`, `.tpr`, or `.tpc` archives. |
 
-### Files
+### Quick Reference Table
 
-| Setting | Meaning |
+| Setting | Group | Summary |
+| --- | --- | --- |
+| `side` | Camera & view | Anatomical side selected for side-view measurements (`left` or `right`). |
+| `facing` | Camera & view | Direction faced in the original, unmirrored image (`left` or `right`). |
+| `capture_profile` | Camera & view | Identifier string stored with capture metadata to tag camera setups. |
+| `allow_all_angles` | Camera & view | Enables the experimental multi-angle path using shoulder/hip midpoints and usable alternate sides. |
+| `model_path` | Files | Path to the pinned MediaPipe Lite `.task` model file (checksum verified). |
+| `analysis_model` | Files | Offline MediaPipe Pose variant for Library and Review analysis (`lite`, `full`, or `heavy`). |
+| `data_dir` | Files | Base folder containing `practice/`, `references/`, `calibrations/`, cached `models/`, and `tango.sqlite3`. |
+| `confidence` | Quality & calibration | Minimum landmark visibility and presence required by strict quality checks (`0`–`1`, default `0.70`). |
+| `min_torso` | Quality & calibration | Minimum projected shoulder-to-hip torso length as a fraction of image height (default `0.12`). |
+| `min_head` | Quality & calibration | Minimum projected shoulder-to-ear segment as a fraction of image height (default `0.04`). |
+| `max_view_width` | Quality & calibration | Projected body-width-to-torso-length boundary separating `side` (`<=`) from `front` (`>`) views (default `0.45`). |
+| `calibration_suggest_lower_pct` | Quality & calibration | Lower percentile proposed by the Calibration Editor's middle-range suggestion (default `10.0%`). |
+| `calibration_suggest_upper_pct` | Quality & calibration | Upper percentile proposed by the Calibration Editor's middle-range suggestion (default `90.0%`). |
+| `calibration_min_usable_samples` | Quality & calibration | Minimum usable samples required in selected passages before summarizing a calibration metric (default `2`). |
+| `smoothing` | Tracking | EMA time constant in seconds for metric evaluation and Analytics comparisons (default `0.25s`). |
+| `overlay_smoothing` | Tracking | EMA time constant in seconds for descriptive frame traces and legacy overlay smoothing (default `0.20s`). |
+| `min_filter_time_constant` | Tracking | Safety floor time constant in seconds clamped onto descriptive knee/shoulder filters (default `0.0001s`). |
+| `entry_duration` | Tracking | Continuous out-of-range duration in seconds required before confirming a deviation event (default `1.5s`). |
+| `clear_duration` | Tracking | Continuous in-range recovery duration in seconds required before closing an active deviation (default `0.75s`). |
+| `max_gap` | Tracking | Maximum timestamp gap in seconds treated as continuous tracking before resetting filters (default `0.5s`). |
+| `head_neutral_offset` | Head & shoulders | Neutral pitch offset subtracted from raw ear-to-nose pitch in fallback cues (default `-12.0 deg`). |
+| `head_down_duration` | Head & shoulders | Persistence in seconds before triggering the fallback downward-head cue (default `3.0s`). |
+| `head_down_angle` | Head & shoulders | Corrected ear-to-nose pitch boundary in degrees for the fallback downward-head cue (default `-15.0 deg`). |
+| `shoulder_tension_duration` | Head & shoulders | Persistence in seconds before triggering the fallback shoulder-elevation cue (default `1.0s`). |
+| `shoulder_raise_threshold` | Head & shoulders | Fallback shoulder elevation percentage boundary above relaxed baseline (default `10.0%`). |
+| `shoulder_neutral_clearance` | Head & shoulders | Starting relaxed ear-to-shoulder clearance baseline ratio for fallback cues (default `1.05`). |
+| `shoulder_visibility_floor` | Head & shoulders | Minimum landmark visibility checked inside the shoulder clearance geometry helper (default `0.50`). |
+| `shoulder_ear_hip_scale_factor` | Head & shoulders | Primary normalization multiplier on vertical ear-to-hip pixel distance (default `0.26`). |
+| `shoulder_min_ear_hip_px` | Head & shoulders | Minimum vertical ear-to-hip pixels required before falling back to head/shoulder scales (default `20.0 px`). |
+| `shoulder_nose_ear_scale_factor` | Head & shoulders | Fallback scale multiplier applied to 2D nose-to-ear pixel distance (default `0.68`). |
+| `shoulder_ear_ear_scale_factor` | Head & shoulders | Fallback scale multiplier applied to horizontal ear-to-ear pixel distance (default `0.65`). |
+| `shoulder_width_scale_factor` | Head & shoulders | Fallback scale multiplier applied to horizontal shoulder-to-shoulder pixel distance (default `0.28`). |
+| `shoulder_min_ref_scale_px` | Head & shoulders | Minimum reference scale `S` in pixels required to report valid shoulder clearance (default `8.0 px`). |
+| `shoulder_baseline_clamp_floor` | Head & shoulders | Minimum floor clamped onto effective neutral shoulder clearance `B` (default `0.20`). |
+| `shoulder_adaptive_max_samples` | Head & shoulders | Maximum qualifying relaxed-clearance samples retained for the adaptive baseline window (default `600`). |
+| `shoulder_adaptive_min_samples` | Head & shoulders | Minimum qualifying samples required before the adaptive percentile activates (default `15`). |
+| `shoulder_adaptive_min_clearance` | Head & shoulders | Lower raw clearance ratio admitted into the adaptive baseline window (default `0.65`). |
+| `shoulder_adaptive_max_clearance` | Head & shoulders | Upper raw clearance ratio admitted into the adaptive baseline window (default `1.50`). |
+| `shoulder_adaptive_percentile` | Head & shoulders | Percentile of qualifying adaptive samples compared against starting neutral clearance (default `75.0%`). |
+| `shoulder_recovery_min_pct` | Head & shoulders | Minimum percentage floor for fallback shoulder elevation recovery hysteresis (default `4.0%`). |
+| `shoulder_recovery_ratio` | Head & shoulders | Fraction of `shoulder_raise_threshold` used as the fallback shoulder recovery boundary (default `0.65`). |
+| `role_assign_ms` | Embrace & knees | Continuous milliseconds an arm pattern must persist before assigning `LEADER` / `FOLLOWER` (default `300 ms`). |
+| `role_hold_ms` | Embrace & knees | Milliseconds a confirmed role label is held across occlusion before resetting to `NONE` (default `5000 ms`). |
+| `embrace_closed_threshold` | Embrace & knees | Compactness threshold separating `CLOSED EMBRACE` (`<=`) from `OPEN EMBRACE` (default `0.72`). |
+| `embrace_hysteresis_seconds` | Embrace & knees | Hysteresis persistence in seconds before switching between `OPEN` and `CLOSED` embrace (default `1.0s`). |
+| `closed_embrace_min_knee_bend` | Embrace & knees | Minimum knee flexion angle in degrees for the fallback straight-knee cue (default `8.0 deg`). |
+| `knee_straight_duration` | Embrace & knees | Persistence in seconds before triggering the fallback straight-knee cue (default `1.0s`). |
+| `knee_recovery_margin` | Embrace & knees | Margin in degrees added to `closed_embrace_min_knee_bend` to clear the fallback knee cue (default `2.5 deg`). |
+| `knee_visibility_floor` | Embrace & knees | Helper landmark visibility floor checked for hip, knee, and ankle in knee geometry (default `0.35`). |
+| `knee_min_segment_px` | Embrace & knees | Minimum pixel length required for both thigh and shin segments before computing knee angle (default `10.0 px`). |
+| `knee_tiebreak_other_max_vis` | Embrace & knees | Far-leg visibility ceiling below which the preferred-side knee tie-break can override `min(...)` (default `0.60`). |
+| `knee_tiebreak_min_advantage` | Embrace & knees | Minimum visibility advantage required for the preferred leg to win the knee tie-break (default `0.15`). |
+| `axis_curve_entry` | Torso & hip offset | Fallback posterior hip-offset ratio starting a pending `AxisCurveTracker` event (default `0.06`). |
+| `axis_curve_clear` | Torso & hip offset | Lower posterior hip-offset recovery ratio required to clear an active fallback event (default `0.035`). |
+| `axis_curve_duration` | Torso & hip offset | Persistence in seconds above `axis_curve_entry` before confirming the fallback event (default `1.5s`). |
+| `axis_curve_clear_duration` | Torso & hip offset | Persistence in seconds below `axis_curve_clear` before closing the fallback event (default `0.75s`). |
+| `axis_neutral_offset` | Torso & hip offset | Baseline offset subtracted from raw ankle-to-head hip offset in fallback tracking (default `0.0`). |
+| `slow_tango_max_bpm` | Slow tango | Maximum tempo in BPM at which the fallback slow-tango ankle-lift cue can operate (default `115.0`). |
+| `ankle_high_lift_ratio` | Slow tango | Vertical ankle separation relative to estimated leg length treated as high lift (default `0.06`). |
+| `max_consecutive_high_ankle_steps` | Slow tango | Consecutive qualifying high-lift steps required before triggering the lift cue (default `2`). |
+| `tango_bpm` | Music | Fallback tempo in BPM supplied when no analyzed soundtrack tempo is present (default `120.0`). |
+| `replay_step_history_seconds` | Replay movement | Media-time window in seconds over which floor step footprints fade out (default `5.0s`). |
+| `replay_joint_interpolation` | Replay movement | Display-only Review skeleton gap filling method (`linear` or `quadratic`). |
+| `replay_joint_max_gap` | Replay movement | Maximum bracketed gap duration in seconds filled visually in Review (`3.0s`; `0` disables). |
+| `ollama_base_url` | Review & Ollama | URL of the local or reachable Ollama HTTP endpoint (default `http://127.0.0.1:11434`). |
+| `ollama_model` | Review & Ollama | Installed Ollama language-model tag requested for report commentary (default `llama3.2`). |
+| `ollama_timeout` | Review & Ollama | Maximum wait in seconds for an Ollama generation response (default `120.0s`). |
+| `ollama_temperature` | Review & Ollama | Sampling variation requested from the Ollama model (`0`–`2`, default `0.2`). |
+| `ollama_num_ctx` | Review & Ollama | Language-model prompt/report context capacity in tokens (default `16384`). |
+| `ollama_num_predict` | Review & Ollama | Maximum generated response length in tokens (default `2048`). |
+| `ollama_max_report_chars` | Review & Ollama | Maximum character length of report text forwarded to Ollama (default `40000`). |
+| `ollama_instruction` | Review & Ollama | Prompt instruction appended when asking AI Coach to summarize a report. |
+
+---
+
+### Camera & view settings
+
+### Measurement side - `side`
+
+**Default:** `left`; choices `left`, `right`.
+
+The anatomical side preferred by side-dependent geometry. This is the dancer's
+left/right, not the screen's. Some helpers can use another usable side.
+
+**Example:** if the dancer's right ear/shoulder/hip chain is the reliably visible
+one, choose `right` before producing reference evidence and matching analysis.
+An existing reference editor restores its cached capture settings; changing this
+dropdown does not relabel an already cached reference.
+
+### Facing direction - `facing`
+
+**Default:** `right`; choices `left`, `right`.
+
+Direction faced in the original image, used to interpret signed forward/posterior
+measurements. It is not a request to flip the video.
+
+**Example:** a dancer facing screen-left should use `left`. Leaving `right`
+can reverse the interpretation of a signed offset. Reanalyze matching evidence
+after correcting the setup rather than compensating with wider posture limits.
+
+### Capture setup name - `capture_profile`
+
+**Default:** `default`.
+
+An identifier stored with capture metadata. It describes the setup; it does not
+change the camera or landmarks.
+
+**Example:** use `studio-side-a` for new evidence from one arrangement and
+`studio-front-b` for another. These names help distinguish saved setups.
+Renaming the setting does not rotate existing footage or update cached metadata.
+
+### Allow all angles - `allow_all_angles`
+
+**Default:** disabled.
+
+Selects the more permissive core measurement path, which can use shoulder/hip
+midpoints or usable alternative sides. It does not invent hidden joints.
+Approved metrics still enforce their own `side`, `front` or `all` view.
+
+**Example:** enabling it can let core geometry survive a usable front-facing
+passage that the strict side-view path rejects. A metric approved only for
+`side` will still be unavailable outside its approved view.
+
+### Files settings
+
+### Lite model file - `model_path`
+
+**Base default:** `models/pose_landmarker_lite.task`; packaged paths can differ.
+
+Location of the pinned Lite model. The selected file must pass checksum
+verification. This does not turn a Lite model into Full or Heavy.
+
+**Example:** with Offline analysis model set to `lite`, select an existing,
+verified Lite `.task` file with **Browse...** to reuse it. Renaming a Heavy file
+to the Lite filename fails verification. Missing offline models are downloaded
+when no local candidate file exists. A corrupt cached candidate raises a
+verification error rather than silently triggering another download.
+
+### Offline analysis model - `analysis_model`
+
+**Default:** `lite`; choices `lite`, `full`, `heavy`.
+
+Selects the MediaPipe variant used by new Library/Review analysis. Existing
+local assets are verified and reused; missing assets download and are cached.
+
+**Example:** switch from `lite` to `full`, then explicitly reanalyze a recording.
+Compare its dots and processing time on the same passage. Merely changing the
+selector leaves saved results unchanged. Calibration and comparison evidence
+must have compatible model identities.
+
+### Data folder - `data_dir`
+
+**Base default:** `data`.
+
+Base location for app data and practice artifacts. Packaged startup can supply
+a different path. This is not the destination of every Save/Export action.
+
+**Example:** changing from `data` to `sessions-b` can show an empty Library
+because it now searches another location. It does not delete the old archives.
+The **Apply & Save settings.toml** destination remains the working directory.
+
+### Quality & calibration settings
+
+These settings determine whether evidence is usable, not whether posture is
+correct. Approved posture limits are configured in `.tpc` profiles or Calibration defaults.
+
+### Minimum landmark confidence - `confidence`
+
+**Default:** `0.70`; allowed `0` to `1`.
+
+Strict app-side checks require finite coordinates, in-image positions, and
+sufficient visibility and presence. Some descriptive/movement helpers have
+their own thresholds.
+
+**Example:** a point with visibility `0.65` and presence `0.95` fails a `0.70`
+strict gate but passes a `0.60` gate if the other checks pass. Lowering the
+setting admits weaker evidence; it does not make the dot more accurate.
+
+### Min torso - `min_torso`
+
+**Default:** `0.12`; positive fraction of image height.
+
+Minimum projected shoulder-to-hip length for core geometry. This does not
+control every helper independently.
+
+**Example:** in a 480-pixel-high video, the minimum is `57.6` pixels. A
+50-pixel torso fails this check. Reducing the setting to `0.10` changes the
+minimum to 48 pixels, but improving framing is preferable to admitting tiny,
+uncertain body segments.
+
+### Min head - `min_head`
+
+**Default:** `0.04`; positive fraction of image height.
+
+Minimum core shoulder-to-ear segment, **not the whole head**. It qualifies
+head-forward/head-inclination evidence; the ear-to-nose pitch helper has
+separate guards.
+
+**Example:** at 480 pixels high, the minimum is `19.2` pixels. A 17-pixel
+segment is unavailable for those core head metrics. A value of `0.03` lowers
+the minimum to `14.4` pixels. Failure does not automatically invalidate every
+other metric or the whole calibration.
+
+### Max view width - `max_view_width`
+
+**Default:** `0.45`; positive ratio.
+
+Separates the projected side/front view policies. Side requires a usable ratio
+at or below the boundary; front requires one above it. `all` skips this split,
+not landmark-quality checks.
+
+**Example:** a usable ratio of `0.48` fails a side-approved metric at `0.45`
+but can pass that view gate at `0.50`. The same change can make it fail a
+front-approved metric. Check the actual viewpoint before changing this boundary.
+
+### Suggested lower percentile (%) - `calibration_suggest_lower_pct`
+
+**Default:** `10%`; from `0` up to below the upper suggested percentile.
+
+Lower percentile proposed when clicking the suggestion button in the Calibration
+editor. It does not restrict manually entered bounds.
+
+**Example:** across 100 sorted samples from a balanced standing passage, `10%`
+proposes the 10th sample as the minimum limit instead of the single lowest
+outlier. Setting `5%` widens the suggested lower bound to cover 95% at the bottom.
+
+### Suggested upper percentile (%) - `calibration_suggest_upper_pct`
+
+**Default:** `90%`; above the lower suggested percentile up to `100%`.
+
+Upper percentile proposed when clicking the suggestion button in the Calibration
+editor. Pair it with `calibration_suggest_lower_pct` (default 10th to 90th =
+middle 80%).
+
+**Example:** with `10%` lower and `90%` upper on a steady walking clip, the
+editor proposes the middle 80% of eligible values; setting `20%` and `80%`
+narrows the suggested proposal to the middle 60%.
+
+### Minimum usable calibration samples - `calibration_min_usable_samples`
+
+**Default:** `2`; integer `2` or greater.
+
+Minimum finite, reliable samples required inside selected passages before the
+Calibration editor summarizes a metric for approval.
+
+**Example:** in a short 30 FPS clip where only `4` frames pass quality checks,
+a minimum of `2` allows summarizing and approving the passage, whereas raising
+it to `10` rejects that sparse clip and asks for more reliable frames.
+
+### Tracking settings
+
+These controls smooth numbers and time events. Set acceptable posture ranges
+in the selected calibration or Calibration defaults, not in this tab.
+
+### Measurement smoothing (seconds) - `smoothing`
+
+**Default:** `0.25`; positive time constant.
+
+Makes evaluated values respond gradually. Higher values smooth more but follow
+changes more slowly.
+
+**Example:** after a sudden change, over `0.1` seconds a `0.25`-second filter
+moves about 33% toward the new value; a `0.50`-second filter moves about 18%.
+This is not a fixed video delay and does not change raw cached landmarks.
+
+### Overlay smoothing - `overlay_smoothing`
+
+**Default:** `0.20`; zero or greater.
+
+Current offline processing uses this for some descriptive head/shoulder/knee
+values. It is not the control for Review's same-frame skeleton or interpolation.
+Some descriptive filters use Measurement smoothing when this is zero.
+
+**Example:** changing `0.20` to `0.10` makes applicable descriptive values
+follow a change faster, with more possible jitter. Setting zero does not remove
+every filter. Reanalyze to regenerate stored descriptive results.
+
+### Minimum filter time constant (seconds) - `min_filter_time_constant`
+
+**Default:** `0.0001` seconds; positive.
+
+Safety floor clamped onto the exponential smoothing time constant for
+descriptive knee and shoulder filters (`max(min_filter_time_constant, overlay_smoothing or smoothing)`),
+preventing division by zero when smoothing is very small or zero.
+
+**Example:** with default `0.0001`, if both Overlay smoothing and Measurement
+smoothing were set near `0.00005`, the descriptive knee/shoulder filter uses
+`0.0001` seconds. Raising it to `0.05` guarantees at least `50 ms` smoothing.
+
+### Entry duration - `entry_duration`
+
+**Default:** `1.5 seconds`; positive.
+
+Time a continuous evaluated excursion must persist before confirming an event.
+It does not change the acceptable range.
+
+**Example:** a `0.4`-second excursion outside approved bounds does not confirm
+at `1.5`, but can at `0.3` if valid observations remain continuous. Raising
+the duration to `2.0` ignores more brief excursions and confirms later.
+
+### Clear duration - `clear_duration`
+
+**Default:** `0.75 seconds`; positive.
+
+Time recovery must persist before an active event clears.
+
+**Example:** returning inside an approved interval for `0.4` seconds is not
+enough at `0.75`; returning for `0.8` seconds can clear it when observations
+qualify. At `0.25`, the same event can clear sooner.
+
+### Max gap - `max_gap`
+
+**Default:** `0.5 seconds`; positive.
+
+Continuity/reset limit for applicable tracking and evaluation paths. Missing
+raw measurements still become UNKNOWN.
+
+**Example:** a `0.7`-second observation gap exceeds `0.5`, so the applicable
+filter/event continuity resets. Increasing to `0.8` permits that timestamp gap
+but does not fill missing joints. The calibration editor uses the gap policy
+saved with its reference; changing current Settings alone does not replace it.
+
+### Head & shoulders settings
+
+These are **fallback descriptive controls and shared geometric helper parameters**.
+Approved `.tpc` ranges and Settings default intervals govern range evaluation
+when active; missing metrics never fall back to these legacy limits.
+
+### Head neutral offset - `head_neutral_offset`
+
+**Default:** `-12 degrees`.
+
+Subtracted from raw ear-to-nose pitch for the corrected fallback cue.
+
+**Example:** raw pitch `-12` minus offset `-12` gives corrected zero.
+Changing the offset to `-8` gives `-4`; changing it to `-16` gives `+4`.
+Approved `head_pitch` instead compares the raw angle without this subtraction.
+
+### Head down duration - `head_down_duration`
+
+**Default:** `3 seconds`; positive.
+
+Persistence required for the fallback downward-head warning.
+
+**Example:** corrected pitch below its limit for two seconds does not confirm
+this warning at `3`. Setting the duration to `1` makes a qualifying two-second
+passage long enough. Approved-range events use Tracking's Entry duration.
+
+### Head down angle limit (degrees) - `head_down_angle`
+
+**Default:** `-15 degrees`; must remain negative.
+
+Boundary for corrected fallback ear-to-nose pitch.
+
+**Example:** corrected pitch `-12` does not cross a `-15` limit, but does cross
+`-10`. Changing to `-20` tolerates more downward pitch. The duration must also
+qualify before a warning; this setting does not move a selected profile's bounds.
+
+### Shoulder tension duration - `shoulder_tension_duration`
+
+**Default:** `1 second`; positive.
+
+Persistence before the fallback shoulder-elevation banner. The name does not
+mean that muscle tension is measured.
+
+**Example:** a `0.6`-second qualifying elevation does not confirm at `1`,
+but can at `0.5`. Increasing to `2` ignores more brief changes. Raw clearance
+and approved clearance bounds are unchanged.
+
+### Shoulder tension limit (%) - `shoulder_raise_threshold`
+
+**Default:** `10%`; positive.
+
+Boundary for computed fallback elevation relative to effective neutral
+clearance. This is a percentage, not the approved clearance ratio.
+
+**Example:** computed elevation `12%` exceeds a `10%` limit, but not `15%`.
+Lowering the limit to `6%` admits more warning candidates. Persistence and
+recovery rules still apply.
+
+### Shoulder neutral clearance - `shoulder_neutral_clearance`
+
+**Default:** `1.05`; positive.
+
+Starting fallback baseline for `100 * (baseline - raw clearance) / baseline`.
+The helper clamps its effective baseline to at least `0.20`; offline processing
+can also adapt it from qualifying observations.
+
+**Example:** at raw clearance `0.95`, a baseline of `1.00` gives `5%` elevation,
+while `1.10` gives about `13.6%`. Raising the baseline can therefore make warning
+more likely without moving any dot. It does not change raw approved clearance.
+
+### Shoulder helper visibility floor - `shoulder_visibility_floor`
+
+**Default:** `0.50`; from `0` to `1`.
+
+Minimum landmark visibility checked inside the shoulder clearance geometry helper
+for ear, shoulder, hip, and nose points, alongside any stricter approval mask.
+
+**Example:** if an occluded ear has visibility `0.45`, it is excluded at `0.50`;
+lowering the helper floor to `0.40` lets fallback/descriptive shoulder estimates
+read that point (unless the stricter approval `confidence` mask rejects it).
+
+### Shoulder ear-to-hip scale factor - `shoulder_ear_hip_scale_factor`
+
+**Default:** `0.26`; positive multiplier.
+
+Primary normalization factor multiplying vertical ear-to-hip pixel height to
+compute the reference scale `S = factor * ear_hip_dy` for shoulder clearance.
+
+**Example:** when vertical ear-to-hip distance is `200` pixels, `0.26` produces a
+`52`-pixel reference scale `S`; a `52`-pixel shoulder/ear gap gives raw clearance
+`1.0`. Setting `0.25` gives `S = 50` px and ratio `1.04` for the same pixel gap.
+
+### Shoulder min ear-to-hip height (px) - `shoulder_min_ear_hip_px`
+
+**Default:** `20.0` pixels; positive.
+
+Minimum vertical ear-to-hip pixel separation required for a side's primary torso
+scale candidate to qualify before falling back to head/shoulder-width scales.
+
+**Example:** in a very small distant crop where vertical ear-to-hip distance is
+only `18` pixels, `20.0` skips the primary torso scale and uses head/shoulder
+fallbacks instead; setting `15.0` keeps the primary torso scale active there.
+
+### Shoulder fallback nose-ear scale factor - `shoulder_nose_ear_scale_factor`
+
+**Default:** `0.68`; positive multiplier.
+
+Fallback reference scale multiplier applied to the 2D pixel distance between
+nose and ear when no primary ear-to-hip candidate qualifies.
+
+**Example:** with hips out of frame and nose-to-ear distance `50` pixels, `0.68`
+yields fallback reference scale `S = 34` pixels. Adjusting to `0.70` gives `35`
+pixels to calibrate head-scale continuity for that camera angle.
+
+### Shoulder fallback ear-ear scale factor - `shoulder_ear_ear_scale_factor`
+
+**Default:** `0.65`; positive multiplier.
+
+Fallback reference scale multiplier applied to horizontal pixel distance between
+left and right ears when both ears are usable and no primary torso scale qualifies.
+
+**Example:** if horizontal ear-to-ear width is `60` pixels in a tight upper-body
+shot, `0.65` gives candidate scale `39` pixels (competing with the other fallback
+candidates, largest wins). Changing to `0.60` yields `36` pixels.
+
+### Shoulder fallback width scale factor - `shoulder_width_scale_factor`
+
+**Default:** `0.28`; positive multiplier.
+
+Fallback reference scale multiplier applied to horizontal pixel distance between
+left and right shoulders when no primary torso scale qualifies.
+
+**Example:** if shoulder-to-shoulder width is `140` pixels with hips cropped out,
+`0.28` yields `39.2` pixels as a fallback scale candidate; `0.30` yields `42.0` px.
+
+### Shoulder min reference scale (px) - `shoulder_min_ref_scale_px`
+
+**Default:** `8.0` pixels; positive.
+
+Minimum selected reference scale `S` in pixels required to compute normalized
+shoulder clearance (`ear_to_shoulder_dy / S`); smaller scales return unavailable.
+
+**Example:** if the subject is far away and `S` drops to `6.5` pixels, clearance
+is reported unavailable at `8.0` rather than dividing by near-zero noise. Lowering
+to `5.0` permits small distant shots at higher sensitivity to pixel jitter.
+
+### Shoulder baseline clamp floor - `shoulder_baseline_clamp_floor`
+
+**Default:** `0.20`; positive ratio.
+
+Minimum floor applied to the effective neutral clearance `B = max(floor, neutral_clearance)`
+when computing fallback shoulder elevation percentage `100 * (B - C) / B`.
+
+**Example:** even if neutral clearance is set very low (say `0.15`), `0.20`
+prevents division by near-zero by clamping `B = 0.20`. Keeping defaults near `1.05`
+never hits this floor unless configured lower.
+
+### Adaptive baseline max samples - `shoulder_adaptive_max_samples`
+
+**Default:** `600`; integer `1` or greater.
+
+Maximum number of qualifying relaxed-clearance samples stored for the adaptive
+neutral shoulder baseline window during fallback analysis.
+
+**Example:** at 30 FPS, `600` samples equals about 20 seconds of qualifying frames
+before the window stops appending new samples. Raising to `900` collects over 30s.
+
+### Adaptive baseline min samples - `shoulder_adaptive_min_samples`
+
+**Default:** `15`; integer from `1` up to `shoulder_adaptive_max_samples`.
+
+Minimum qualifying relaxed-clearance samples required before the adaptive
+percentile replaces/raises the starting neutral shoulder clearance baseline.
+
+**Example:** for the first `14` qualifying frames at default `15`, fallback
+elevation uses `shoulder_neutral_clearance` (`1.05`). On frame `15`, the `75th`
+percentile enters (`max(start, percentile)`). Setting `30` waits twice as long.
+
+### Adaptive baseline min clearance - `shoulder_adaptive_min_clearance`
+
+**Default:** `0.65`; positive ratio below `shoulder_adaptive_max_clearance`.
+
+Lowest raw clearance ratio `C` admitted into the adaptive relaxed-clearance
+sample window, filtering out already-tense/shrugged frames from the baseline.
+
+**Example:** a shrugged frame with raw clearance `0.55` is rejected from the
+baseline window at `0.65`, avoiding teaching the baseline that tense shoulders
+are "neutral". Lowering to `0.55` would admit tighter anatomy frames.
+
+### Adaptive baseline max clearance - `shoulder_adaptive_max_clearance`
+
+**Default:** `1.50`; positive ratio above `shoulder_adaptive_min_clearance`.
+
+Highest raw clearance ratio `C` admitted into the adaptive baseline window,
+rejecting outlier/elongated landmark spikes from raising the neutral baseline too high.
+
+**Example:** an anatomical outlier spike of `1.65` is skipped at `1.50` so it
+does not inflate the baseline. Raising to `1.80` accommodates dancers with unusually
+long measured ear-to-shoulder clearance.
+
+### Adaptive baseline percentile (%) - `shoulder_adaptive_percentile`
+
+**Default:** `75%`; above `0` up to `100%`.
+
+Percentile of collected qualifying relaxed-clearance samples compared against
+the starting neutral clearance (`max(start, percentile)`).
+
+**Example:** given 20 qualifying samples between `0.90` and `1.30`, `75%` takes
+the 75th percentile (~`1.20`) so a naturally relaxed baseline wins over `1.05`.
+Lowering to `50%` uses the median instead of the upper quartile.
+
+### Shoulder recovery min floor (%) - `shoulder_recovery_min_pct`
+
+**Default:** `4.0%`; zero or greater.
+
+Minimum percentage floor used in the fallback shoulder tension hysteresis
+recovery boundary `max(floor, shoulder_recovery_ratio * shoulder_raise_threshold)`.
+
+**Example:** if `shoulder_raise_threshold` is reduced to `5%` with `0.65` ratio
+(`3.25%`), the `4.0%` floor keeps the clear boundary at `4.0%` unless lowered.
+
+### Shoulder recovery threshold ratio - `shoulder_recovery_ratio`
+
+**Default:** `0.65`; above `0` up to `1.0`.
+
+Fraction of `shoulder_raise_threshold` used as the fallback shoulder recovery
+boundary (hysteresis band) once a shoulder warning has started.
+
+**Example:** at default `10%` raise threshold and `0.65` ratio, the warning starts
+at `10%` and clears once elevation drops below `max(4.0, 6.5) = 6.5%`. Setting
+`0.80` narrows the hysteresis band so recovery occurs at `8.0%`.
+
+### Embrace & knees settings
+
+Role/embrace recognition runs independently of the source of posture limits.
+The knee-geometry controls apply to both fallback cues and `knee_flexion` helper masks.
+
+### Role assign ms - `role_assign_ms`
+
+**Default:** `300 milliseconds`; zero or greater.
+
+Required persistence of a matching arm pattern before assigning its role label.
+It is not person-identity tracking.
+
+**Example:** a pattern visible for `0.2` seconds is too brief at `300 ms`,
+but can qualify at `100 ms` once the update timestamps permit assignment.
+Increasing to `600 ms` makes assignment slower and more resistant to brief noise.
+
+### Role hold ms - `role_hold_ms`
+
+**Default:** `5000 milliseconds`; zero or greater.
+
+How long a confirmed role label can remain after the matching pattern disappears.
+
+**Example:** after a turn hides the pattern for two seconds, a `5000 ms` hold
+can retain the previous label; a `1000 ms` hold releases it sooner. A retained
+label is history, not fresh evidence that the arms remain in that position.
+
+### Embrace closed threshold - `embrace_closed_threshold`
+
+**Default:** `0.72`; greater than zero and at most one.
+
+Boundary on a heuristic openness score, not physical partner distance.
+The recognizer also applies smoothing, a switching band and persistence.
+
+**Example:** an initial smoothed score of `0.70` falls on the CLOSED side of
+`0.72`, but the OPEN side of `0.65`. Raising the threshold makes CLOSED more
+likely for a fixed score. State changes still depend on the recognizer's timing.
+
+### Embrace hysteresis seconds - `embrace_hysteresis_seconds`
+
+**Default:** `1 second`; zero or greater.
+
+Persistence before switching between OPEN and CLOSED once the switching
+conditions qualify.
+
+**Example:** a candidate lasting `0.4` seconds is too brief at `1.0`, but can
+switch at `0.3`. A longer duration gives steadier but later labels; it does not
+change the measured knee angle or approve a calibration range.
+
+### Closed embrace min knee bend - `closed_embrace_min_knee_bend`
+
+**Default:** `8 degrees`; zero or greater.
+
+Minimum projected knee flexion for the fallback straight-knee cue. Despite
+its historical name, older offline fallback scoring was not CLOSED-gated.
+
+**Example:** a measured/smoothed bend of `6` is below `8`, so it can start a
+warning candidate; at a minimum of `5`, it does not. Raising the minimum to `12`
+requires more bend. Do not bend to satisfy an arbitrary software example.
+
+### Knee straight duration - `knee_straight_duration`
+
+**Default:** `1 second`; positive.
+
+Persistence required for the fallback straight-knee banner.
+
+**Example:** a qualifying straight-looking interval of `0.7` seconds does not
+confirm at `1.0`, but can at `0.5`. A selected/default approved knee range uses
+Tracking's event timing instead.
+
+### Knee recovery margin (degrees) - `knee_recovery_margin`
+
+**Default:** `2.5` degrees; zero or greater.
+
+Hysteresis margin added above `closed_embrace_min_knee_bend` to form the
+fallback straight-knee clear boundary (`min_knee_bend + margin`).
+
+**Example:** with `closed_embrace_min_knee_bend = 8.0` and margin `2.5`, a
+straight-knee warning starts below `8.0°` and only clears once knee bend exceeds
+`10.5°`. Raising margin to `4.0` requires `12.0°` bend before clearing.
+
+### Knee helper visibility floor - `knee_visibility_floor`
+
+**Default:** `0.35`; from `0` to `1`.
+
+Minimum landmark visibility checked inside the knee flexion geometry helper for
+hip, knee, and ankle joints, alongside any stricter approval `confidence` mask.
+
+**Example:** if a dancer's trailing ankle dips to visibility `0.40`, it qualifies
+at `0.35` in descriptive knee overlays (when approval mask isn't stricter);
+raising this floor to `0.55` drops noisy low-visibility legs sooner.
+
+### Knee min segment length (px) - `knee_min_segment_px`
+
+**Default:** `10.0` pixels; positive.
+
+Minimum pixel length required for both the hip-to-knee (`u`) and ankle-to-knee (`v`)
+segments before computing the knee interior angle.
+
+**Example:** if foreshortening or a tiny subject shrinks the shin segment to `8`
+pixels, `10.0` rejects that leg rather than outputting unstable `atan/acos` angles.
+Lowering to `6.0` accepts smaller distant subjects at higher angular noise risk.
+
+### Knee tie-break other-leg max visibility - `knee_tiebreak_other_max_vis`
+
+**Default:** `0.60`; from `0` to `1`.
+
+Maximum visibility of the occluded/far leg below which the preferred-side knee
+tie-break rule can override `min(near_bend, far_bend)`.
+
+**Example:** when both legs qualify (`left` `0.90` vis at `14°` bend; `right`
+`0.50` vis at `3°`), `right < 0.60` permits selecting `left` (`14°`) instead of
+being misled by the noisy occluded leg. Lowering to `0.45` keeps `min(...)` active.
+
+### Knee tie-break min visibility advantage - `knee_tiebreak_min_advantage`
+
+**Default:** `0.15`; from `0` to `1`.
+
+Minimum visibility advantage (`preferred_vis - other_vis >= advantage`) required
+for the preferred camera-facing side to win the knee tie-break.
+
+**Example:** with preferred leg vis `0.72` and other leg `0.55` (difference `0.17`),
+`0.15` triggers preferring the camera-facing leg (provided other < `0.60`), whereas
+`0.25` keeps reporting the smaller bend across both legs.
+
+### Torso & hip offset settings
+
+These fallback controls concern hip displacement from the ankle-to-head
+line. **They are not pink torso-line tilt settings.**
+
+### Axis curve entry - `axis_curve_entry`
+
+**Default:** `0.06`; positive ratio.
+
+Posterior corrected hip-offset boundary for starting a fallback event candidate.
+
+**Example:** corrected deviation `0.07` exceeds `0.06`, but not `0.08`.
+Raising entry tolerates more displacement; lowering it detects smaller changes.
+The ratio is not degrees. Approved `hip_offset` uses its native bounds instead.
+
+### Axis curve clear - `axis_curve_clear`
+
+**Default:** `0.035`; nonnegative and below entry.
+
+Recovery boundary for the active fallback hip-offset event.
+
+**Example:** smoothed corrected deviation `0.03` is below `0.035`, allowing
+clearing to begin. At a clear threshold of `0.02`, it must recover farther.
+Keep clear below entry; the two thresholds have different jobs.
+
+### Axis curve duration - `axis_curve_duration`
+
+**Default:** `1.5 seconds`; positive.
+
+Persistence above the fallback hip-offset entry threshold before confirmation.
+
+**Example:** a one-second qualifying excursion does not confirm at `1.5`,
+but can at `0.5`. It does not alter the hip-offset ratio or the timing of
+approved-range metrics.
+
+### Axis curve clear duration - `axis_curve_clear_duration`
+
+**Default:** `0.75 seconds`; positive.
+
+Persistence of recovery before the fallback hip-offset event clears.
+
+**Example:** `0.5` seconds below the recovery threshold is insufficient at
+`0.75`, but can clear at `0.3`. Increasing this setting keeps the event active
+through more brief recoveries without moving either threshold.
+
+### Axis neutral offset - `axis_neutral_offset`
+
+**Default:** `0.0`.
+
+Neutral value subtracted from raw hip offset for fallback corrected deviation.
+
+**Example:** raw `0.05` minus neutral `0.02` gives corrected `0.03`.
+Neutral `-0.01` instead gives `0.06`. This shifts the fallback cue, not the hip,
+and does not change the approved raw `hip_offset` measurement.
+
+### Slow tango settings
+
+This is a fallback ankle-height/consecutive-step cue, separate from offline
+footprint placement and pivot detection. It does not create uncalibrated Review alerts.
+
+### Slow tango max BPM - `slow_tango_max_bpm`
+
+**Default:** `115 BPM`; positive and at most `240`.
+
+This setting exists **once** in the app. It is the maximum tempo at which the
+slow-tango lift cue can operate, not the current/fallback tempo itself.
+
+**Example:** with a supplied tempo of `110 BPM`, a `115` cutoff allows the cue
+to operate if ankle evidence and high-step conditions qualify. At `120 BPM`,
+that cutoff disables the cue. Raising the cutoff to `125` admits `120 BPM`.
+This does not change playback speed or the separate footprint detector.
+
+### Ankle high lift ratio - `ankle_high_lift_ratio`
+
+**Default:** `0.06`; greater than zero and at most one.
+
+Vertical ankle separation considered high relative to estimated leg length.
+Internal step-start/end boundaries are also derived from this value.
+
+**Example:** with a 300-pixel estimated leg length, `0.06` corresponds to an
+18-pixel threshold, while `0.08` corresponds to 24 pixels. A 21-pixel separation
+is above the first but below the second. This is projected separation, not
+certified floor clearance in centimetres.
+
+### Max consecutive high ankle steps - `max_consecutive_high_ankle_steps`
+
+**Default:** `2`; integer at least one.
+
+Consecutive qualifying high steps needed for the lift alert.
+
+**Example:** at `2`, the alert can appear during the second qualifying high
+step; at `3`, it waits for another. A qualifying low step can reset the streak.
+The BPM gate must also permit the cue, and hidden feet can make it unavailable.
+
+### Music settings
+
+This tab contains only the fallback tempo.
+
+### Fallback tempo (BPM) - `tango_bpm`
+
+**Default:** `120 BPM`; greater than `20` and at most `240`.
+
+Tempo supplied when analysis has no soundtrack BPM. Current Library/Review
+analysis disables soundtrack analysis and does not show fallback lift alerts.
+It is **not another copy of the slow-tango cutoff**.
+
+**Example:** the defaults supply `120 BPM` against a `115 BPM` slow-tango
+cutoff, so that lift cue is inactive. Setting the fallback to `105 BPM` makes
+the BPM gate pass; an alert still needs qualifying high steps. Enter a tempo
+appropriate to the clip rather than lowering it just to force an alert.
+
+### Replay movement settings
+
+### Replay step history seconds - `replay_step_history_seconds`
+
+**Default:** `5 seconds`; allowed `0.5` to `30`.
+
+Media-time window over which observed step footprints fade out.
+
+**Example:** increasing to `10` shows a longer trail during playback or
+scrubbing; reducing to `2` leaves fewer recent footprints visible. It does
+not create/delete steps or change their stored timestamps.
+
+### Review joint interpolation - `replay_joint_interpolation`
+
+**Default:** `linear`; choices `linear`, `quadratic`.
+
+Display-only filling of bracketed gaps between reliable joint observations.
+Quadratic attempts a curve using another sample and falls back to linear
+when unsuitable.
+
+**Example:** for a joint seen before and after a short gap, `linear` moves it
+along the direct path between those observations. `quadratic` can curve that
+path. Neither guarantees the actual hidden motion or supplies scoring evidence.
+
+### Maximum joint gap to fill (seconds; 0 disables) - `replay_joint_max_gap`
+
+**Default:** `3 seconds`; zero or greater.
+
+Maximum separation of bracketing usable observations for drawing interpolation.
+It is different from Tracking's continuity limit.
+
+**Example:** endpoints separated by `0.4` seconds can be filled at `0.5`,
+but not at `0.2`. Setting zero disables filling. Increasing to `3` bridges
+longer, more uncertain intervals; there is no indefinite edge extrapolation.
+
+### Review & Ollama settings
+
+Ollama is optional report commentary, not the pose tracker or calibration
+evaluator. Report text is sent to the configured server only on explicit user action.
+
+### Ollama server address - `ollama_base_url`
+
+**Default:** `http://127.0.0.1:11434`.
+
+Address of the Ollama service, not a pose-model download location.
+
+**Example:** use the default for a server on the same machine at port 11434.
+If you deliberately run it locally at port 11435, use
+`http://127.0.0.1:11435`. Changing the address does not start the server.
+
+### Ollama model - `ollama_model`
+
+**Default:** `llama3.2`; nonempty text.
+
+Language model requested from Ollama. This does not select MediaPipe.
+
+**Example:** choose an installed model name such as `llama3.2`. A name that
+is unavailable on that server produces a request error; changing it to a
+larger language model does not improve joint coordinates.
+
+### Ollama timeout - `ollama_timeout`
+
+**Default:** `120 seconds`; positive and at most `1800`.
+
+Maximum wait for a model request.
+
+**Example:** a request taking 150 seconds can time out at `120`; a `180`
+timeout permits waiting longer. This does not make generation faster.
+Reducing to `30` fails sooner when the service is slow.
+
+### Response variation - `ollama_temperature`
+
+**Default:** `0.2`; allowed `0` to `2`.
+
+Requested variation in generated language.
+
+**Example:** changing from `0.2` to `0.8` can produce more variable wording
+for the same report. Setting zero requests less variation, not guaranteed
+accuracy or deterministic behaviour on every server.
+
+### Model context size (tokens) - `ollama_num_ctx`
+
+**Default:** `16384`; integer `1024` to `131072`.
+
+Requested language-model context capacity. Tokens are text units, not frames.
+
+**Example:** reducing to `8192` requests less context capacity and can reduce
+resource demand, but leaves less room for the prompt/report. Increasing to
+`32768` requests more capacity if the server/model supports it.
+
+### Maximum response length (tokens) - `ollama_num_predict`
+
+**Default:** `2048`; integer `128` to `16384`.
+
+Maximum requested generated response length, not an exact output length.
+
+**Example:** setting `512` asks for a shorter generation budget than `2048`.
+A model may still stop before either maximum. Increasing it permits a longer
+answer and potentially more generation time.
+
+### Maximum report length (characters) - `ollama_max_report_chars`
+
+**Default:** `40000`; at least `1000`.
+
+Budget for report text included for commentary, not the amount of raw video
+analyzed.
+
+**Example:** a 30000-character report fits a `40000` budget. At `10000`,
+the supplied report content is limited and can omit useful context. Increasing
+context tokens is not the same as increasing this character budget.
+
+### Analysis focus - `ollama_instruction`
+
+**Default:** explain supported observations and suggest three focused practice
+exercises.
+
+Additional instruction accompanying the report.
+
+**Example:** enter "Summarize observable changes and identify unavailable
+measurements." This requests different commentary; it does not change
+numeric limits, run new video inference or make medical assessments valid.
+
+### Calibration defaults rows
+
+Each row in `[calibration_defaults]` has **Use**, minimum, maximum and applicable view (`side`, `front`, `all`).
+Minimum must not exceed maximum, and endpoints are included. In **Analytics**,
+selecting *Settings default ranges* plots these enabled intervals as reference bands.
+Use **Use as Settings defaults** in Library or the Calibration Editor to copy
+a profile's approved bounds, units, and views here without altering saved archives.
+
+### Head pitch (ear-to-nose) - `head_pitch`
+
+**Unit:** degrees; raw ear-to-nose image angle.
+
+**Example:** enable a deliberately chosen interval `-20` to `-5`: raw `-12`
+is inside, raw `-25` is outside. Lowering the minimum to `-30` admits `-25`.
+The fallback neutral offset is not subtracted from these values.
+
+### Head-forward offset - `head_forward`
+
+**Unit:** torso lengths; signed torso-relative forward ear displacement.
+
+**Example:** with a range `-0.02` to `0.06`, a value of `0.08` is outside.
+Raising the maximum to `0.10` admits it. This changes an approved native
+interval, not a change-from-baseline threshold.
+
+### Head inclination - `head_inclination`
+
+**Unit:** degrees; shoulder-to-ear orientation relative to the torso.
+
+**Example:** a chosen interval `-5` to `10` accepts `7` but rejects `12`.
+Raising the maximum to `15` admits `12`. This is not horizontal ear-to-nose
+pitch or lateral head roll.
+
+### Ear-to-shoulder clearance - `shoulder_clearance`
+
+**Unit:** normalized clearance; smaller generally means shoulder nearer ear.
+
+**Example:** a range `0.85` to `1.15` rejects `0.80`. Lowering the minimum
+to `0.75` admits that smaller clearance. These values are not elevation
+percentages or a left/right shoulder-height comparison.
+
+### Hip offset from ankle-to-head axis - `hip_offset`
+
+**Unit:** axis lengths; signed raw projected hip offset.
+
+**Example:** a range `-0.02` to `0.04` rejects `0.05`. Raising the maximum
+to `0.06` admits it. The fallback neutral offset is not subtracted here.
+This is not pelvic rotation or an actual balance measurement.
+
+### Torso axis tilt (pink line) - `torso_axis_tilt`
+
+**Unit:** degrees; absolute midpoint-torso tilt from image vertical.
+
+**Example:** a range `0` to `8` accepts a tilt magnitude of `6` and rejects
+`10`. Raising the maximum to `12` admits `10`; raising the minimum to `2`
+would also reject upright zero. Both shoulders and hips must be reliable.
+
+### Trunk inclination - `trunk_inclination`
+
+**Unit:** degrees; signed core torso orientation.
+
+**Example:** a range `-4` to `6` rejects `-7`. Lowering the minimum to `-8`
+admits it. The landmark/sign rules differ from the pink-axis magnitude;
+do not copy one metric's limits into the other.
+
+### Least-bent reliably visible knee - `knee_flexion`
+
+**Unit:** degrees; zero is straight in the projected geometry.
+
+**Example:** with an interval `5` to `25`, a bend of `12` is inside and `3`
+is outside. Raising the minimum to `15` also rejects `12`; raising the maximum
+permits more bend. These examples are not instructions to force a knee angle.
+
+---
+
+## 6. Architecture, Storage, Troubleshooting & Glossary
+
+### Software Architecture & Component Ownership
+
+The desktop application runs in one Python (`3.11+`) Qt (`PySide6`) process without requiring an external web backend or account:
+
+```mermaid
+flowchart LR
+    Entry["CLI / Packaged Entry<br/>cli.py, desktop.py"] --> Shell["Qt Shell & Router<br/>desktop_qt/shell.py, router.py"]
+    Shell --> Views["Workspaces<br/>Home, References, Library, Review,<br/>Analytics, Coach, Settings, Help, Database"]
+    Views --> Bridge["ServiceBridge<br/>desktop_qt/service_bridge.py"]
+    Views --> FeatureAdapters["Feature Adapters<br/>library/, review/, analytics/, calibration/editor.py"]
+    FeatureAdapters --> Analysis["Shared Offline Pipeline<br/>references/pipeline.py (analyze_clip)"]
+    Analysis --> Calibration["Calibration Engine<br/>evidence.py, measurements.py, statistics.py"]
+    Analysis --> Engine["Pose & Movement<br/>MediaPipe, geometry.py, quality.py,<br/>temporal.py, movement.py"]
+    FeatureAdapters --> Persistence["Local Storage<br/>archive.py, storage.py, reports.py"]
+```
+
+Key module boundaries:
+
+| Area | Owning Modules | Responsibility |
+| --- | --- | --- |
+| **Launch & Config** | `cli.py`, `desktop.py`, `config.py`, `domain.py` | Validated Pydantic TOML configuration, core immutable/domain dataclasses, `PoseEstimator` protocol |
+| **Desktop Shell & Screens** | `desktop_qt/shell.py`, `router.py`, `service_bridge.py`, `desktop_qt/screens/*` | Navigation rail, stacked screens, reusable `MetricChart` (`desktop_qt/components/metric_chart.py`), background worker coordination |
+| **Calibration Engine** | `calibration/models.py`, `archives.py`, `evidence.py`, `measurements.py`, `statistics.py`, `baseline.py` | Version-2 `.tpc` range profiles, dancer spatial association, raw per-view measurements, passage percentiles |
+| **Offline Analysis & Replay** | `references/pipeline.py`, `coach.py`, `archives.py`, `movement.py`, `replay.py`, `overlay.py` | Clip decoding, MediaPipe inference, cached frame analytics, step/pivot detection, video playback/rendering |
+| **Help & Tutorial Renderer** | `tutorial_rendering.py`, `desktop_qt/screens/help.py` | Converts this manual (`docs/TANGO_POSTURE_GUIDE.md` -> packaged `TANGO_POSTURE_MANUAL.md`) to searchable HTML with `#setting-...` targets |
+| **Persistence & AI Coach** | `archive.py`, `storage.py`, `reports.py`, `ollama.py` | Atomic ZIP archive contracts (`.tp`, `.tpr`, `.tpc`), SQLite version-1 schema, Markdown report generation, optional Ollama client |
+
+### Archive Formats & Privacy
+
+| File / Directory | Purpose & Contents |
 | --- | --- |
-| `model_path` | Location of the pinned Lite model used when offline analysis selects Lite. |
-| `analysis_model` | Offline analysis model: `lite` (default), `full`, or `heavy`. Missing models download when analysis starts; live coaching remains Lite. |
-| `data_dir` | Directory for the local database and practice artifacts. |
+| `practice/<name>.tp` | Self-contained ZIP archive storing raw video (`video_XX.mp4`), rendered overlay (`overlay_XX.mp4`), floor lines video, `analytics_XX.json`, Markdown `report_XX.md`, metadata, and manifest. |
+| `references/<name>.tpr` | Replayable reference video ZIP storing raw media, cached raw `measurement_poses`, movement data, and saved dancer selection metadata. |
+| `calibrations/<name>.tpc` | Lightweight version-2 approved range ZIP (`profile.json` + manifest) storing explicit metric bounds (`lower`, `upper`), `view`, `unit`, approved passages, and model/capture identity. |
+| `<data_dir>/tango.sqlite3` | Optional SQLite v1 session metadata database. Portable `.tp`, `.tpr`, and `.tpc` archives work independently of `tango.sqlite3`. |
 
-### Quality & calibration
+**Offline & Privacy**: Pose estimation, calibration, video playback, and analytics operate 100% locally on disk. Network access is requested *only* when you start analysis with a missing `full`/`heavy` MediaPipe model (downloaded once and SHA-256 verified) or when you explicitly click **Check Ollama** / **Analyze Selected Report** in **AI Coach**. Source code is licensed under [Apache-2.0](../LICENSE); see [Third-Party Notices](../THIRD_PARTY_NOTICES.md) and `docs/licenses/` for dependency terms.
 
-| Setting | Meaning |
-| --- | --- |
-| `confidence` | Minimum landmark confidence used by quality checks. |
-| `min_torso` | Minimum visible torso length as a fraction of image height. |
-| `min_head` | Minimum visible shoulder-to-ear segment as a fraction of image height. |
-| `max_view_width` | Maximum body-width-to-torso ratio accepted for a side view. |
+### Troubleshooting by Symptom
 
-### Tracking and reference thresholds
+| Symptom | Likely Cause | Next Action |
+| --- | --- | --- |
+| **`Not in profile`** displayed in Review Insights or Analytics | The selected `.tpc` calibration skipped or did not include that metric | Open **Library**, open **Profile details** for that `.tpc`, click **Edit calibration…**, approve the missing metric, and save. |
+| **`Not measured`** (`UNKNOWN`) shown on frames where dancer is visible | Required landmarks failed `confidence`, torso/head fell below `min_torso` / `min_head`, two poses were detected, or dancer turned out of `side` / `front` view | Inspect skeleton dot colors (orange = low confidence). Re-check `facing`, `side`, and `max_view_width`, or switch metric view to `all` when appropriate. |
+| Changing **`analysis_model`** (`lite` -> `heavy`) had no visible effect in Review | Changing Settings does not rewrite already cached `analytics_XX.json` | Click **Analyze posture & movement** in **Review** to re-run pose inference on the clip. |
+| Skeleton draws continuously through an occlusion while score shows **Not measured** | `replay_joint_interpolation` fills display dots visually up to `replay_joint_max_gap`, but measurement/calibration logic never consumes synthetic joints | Set `replay_joint_max_gap = 0` temporarily to inspect exact raw detector dropouts. |
+| Overlay colors or text don't react when toggling layers in Review | You are viewing the **Annotated overlay** stream whose pixels are already baked into the video | Switch stream selector to **Raw video** so Review renders dynamic layers live. |
+| Footprints missing in Review during walking steps | Heel or forefoot landmarks cropped/occluded, travel below `0.075` body scales, or camera cut interrupted tracking | Ensure full body and shoes stay comfortably in frame with contrast against the floor; use `full` or `heavy` model if feet jitter. |
+| Calibration comparison rejected in Review as incompatible | Source model hash mismatch or legacy/display-only pose cache | Re-analyze the video and reference with the same `analysis_model` and create/update a compatible `.tpc` profile. |
 
-| Setting | Meaning |
-| --- | --- |
-| `smoothing` | Time constant for smoothing measurements over time. |
-| `overlay_smoothing` | Smoothing time constant for rendered landmark lines and segments. |
-| `entry_duration` | Time a threshold must be crossed before confirming a deviation. |
-| `clear_duration` | Time a value must remain below its clear threshold before closing an event. |
-| `max_gap` | Maximum observation gap treated as continuous tracking. |
+### Glossary
 
-### Head & shoulders
+- **`WITHIN_REFERENCE` / `PENDING` / `DEVIATION` / `UNKNOWN`**: The four temporal states produced by `Evaluator`. `PENDING` buffers brief excursions shorter than `entry_duration` (`1.5s`); `DEVIATION` persists until recovery lasts `clear_duration` (`0.75s`).
+- **Raw `measurement_poses` vs `display_poses`**: `measurement_poses` are unsmoothed landmarks directly from MediaPipe used for calibration and comparison; `display_poses` hold interpolated visual points rendered only during Review playback.
+- **`entry_duration` & `clear_duration`**: Persistence filters preventing transient single-frame noise from triggering or prematurely clearing posture events.
+- **Projected 2D ratio vs Physical Units**: Ratios like torso lengths (`head_forward`), axis lengths (`hip_offset`), and normalized clearances divide pixel distances by body segments in the image plane rather than inferring centimetres in 3D space.
 
-| Setting | Meaning |
-| --- | --- |
-| `head_neutral_offset` | Offset used by the separate ear-to-nose horizontal-angle cue. |
-| `head_down_duration` | Duration required before showing the head-angle warning. |
-| `head_down_angle` | Ear-to-nose image-angle boundary for that warning. |
-| `shoulder_tension_duration` | Duration required before showing the shoulder cue. |
-| `shoulder_raise_threshold` | Shoulder-elevation threshold above the relaxed baseline. |
-| `shoulder_neutral_clearance` | Fallback clearance used when no captured shoulder baseline is available. |
-
-### Embrace & knees
-
-| Setting | Meaning |
-| --- | --- |
-| `role_assign_ms` | Time an arm pattern must persist before assigning a role label. |
-| `role_hold_ms` | Time to retain a role label after the pattern disappears. |
-| `embrace_closed_threshold` | Boundary for the heuristic open/closed embrace label. |
-| `embrace_hysteresis_seconds` | Hysteresis duration used to stabilize embrace classification. |
-| `closed_embrace_min_knee_bend` | Minimum knee flexion used by the straight-knee cue in closed embrace. |
-| `knee_straight_duration` | Duration required before showing the knee cue. |
-
-### Torso & hip offset
-
-| Setting | Meaning |
-| --- | --- |
-| `axis_curve_entry` | Posterior hip offset that starts a pending axis event. |
-| `axis_curve_clear` | Lower offset at which a confirmed axis event can clear. |
-| `axis_curve_duration` | Time above the entry threshold required to confirm an axis event. |
-| `axis_curve_clear_duration` | Time below the clear threshold required to close an axis event. |
-| `axis_neutral_offset` | Fallback neutral offset when no captured reference is available. |
-
-### Slow tango
-
-| Setting | Meaning |
-| --- | --- |
-| `slow_tango_max_bpm` | Tempo ceiling for the slow-tango ankle-lift cue. |
-| `ankle_high_lift_ratio` | Ankle lift threshold relative to estimated leg length. |
-| `max_consecutive_high_ankle_steps` | Consecutive high-lift steps required to trigger the cue. |
-
-### Music
-
-| Setting | Meaning |
-| --- | --- |
-| `tango_bpm` | Fallback tempo when analysis has no soundtrack BPM; compared with the separate slow-tango ceiling for the ankle-lift cue. |
-
-### Replay movement
-
-| Setting | Meaning |
-| --- | --- |
-| `replay_step_history_seconds` | Replay media-time window (0.5 to 30 seconds) over which observed step footprints fade out. |
-| `replay_joint_interpolation` | Display-only Review joint gap filling: linear by default, or quadratic with a linear fallback. Raw calibration/scoring evidence is unchanged. |
-| `replay_joint_max_gap` | Maximum bracketed joint gap filled in Review, in seconds; default 3.0, and 0 disables filling. Not the measurement tracking gap limit. |
-
-### Review & Ollama
-
-| Setting | Meaning |
-| --- | --- |
-| `ollama_base_url` | Address of the local or reachable Ollama server. |
-| `ollama_model` | Model name installed on that Ollama server. |
-| `ollama_timeout` | Maximum wait for a local model request. |
-| `ollama_temperature` | Controls response variation. |
-| `ollama_num_ctx` | Requested model context capacity in tokens. |
-| `ollama_num_predict` | Maximum generated response length in tokens. |
-| `ollama_max_report_chars` | Maximum report text sent for local analysis. |
-| `ollama_instruction` | Additional instruction accompanying a report. |
-
-These heuristics describe software settings and visible image cues. They do not establish a universal technique standard, a dancer's role, gaze, or weight-bearing support.
+Helpful links: [Project README](../README.md) · [Model manifest](../models/manifest.json) · [Default configuration](../configs/default.toml)

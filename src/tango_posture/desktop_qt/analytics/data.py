@@ -925,14 +925,22 @@ def _compare_range_targets(
         )
 
         if observations:
-            series = samples_by_view[range_target.view][key]
+            view_series = samples_by_view[range_target.view][key]
             used_fallback = False
-            if not any(value is not None for _, value in series) and range_target.view != "all":
+            if range_target.view != "all":
                 all_series = samples_by_view["all"][key]
-                if any(value is not None for _, value in all_series):
-                    series = all_series
-                    used_fallback = True
+                combined: list[tuple[float, float | None]] = []
+                for (t, v_view), (_, v_all) in zip(view_series, all_series, strict=True):
+                    if v_view is None and v_all is not None:
+                        used_fallback = True
+                        combined.append((t, v_all))
+                    else:
+                        combined.append((t, v_view))
+                series = combined
+                if used_fallback:
                     fallback_metrics.append(key)
+            else:
+                series = view_series
             center = (range_target.lower + range_target.upper) / 2.0
             rel_raw: list[Point] = [
                 (

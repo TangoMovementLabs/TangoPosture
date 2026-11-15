@@ -5,8 +5,8 @@ from __future__ import annotations
 from importlib.resources import files as package_files
 from pathlib import Path
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor, QTextCharFormat, QTextCursor
+from PySide6.QtCore import Qt, QUrl
+from PySide6.QtGui import QColor, QDesktopServices, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
@@ -44,7 +44,10 @@ class HelpScreen(QWidget):
         title_box = QVBoxLayout()
         title = QLabel("Tango Posture Manual & Guide")
         title.setProperty("class", "title")
-        subtitle = QLabel("Styled offline manual, searchable topics, and linked contents.")
+        subtitle = QLabel(
+            "Unified offline manual: quick start, workspaces, metrics, calibration, "
+            "tracking, Settings reference, and architecture."
+        )
         subtitle.setProperty("class", "subtitle")
         title_box.addWidget(title)
         title_box.addWidget(subtitle)
@@ -76,7 +79,9 @@ class HelpScreen(QWidget):
 
         self.viewer = QTextBrowser()
         self.viewer.setReadOnly(True)
-        self.viewer.setOpenExternalLinks(True)
+        self.viewer.setOpenLinks(False)
+        self.viewer.setOpenExternalLinks(False)
+        self.viewer.anchorClicked.connect(self._on_anchor_clicked)
         self.viewer.setAccessibleName("Manual")
         self.viewer.document().setDefaultStyleSheet(STYLE)
         splitter.addWidget(self.viewer)
@@ -87,13 +92,15 @@ class HelpScreen(QWidget):
 
     def _load_manual(self) -> None:
         content = ""
-        try:
-            manual = package_files("tango_posture").joinpath("TANGO_POSTURE_MANUAL.md")
-            content = manual.read_text(encoding="utf-8")
-        except (OSError, ValueError, FileNotFoundError):
-            path = Path(__file__).resolve().parents[4] / "docs" / "TANGO_POSTURE_GUIDE.md"
-            if path.is_file():
-                content = path.read_text(encoding="utf-8")
+        repo_manual = Path(__file__).resolve().parents[4] / "docs" / "TANGO_POSTURE_GUIDE.md"
+        if repo_manual.is_file():
+            content = repo_manual.read_text(encoding="utf-8")
+        else:
+            try:
+                manual = package_files("tango_posture").joinpath("TANGO_POSTURE_MANUAL.md")
+                content = manual.read_text(encoding="utf-8")
+            except (OSError, ValueError, FileNotFoundError):
+                content = ""
 
         if not content:
             content = "# TangoPosture Guide\n\nManual file could not be loaded."
@@ -101,6 +108,34 @@ class HelpScreen(QWidget):
         self.manual_html, self.headings, _ = render_tutorial(content)
         self.viewer.setHtml(self.manual_html)
         self._populate_contents()
+
+    def _select_toc_anchor(self, anchor: str) -> None:
+        def visit(item: QTreeWidgetItem | None) -> QTreeWidgetItem | None:
+            if item is None:
+                return None
+            if item.data(0, Qt.ItemDataRole.UserRole) == anchor:
+                return item
+            for index in range(item.childCount()):
+                found = visit(item.child(index))
+                if found is not None:
+                    return found
+            return None
+
+        for index in range(self.toc_list.topLevelItemCount()):
+            match = visit(self.toc_list.topLevelItem(index))
+            if match is not None:
+                self.toc_list.setCurrentItem(match)
+                self.toc_list.scrollToItem(match)
+                return
+
+    def _on_anchor_clicked(self, url: QUrl) -> None:
+        if url.hasFragment() and not url.scheme():
+            fragment = url.fragment()
+            self.viewer.scrollToAnchor(fragment)
+            self._select_toc_anchor(fragment)
+            return
+        if url.scheme() in ("http", "https"):
+            QDesktopServices.openUrl(url)
 
     def _populate_contents(self) -> None:
         self.toc_list.clear()

@@ -367,7 +367,7 @@ def test_analytics_loads_tpr_and_tp_with_all_metrics_and_tpc_comparison(qapp, tm
     assert "WITHIN_REFERENCE" in head_chart.states.values()
     assert "PENDING" in head_chart.states.values()
     assert "DEVIATION" in head_chart.states.values()
-    assert screen.event_table.rowCount() >= 1
+    assert not hasattr(screen, "event_table")
     assert "Range:" in screen.coverage_labels["head_forward"].text()
     assert "Ref:" in screen.coverage_labels["head_forward"].text()
     assert "Within range:" in screen.coverage_labels["head_forward"].text()
@@ -389,8 +389,11 @@ def test_analytics_view_mismatch_falls_back_to_all_angles_and_supports_defaults(
     )
     capture_profile = profile(cfg, 640, 480, "video")
     timestamps = [0.0, 0.2, 0.4, 0.6]
-    # Wide shoulder spread -> view_width > max_view_width (frontal video vs side target view)
-    observations = [_full_pose_observation(ts, shoulder_spread=160.0) for ts in timestamps]
+    # Mixed side + frontal view frames (wide shoulder spread on 2 frames) vs side target view
+    observations = [
+        _full_pose_observation(ts, shoulder_spread=10.0 if i % 2 == 0 else 160.0)
+        for i, ts in enumerate(timestamps)
+    ]
     ext_tpr = tmp_path / "external" / "FrontalClip.tpr"
     _make_pose_archive(
         ext_tpr, tmp_path / "rep.md", timestamps, observations, capture_profile, is_reference=True
@@ -408,6 +411,9 @@ def test_analytics_view_mismatch_falls_back_to_all_angles_and_supports_defaults(
     assert screen.dataset is not None
     assert "all-angle measurement" in screen.state_label.text()
     assert screen.charts["head_forward"].isEnabled()
+    head_points = screen.charts["head_forward"].data.points
+    assert len(head_points) == len(timestamps)
+    assert all(val is not None for _, val in head_points)
 
     defaults_idx = screen.calibration_combo.findData("__defaults__")
     screen.calibration_combo.setCurrentIndex(defaults_idx)

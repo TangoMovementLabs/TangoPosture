@@ -17,12 +17,9 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QFrame,
     QHBoxLayout,
-    QHeaderView,
     QLabel,
     QPushButton,
     QScrollArea,
-    QTableWidget,
-    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -154,18 +151,6 @@ class AnalyticsScreen(QWidget):
             "Time alignment unavailable; no offset or scale has been calculated."
         )
         layout.addWidget(alignment_note)
-        event_label = QLabel("Posture deviation events · double-click to seek in Review")
-        layout.addWidget(event_label)
-        self.event_table = QTableWidget(0, 5)
-        self.event_table.setHorizontalHeaderLabels(
-            ["Metric", "Onset", "Detected", "End", "Peak deviation"]
-        )
-        self.event_table.horizontalHeader().setSectionResizeMode(
-            0, QHeaderView.ResizeMode.Stretch
-        )
-        self.event_table.setMaximumHeight(155)
-        self.event_table.cellDoubleClicked.connect(self._seek_event)
-        layout.addWidget(self.event_table)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -215,7 +200,6 @@ class AnalyticsScreen(QWidget):
         self._current_source = None
         self._comparison = None
         self.state_label.setText(message)
-        self.event_table.setRowCount(0)
         self.export_charts_btn.setEnabled(False)
         for metric in self.charts:
             self.charts[metric].set_data(None)
@@ -454,21 +438,6 @@ class AnalyticsScreen(QWidget):
             f"Active duration: {_seconds(dataset.active_duration)} · {cal_summary}. "
             f"{note}{extra_note}"
         )
-
-        self.event_table.setRowCount(len(comparison.events))
-        for row, event in enumerate(comparison.events):
-            values = (
-                event.metric,
-                _seconds(event.onset - dataset.origin_timestamp),
-                _seconds(event.detection - dataset.origin_timestamp),
-                _seconds(event.end - dataset.origin_timestamp) if event.end is not None else "Open",
-                f"{event.peak_deviation:+.3g}" if event.peak_deviation is not None else "Unknown",
-            )
-            for column, value in enumerate(values):
-                item = QTableWidgetItem(value)
-                if column == 0:
-                    item.setData(Qt.ItemDataRole.UserRole, event.onset)
-                self.event_table.setItem(row, column, item)
 
         calibration_selected = (
             self.calibration_combo.currentData() is not None and not cal_error
@@ -826,11 +795,3 @@ class AnalyticsScreen(QWidget):
             Route.REVIEW,
             {"archive_path": path, "segment_index": index, "timestamp": timestamp},
         )
-
-    def _seek_event(self, row: int, _column: int) -> None:
-        item = self.event_table.item(row, 0)
-        if item is None:
-            return
-        timestamp = finite_number(item.data(Qt.ItemDataRole.UserRole))
-        if timestamp is not None:
-            self._seek_to_recording(timestamp)
