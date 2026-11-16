@@ -23,7 +23,13 @@ from ..couple import (
     CoupleAnalysisRequest,
     classify_opening_window,
     extract_single_target_observations,
+    resolve_close_embrace_frame_poses,
     run_couple_analysis,
+)
+from ..couple.tracking import (
+    _pose_torso_mid_norm,
+    _translate_pose,
+    _wide_ankle_span_for_pair,
 )
 from ..domain import (
     METRIC_VERSION,
@@ -156,6 +162,7 @@ def analyze_clip(
     else:
         est = estimator_factory()
     decoded_frames: list[tuple[int, float, float, FrameObservation]] = []
+    auto_observations: list[tuple[int, FrameObservation]] = []
     frame_times: list[tuple[int, float, float]] = []
     expected_frames = max(1, round(clip_duration * max(probe.fps, 1.0)))
     infer_times: list[float] = []
@@ -183,6 +190,26 @@ def analyze_clip(
     run_auto_window = requested_mode == "auto" and not forced_override
     auto_decision: AutoDecisionResult | None = None
     selection_required = False
+    image_detector: Any = None
+
+    def _get_image_detector() -> Any:
+        nonlocal image_detector
+        if image_detector is None:
+            import mediapipe as mp
+
+            image_detector = mp.tasks.vision.PoseLandmarker.create_from_options(
+                mp.tasks.vision.PoseLandmarkerOptions(
+                    base_options=mp.tasks.BaseOptions(
+                        model_asset_path=str(model_path),
+                        delegate=mp.tasks.BaseOptions.Delegate.CPU,
+                    ),
+                    running_mode=mp.tasks.vision.RunningMode.IMAGE,
+                    num_poses=2,
+                    min_pose_detection_confidence=0.35,
+                    min_pose_presence_confidence=0.35,
+                )
+            )
+        return image_detector
 
     try:
         for idx, item in enumerate(
@@ -198,10 +225,10 @@ def analyze_clip(
                 run_auto_window
                 and auto_decision is None
                 and item.source_time >= window_end - 1e-9
-                and decoded_frames
+                and auto_observations
             ):
                 auto_decision = classify_opening_window(
-                    [(f_idx, f_obs) for f_idx, _, _, f_obs in decoded_frames],
+                    auto_observations,
                     cfg,
                     clip_in=clip_in,
                     clip_out=clip_out,
@@ -218,6 +245,21 @@ def analyze_clip(
             obs = est.estimate(item.image, item.source_time)
             infer_times.append(time.perf_counter() - t0)
             decoded_frames.append((item.frame_index, item.source_time, item.clip_time, obs))
+            auto_obs = obs
+            if (
+                estimator_factory is None
+                and run_auto_window
+                and auto_decision is None
+                and idx % 2 == 0
+                and len(obs.poses) == 1
+                and _wide_ankle_span_for_pair(obs.poses[0], cfg.confidence)
+            ):
+                resolved_poses = resolve_close_embrace_frame_poses(
+                    item.image, obs.poses[0], _get_image_detector(), obs.width, obs.height, cfg
+                )
+                if len(resolved_poses) >= 2:
+                    auto_obs = FrameObservation(obs.timestamp, obs.width, obs.height, resolved_poses)
+            auto_observations.append((item.frame_index, auto_obs))
             frame_times.append((item.frame_index, item.source_time, item.clip_time))
             if progress_callback is not None and (idx % 5 == 0 or idx + 1 >= expected_frames):
                 pct = min(75, 20 + round(((idx + 1) / max(expected_frames, idx + 1)) * 55))
@@ -242,6 +284,10 @@ def analyze_clip(
     finally:
         with suppress(Exception):
             est.close()
+        if image_detector is not None:
+            with suppress(Exception):
+                image_detector.close()
+            image_detector = None
 
     if not decoded_frames:
         raise ValueError("Selected clip range contains no decodable frames")
@@ -251,7 +297,7 @@ def analyze_clip(
 
     if auto_decision is None:
         auto_decision = classify_opening_window(
-            [(f_idx, f_obs) for f_idx, _, _, f_obs in decoded_frames],
+            auto_observations,
             cfg,
             clip_in=clip_in,
             clip_out=clip_out,
@@ -336,21 +382,6 @@ def analyze_clip(
         "single" if auto_decision.resolved_mode == "needs_selection" else auto_decision.resolved_mode
     )
     raw_observations = [(f_idx, f_obs) for f_idx, _, _, f_obs in decoded_frames]
-    if resolved_mode == "single" and (
-        request_obj is not None
-        or analysis_region is not None
-    ):
-        single_anchor = anchors[0] if anchors else None
-        filtered_single = extract_single_target_observations(
-            raw_observations,
-            cfg,
-            anchor=single_anchor,
-            analysis_region=analysis_region,
-        )
-        decoded_frames = [
-            (f_idx, s_time, c_time, f_obs)
-            for (f_idx, s_time, c_time, _), (_, f_obs) in zip(decoded_frames, filtered_single)
-        ]
 
     if progress_callback is not None:
         progress_callback(80, 100, "Analysing soundtrack & movement…")
@@ -364,6 +395,246 @@ def analyze_clip(
         enabled=effective_soundtrack,
         video_first_pts_seconds=probe.first_pts_seconds,
     )
+
+    if resolved_mode == "couple":
+        # Dedicated Couple Axis & Coordination Engine (strictly segregated from Single-dancer engine)
+        couple_observations = list(auto_observations) if auto_observations else list(raw_observations)
+        if estimator_factory is None and any(len(obs.poses) == 1 for _, obs in couple_observations):
+            import mediapipe as mp
+
+            pair_det = mp.tasks.vision.PoseLandmarker.create_from_options(
+                mp.tasks.vision.PoseLandmarkerOptions(
+                    base_options=mp.tasks.BaseOptions(
+                        model_asset_path=str(model_path),
+                        delegate=mp.tasks.BaseOptions.Delegate.CPU,
+                    ),
+                    running_mode=mp.tasks.vision.RunningMode.IMAGE,
+                    num_poses=2,
+                    min_pose_detection_confidence=0.35,
+                    min_pose_presence_confidence=0.35,
+                )
+            )
+            obs_by_idx = {f_idx: obs for f_idx, obs in couple_observations}
+            total_frames_n = len(couple_observations)
+            resolved_map: dict[int, FrameObservation] = {}
+            last_split_pos: int | None = None
+            last_primary_mid: tuple[float, float] | None = None
+            last_split_pair: list[dict[str, Any]] | None = None
+            try:
+                for pos, item in enumerate(
+                    iter_virtual_clip_frames(
+                        probe.path,
+                        clip_in,
+                        clip_out,
+                        probe=probe,
+                        cancel_check=cancel_check,
+                    )
+                ):
+                    if cancel_check is not None and cancel_check():
+                        raise ImportCancelledError("Couple analysis was cancelled")
+                    cur_obs = obs_by_idx.get(item.frame_index)
+                    if cur_obs is None:
+                        continue
+                    if len(cur_obs.poses) == 1:
+                        primary_pose = cur_obs.poses[0]
+                        cur_mid = _pose_torso_mid_norm(primary_pose, cfg.confidence)
+                        propagated = False
+                        if (
+                            pos % 3 != 0
+                            and last_split_pos is not None
+                            and (pos - last_split_pos) <= 2
+                            and last_split_pair is not None
+                            and last_primary_mid is not None
+                            and cur_mid is not None
+                        ):
+                            dx = cur_mid[0] - last_primary_mid[0]
+                            dy = cur_mid[1] - last_primary_mid[1]
+                            if math.hypot(dx, dy) <= 0.05:
+                                split_poses = [_translate_pose(p, dx, dy) for p in last_split_pair]
+                                cur_obs = FrameObservation(
+                                    cur_obs.timestamp, cur_obs.width, cur_obs.height, split_poses
+                                )
+                                propagated = True
+                        if not propagated:
+                            split_poses = resolve_close_embrace_frame_poses(
+                                item.image,
+                                primary_pose,
+                                pair_det,
+                                cur_obs.width,
+                                cur_obs.height,
+                                cfg,
+                            )
+                            if len(split_poses) >= 2:
+                                cur_obs = FrameObservation(
+                                    cur_obs.timestamp, cur_obs.width, cur_obs.height, split_poses
+                                )
+                                last_split_pos = pos
+                                last_primary_mid = cur_mid
+                                last_split_pair = split_poses
+                            else:
+                                last_split_pos = None
+                                last_primary_mid = None
+                                last_split_pair = None
+                    elif len(cur_obs.poses) >= 2:
+                        last_split_pos = None
+                        last_primary_mid = None
+                        last_split_pair = None
+                    resolved_map[item.frame_index] = cur_obs
+                    if progress_callback is not None and (pos % 10 == 0 or pos + 1 >= total_frames_n):
+                        pct = min(92, 80 + round(((pos + 1) / max(1, total_frames_n)) * 12))
+                        progress_callback(
+                            pct,
+                            100,
+                            f"Resolving close-embrace couple axes ({pos + 1}/{total_frames_n})…",
+                        )
+            finally:
+                with suppress(Exception):
+                    pair_det.close()
+            if resolved_map:
+                couple_observations = [
+                    (f_idx, resolved_map.get(f_idx, obs)) for f_idx, obs in couple_observations
+                ]
+
+        beat_timestamps: list[float] = []
+        if soundtrack_summary.enabled and soundtrack_summary.frame_states:
+            prev_beat: int | None = None
+            for f_idx, _, _ in frame_times:
+                st = soundtrack_summary.frame_states.get(f_idx)
+                if not st or not st.get("playing"):
+                    prev_beat = None
+                    continue
+                b_num = st.get("beat")
+                if isinstance(b_num, int) and b_num > 0 and b_num != prev_beat:
+                    src_t = st.get("source_time")
+                    if src_t is not None:
+                        beat_timestamps.append(float(src_t))
+                prev_beat = b_num if isinstance(b_num, int) and b_num > 0 else None
+
+        couple_res = run_couple_analysis(
+            couple_observations,
+            cfg,
+            clip_in=clip_in,
+            clip_out=clip_out,
+            video_sha256=source_sha,
+            request=request_obj,
+            auto_decision=auto_decision,
+            soundtrack_beats=beat_timestamps,
+        )
+        couple_result_dict = couple_res.to_dict()
+        total_source_frames = max(probe.frame_count, decoded_frames[-1][0] + 1)
+        empty_obs = [
+            (f_idx, FrameObservation(s_time, probe.width, probe.height, []))
+            for f_idx, s_time, _ in frame_times
+        ]
+        movement_data = analyse_movement_observations(
+            empty_obs,
+            width=probe.width,
+            height=probe.height,
+            fps=probe.fps,
+            frame_count=total_source_frames,
+            sample_stride=1,
+            model_hash=model_hash,
+            source_sha256=source_sha,
+            segment_index=-1,
+            source_member=probe.path.name,
+        )
+        couple_coach_data: dict[str, Any] = {
+            "version": 1,
+            "model_hash": model_hash,
+            "model_variant": cfg.analysis_model,
+            "capture_profile": cap_profile,
+            "source_sha256": source_sha,
+            "width": probe.width,
+            "height": probe.height,
+            "fps": probe.fps,
+            "clip_in": round(clip_in, 4),
+            "clip_out": round(clip_out, 4),
+            "neutral_offset": cfg.head_neutral_offset,
+            "axis_neutral_offset": cfg.axis_neutral_offset,
+            "settings_coaching": False,
+            "couple_analysis": couple_result_dict,
+            "frames": {
+                str(f_idx): {
+                    "timestamp": round(float(s_time), 4),
+                    "clip_timestamp": round(float(c_time), 4),
+                    "poses": [],
+                    "measurement_poses": [],
+                }
+                for f_idx, s_time, c_time in frame_times
+            },
+        }
+        couple_frame_log: list[dict[str, Any]] = [
+            {
+                "frame_index": f_idx,
+                "timestamp": s_time,
+                "clip_timestamp": c_time,
+                "in_calibration_window": False,
+            }
+            for f_idx, s_time, c_time in frame_times
+        ]
+        manifest = RunManifest(
+            model_variant=cfg.analysis_model,
+            model_hash=model_hash,
+            metric_version=METRIC_VERSION,
+            capture_profile=cap_profile,
+            source_sha256=source_sha,
+            source_filename=probe.path.name,
+            width=probe.width,
+            height=probe.height,
+            fps=probe.fps,
+            selected_in=clip_in,
+            selected_out=clip_out,
+            clip_duration=clip_duration,
+            analysis_mode=analysis_mode,
+            processed_fps=processed_fps,
+            requested_dancer_mode=requested_mode,
+            resolved_dancer_mode="couple",
+            detector_version="couple_auto_v1",
+        )
+        return ClipAnalysisResult(
+            manifest=manifest,
+            video_path=probe.path,
+            title=clean_title,
+            source_sha256=source_sha,
+            selected_in=clip_in,
+            selected_out=clip_out,
+            clip_duration=clip_duration,
+            analysis_mode=analysis_mode,
+            readiness=readiness,
+            reference=None,
+            calibration_window=None,
+            coach_data=couple_coach_data,
+            movement_data=movement_data,
+            soundtrack=soundtrack_summary,
+            coverage={},
+            frame_log=couple_frame_log,
+            scored_frame_log=couple_frame_log,
+            frame_observations=decoded_frames,
+            performance=performance,
+            session_id=None,
+            session_summary=None,
+            session_events=None,
+            pose_recovery=None,
+            requested_dancer_mode=requested_mode,
+            resolved_dancer_mode="couple",
+            auto_decision=auto_decision.to_dict(),
+            couple_result=couple_result_dict,
+            selection_required=False,
+        )
+
+    # Single Dancer Engine (identical pre-Couple pipeline unless user pinned an anchor or ROI)
+    single_anchor = anchors[0] if anchors else None
+    if single_anchor is not None or analysis_region is not None:
+        filtered_single = extract_single_target_observations(
+            raw_observations,
+            cfg,
+            anchor=single_anchor,
+            analysis_region=analysis_region,
+        )
+        decoded_frames = [
+            (f_idx, s_time, c_time, f_obs)
+            for (f_idx, s_time, c_time, _), (_, f_obs) in zip(decoded_frames, filtered_single)
+        ]
 
     active_reference: Calibration | None = reference if analysis_mode == "posture" else None
     cal_window: tuple[float, float] | None = (
@@ -821,10 +1092,7 @@ def analyze_clip(
         "frames": {str(k): v for k, v in coach_pending.items()},
     }
 
-    should_recover = (
-        resolved_mode == "single"
-        and (cfg.replay_recovery_auto if recover_tracking is None else bool(recover_tracking))
-    )
+    should_recover = cfg.replay_recovery_auto if recover_tracking is None else bool(recover_tracking)
     pose_recovery: dict[str, Any] | None = None
     if should_recover:
         try:
@@ -839,12 +1107,6 @@ def analyze_clip(
                 cancel_check=cancel_check,
             )
             coach_data["pose_recovery"] = pose_recovery
-            coach_data = interpolate_coach_data(
-                coach_data,
-                cfg,
-                pose_recovery=pose_recovery,
-                movement_data=movement_data,
-            )
         except ImportCancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 - fallback preserves forward tracking and base analytics
@@ -875,6 +1137,16 @@ def analyze_clip(
             }
             coach_data["pose_recovery"] = pose_recovery
 
+    try:
+        coach_data = interpolate_coach_data(
+            coach_data,
+            cfg,
+            pose_recovery=pose_recovery,
+            movement_data=movement_data,
+        )
+    except Exception as exc:  # noqa: BLE001 - display interpolation must never abort base analysis
+        logger.warning("Display pose interpolation failed; keeping forward poses: %s", exc)
+
     coverage = _compute_family_coverage(
         clip_duration=clip_duration,
         total_frames=len(decoded_frames),
@@ -896,35 +1168,6 @@ def analyze_clip(
         "dropped_frames": 0,
         "timestamp_fallback": False,
     }
-
-    couple_result_dict: dict[str, Any] | None = None
-    if resolved_mode == "couple":
-        beat_timestamps: list[float] = []
-        if soundtrack_summary.enabled and soundtrack_summary.frame_states:
-            prev_beat: int | None = None
-            for f_idx, _, _ in frame_times:
-                st = soundtrack_summary.frame_states.get(f_idx)
-                if not st or not st.get("playing"):
-                    prev_beat = None
-                    continue
-                b_num = st.get("beat")
-                if isinstance(b_num, int) and b_num > 0 and b_num != prev_beat:
-                    src_t = st.get("source_time")
-                    if src_t is not None:
-                        beat_timestamps.append(float(src_t))
-                prev_beat = b_num if isinstance(b_num, int) and b_num > 0 else None
-        couple_res = run_couple_analysis(
-            raw_observations,
-            cfg,
-            clip_in=clip_in,
-            clip_out=clip_out,
-            video_sha256=source_sha,
-            request=request_obj,
-            auto_decision=auto_decision,
-            soundtrack_beats=beat_timestamps,
-        )
-        couple_result_dict = couple_res.to_dict()
-        coach_data["couple_analysis"] = couple_result_dict
 
     session_summary: dict[str, Any] | None = None
     session_events: list[dict[str, Any]] | None = None
@@ -954,7 +1197,7 @@ def analyze_clip(
         analysis_mode=analysis_mode,
         processed_fps=processed_fps,
         requested_dancer_mode=requested_mode,
-        resolved_dancer_mode=resolved_mode,
+        resolved_dancer_mode="single",
         detector_version="couple_auto_v1",
     )
 
@@ -983,9 +1226,9 @@ def analyze_clip(
         session_events=session_events,
         pose_recovery=pose_recovery,
         requested_dancer_mode=requested_mode,
-        resolved_dancer_mode=resolved_mode,
+        resolved_dancer_mode="single",
         auto_decision=auto_decision.to_dict(),
-        couple_result=couple_result_dict,
+        couple_result=None,
         selection_required=False,
     )
 

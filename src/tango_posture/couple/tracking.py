@@ -10,6 +10,7 @@ import numpy as np
 
 from ..config import Config
 from ..domain import FrameObservation, Landmark
+from ..pose.constants import NAMES
 from ..quality import reliable
 from .models import (
     CandidatePreview,
@@ -743,20 +744,13 @@ def extract_single_target_observations(
         pose_index=anchor.pose_index,
     )] if anchor is not None else None
 
-    if anchors is None and all(
-        len(filter_and_deduplicate_poses(obs, cfg, analysis_region)) <= 1
-        for _, obs in observations
+    if (
+        anchors is None
+        and analysis_region is None
+        and all(len(obs.poses) <= 1 for _, obs in observations)
     ):
-        # Preserve strictly single-pose clips untouched when no manual anchors were given.
-        filtered: list[tuple[int, FrameObservation]] = []
-        for idx, obs in observations:
-            cands = filter_and_deduplicate_poses(obs, cfg, analysis_region)
-            if len(cands) == 1:
-                w = [cands[0].world_pose] if cands[0].world_pose is not None else []
-                filtered.append((idx, FrameObservation(obs.timestamp, obs.width, obs.height, [cands[0].pose], w)))
-            else:
-                filtered.append((idx, FrameObservation(obs.timestamp, obs.width, obs.height, [], [])))
-        return filtered
+        # Preserve strictly single-pose clips untouched when no manual anchors or region were given.
+        return list(observations)
 
     tracked = track_couple_frames(observations, cfg, analysis_region=analysis_region, anchors=anchors)
     use_b = False
@@ -782,3 +776,195 @@ def extract_single_target_observations(
         else:
             out.append((pf.frame_index, FrameObservation(pf.timestamp, width, height, [], [])))
     return out
+
+
+def _pose_torso_mid_norm(pose: dict[str, Landmark], conf: float) -> tuple[float, float] | None:
+    keys = ("left_shoulder", "right_shoulder", "left_hip", "right_hip")
+    pts = [pose.get(k) for k in keys]
+    if not all(reliable(p, conf) and p is not None for p in pts):
+        return None
+    valid_pts = [p for p in pts if p is not None]
+    return (
+        sum(float(p.x) for p in valid_pts) / 4.0,
+        sum(float(p.y) for p in valid_pts) / 4.0,
+    )
+
+
+def _translate_pose(pose: dict[str, Landmark], dx: float, dy: float) -> dict[str, Landmark]:
+    return {
+        name: replace(lm, x=float(lm.x) + dx, y=float(lm.y) + dy)
+        for name, lm in pose.items()
+    }
+
+
+def _wide_ankle_span_for_pair(pose: dict[str, Landmark], confidence: float) -> bool:
+    lh, rh = pose.get("left_hip"), pose.get("right_hip")
+    la, ra = pose.get("left_ankle"), pose.get("right_ankle")
+    if not (reliable(lh, confidence) and reliable(rh, confidence) and lh is not None and rh is not None):
+        return False
+    if not (reliable(la, confidence) and reliable(ra, confidence) and la is not None and ra is not None):
+        return False
+    hip_span = max(0.02, abs(float(la.x) * 0.0 + float(lh.x) - float(rh.x)))
+    ankle_span = abs(float(la.x) - float(ra.x))
+    return ankle_span > 1.45 * hip_span
+
+
+def _mp_landmarks_to_pose(
+    landmarks: Any,
+    *,
+    crop_x0: float = 0.0,
+    crop_y0: float = 0.0,
+    crop_w: float = 1.0,
+    crop_h: float = 1.0,
+) -> dict[str, Landmark]:
+    return {
+        name: Landmark(
+            crop_x0 + float(landmarks[i].x) * crop_w,
+            crop_y0 + float(landmarks[i].y) * crop_h,
+            float(landmarks[i].visibility),
+            float(landmarks[i].presence),
+            float(getattr(landmarks[i], "z", 0.0) or 0.0),
+        )
+        for name, i in NAMES.items()
+    }
+
+
+def _pose_head_x(pose: dict[str, Landmark], conf: float) -> float | None:
+    nose = pose.get("nose")
+    if reliable(nose, conf) and nose is not None:
+        return float(nose.x)
+    ears = [pose.get(k) for k in ("left_ear", "right_ear")]
+    rel = [float(e.x) for e in ears if reliable(e, conf) and e is not None]
+    if rel:
+        return sum(rel) / len(rel)
+    return None
+
+
+def resolve_close_embrace_frame_poses(
+    image: np.ndarray,
+    primary_pose: dict[str, Landmark],
+    detector: Any,
+    width: int,
+    height: int,
+    cfg: Config,
+) -> list[dict[str, Landmark]]:
+    """Split a merged close-embrace single detection into left/right dancer poses when valid.
+
+    In close embrace, MediaPipe's single-stage detector can merge both bodies into one pose.
+    This helper crops tightly around the primary detection (eliminating mirror reflections or
+    distant bystanders) and masks the right/left half of the torso midline before running
+    ``detector`` in IMAGE mode, accepting two poses only when strict anatomical gates pass.
+    """
+    import cv2
+    import mediapipe as mp
+
+    conf = float(cfg.confidence)
+    l_sh, r_sh = primary_pose.get("left_shoulder"), primary_pose.get("right_shoulder")
+    l_hip, r_hip = primary_pose.get("left_hip"), primary_pose.get("right_hip")
+    if not (
+        reliable(l_sh, conf) and reliable(r_sh, conf) and reliable(l_hip, conf) and reliable(r_hip, conf)
+        and l_sh is not None and r_sh is not None and l_hip is not None and r_hip is not None
+    ):
+        return [primary_pose]
+
+    sh_x = 0.5 * (float(l_sh.x) + float(r_sh.x))
+    sh_y = 0.5 * (float(l_sh.y) + float(r_sh.y))
+    hip_x = 0.5 * (float(l_hip.x) + float(r_hip.x))
+    hip_y = 0.5 * (float(l_hip.y) + float(r_hip.y))
+    torso_px = math.hypot((sh_x - hip_x) * width, (sh_y - hip_y) * height)
+    min_torso_px = max(12.0, 0.5 * float(cfg.min_torso) * max(1, height))
+    if not math.isfinite(torso_px) or torso_px < min_torso_px:
+        return [primary_pose]
+
+    cx = 0.5 * (sh_x + hip_x)
+    ys = [
+        float(lm.y)
+        for lm in primary_pose.values()
+        if math.isfinite(lm.y) and (lm.visibility is None or lm.visibility >= 0.4)
+    ]
+    top_y = max(0.0, (min(ys) if ys else min(sh_y, hip_y)) - 0.08)
+    bot_y = min(1.0, (max(ys) if ys else max(sh_y, hip_y)) + 0.05)
+
+    # Crop tightly around the embrace cluster so mirrors / distant passers-by cannot leak into masked runs.
+    roi_half_x = max(0.14, 1.8 * torso_px / max(1, width))
+    cx0 = max(0.0, cx - roi_half_x)
+    cx1 = min(1.0, cx + roi_half_x)
+    px0, px1 = int(cx0 * width), math.ceil(cx1 * width)
+    py0, py1 = int(top_y * height), math.ceil(bot_y * height)
+    if px1 - px0 < 32 or py1 - py0 < 48:
+        return [primary_pose]
+
+    crop_rgb = cv2.cvtColor(image[py0:py1, px0:px1], cv2.COLOR_BGR2RGB)
+    cw = max(1, px1 - px0)
+    ch = max(1, py1 - py0)
+    crop_x0 = px0 / max(1, width)
+    crop_y0 = py0 / max(1, height)
+    crop_w = cw / max(1, width)
+    crop_h = ch / max(1, height)
+
+    mid_crop_x = max(2, min(cw - 2, round(((cx - crop_x0) / max(1e-6, crop_w)) * cw)))
+    span_px = max(12, round((1.3 * torso_px / max(1, width)) * width))
+
+    m_left = crop_rgb.copy()
+    m_left[:, min(cw, mid_crop_x + 2):min(cw, mid_crop_x + span_px)] = 128
+    rl = detector.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=m_left))
+
+    m_right = crop_rgb.copy()
+    m_right[:, max(0, mid_crop_x - span_px):max(0, mid_crop_x - 2)] = 128
+    rr = detector.detect(mp.Image(image_format=mp.ImageFormat.SRGB, data=m_right))
+
+    if not getattr(rl, "pose_landmarks", None) or not getattr(rr, "pose_landmarks", None):
+        return [primary_pose]
+
+    pose_l = _mp_landmarks_to_pose(rl.pose_landmarks[0], crop_x0=crop_x0, crop_y0=crop_y0, crop_w=crop_w, crop_h=crop_h)
+    pose_r = _mp_landmarks_to_pose(rr.pose_landmarks[0], crop_x0=crop_x0, crop_y0=crop_y0, crop_w=crop_w, crop_h=crop_h)
+
+    cand_l = extract_pose_candidate(0, pose_l, None, width, height, cfg)
+    cand_r = extract_pose_candidate(1, pose_r, None, width, height, cfg)
+    if (
+        not cand_l.torso_eligible
+        or not cand_r.torso_eligible
+        or cand_l.hip_norm is None
+        or cand_r.hip_norm is None
+        or cand_l.hip_px is None
+        or cand_r.hip_px is None
+        or cand_l.shoulder_px is None
+        or cand_r.shoulder_px is None
+        or cand_l.torso_length_px is None
+        or cand_r.torso_length_px is None
+    ):
+        return [primary_pose]
+
+    hlx = cand_l.hip_norm[0]
+    hrx = cand_r.hip_norm[0]
+    if not (hlx < cx < hrx):
+        return [primary_pose]
+
+    mean_tl = 0.5 * (cand_l.torso_length_px + cand_r.torso_length_px)
+    if mean_tl < 1.0:
+        return [primary_pose]
+    ratio = cand_l.torso_length_px / cand_r.torso_length_px
+    if not (0.72 <= ratio <= 1.38):
+        return [primary_pose]
+
+    hip_sep_tl = (cand_r.hip_px[0] - cand_l.hip_px[0]) / mean_tl
+    sh_sep_tl = (cand_r.shoulder_px[0] - cand_l.shoulder_px[0]) / mean_tl
+    if not (0.38 <= hip_sep_tl <= 1.45 and 0.32 <= sh_sep_tl <= 1.45):
+        return [primary_pose]
+
+    tilt_l = abs(math.degrees(math.atan2(cand_l.shoulder_px[0] - cand_l.hip_px[0], cand_l.shoulder_px[1] - cand_l.hip_px[1])))
+    tilt_r = abs(math.degrees(math.atan2(cand_r.shoulder_px[0] - cand_r.hip_px[0], cand_r.shoulder_px[1] - cand_r.hip_px[1])))
+    if tilt_l > 25.0 or tilt_r > 25.0:
+        return [primary_pose]
+
+    head_lx = _pose_head_x(pose_l, conf)
+    head_rx = _pose_head_x(pose_r, conf)
+    if (
+        head_lx is not None
+        and head_rx is not None
+        and abs(head_rx - head_lx) * width < 0.015 * mean_tl
+        and hip_sep_tl < 0.44
+    ):
+        return [primary_pose]
+
+    return [pose_l, pose_r]

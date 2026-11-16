@@ -268,26 +268,36 @@ class SettingsScreen(QScrollArea):
                     fallback_summary=SETTING_DESCRIPTIONS.get(field, ""),
                 )
                 form.addRow(self._field_label(field), wrapped)
-            if group == "Review & Ollama":
-                self.normalization_panel = MeasurementNormalizationPanel(self.bridge, page)
-                self._parameter_guides.setdefault("measurement_normalization", {
-                    "meta": "Per calibration profile & recording pair · Additive Review offset",
-                    "explanation": (
-                        "Re-expresses Review metric observations on the approved calibration profile's scale "
-                        "before temporal evaluation, while leaving .tpc bounds unchanged. Use ONLY to remove "
-                        "a verified camera, costume, or teacher-vs-student anatomical neutral difference — never "
-                        "to hide genuine student posture habits."
-                    ),
-                    "example": (
-                        "Worked example (head pitch): reference fit hold reads 3.0° and practice fit hold "
-                        "reads 7.0° -> signed offset -4.0°. On separate Check holds (3.2° vs 7.4°), "
-                        "7.4° + (-4.0°) = 3.4° (error 0.2° <= 1.0° -> Verified). In Review, raw 8.0° maps to "
-                        "8.0° + (-4.0°) = 4.0°, inside 1.0°..5.0° (WITHIN_REFERENCE)."
-                    ),
-                })
-                wrapped_norm = self._wrap_with_guide("measurement_normalization", self.normalization_panel)
-                form.addRow("Measurement normalization", wrapped_norm)
             self.tabs.addTab(page, group)
+        norm_page = QWidget()
+        norm_layout = QVBoxLayout(norm_page)
+        norm_layout.setContentsMargins(16, 16, 16, 16)
+        norm_layout.setSpacing(12)
+        norm_hint = QLabel(
+            "Re-express Review metric observations on an approved calibration profile's scale "
+            "using matched holds or an explicit offset, without altering the saved .tpc bounds."
+        )
+        norm_hint.setWordWrap(True)
+        norm_layout.addWidget(norm_hint)
+        self.normalization_panel = MeasurementNormalizationPanel(self.bridge, norm_page)
+        self._parameter_guides.setdefault("measurement_normalization", {
+            "meta": "Per calibration profile & recording pair · Additive Review offset",
+            "explanation": (
+                "Re-expresses Review metric observations on the approved calibration profile's scale "
+                "before temporal evaluation, while leaving .tpc bounds unchanged. Use ONLY to remove "
+                "a verified camera, costume, or teacher-vs-student anatomical neutral difference — never "
+                "to hide genuine student posture habits."
+            ),
+            "example": (
+                "Worked example (head pitch): reference fit hold reads 3.0° and practice fit hold "
+                "reads 7.0° -> signed offset -4.0°. On separate Check holds (3.2° vs 7.4°), "
+                "7.4° + (-4.0°) = 3.4° (error 0.2° <= 1.0° -> Verified). In Review, raw 8.0° maps to "
+                "8.0° + (-4.0°) = 4.0°, inside 1.0°..5.0° (WITHIN_REFERENCE)."
+            ),
+        })
+        wrapped_norm = self._wrap_with_guide("measurement_normalization", self.normalization_panel)
+        norm_layout.addWidget(wrapped_norm, 1)
+        self.tabs.addTab(norm_page, "Measurement normalization")
         ranges_page = QWidget()
         ranges_form = QFormLayout(ranges_page)
         ranges_hint = QLabel(
@@ -687,7 +697,7 @@ class SettingsScreen(QScrollArea):
 
     def open_measurement_normalization(self, payload: dict[str, Any]) -> None:
         for index in range(self.tabs.count()):
-            if self.tabs.tabText(index) == "Review & Ollama":
+            if self.tabs.tabText(index) == "Measurement normalization":
                 self.tabs.setCurrentIndex(index)
                 break
         if hasattr(self, "normalization_panel"):

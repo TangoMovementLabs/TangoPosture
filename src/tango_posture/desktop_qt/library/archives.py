@@ -176,6 +176,12 @@ def archive_report(
                     for s in indexed_couple["samples"]
                     if isinstance(s, dict) and start <= int(s.get("frame_index", -1)) <= end
                 ]
+            if isinstance(indexed_couple.get("frame_overlays"), list):
+                indexed_couple["frame_overlays"] = [
+                    {**fo, "frame_index": int(fo["frame_index"]) - start}
+                    for fo in indexed_couple["frame_overlays"]
+                    if isinstance(fo, dict) and start <= int(fo.get("frame_index", -1)) <= end
+                ]
             run_id = str(indexed_couple.get("run_id") or f"couple-0-{raw_sha[:8]}")
             decision = indexed_couple.get("auto_decision")
             dancer_analysis = {

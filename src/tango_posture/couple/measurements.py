@@ -1017,6 +1017,25 @@ def _apply_annotations_to_candidates(
     return paired, summaries
 
 
+_AXIS_OVERLAY_LANDMARKS = frozenset(
+    {
+        "left_shoulder",
+        "right_shoulder",
+        "left_hip",
+        "right_hip",
+        "left_ankle",
+        "right_ankle",
+        "left_heel",
+        "right_heel",
+        "left_foot_index",
+        "right_foot_index",
+        "nose",
+        "left_ear",
+        "right_ear",
+    }
+)
+
+
 def run_couple_analysis(
     observations: list[tuple[int, FrameObservation]],
     cfg: Config,
@@ -1225,6 +1244,8 @@ def run_couple_analysis(
         hip_only_norm: list[float] | None = None
         pair_hip_norm: list[float] | None = None
         pair_sh_norm: list[float] | None = None
+        mid_tilt: float | None = None
+        sep: float | None = None
 
         if pf.pair_torso_eligible and pf.dancer_a and pf.dancer_b:
             assert pf.dancer_a.hip_px and pf.dancer_b.hip_px and pf.dancer_a.shoulder_px and pf.dancer_b.shoulder_px
@@ -1281,16 +1302,7 @@ def run_couple_analysis(
                 "landmarks": {
                     k: [round(lm.x, 5), round(lm.y, 5), round(lm.visibility or 0.0, 3)]
                     for k, lm in d_sample.display_pose.items()
-                    if k
-                    in (
-                        "left_shoulder",
-                        "right_shoulder",
-                        "left_hip",
-                        "right_hip",
-                        "left_ankle",
-                        "right_ankle",
-                        "nose",
-                    )
+                    if k in _AXIS_OVERLAY_LANDMARKS
                 },
                 "interpolated_display": bool(d_sample.interpolated_display),
                 "quality_status": d_sample.quality_status,
@@ -1305,6 +1317,16 @@ def run_couple_analysis(
                 "pair_hip_norm": pair_hip_norm,
                 "pair_shoulder_norm": pair_sh_norm,
                 "hip_only_travel_point": hip_only_norm,
+                "tilt_a_deg": round(ta, 2) if ta is not None and math.isfinite(ta) else None,
+                "tilt_b_deg": round(tb, 2) if tb is not None and math.isfinite(tb) else None,
+                "couple_midpoint_tilt_deg": (
+                    round(mid_tilt, 2) if mid_tilt is not None and math.isfinite(mid_tilt) else None
+                ),
+                "torso_separation_deg": (
+                    round(sep, 2)
+                    if pf.pair_torso_eligible and sep is not None and math.isfinite(sep)
+                    else None
+                ),
                 "travel_axis_unit": [round(u_travel[0], 5), round(u_travel[1], 5)],
             }
         )

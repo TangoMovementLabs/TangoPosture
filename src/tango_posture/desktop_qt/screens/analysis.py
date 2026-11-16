@@ -780,6 +780,16 @@ class AnalysisScreen(QWidget):
                     "clip_out": result.selected_out,
                 },
             }
+            if result.resolved_dancer_mode == "couple":
+                prev_analytics = read_analytics(archive_path, segment_index) or {}
+                prev_coach = prev_analytics.get("coach_data")
+                if isinstance(prev_coach, dict) and any(
+                    isinstance(v, dict) and (v.get("poses") or v.get("measurement_poses"))
+                    for v in (prev_coach.get("frames") or {}).values()
+                ):
+                    for preserve_key in ("coach_data", "movement_data", "session", "session_events", "frames", "frame_timestamps"):
+                        if preserve_key in prev_analytics:
+                            payload[preserve_key] = prev_analytics[preserve_key]
             try:
                 store_analytics(
                     archive_path,

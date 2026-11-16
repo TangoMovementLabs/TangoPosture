@@ -270,7 +270,6 @@ def save_overlay_video(
             "copy",
             "-c:a",
             "aac",
-            "-shortest",
             str(output),
         ]
         try:

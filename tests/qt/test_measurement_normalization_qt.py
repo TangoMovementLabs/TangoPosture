@@ -274,11 +274,11 @@ def test_review_to_settings_routing_playhead_preview_async_holds_and_snapshot_ca
         review._show_frame(20)  # t = 4.0, head_pitch = 8.0°
         qapp.processEvents()
 
-        # Click "Measurement normalization settings…" from Review -> lands on Settings "Review & Ollama" tab
+        # Click "Measurement normalization settings…" from Review -> lands on Settings "Measurement normalization" tab
         review.normalization_settings_btn.click()
         qapp.processEvents()
         assert window.router.current == Route.SETTINGS
-        assert settings.tabs.tabText(settings.tabs.currentIndex()) == "Review & Ollama"
+        assert settings.tabs.tabText(settings.tabs.currentIndex()) == "Measurement normalization"
         assert panel.profile_combo.currentData() == profile.id
         assert tuple(panel.practice_combo.currentData()) == (str(tp_a.resolve()), 0)
 

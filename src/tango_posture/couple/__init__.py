@@ -32,6 +32,7 @@ from .tracking import (
     canonical_xy,
     extract_single_target_observations,
     filter_and_deduplicate_poses,
+    resolve_close_embrace_frame_poses,
     track_couple_frames,
 )
 
@@ -63,6 +64,7 @@ __all__ = [
     "filter_and_deduplicate_poses",
     "rebuild_couple_result_with_annotations",
     "render_couple_frame_overlay",
+    "resolve_close_embrace_frame_poses",
     "run_couple_analysis",
     "track_couple_frames",
 ]

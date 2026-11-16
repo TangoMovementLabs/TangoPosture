@@ -611,6 +611,7 @@ class ReviewScreen(QWidget):
         metrics_grid.setHorizontalSpacing(8)
         metrics_grid.setVerticalSpacing(2)
         metrics_grid.setColumnStretch(1, 1)
+        self.metric_name_labels: dict[str, QLabel] = {}
         self.metric_values: dict[str, QLabel] = {}
         self.metric_states: dict[str, QLabel] = {}
         self.metric_ranges: dict[str, QLabel] = {}
@@ -618,6 +619,7 @@ class ReviewScreen(QWidget):
             state_dot = QLabel("●")
             state_dot.setFixedWidth(12)
             name_label = QLabel(title)
+            self.metric_name_labels[key] = name_label
             name_label.setStyleSheet(f"color: {COLOR_TEXT_PRIMARY}; font-weight: 500;")
             name_label.setWordWrap(True)
             range_label = QLabel()
@@ -1480,6 +1482,27 @@ class ReviewScreen(QWidget):
 
         return time_pattern.sub(link_time, markdown)
 
+    def _resolve_couple_frame_overlay(self, frame_index: int) -> dict[str, Any] | None:
+        if not isinstance(self._couple_result, dict):
+            return None
+        overlay_root = self._couple_result.get("overlay")
+        if isinstance(overlay_root, dict):
+            by_frame = overlay_root.get("by_frame")
+            if isinstance(by_frame, dict):
+                cand = by_frame.get(str(frame_index))
+                if isinstance(cand, dict):
+                    return cand
+        frame_overlays = self._couple_result.get("frame_overlays")
+        if isinstance(frame_overlays, list) and frame_overlays:
+            for item in frame_overlays:
+                if isinstance(item, dict) and item.get("frame_index") == frame_index:
+                    return item
+            if 0 <= frame_index < len(frame_overlays):
+                cand = frame_overlays[frame_index]
+                if isinstance(cand, dict):
+                    return cand
+        return None
+
     def _render_primary_frame(
         self,
         frame: np.ndarray,
@@ -1502,16 +1525,21 @@ class ReviewScreen(QWidget):
             if update_status:
                 self.axis_status.clear()
                 self.axis_status.setVisible(False)
-            overlay_root = self._couple_result.get("overlay") or {}
-            by_frame = overlay_root.get("by_frame") or {}
-            frame_overlay = by_frame.get(str(frame_index))
+            frame_overlay = self._resolve_couple_frame_overlay(frame_index)
             ann = self._couple_result.get("annotations") or {}
+            clip_in = float(self._couple_result.get("clip_in") or 0.0)
             events = [
                 ev
                 for ev in (self._couple_result.get("events") or [])
                 if isinstance(ev, dict)
                 and not ev.get("deleted")
-                and abs(float(ev.get("timestamp", -999.0)) - frame_time_sec) <= 0.35
+                and (
+                    abs(float(ev.get("timestamp", -999.0)) - frame_time_sec) <= 0.35
+                    or (
+                        clip_in > 0.0
+                        and abs(float(ev.get("timestamp", -999.0)) - (frame_time_sec + clip_in)) <= 0.35
+                    )
+                )
             ]
             return render_couple_frame_overlay(
                 rendered,
@@ -1886,6 +1914,14 @@ class ReviewScreen(QWidget):
                         }
                         if resolved_mode == "couple" and couple_result is not None:
                             dancer_run["couple_result"] = couple_result
+                            prev_coach = previous.get("coach_data")
+                            if isinstance(prev_coach, dict) and any(
+                                isinstance(v, dict) and (v.get("poses") or v.get("measurement_poses"))
+                                for v in (prev_coach.get("frames") or {}).values()
+                            ):
+                                for preserve_key in ("coach_data", "movement_data", "session", "session_events", "frames", "frame_timestamps"):
+                                    if preserve_key in previous:
+                                        payload[preserve_key] = previous[preserve_key]
                         else:
                             dancer_run["coach_data"] = coach_data.coach_data
                             dancer_run["movement_data"] = coach_data.movement_data
@@ -2347,7 +2383,120 @@ class ReviewScreen(QWidget):
             self.metric_ranges[key].setVisible(False)
             self._set_metric_state(key, None)
 
+    def _couple_insights_snapshot(self, frame_index: int) -> dict[str, Any]:
+        assert isinstance(self._couple_result, dict)
+        ann = self._couple_result.get("annotations") or {}
+        a_name = str(ann.get("dancer_a_name") or "Dancer A")
+        b_name = str(ann.get("dancer_b_name") or "Dancer B")
+        titles = {
+            "head_angle": f"{a_name} torso tilt",
+            "shoulder_elev_pct": f"{b_name} torso tilt",
+            "axis_curve_smoothed": "Couple midpoint tilt",
+            "torso_axis_tilt": "Torso separation",
+            "knee_bend_deg": "Pair axis status",
+        }
+        values: dict[str, str] = {key: "Unavailable" for key in titles}
+        ranges: dict[str, str | None] = {key: None for key in titles}
+        states: dict[str, tuple[str | None, str, bool]] = {
+            key: ("UNKNOWN", "Not measured on this frame", True) for key in titles
+        }
+        samples = self._couple_result.get("samples") or []
+        sample: dict[str, Any] | None = None
+        if isinstance(samples, list) and samples:
+            for item in samples:
+                if isinstance(item, dict) and item.get("frame_index") == frame_index:
+                    sample = item
+                    break
+            if sample is None and 0 <= frame_index < len(samples) and isinstance(samples[frame_index], dict):
+                sample = samples[frame_index]
+
+        frame_overlay = self._resolve_couple_frame_overlay(frame_index)
+        ta = sample.get("torso_tilt_a_deg") if isinstance(sample, dict) else None
+        tb = sample.get("torso_tilt_b_deg") if isinstance(sample, dict) else None
+        tm = sample.get("couple_midpoint_tilt_deg") if isinstance(sample, dict) else None
+        sep = sample.get("torso_separation_deg") if isinstance(sample, dict) else None
+        if ta is None and isinstance(frame_overlay, dict):
+            ta = frame_overlay.get("tilt_a_deg")
+        if tb is None and isinstance(frame_overlay, dict):
+            tb = frame_overlay.get("tilt_b_deg")
+        if tm is None and isinstance(frame_overlay, dict):
+            tm = frame_overlay.get("couple_midpoint_tilt_deg")
+        if sep is None and isinstance(frame_overlay, dict):
+            sep = frame_overlay.get("torso_separation_deg")
+
+        def _fmt_deg(val: Any) -> str | None:
+            return f"{float(val):+.1f}°" if isinstance(val, int | float) and not isinstance(val, bool) else None
+
+        if (txt := _fmt_deg(ta)) is not None:
+            values["head_angle"] = txt
+            ranges["head_angle"] = "Measured individual torso axis"
+            states["head_angle"] = ("WITHIN_REFERENCE", f"{a_name} signed torso tilt", False)
+        if (txt := _fmt_deg(tb)) is not None:
+            values["shoulder_elev_pct"] = txt
+            ranges["shoulder_elev_pct"] = "Measured individual torso axis"
+            states["shoulder_elev_pct"] = ("WITHIN_REFERENCE", f"{b_name} signed torso tilt", False)
+        if (txt := _fmt_deg(tm)) is not None:
+            values["axis_curve_smoothed"] = txt
+            ranges["axis_curve_smoothed"] = "Measured couple midpoint axis"
+            states["axis_curve_smoothed"] = ("WITHIN_REFERENCE", "Couple midpoint tilt", False)
+        if isinstance(sep, int | float) and not isinstance(sep, bool):
+            values["torso_axis_tilt"] = f"{float(sep):.1f}°"
+            ranges["torso_axis_tilt"] = "Absolute angle between A & B"
+            states["torso_axis_tilt"] = ("WITHIN_REFERENCE", "Torso axis separation", False)
+
+        pair_ok = isinstance(tm, int | float) and not isinstance(tm, bool)
+        if pair_ok:
+            values["knee_bend_deg"] = "Measured"
+            ranges["knee_bend_deg"] = "Both dancers tracked"
+            states["knee_bend_deg"] = ("WITHIN_REFERENCE", "Pair axes measured", False)
+            alert: tuple[str, str] = ("Couple axes measured on this frame.", "success")
+        elif isinstance(ta, int | float) or isinstance(tb, int | float):
+            values["knee_bend_deg"] = "Single dancer only"
+            ranges["knee_bend_deg"] = "Need both dancers for pair axis"
+            states["knee_bend_deg"] = ("PENDING", "Second dancer unavailable on this frame", True)
+            alert = (
+                "Pair axis unavailable on this frame — showing detected individual dancer axis only.",
+                "warning",
+            )
+        else:
+            values["knee_bend_deg"] = "Unavailable"
+            alert = ("Neither dancer torso axis is measurable on this frame.", "muted")
+
+        summaries = self._couple_result.get("summaries") or {}
+        coord = summaries.get("coordination") or {}
+        posture = summaries.get("posture") or {}
+        detail_lines: list[str] = ["Couple Axis & Coordination Engine (isolated from Single posture coaching)."]
+        for p_key, p_lbl in (
+            ("torso_tilt_a", f"{a_name} axis"),
+            ("torso_tilt_b", f"{b_name} axis"),
+            ("couple_midpoint_tilt", "Couple midpoint"),
+            ("torso_separation", "Separation"),
+        ):
+            ps = posture.get(p_key) or {}
+            if isinstance(ps, dict) and ps.get("median_deg") is not None:
+                detail_lines.append(
+                    f"{p_lbl}: median {float(ps['median_deg']):+.1f}° · coverage {float(ps.get('coverage') or 0.0) * 100:.0f}%"
+                )
+        for c_key, c_lbl in (
+            ("start_lag_ms", "Start lag (B−A)"),
+            ("settle_lag_ms", "Settle lag (B−A)"),
+        ):
+            cs = coord.get(c_key) or {}
+            if isinstance(cs, dict) and cs.get("value") is not None:
+                detail_lines.append(f"{c_lbl}: {float(cs['value']):+.0f} ms")
+        return {
+            "titles": titles,
+            "values": values,
+            "ranges": ranges,
+            "states": states,
+            "alert": alert,
+            "details": "\n".join(detail_lines),
+        }
+
     def _frame_insights_snapshot(self, frame_index: int) -> dict[str, Any]:
+        if self._active_dancer_view_mode == "couple" and isinstance(self._couple_result, dict):
+            return self._couple_insights_snapshot(frame_index)
+        titles = dict(_METRIC_TITLES)
         values = {key: "Not observed" for key, _ in _METRIC_TITLES}
         ranges: dict[str, str | None] = {key: None for key, _ in _METRIC_TITLES}
         states: dict[str, tuple[str | None, str, bool]] = {
@@ -2359,6 +2508,7 @@ class ReviewScreen(QWidget):
         )
         if self._calibration_error:
             return {
+                "titles": titles,
                 "values": values,
                 "ranges": ranges,
                 "states": states,
@@ -2368,6 +2518,7 @@ class ReviewScreen(QWidget):
         data = self._display_coach_data()
         if data is None:
             return {
+                "titles": titles,
                 "values": values,
                 "ranges": ranges,
                 "states": states,
@@ -2379,6 +2530,7 @@ class ReviewScreen(QWidget):
         entry = frames.get(str(frame_index)) if isinstance(frames, dict) else None
         if not isinstance(entry, dict):
             return {
+                "titles": titles,
                 "values": values,
                 "ranges": ranges,
                 "states": states,
@@ -2404,6 +2556,7 @@ class ReviewScreen(QWidget):
 
         if not self._using_range_targets():
             return {
+                "titles": titles,
                 "values": values,
                 "ranges": ranges,
                 "states": states,
@@ -2514,6 +2667,7 @@ class ReviewScreen(QWidget):
             details.append(f"Not measured — {', '.join(labels)}: {reason}.")
 
         return {
+            "titles": titles,
             "values": values,
             "ranges": ranges,
             "states": states,
@@ -2522,9 +2676,11 @@ class ReviewScreen(QWidget):
         }
 
     def _frame_metrics_lines(self, frame_index: int) -> list[str]:
-        values = self._frame_insights_snapshot(frame_index)["values"]
+        snapshot = self._frame_insights_snapshot(frame_index)
+        values = snapshot["values"]
+        titles = snapshot.get("titles") or dict(_METRIC_TITLES)
         return [
-            f"{title}: {str(values.get(key, 'Not observed')).replace('°', ' deg')}"
+            f"{titles.get(key, title)}: {str(values.get(key, 'Not observed')).replace('°', ' deg')}"
             for key, title in _METRIC_TITLES
         ]
 
@@ -2563,6 +2719,11 @@ class ReviewScreen(QWidget):
     def _update_frame_insights(self, frame_index: int) -> None:
         self._reset_metrics()
         snapshot = self._frame_insights_snapshot(frame_index)
+        titles = snapshot.get("titles")
+        if isinstance(titles, Mapping):
+            for key, label in self.metric_name_labels.items():
+                if key in titles:
+                    label.setText(str(titles[key]))
         for key, value_text in snapshot["values"].items():
             self.metric_values[key].setText(value_text)
         for key, range_text in snapshot["ranges"].items():
@@ -2816,6 +2977,27 @@ class ReviewScreen(QWidget):
             saved_label = "Single (legacy)"
         self.saved_vs_next_label.setText(f"Saved result: {saved_label} · Next run: {next_label}")
 
+    def _sync_mode_specific_controls(self) -> None:
+        if not hasattr(self, "show_coach_cb"):
+            return
+        is_couple = self._active_dancer_view_mode == "couple" and isinstance(self._couple_result, dict)
+        for single_cb in (
+            self.show_coach_cb,
+            self.show_torso_axis_cb,
+            self.show_head_alignment_cb,
+            self.show_head_posture_cb,
+            self.show_pivots_cb,
+            self.show_steps_cb,
+        ):
+            single_cb.setVisible(not is_couple)
+        for couple_cb in (
+            self.show_dancer_a_cb,
+            self.show_dancer_b_cb,
+            self.show_couple_axis_cb,
+            self.show_couple_steps_cb,
+        ):
+            couple_cb.setVisible(is_couple)
+
     def _sync_dancer_analysis_state(self, *, preferred_run_id: str | None = None) -> None:
         self.view_run_combo.blockSignals(True)
         self.view_run_combo.clear()
@@ -2842,6 +3024,7 @@ class ReviewScreen(QWidget):
             self.view_run_combo.setEnabled(False)
             self._active_dancer_view_mode = "couple" if self._couple_result is not None else "single"
         self.view_run_combo.blockSignals(False)
+        self._sync_mode_specific_controls()
         self._update_saved_vs_next_label()
         self._refresh_couple_evidence_tab()
 
@@ -2863,6 +3046,7 @@ class ReviewScreen(QWidget):
                 self._movement_data = entry["movement_data"]
             self._couple_result = None
             self._couple_run_id = str(entry.get("run_id") or "")
+        self._sync_mode_specific_controls()
 
     def _select_run_by_id(self, run_id: str) -> None:
         da = self._dancer_analysis
@@ -2884,6 +3068,7 @@ class ReviewScreen(QWidget):
                     self.view_run_combo.setCurrentIndex(idx)
                 self.view_run_combo.blockSignals(False)
                 self._apply_run_selection(m_key)
+                self._update_calibration_comparison()
                 self._refresh_couple_evidence_tab()
                 self._refresh_overlay()
                 return
@@ -2908,6 +3093,7 @@ class ReviewScreen(QWidget):
                     self._dancer_analysis = updated["dancer_analysis"]
             except (OSError, ValueError):
                 pass
+        self._update_calibration_comparison()
         self._update_saved_vs_next_label()
         self._refresh_couple_evidence_tab()
         self._refresh_overlay()
