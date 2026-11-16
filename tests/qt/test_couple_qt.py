@@ -534,3 +534,225 @@ def test_analytics_mode_filter_five_panes_seek_and_csv(qapp, tmp_path):
     assert any(r["row_type"] == "summary" and r["run_id"] == "analytics-couple-99" for r in rows)
     assert any(r["row_type"] == "event" and r["run_id"] == "analytics-couple-99" for r in rows)
     window.close()
+
+
+def test_video_analysis_local_couple_saves_tpr_archive(qapp, tmp_path, monkeypatch):
+    from tango_posture.archive import read_manifest
+    from tango_posture.references.archives import reference_directory
+
+    cfg = Config(data_dir=str(tmp_path / "data"))
+    local_vid = _write_video(tmp_path / "LocalCouple.avi", fps=20.0, duration_s=2.0)
+    vsha = file_sha256(local_vid)
+    timestamps = [round(i / 20.0, 4) for i in range(40)]
+    couple_dict = _build_couple_result(vsha, cfg, run_id="local-couple-run-1")
+
+    res = ClipAnalysisResult(
+        manifest=RunManifest(
+            model_variant="lite",
+            model_hash="qt-local-couple",
+            metric_version="v1",
+            capture_profile={"width": 160, "height": 120, "side": "left", "facing": "right"},
+            source_sha256=vsha,
+            source_filename=local_vid.name,
+            width=160,
+            height=120,
+            fps=20.0,
+            selected_in=0.0,
+            selected_out=2.0,
+            clip_duration=2.0,
+            analysis_mode="movement",
+            requested_dancer_mode="couple",
+            resolved_dancer_mode="couple",
+        ),
+        video_path=local_vid,
+        title="LocalCouple",
+        source_sha256=vsha,
+        selected_in=0.0,
+        selected_out=2.0,
+        clip_duration=2.0,
+        analysis_mode="movement",
+        readiness=CalibrationReadiness(True, "movement", "Ready"),
+        reference=None,
+        calibration_window=None,
+        coach_data={
+            "width": 160,
+            "height": 120,
+            "frames": {
+                str(i): {"timestamp": timestamps[i], "poses": [], "measurement_poses": []}
+                for i in range(40)
+            },
+        },
+        movement_data={"steps": [], "pivots": []},
+        soundtrack=SoundtrackAnalysisSummary(enabled=False, available=False, status="disabled"),
+        coverage={},
+        frame_log=[{"frame_index": i, "timestamp": timestamps[i]} for i in range(40)],
+        scored_frame_log=[{"frame_index": i, "timestamp": timestamps[i]} for i in range(40)],
+        frame_observations=[],
+        performance={},
+        requested_dancer_mode="couple",
+        resolved_dancer_mode="couple",
+        auto_decision={"requested_mode": "couple", "resolved_mode": "couple", "explanation": "Couple"},
+        couple_result=couple_dict,
+        selection_required=False,
+    )
+    monkeypatch.setattr("tango_posture.desktop_qt.screens.analysis.analyze_clip", lambda **_kw: res)
+
+    window = MainWindow(cfg)
+    try:
+        window.router.navigate(Route.ANALYSIS)
+        qapp.processEvents()
+        assert window.nav_buttons[Route.ANALYSIS].text() == "Video Analysis"
+        assert window.nav_buttons[Route.ANALYTICS].text() == "Analytics"
+
+        screen: AnalysisScreen = window.screens[Route.ANALYSIS]  # type: ignore[assignment]
+        screen.local_radio.setChecked(True)
+        screen._set_local_video(local_vid)
+        idx_couple = screen.options_widget.mode_combo.findData("couple")
+        screen.options_widget.mode_combo.setCurrentIndex(idx_couple)
+        screen._on_run_clicked()
+
+        deadline = time.monotonic() + 10.0
+        while (screen.has_active_jobs() or screen._last_archive_path is None) and time.monotonic() < deadline:
+            qapp.processEvents()
+            time.sleep(0.02)
+        qapp.processEvents()
+
+        tprs = list(reference_directory(cfg.data_dir).glob("*.tpr"))
+        assert len(tprs) == 1
+        saved_tpr = tprs[0]
+        assert screen._last_archive_path == saved_tpr
+        assert screen.open_review_btn.isEnabled()
+        assert screen.open_analytics_btn.isEnabled()
+        assert ".tpr" in screen.status_label.text()
+        manifest = read_manifest(saved_tpr)
+        assert manifest["kind"] == "reference"
+        saved_analytics = read_analytics(saved_tpr, 0)
+        assert saved_analytics is not None
+        assert saved_analytics["dancer_analysis"]["active_mode"] == "couple"
+        assert "couple" in saved_analytics["dancer_analysis"]["runs"]
+    finally:
+        window.close()
+
+
+def test_review_couple_local_video_saves_tpr_even_when_hidden(qapp, tmp_path, monkeypatch):
+    import threading
+
+    from tango_posture.archive import read_manifest
+    from tango_posture.desktop_qt.review.analysis import ReviewAnalysis
+    from tango_posture.references.archives import reference_directory
+
+    cfg = Config(data_dir=str(tmp_path / "data"))
+    local_vid = _write_video(tmp_path / "ReviewCoupleLocal.avi", fps=20.0, duration_s=2.0)
+    vsha = file_sha256(local_vid)
+    timestamps = [round(i / 20.0, 4) for i in range(40)]
+    couple_dict = _build_couple_result(vsha, cfg, run_id="rev-local-couple-1")
+    started = threading.Event()
+    proceed = threading.Event()
+
+    res = ClipAnalysisResult(
+        manifest=RunManifest(
+            model_variant="lite",
+            model_hash="qt-rev-couple",
+            metric_version="v1",
+            capture_profile={"width": 160, "height": 120, "side": "left", "facing": "right"},
+            source_sha256=vsha,
+            source_filename=local_vid.name,
+            width=160,
+            height=120,
+            fps=20.0,
+            selected_in=0.0,
+            selected_out=2.0,
+            clip_duration=2.0,
+            analysis_mode="movement",
+            requested_dancer_mode="couple",
+            resolved_dancer_mode="couple",
+        ),
+        video_path=local_vid,
+        title="ReviewCoupleLocal",
+        source_sha256=vsha,
+        selected_in=0.0,
+        selected_out=2.0,
+        clip_duration=2.0,
+        analysis_mode="movement",
+        readiness=CalibrationReadiness(True, "movement", "Ready"),
+        reference=None,
+        calibration_window=None,
+        coach_data={
+            "width": 160,
+            "height": 120,
+            "frames": {
+                str(i): {"timestamp": timestamps[i], "poses": [], "measurement_poses": []}
+                for i in range(40)
+            },
+        },
+        movement_data={"steps": [], "pivots": []},
+        soundtrack=SoundtrackAnalysisSummary(enabled=False, available=False, status="disabled"),
+        coverage={},
+        frame_log=[{"frame_index": i, "timestamp": timestamps[i]} for i in range(40)],
+        scored_frame_log=[{"frame_index": i, "timestamp": timestamps[i]} for i in range(40)],
+        frame_observations=[],
+        performance={},
+        requested_dancer_mode="couple",
+        resolved_dancer_mode="couple",
+        auto_decision={"requested_mode": "couple", "resolved_mode": "couple", "explanation": "Couple"},
+        couple_result=couple_dict,
+        selection_required=False,
+    )
+
+    def fake_review_clip(_path, _cfg, **_kwargs):
+        started.set()
+        assert proceed.wait(5.0)
+        return ReviewAnalysis(
+            res.coach_data,
+            res.movement_data,
+            res.manifest,
+            res,
+            requested_dancer_mode="couple",
+            resolved_dancer_mode="couple",
+            auto_decision=res.auto_decision,
+            couple_result=couple_dict,
+        )
+
+    monkeypatch.setattr(
+        "tango_posture.desktop_qt.screens.review.analyse_review_clip", fake_review_clip
+    )
+
+    window = MainWindow(cfg)
+    try:
+        window.router.navigate(Route.REVIEW, local_vid)
+        qapp.processEvents()
+        review = window.screens[Route.REVIEW]
+        idx_couple = review.dancer_mode_combo.findData("couple")
+        review.dancer_mode_combo.setCurrentIndex(idx_couple)
+
+        review._start_posture_analysis()
+        assert started.wait(5.0)
+
+        # Switching screens while analysis runs must not cancel it
+        window.router.navigate(Route.HOME)
+        qapp.processEvents()
+        assert review.has_active_jobs()
+
+        proceed.set()
+        deadline = time.monotonic() + 10.0
+        while review.has_active_jobs() and time.monotonic() < deadline:
+            qapp.processEvents()
+            review._poll_posture_analysis()
+            time.sleep(0.02)
+        qapp.processEvents()
+        review._poll_posture_analysis()
+
+        tprs = list(reference_directory(cfg.data_dir).glob("*.tpr"))
+        assert len(tprs) == 1
+        saved_tpr = tprs[0]
+        assert review.current_archive_path == saved_tpr
+        manifest = read_manifest(saved_tpr)
+        assert manifest["kind"] == "reference"
+        assert manifest["segments"][0]["overlay"] == "overlay_00.mp4"
+        assert manifest["segments"][0]["lines"] == "lines_00.mp4"
+        saved_analytics = read_analytics(saved_tpr, 0)
+        assert saved_analytics is not None
+        assert saved_analytics["dancer_analysis"]["active_mode"] == "couple"
+        assert "couple" in saved_analytics["dancer_analysis"]["runs"]
+    finally:
+        window.close()

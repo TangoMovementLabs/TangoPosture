@@ -106,7 +106,7 @@ class AnalyticsScreen(QWidget):
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(24, 20, 24, 20)
-        title = QLabel("Archived Recording Analytics")
+        title = QLabel("Analytics")
         title.setProperty("class", "title")
         layout.addWidget(title)
         subtitle = QLabel(

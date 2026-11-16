@@ -30,6 +30,7 @@ class ReviewAnalysis:
     auto_decision: dict[str, Any] | None = None
     couple_result: dict[str, Any] | None = None
     selection_required: bool = False
+    saved_archive_path: Path | None = None
 
 
 def analyse_review_clip(

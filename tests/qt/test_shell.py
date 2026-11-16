@@ -207,6 +207,8 @@ def test_navigation_buttons_have_icons_and_accessible_labels(qapp):
 
     assert len(window.nav_buttons) == 9
     assert Route.ANALYSIS in window.nav_buttons
+    assert window.nav_buttons[Route.ANALYSIS].text() == "Video Analysis"
+    assert window.nav_buttons[Route.ANALYTICS].text() == "Analytics"
     assert Route.REFERENCES not in window.nav_buttons
     for button in window.nav_buttons.values():
         assert not button.icon().isNull()

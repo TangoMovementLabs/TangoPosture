@@ -9,6 +9,8 @@ import re
 import threading
 import time
 from collections.abc import Callable, Mapping
+from contextlib import suppress
+from dataclasses import replace
 from pathlib import Path
 from tempfile import NamedTemporaryFile, TemporaryDirectory
 from threading import Event, Thread
@@ -87,11 +89,13 @@ from ...references.companions import (
     save_couple_companion,
 )
 from ...references.constants import MAX_IMPORT_RANGE_SECONDS
+from ...references.results import ClipAnalysisResult
 from ...replay import VideoReader, time_label
 from ...reports import latest_analysis_model_section
 from ..calibration import editor as calibration_editor
 from ..components.analysis_options import NeedsSelectionDialog
 from ..components.video_stage import VideoStage
+from ..library.archives import promote_segment_to_tpr, save_clip_result_as_tpr
 from ..review.analysis import (
     ReviewAnalysis,
     analyse_review_clip,
@@ -1955,9 +1959,31 @@ class ReviewScreen(QWidget):
                                         "resolved_dancer_mode": resolved_mode,
                                     },
                                 )
+                                if (
+                                    archive_path.suffix.lower() == ".tp"
+                                    and isinstance(result, ClipAnalysisResult)
+                                ):
+                                    with suppress(Exception):
+                                        promoted_tpr = promote_segment_to_tpr(
+                                            archive_path,
+                                            segment_index,
+                                            cfg,
+                                            preferred_name=str(manifest.get("name") or archive_path.stem),
+                                        )
+                                        coach_data = replace(coach_data, saved_archive_path=promoted_tpr)
                             event = "cancelled" if cancelled else "done"
                             self._analysis_events.put((job_id, event, coach_data))
                         return
+                result = getattr(coach_data, "result", None)
+                if not cancel_event.is_set() and isinstance(result, ClipAnalysisResult):
+                    report_progress(95, 100, "Saving .tpr reference archive")
+                    saved_tpr = save_clip_result_as_tpr(
+                        result,
+                        cfg,
+                        cancel_event.is_set,
+                        preferred_name=video_path.stem,
+                    )
+                    coach_data = replace(coach_data, saved_archive_path=saved_tpr)
                 with self._analysis_commit_lock:
                     cancelled = cancel_event.is_set() or self._active_analysis_job != job_id
                     event = "cancelled" if cancelled else "done"
@@ -2281,6 +2307,13 @@ class ReviewScreen(QWidget):
                         self.load_archive(path, segment_index=index)
                         if self._playback.reader is not None:
                             self._show_frame(min(frame, self._playback.reader.count - 1))
+                    elif payload.saved_archive_path is not None:
+                        frame = self._playback.reader.index if self._playback.reader else 0
+                        self._analysis_cancel = None
+                        self._active_analysis_job = None
+                        self.load_archive(payload.saved_archive_path, segment_index=0)
+                        if self._playback.reader is not None:
+                            self._show_frame(min(frame, self._playback.reader.count - 1))
                     else:
                         self._sync_dancer_analysis_state()
                         original = self._playback.report
@@ -2295,11 +2328,21 @@ class ReviewScreen(QWidget):
                     self.bridge.status_message.emit(f"Could not refresh the analysis report: {error}")
                 frames = payload.coach_data.get("frames")
                 frame_count = len(frames) if isinstance(frames, dict) else 0
-                saved_note = (
-                    "Previous analysis, report and overlay videos were replaced and saved. "
-                    if self.current_archive_path is not None
-                    and self.current_archive_path.suffix.lower() in (".tp", ".tpr") else ""
-                )
+                saved_note = ""
+                if (
+                    self.current_archive_path is not None
+                    and self.current_archive_path.suffix.lower() in (".tp", ".tpr")
+                ):
+                    if (
+                        payload.saved_archive_path is not None
+                        and payload.saved_archive_path != self.current_archive_path
+                    ):
+                        saved_note = (
+                            "Previous analysis, report and overlay videos were replaced and saved, "
+                            f"and reference {payload.saved_archive_path.name} was created. "
+                        )
+                    else:
+                        saved_note = "Previous analysis, report and overlay videos were replaced and saved. "
                 self.analysis_status.setText(
                     f"Analysis ready: {frame_count} frames, "
                     f"{len(payload.movement_data.get('pivots', []))} pivots, "
@@ -3395,6 +3438,10 @@ class ReviewScreen(QWidget):
             self._show_frame(self._playback.frame_for_timestamp(ts))
 
     def hideEvent(self, event: QHideEvent) -> None:
+        if self.has_active_jobs():
+            self._pause()
+            super().hideEvent(event)
+            return
         path = self.current_archive_path
         self._release()
         self._reopen_path = path

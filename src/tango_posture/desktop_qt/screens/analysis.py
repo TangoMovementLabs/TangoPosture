@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shutil
+from contextlib import suppress
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from threading import Event, Thread
@@ -45,6 +46,8 @@ from ...references.results import ClipAnalysisResult
 from ...references.video import probe_import_video
 from ...replay import VideoReader
 from ..components.analysis_options import AnalysisOptionsWidget, NeedsSelectionDialog
+from ..library.archives import promote_segment_to_tpr, save_clip_result_as_tpr
+from ..review.analysis import render_review_report
 from ..router import Route, Router
 from ..service_bridge import ServiceBridge
 
@@ -131,7 +134,7 @@ class AnalysisScreen(QWidget):
         # Header
         header = QHBoxLayout()
         title_box = QVBoxLayout()
-        title = QLabel("Analysis")
+        title = QLabel("Video Analysis")
         title.setProperty("class", "title")
         subtitle = QLabel(
             "Run Auto, Single, or Couple movement & posture analysis on archive recordings or local video clips."
@@ -365,9 +368,8 @@ class AnalysisScreen(QWidget):
     def has_active_jobs(self) -> bool:
         return self._worker_thread is not None and self._worker_thread.is_alive()
 
-    def refresh(self) -> None:
-        self.options_widget.set_config(self.bridge.config)
-        current_path = self.archive_combo.currentData()
+    def _refresh_archive_combo(self, select_path: Path | None = None) -> None:
+        current_path = select_path if isinstance(select_path, Path) else self.archive_combo.currentData()
         self.archive_combo.blockSignals(True)
         self.archive_combo.clear()
         items = [
@@ -382,6 +384,10 @@ class AnalysisScreen(QWidget):
             if idx >= 0:
                 self.archive_combo.setCurrentIndex(idx)
         self.archive_combo.blockSignals(False)
+
+    def refresh(self) -> None:
+        self.options_widget.set_config(self.bridge.config)
+        self._refresh_archive_combo()
         self._on_archive_changed()
 
     def _find_archive_combo_index(self, target: Path) -> int:
@@ -685,6 +691,15 @@ class AnalysisScreen(QWidget):
                 if cancel_ev.is_set():
                     self._events.cancelled.emit(job_id)
                 else:
+                    if not res.selection_required and target_info.get("kind") == "local":
+                        self._events.progress.emit(job_id, 95, 100, "Saving .tpr reference archive…")
+                        saved_tpr = save_clip_result_as_tpr(
+                            res,
+                            cfg,
+                            cancel_ev.is_set,
+                            preferred_name=str(target_info["title"]),
+                        )
+                        target_info["saved_tpr_path"] = saved_tpr
                     self._events.completed.emit(job_id, res)
             except ImportCancelledError:
                 self._events.cancelled.emit(job_id)
@@ -790,27 +805,69 @@ class AnalysisScreen(QWidget):
                     for preserve_key in ("coach_data", "movement_data", "session", "session_events", "frames", "frame_timestamps"):
                         if preserve_key in prev_analytics:
                             payload[preserve_key] = prev_analytics[preserve_key]
+            report_text = render_review_report(
+                result, cfg, segment_index, {"title": archive_path.stem}
+            )
+            metadata_updates: dict[str, Any] = {
+                "frame_timestamps": [float(r["timestamp"]) for r in result.frame_log],
+                "analysis_mode": result.analysis_mode,
+                "is_imported_reference": archive_path.suffix.lower() == ".tpr",
+                "clip_in": result.selected_in,
+                "clip_out": result.selected_out,
+                "capture_profile": result.manifest.capture_profile,
+                "requested_dancer_mode": result.requested_dancer_mode,
+                "resolved_dancer_mode": result.resolved_dancer_mode,
+            }
             try:
                 store_analytics(
                     archive_path,
                     segment_index,
                     payload,
                     expected_video_sha256=str(video_sha) if video_sha else None,
+                    report_text=report_text,
+                    metadata_updates=metadata_updates,
                     dancer_analysis_run=dancer_run,
                 )
+                promoted_tpr: Path | None = None
+                if archive_path.suffix.lower() == ".tp":
+                    with suppress(Exception):
+                        promoted_tpr = promote_segment_to_tpr(
+                            archive_path,
+                            segment_index,
+                            cfg,
+                            preferred_name=archive_path.stem,
+                        )
                 self._last_archive_path = archive_path
                 self._last_segment_index = segment_index
+                self._refresh_archive_combo(select_path=promoted_tpr or archive_path)
                 self.open_review_btn.setEnabled(True)
                 self.open_analytics_btn.setEnabled(True)
-                self.status_label.setText(
-                    f"Saved {result.resolved_dancer_mode.capitalize()} analysis into {archive_path.name}."
-                )
+                if promoted_tpr is not None:
+                    self.status_label.setText(
+                        f"Saved {result.resolved_dancer_mode.capitalize()} analysis into "
+                        f"{archive_path.name} and {promoted_tpr.name}."
+                    )
+                else:
+                    self.status_label.setText(
+                        f"Saved {result.resolved_dancer_mode.capitalize()} analysis into {archive_path.name}."
+                    )
             except (OSError, ValueError, RuntimeError) as exc:
                 self.status_label.setText(f"Analysis finished but archive save failed: {exc}")
         else:
-            self.status_label.setText(
-                f"Completed {result.resolved_dancer_mode.capitalize()} analysis on local clip."
-            )
+            saved_tpr = self._active_target_info.get("saved_tpr_path")
+            if isinstance(saved_tpr, Path):
+                self._last_archive_path = saved_tpr
+                self._last_segment_index = 0
+                self._refresh_archive_combo(select_path=saved_tpr)
+                self.open_review_btn.setEnabled(True)
+                self.open_analytics_btn.setEnabled(True)
+                self.status_label.setText(
+                    f"Saved {result.resolved_dancer_mode.capitalize()} analysis into {saved_tpr.name}."
+                )
+            else:
+                self.status_label.setText(
+                    f"Completed {result.resolved_dancer_mode.capitalize()} analysis on local clip."
+                )
 
         self._cleanup_temp()
         self._populate_decision_view(result.auto_decision, result.couple_result)

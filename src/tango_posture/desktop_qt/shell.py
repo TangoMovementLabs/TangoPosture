@@ -111,7 +111,7 @@ class MainWindow(QMainWindow):
         nav_items = [
             (Route.HOME, "Home", "home"),
             (Route.LIBRARY, "Library", "library"),
-            (Route.ANALYSIS, "Analysis", "analysis"),
+            (Route.ANALYSIS, "Video Analysis", "analysis"),
             (Route.REVIEW, "Review", "review"),
             (Route.ANALYTICS, "Analytics", "analytics"),
             (Route.COACH, "AI Coach", "coach"),
