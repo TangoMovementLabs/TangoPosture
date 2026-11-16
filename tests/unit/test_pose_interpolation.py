@@ -174,3 +174,84 @@ def test_interpolate_coach_data_recovers_limbs_across_pivots_and_low_confidence_
             assert f["display_poses"][0][j][3] >= cfg.confidence
             assert f["display_joint_origins"][j] == "interpolated"
         assert original["frames"][str(idx)]["measurement_poses"][0]["right_elbow"][3] == pytest.approx(0.25)
+
+
+def test_interpolate_coach_data_recovers_whole_frame_boundary_dropout_and_near_edge_limbs():
+    def _pt(x: float, y: float, conf: float = 0.95) -> list[float]:
+        return [x, y, 0.0, conf, conf]
+
+    cfg = Config(confidence=0.65, replay_joint_max_gap=3.0)
+    pose_1 = {
+        "nose": _pt(0.50, 0.15),
+        "left_shoulder": _pt(0.42, 0.26),
+        "right_shoulder": _pt(0.58, 0.26),
+        "left_elbow": _pt(0.39, 0.40),
+        "right_elbow": _pt(0.61, 0.40, 0.10),
+        "left_wrist": _pt(0.38, 0.52),
+        "right_wrist": _pt(0.62, 0.52),
+        "left_hip": _pt(0.45, 0.54),
+        "right_hip": _pt(0.55, 0.54),
+        "left_knee": _pt(0.45, 0.85),
+        "left_ankle": _pt(0.45, 1.04, 0.40),
+        "right_knee": _pt(0.55, 0.74),
+        "right_ankle": _pt(0.55, 0.91),
+    }
+    pose_2 = {
+        "nose": _pt(0.50, 0.15),
+        "left_shoulder": _pt(0.42, 0.26),
+        "right_shoulder": _pt(0.58, 0.26),
+        "left_elbow": _pt(0.39, 0.40),
+        "right_elbow": _pt(0.61, 0.40, 0.10),
+        "left_wrist": _pt(0.38, 0.52),
+        "right_wrist": _pt(0.62, 0.52),
+        "left_hip": _pt(0.45, 0.54),
+        "right_hip": _pt(0.55, 0.54),
+        "left_knee": _pt(0.45, 0.75),
+        "left_ankle": _pt(0.45, 0.92),
+        "right_knee": _pt(0.55, 0.74),
+        "right_ankle": _pt(0.55, 0.91),
+    }
+    data = {
+        "width": 100,
+        "height": 100,
+        "frames": {
+            "0": {"timestamp": 0.0, "measurement_poses": [], "poses": []},
+            "1": {"timestamp": 0.1, "measurement_poses": [pose_1], "poses": [deepcopy(pose_1)]},
+            "2": {"timestamp": 0.2, "measurement_poses": [pose_2], "poses": [deepcopy(pose_2)]},
+        },
+    }
+    original = deepcopy(data)
+
+    interpolated = interpolate_coach_data(data, cfg)
+
+    assert data == original
+    for idx in ("0", "1", "2"):
+        assert interpolated["frames"][idx]["measurement_poses"] == original["frames"][idx]["measurement_poses"]
+
+    # Whole-frame boundary dropout at frame 0 is recovered with bounded coordinates
+    f0 = interpolated["frames"]["0"]
+    assert len(f0["display_poses"]) == 1
+    for joint in ("left_shoulder", "right_shoulder", "left_hip", "right_hip", "left_ankle", "right_elbow"):
+        lm = f0["display_poses"][0][joint]
+        assert 0.0 <= lm[0] <= 1.0
+        assert 0.0 <= lm[1] <= 1.0
+        assert lm[3] >= cfg.confidence
+        assert f0["display_joint_origins"][joint] == "interpolated"
+
+    # Near-edge left_ankle (raw y=1.04, vis=0.40) and always-low-conf right_elbow (0.10) are recovered & clamped
+    f1 = interpolated["frames"]["1"]
+    ankle1 = f1["display_poses"][0]["left_ankle"]
+    assert 0.0 <= ankle1[0] <= 1.0
+    assert 0.0 <= ankle1[1] <= 1.0
+    assert ankle1[3] >= cfg.confidence
+    assert f1["display_joint_origins"]["left_ankle"] == "interpolated"
+    assert original["frames"]["1"]["measurement_poses"][0]["left_ankle"][1] == pytest.approx(1.04)
+    assert original["frames"]["1"]["measurement_poses"][0]["left_ankle"][3] == pytest.approx(0.40)
+
+    for idx in ("1", "2"):
+        re = interpolated["frames"][idx]["display_poses"][0]["right_elbow"]
+        assert 0.0 <= re[0] <= 1.0
+        assert 0.0 <= re[1] <= 1.0
+        assert re[3] >= cfg.confidence
+        assert interpolated["frames"][idx]["display_joint_origins"]["right_elbow"] == "interpolated"
+        assert original["frames"][idx]["measurement_poses"][0]["right_elbow"][3] == pytest.approx(0.10)

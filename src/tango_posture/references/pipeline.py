@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import time
 from collections.abc import Callable
 from contextlib import suppress
@@ -22,7 +23,11 @@ from ..couple import (
     classify_opening_window,
     resolve_close_embrace_frame_poses,
 )
-from ..couple.tracking import _wide_ankle_span_for_pair
+from ..couple.tracking import (
+    _pose_torso_mid_norm,
+    _translate_pose,
+    _wide_ankle_span_for_pair,
+)
 from ..domain import Calibration, FrameObservation, PoseEstimator
 from ..engines import (
     CommonEngineContext,
@@ -127,6 +132,9 @@ def analyze_clip(
         est = estimator_factory()
     decoded_frames: list[tuple[int, float, float, FrameObservation]] = []
     auto_observations: list[tuple[int, FrameObservation]] = []
+    last_split_pos: int | None = None
+    last_primary_mid: tuple[float, float] | None = None
+    last_split_pair: list[dict[str, Any]] | None = None
     frame_times: list[tuple[int, float, float]] = []
     expected_frames = max(1, round(clip_duration * max(probe.fps, 1.0)))
     infer_times: list[float] = []
@@ -210,7 +218,51 @@ def analyze_clip(
             infer_times.append(time.perf_counter() - t0)
             decoded_frames.append((item.frame_index, item.source_time, item.clip_time, obs))
             auto_obs = obs
-            if (
+            split_couple_in_pass = requested_mode == "couple" or (
+                auto_decision is not None and auto_decision.resolved_mode == "couple"
+            )
+            if estimator_factory is None and split_couple_in_pass and len(obs.poses) == 1:
+                primary_pose = obs.poses[0]
+                cur_mid = _pose_torso_mid_norm(primary_pose, cfg.confidence)
+                propagated = False
+                if (
+                    idx % 3 != 0
+                    and last_split_pos is not None
+                    and (idx - last_split_pos) <= 2
+                    and last_split_pair is not None
+                    and last_primary_mid is not None
+                    and cur_mid is not None
+                ):
+                    dx = cur_mid[0] - last_primary_mid[0]
+                    dy = cur_mid[1] - last_primary_mid[1]
+                    if math.hypot(dx, dy) <= 0.05:
+                        auto_obs = FrameObservation(
+                            obs.timestamp,
+                            obs.width,
+                            obs.height,
+                            [_translate_pose(p, dx, dy) for p in last_split_pair],
+                        )
+                        propagated = True
+                if not propagated and idx % 3 == 0:
+                    resolved_poses = resolve_close_embrace_frame_poses(
+                        item.image, primary_pose, _get_image_detector(), obs.width, obs.height, cfg
+                    )
+                    if len(resolved_poses) >= 2:
+                        auto_obs = FrameObservation(
+                            obs.timestamp, obs.width, obs.height, resolved_poses
+                        )
+                        last_split_pos = idx
+                        last_primary_mid = cur_mid
+                        last_split_pair = resolved_poses
+                    else:
+                        last_split_pos = None
+                        last_primary_mid = None
+                        last_split_pair = None
+            elif estimator_factory is None and split_couple_in_pass and len(obs.poses) >= 2:
+                last_split_pos = None
+                last_primary_mid = None
+                last_split_pair = None
+            elif (
                 estimator_factory is None
                 and run_auto_window
                 and auto_decision is None

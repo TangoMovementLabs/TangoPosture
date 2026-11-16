@@ -312,7 +312,6 @@ class CalibrationEditor(QDialog):
                         for index, frame in enumerate(self.evidence.frames)
                     },
                 }
-            self._coach_data = interpolate_coach_data(coach, self.cfg)
             self._movement_data = analytics.get("movement_data")
             if self._movement_data is None:
                 movement = read_movement_analysis(self._archive.folder, 0)
@@ -320,6 +319,12 @@ class CalibrationEditor(QDialog):
                     self._movement_data = validate_movement_analysis(
                         movement, expected_segment_index=0
                     )
+            self._coach_data = interpolate_coach_data(
+                coach,
+                self.cfg,
+                pose_recovery=coach.get("pose_recovery"),
+                movement_data=self._movement_data,
+            )
         except Exception:
             if hasattr(self, "_reader"):
                 self._reader.close()

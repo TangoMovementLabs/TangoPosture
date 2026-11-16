@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import logging
 import math
-from collections.abc import Callable
-from dataclasses import asdict
+from collections.abc import Callable, Sequence
+from dataclasses import asdict, dataclass
 from typing import Any
 
 import numpy as np
@@ -13,10 +13,13 @@ import numpy as np
 from ..calibration.baseline import calibrate
 from ..calibration.measurements import measure_profile
 from ..calibration.models import profile_from_calibration
+from ..config import Config
 from ..couple import extract_single_target_observations
 from ..domain import (
     METRIC_VERSION,
     Calibration,
+    FrameObservation,
+    Landmark,
     MetricObservation,
     PoseEstimator,
 )
@@ -57,115 +60,172 @@ from .common import CommonEngineContext
 
 logger = logging.getLogger(__name__)
 
+_DecodedFrame = tuple[int, float, float, FrameObservation]
 
-def run_solo_dancer_engine(
-    ctx: CommonEngineContext,
-    *,
-    reference: Calibration | None = None,
-    calibration_interval: tuple[float, float] | None = None,
-    storage: Storage | None = None,
-    estimator_factory: Callable[[], PoseEstimator] | None = None,
-    progress_callback: Callable[[int, int, str], None] | None = None,
-    cancel_check: Callable[[], bool] | None = None,
-    recover_tracking: bool | None = None,
-    build_coach_frame_entry: Callable[..., tuple[dict[str, Any], dict[str, Any]]] | None = None,
-) -> ClipAnalysisResult:
-    """Execute the Solo Dancer Engine (calibration, posture, pivots, steps, gap completion)."""
-    cfg = ctx.cfg
-    probe = ctx.probe
+
+@dataclass
+class _SoloEvaluationResult:
+    session: Session | None
+    coach_pending: dict[int, dict[str, Any]]
+    coach_frame_meta: dict[int, dict[str, Any]]
+    frame_log: list[dict[str, Any]]
+    neutral_offset: float
+    axis_neutral: float
+
+
+def _filter_solo_target_frames(ctx: CommonEngineContext) -> list[_DecodedFrame]:
+    """Isolate the target dancer when user anchor or analysis region is configured."""
     decoded_frames = list(ctx.decoded_frames)
-    soundtrack_summary = ctx.soundtrack_summary or SoundtrackAnalysisSummary(
-        enabled=False, available=False, status="disabled", reason=""
-    )
-    coach_entry_builder = build_coach_frame_entry or _build_coach_frame_entry
-
     analysis_region = ctx.request_obj.analysis_region if ctx.request_obj is not None else None
     anchors = list(ctx.request_obj.annotations.anchors) if ctx.request_obj is not None else []
     single_anchor = anchors[0] if anchors else None
-    if single_anchor is not None or analysis_region is not None:
-        filtered_single = extract_single_target_observations(
-            ctx.raw_observations,
-            cfg,
-            anchor=single_anchor,
-            analysis_region=analysis_region,
+    if single_anchor is None and analysis_region is None:
+        return decoded_frames
+    filtered_single = extract_single_target_observations(
+        ctx.raw_observations,
+        ctx.cfg,
+        anchor=single_anchor,
+        analysis_region=analysis_region,
+    )
+    return [
+        (f_idx, s_time, c_time, f_obs)
+        for (f_idx, s_time, c_time, _), (_, f_obs) in zip(
+            decoded_frames, filtered_single, strict=True
         )
-        decoded_frames = [
-            (f_idx, s_time, c_time, f_obs)
-            for (f_idx, s_time, c_time, _), (_, f_obs) in zip(
-                decoded_frames, filtered_single, strict=True
-            )
-        ]
+    ]
 
+
+def _resolve_solo_calibration(
+    ctx: CommonEngineContext,
+    decoded_frames: Sequence[_DecodedFrame],
+    reference: Calibration | None,
+    calibration_interval: tuple[float, float] | None,
+) -> tuple[Calibration | None, tuple[float, float] | None]:
+    """Resolve explicit Solo reference calibration or derive it from the calibration interval."""
+    cfg = ctx.cfg
     active_reference: Calibration | None = reference if ctx.analysis_mode == "posture" else None
     cal_window: tuple[float, float] | None = (
         (float(calibration_interval[0]), float(calibration_interval[1]))
         if ctx.analysis_mode == "posture" and calibration_interval is not None
         else None
     )
+    if ctx.analysis_mode != "posture" or active_reference is not None or cal_window is None:
+        return active_reference, cal_window
 
-    if ctx.analysis_mode == "posture" and active_reference is None and cal_window is not None:
-        cal_in, cal_out = cal_window
-        cal_samples: list[MetricObservation] = []
-        cal_head_angles: list[float] = []
-        cal_shoulder_clearances: list[float] = []
-        cal_axis_offsets: list[float] = []
-        for _, source_time, _, frame_obs in decoded_frames:
-            if cal_in - 1e-6 <= source_time <= cal_out + 1e-6:
-                cal_samples.append(measure(frame_obs, cfg, None))
-                if len(frame_obs.poses) == 1:
-                    pose = frame_obs.poses[0]
-                    raw_head = head_horizontal_alignment(
-                        pose, frame_obs.width, frame_obs.height, neutral_offset=0.0
-                    )
-                    if raw_head is not None:
-                        cal_head_angles.append(raw_head[0])
-                    sh_info = shoulder_tension_alignment(
-                        pose,
-                        frame_obs.width,
-                        frame_obs.height,
-                        neutral_clearance=cfg.shoulder_neutral_clearance,
-                        **shoulder_geometry_kwargs(cfg),
-                    )
-                    if sh_info is not None:
-                        cal_shoulder_clearances.append(sh_info[1])
-                    ax_info = axis_curve_alignment(
-                        pose,
-                        frame_obs.width,
-                        frame_obs.height,
-                        facing=cfg.facing,
-                        side=cfg.side,
-                        neutral_offset=cfg.axis_neutral_offset,
-                    )
-                    if ax_info is not None:
-                        cal_axis_offsets.append(ax_info[1])
-        cal_cfg = cfg.model_copy(
-            update={
-                "calibration_duration": max(
-                    float(cal_out - cal_in), float(cfg.calibration_valid_duration)
-                )
-            }
+    cal_in, cal_out = cal_window
+    cal_samples: list[MetricObservation] = []
+    cal_head_angles: list[float] = []
+    cal_shoulder_clearances: list[float] = []
+    cal_axis_offsets: list[float] = []
+    for _, source_time, _, frame_obs in decoded_frames:
+        if not (cal_in - 1e-6 <= source_time <= cal_out + 1e-6):
+            continue
+        cal_samples.append(measure(frame_obs, cfg, None))
+        if len(frame_obs.poses) != 1:
+            continue
+        pose = frame_obs.poses[0]
+        raw_head = head_horizontal_alignment(
+            pose, frame_obs.width, frame_obs.height, neutral_offset=0.0
         )
-        active_reference = calibrate(
-            cal_samples,
-            cal_in,
-            cal_cfg,
-            ctx.cap_profile,
-            ctx.model_hash,
-            name=f"{ctx.clean_title or probe.path.stem} clip reference",
-            review={
-                "label": "imported-clip-interval",
-                "interval": [round(cal_in, 3), round(cal_out, 3)],
-            },
+        if raw_head is not None:
+            cal_head_angles.append(raw_head[0])
+        sh_info = shoulder_tension_alignment(
+            pose,
+            frame_obs.width,
+            frame_obs.height,
+            neutral_clearance=cfg.shoulder_neutral_clearance,
+            **shoulder_geometry_kwargs(cfg),
         )
-        if cal_head_angles:
-            active_reference.quality["head_neutral_offset"] = float(np.median(cal_head_angles))
-        if cal_shoulder_clearances:
-            active_reference.quality["shoulder_neutral_clearance"] = float(
-                np.median(cal_shoulder_clearances)
+        if sh_info is not None:
+            cal_shoulder_clearances.append(sh_info[1])
+        ax_info = axis_curve_alignment(
+            pose,
+            frame_obs.width,
+            frame_obs.height,
+            facing=cfg.facing,
+            side=cfg.side,
+            neutral_offset=cfg.axis_neutral_offset,
+        )
+        if ax_info is not None:
+            cal_axis_offsets.append(ax_info[1])
+
+    cal_cfg = cfg.model_copy(
+        update={
+            "calibration_duration": max(
+                float(cal_out - cal_in), float(cfg.calibration_valid_duration)
             )
-        if cal_axis_offsets:
-            active_reference.quality["axis_neutral_offset"] = float(np.median(cal_axis_offsets))
+        }
+    )
+    active_reference = calibrate(
+        cal_samples,
+        cal_in,
+        cal_cfg,
+        ctx.cap_profile,
+        ctx.model_hash,
+        name=f"{ctx.clean_title or ctx.probe.path.stem} clip reference",
+        review={
+            "label": "imported-clip-interval",
+            "interval": [round(cal_in, 3), round(cal_out, 3)],
+        },
+    )
+    if cal_head_angles:
+        active_reference.quality["head_neutral_offset"] = float(np.median(cal_head_angles))
+    if cal_shoulder_clearances:
+        active_reference.quality["shoulder_neutral_clearance"] = float(
+            np.median(cal_shoulder_clearances)
+        )
+    if cal_axis_offsets:
+        active_reference.quality["axis_neutral_offset"] = float(np.median(cal_axis_offsets))
+    return active_reference, cal_window
 
+
+def _extract_upper_body_metrics(
+    observation: MetricObservation,
+    pose: dict[str, Landmark],
+    width: int,
+    height: int,
+    cfg: Config,
+) -> dict[str, float] | None:
+    if all(observation.values.get(m) is not None for m in observation.values):
+        return {m: float(v) for m, v in observation.values.items() if v is not None}
+    for side_cand in (cfg.side, "left", "right"):
+        ear_lm = pose.get(f"{side_cand}_ear")
+        sh_lm = pose.get(f"{side_cand}_shoulder")
+        hip_lm = pose.get(f"{side_cand}_hip")
+        if all(
+            lm is not None
+            and 0 <= lm.x <= 1
+            and 0 <= lm.y <= 1
+            and (lm.visibility is None or lm.visibility >= 0.5)
+            for lm in (ear_lm, sh_lm, hip_lm)
+        ):
+            assert ear_lm is not None and sh_lm is not None and hip_lm is not None
+            try:
+                return calculate(
+                    pixel(ear_lm, width, height),
+                    pixel(sh_lm, width, height),
+                    pixel(hip_lm, width, height),
+                    cfg.facing,
+                )
+            except ValueError:
+                return None
+    return None
+
+
+def _evaluate_solo_frames(
+    ctx: CommonEngineContext,
+    decoded_frames: Sequence[_DecodedFrame],
+    active_reference: Calibration | None,
+    cal_window: tuple[float, float] | None,
+    soundtrack_summary: SoundtrackAnalysisSummary,
+    coach_entry_builder: Callable[..., tuple[dict[str, Any], dict[str, Any]]],
+    *,
+    storage: Storage | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+) -> _SoloEvaluationResult:
+    """Evaluate per-frame Solo posture, axis curve, role, embrace, and ankle trackers."""
+    cfg = ctx.cfg
+    probe = ctx.probe
     role_tracker = RoleTracker(assign_ms=cfg.role_assign_ms, hold_ms=cfg.role_hold_ms)
     embrace_tracker = EmbraceTracker(
         closed_threshold=cfg.embrace_closed_threshold,
@@ -248,7 +308,6 @@ def run_solo_dancer_engine(
         in_cal = bool(
             cal_window is not None and cal_window[0] - 1e-6 <= source_time < cal_window[1] - 1e-6
         )
-
         observation = (
             measure_profile(frame_obs, cfg, range_profile)
             if range_profile is not None
@@ -361,33 +420,9 @@ def run_solo_dancer_engine(
                 shoulder_last_ts = source_time
                 shoulder_elev_pct = shoulder_smoothed
 
-            if all(observation.values.get(m) is not None for m in observation.values):
-                upper_body = {
-                    m: float(v) for m, v in observation.values.items() if v is not None
-                }
-            else:
-                for side_cand in (cfg.side, "left", "right"):
-                    ear_lm = pose.get(f"{side_cand}_ear")
-                    sh_lm = pose.get(f"{side_cand}_shoulder")
-                    hip_lm = pose.get(f"{side_cand}_hip")
-                    if all(
-                        lm is not None
-                        and 0 <= lm.x <= 1
-                        and 0 <= lm.y <= 1
-                        and (lm.visibility is None or lm.visibility >= 0.5)
-                        for lm in (ear_lm, sh_lm, hip_lm)
-                    ):
-                        assert ear_lm is not None and sh_lm is not None and hip_lm is not None
-                        try:
-                            upper_body = calculate(
-                                pixel(ear_lm, frame_obs.width, frame_obs.height),
-                                pixel(sh_lm, frame_obs.width, frame_obs.height),
-                                pixel(hip_lm, frame_obs.width, frame_obs.height),
-                                cfg.facing,
-                            )
-                            break
-                        except ValueError:
-                            upper_body = None
+            upper_body = _extract_upper_body_metrics(
+                observation, pose, frame_obs.width, frame_obs.height, cfg
+            )
 
         role = role_tracker.update(raw_role, source_time)
         embrace_type = embrace_tracker.update(
@@ -504,13 +539,34 @@ def run_solo_dancer_engine(
             }
         )
 
+    return _SoloEvaluationResult(
+        session=session,
+        coach_pending=coach_pending,
+        coach_frame_meta=coach_frame_meta,
+        frame_log=frame_log,
+        neutral_offset=neutral_offset,
+        axis_neutral=axis_neutral,
+    )
+
+
+def _recover_and_complete_solo_coach_data(
+    ctx: CommonEngineContext,
+    decoded_frames: Sequence[_DecodedFrame],
+    eval_res: _SoloEvaluationResult,
+    *,
+    estimator_factory: Callable[[], PoseEstimator] | None = None,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+    recover_tracking: bool | None = None,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any] | None]:
+    """Run Solo movement analysis, gap recovery, and display limb completion."""
+    cfg = ctx.cfg
+    probe = ctx.probe
     if cancel_check is not None and cancel_check():
         raise ImportCancelledError("Reference video analysis was cancelled")
 
     total_source_frames = max(probe.frame_count, decoded_frames[-1][0] + 1)
-    movement_observations = [
-        (frame_index, obs) for frame_index, _, _, obs in decoded_frames
-    ]
+    movement_observations = [(frame_index, obs) for frame_index, _, _, obs in decoded_frames]
     movement_data = analyse_movement_observations(
         movement_observations,
         width=probe.width,
@@ -527,8 +583,8 @@ def run_solo_dancer_engine(
     if cancel_check is not None and cancel_check():
         raise ImportCancelledError("Reference video analysis was cancelled")
 
-    for frame_index, entry in coach_pending.items():
-        meta = coach_frame_meta[frame_index]
+    for frame_index, entry in eval_res.coach_pending.items():
+        meta = eval_res.coach_frame_meta[frame_index]
         movement_notes = _movement_note_lines(
             movement_data, frame_index, probe.fps, cfg.replay_step_history_seconds
         )
@@ -537,6 +593,7 @@ def run_solo_dancer_engine(
         else:
             entry["lines"] = list(meta["lines"])
             entry["notes"] = [meta["primary"], *meta["lines"], *movement_notes]
+
     coach_data: dict[str, Any] = {
         "version": 1,
         "model_hash": ctx.model_hash,
@@ -548,10 +605,10 @@ def run_solo_dancer_engine(
         "fps": probe.fps,
         "clip_in": round(ctx.clip_in, 4),
         "clip_out": round(ctx.clip_out, 4),
-        "neutral_offset": neutral_offset,
-        "axis_neutral_offset": axis_neutral,
+        "neutral_offset": eval_res.neutral_offset,
+        "axis_neutral_offset": eval_res.axis_neutral,
         "settings_coaching": ctx.analysis_mode != "movement",
-        "frames": {str(k): v for k, v in coach_pending.items()},
+        "frames": {str(k): v for k, v in eval_res.coach_pending.items()},
     }
 
     should_recover = cfg.replay_recovery_auto if recover_tracking is None else bool(recover_tracking)
@@ -609,17 +666,65 @@ def run_solo_dancer_engine(
     except Exception as exc:  # noqa: BLE001 - display interpolation must never abort base analysis
         logger.warning("Display pose interpolation failed; keeping forward poses: %s", exc)
 
+    return movement_data, coach_data, pose_recovery
+
+
+def run_solo_dancer_engine(
+    ctx: CommonEngineContext,
+    *,
+    reference: Calibration | None = None,
+    calibration_interval: tuple[float, float] | None = None,
+    storage: Storage | None = None,
+    estimator_factory: Callable[[], PoseEstimator] | None = None,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+    recover_tracking: bool | None = None,
+    build_coach_frame_entry: Callable[..., tuple[dict[str, Any], dict[str, Any]]] | None = None,
+) -> ClipAnalysisResult:
+    """Execute the Solo Dancer Engine (calibration, posture, pivots, steps, gap completion)."""
+    cfg = ctx.cfg
+    probe = ctx.probe
+    soundtrack_summary = ctx.soundtrack_summary or SoundtrackAnalysisSummary(
+        enabled=False, available=False, status="disabled", reason=""
+    )
+    coach_entry_builder = build_coach_frame_entry or _build_coach_frame_entry
+
+    decoded_frames = _filter_solo_target_frames(ctx)
+    active_reference, cal_window = _resolve_solo_calibration(
+        ctx, decoded_frames, reference, calibration_interval
+    )
+    eval_res = _evaluate_solo_frames(
+        ctx,
+        decoded_frames,
+        active_reference,
+        cal_window,
+        soundtrack_summary,
+        coach_entry_builder,
+        storage=storage,
+        cancel_check=cancel_check,
+    )
+    movement_data, coach_data, pose_recovery = _recover_and_complete_solo_coach_data(
+        ctx,
+        decoded_frames,
+        eval_res,
+        estimator_factory=estimator_factory,
+        progress_callback=progress_callback,
+        cancel_check=cancel_check,
+        recover_tracking=recover_tracking,
+    )
+
     coverage = _compute_family_coverage(
         clip_duration=ctx.clip_duration,
         total_frames=len(decoded_frames),
         fps=probe.fps,
-        frame_log=frame_log,
+        frame_log=eval_res.frame_log,
         movement_data=movement_data,
         soundtrack=soundtrack_summary,
         cfg=cfg,
         evaluate_posture=ctx.analysis_mode != "movement",
     )
 
+    session = eval_res.session
     session_summary: dict[str, Any] | None = None
     session_events: list[dict[str, Any]] | None = None
     if session is not None:
@@ -628,8 +733,8 @@ def run_solo_dancer_engine(
         session_events = [asdict(e) for v in session.evaluators.values() for e in v.events]
 
     scored_frame_log = [
-        row for row in frame_log if not row.get("in_calibration_window", False)
-    ] or frame_log
+        row for row in eval_res.frame_log if not row.get("in_calibration_window", False)
+    ] or eval_res.frame_log
 
     manifest = RunManifest(
         model_variant=cfg.analysis_model,
@@ -667,7 +772,7 @@ def run_solo_dancer_engine(
         movement_data=movement_data,
         soundtrack=soundtrack_summary,
         coverage=coverage,
-        frame_log=frame_log,
+        frame_log=eval_res.frame_log,
         scored_frame_log=scored_frame_log,
         frame_observations=decoded_frames,
         performance=ctx.performance,
