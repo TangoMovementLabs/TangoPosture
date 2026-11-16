@@ -1044,3 +1044,87 @@ def test_edit_calibration_resolves_renamed_reference_and_works_in_review_and_ana
         analytics.close()
 
 
+def test_opening_portrait_giro_reference_auto_links_and_switches_to_all_view(qapp, tmp_path):
+    width, height = 608, 1080
+    video, report, practice = (
+        tmp_path / name for name in ("giro.mp4", "giro.md", "giro.tp")
+    )
+    writer = cv2.VideoWriter(str(video), cv2.VideoWriter.fourcc(*"mp4v"), 10, (width, height))
+    assert writer.isOpened()
+
+    coach_frames = {}
+    for index in range(20):
+        writer.write(np.zeros((height, width, 3), dtype=np.uint8))
+        if index in (10, 11):
+            coach_frames[str(index)] = {"timestamp": index / 10.0, "measurement_poses": []}
+            continue
+        shift = 2.0 * index
+        # First 5 frames (0..4) are side-on (10 px shoulder span); remaining valid frames rotate frontal (70 px).
+        right_offset = 10.0 if index < 5 else 70.0
+        coords = {
+            "nose": (300.0 + shift, 300.0),
+            "left_ear": (300.0 + shift, 330.0),
+            "right_ear": (300.0 + shift + right_offset, 330.0),
+            "left_shoulder": (300.0 + shift, 360.0),
+            "right_shoulder": (300.0 + shift + right_offset, 360.0),
+            "left_hip": (300.0 + shift, 475.0),
+            "right_hip": (300.0 + shift + right_offset, 475.0),
+            "left_ankle": (300.0 + shift, 700.0),
+            "right_ankle": (300.0 + shift + right_offset, 700.0),
+        }
+        pose = {
+            name: [x / width, y / height, 0.0, 0.99, 0.99]
+            for name, (x, y) in coords.items()
+        }
+        coach_frames[str(index)] = {
+            "timestamp": index / 10.0,
+            "measurement_poses": [pose],
+        }
+    writer.release()
+
+    report.write_text("# Giro Source\n")
+    append_segment(
+        practice,
+        report,
+        video,
+        None,
+        [i / 10.0 for i in range(20)],
+        analytics={
+            "model_hash": MANIFEST["sha256"],
+            "capture_profile": profile(Config(), width, height, "video"),
+            "coach_data": {
+                "width": width,
+                "height": height,
+                "model_hash": MANIFEST["sha256"],
+                "frames": coach_frames,
+            },
+            "max_gap": 0.5,
+        },
+    )
+    ref_dir = tmp_path / "references"
+    ref_dir.mkdir(parents=True, exist_ok=True)
+    reference = ref_dir / "PortraitGiro.tpr"
+    promote_reference(practice, reference, "Portrait Giro")
+
+    cfg = Config(data_dir=str(tmp_path))
+    editor = CalibrationEditor(reference, cfg)
+    try:
+        editor.show()
+        qapp.processEvents()
+        # Opened immediately at the initial metric without touching the step/metric combo box:
+        # 1) single dancer auto-linked across the 1.0s-1.1s dropout gap
+        assert editor._anchors == {0: 0, 12: 0}
+        assert editor.confirm_identity.isChecked()
+        # 2) switched to 'all' camera view because side view covers < 50% of valid samples
+        assert editor.view_combo.currentText() == "all"
+        # 3) full portrait timeline plotted from 0.0s to 1.9s with no dropout warning
+        assert editor.chart.time_end == pytest.approx(1.9)
+        assert "Track stopped" not in editor.status_label.text()
+        valid_points = [val for _, val in editor.chart.data.points if val is not None]
+        assert len(valid_points) == 18
+    finally:
+        if editor.isVisible():
+            editor.reject()
+
+
+

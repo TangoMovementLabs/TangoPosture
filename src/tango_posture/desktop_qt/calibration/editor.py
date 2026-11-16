@@ -295,8 +295,12 @@ class CalibrationEditor(QDialog):
             analytics = read_analytics(self._archive.folder, 0)
             if analytics is None:
                 raise ValueError("Reference analysis is missing; analyze it in Review first")
-            coach = analytics.get("coach_data")
-            if not isinstance(coach, dict) or not coach.get("frames"):
+            raw_coach = analytics.get("coach_data")
+            has_coach_frames = isinstance(raw_coach, dict) and bool(raw_coach.get("frames"))
+            coach: dict[str, Any]
+            if isinstance(raw_coach, dict) and raw_coach.get("frames"):
+                coach = raw_coach
+            else:
                 coach = {
                     "width": self.evidence.frames[0].width,
                     "height": self.evidence.frames[0].height,
@@ -312,6 +316,16 @@ class CalibrationEditor(QDialog):
                         for index, frame in enumerate(self.evidence.frames)
                     },
                 }
+            auto_linked_single = False
+            if (
+                anchors is None
+                and self._editing_profile_path is None
+                and has_coach_frames
+                and max((len(frame.poses) for frame in self.evidence.frames), default=0) == 1
+            ):
+                self._anchors = single_dancer_anchors(self.evidence, self.cfg.confidence)
+                self._track_start = min(self._anchors)
+                auto_linked_single = True
             self._movement_data = analytics.get("movement_data")
             if self._movement_data is None:
                 movement = read_movement_analysis(self._archive.folder, 0)
@@ -410,7 +424,7 @@ class CalibrationEditor(QDialog):
         selection.addWidget(self.auto_link_button)
         video_layout.addLayout(selection)
         self.confirm_identity = QCheckBox("I confirm all manually linked passages follow the same dancer")
-        self.confirm_identity.setChecked(len(self._anchors) == 1)
+        self.confirm_identity.setChecked(len(self._anchors) == 1 or auto_linked_single)
         video_layout.addWidget(self.confirm_identity)
         save_selection = QPushButton("Save dancer selection in reference (.tpr)")
         save_selection.clicked.connect(self._save_selection)
@@ -744,17 +758,18 @@ class CalibrationEditor(QDialog):
                     1 for _, value in self._samples.get(key, [])
                     if value is not None and math.isfinite(value)
                 )
+                all_valid = sum(
+                    1 for _, value in self._samples_for_view("all").get(key, [])
+                    if value is not None and math.isfinite(value)
+                )
                 profile_uses_all = (
                     self._editing_profile_path is not None
                     and bool(self.approved)
                     and all(existing.view == "all" for existing in self.approved.values())
                 )
                 if profile_uses_all or (
-                    side_valid < min_samples
-                    and sum(
-                        1 for _, value in self._samples_for_view("all").get(key, [])
-                        if value is not None and math.isfinite(value)
-                    ) >= min_samples
+                    all_valid >= min_samples
+                    and (side_valid < min_samples or side_valid < 0.5 * all_valid)
                 ):
                     self.view_combo.blockSignals(True)
                     self.view_combo.setCurrentText("all")

@@ -381,3 +381,45 @@ def test_single_dancer_anchors_skips_trailing_static_poster_frames():
     assert is_static_pose_run(frames, 18) is True
     assert single_dancer_anchors(ev, 0.7) == {0: 0}
 
+
+def test_portrait_video_measures_head_and_trunk_across_full_clip():
+    from tango_posture.domain import FrameObservation
+
+    width, height = 608, 1080
+
+    def portrait_frame(ts: float) -> FrameObservation:
+        # 115 px torso and 30 px ear-shoulder segment: above min(608, 1080) floors
+        # (73.0 px and 24.3 px) while below naive 1080 px floors (129.6 px and 43.2 px).
+        coords = {
+            "nose": (304, 300),
+            "left_ear": (304, 330),
+            "right_ear": (314, 330),
+            "left_shoulder": (304, 360),
+            "right_shoulder": (314, 360),
+            "left_hip": (304, 475),
+            "right_hip": (314, 475),
+            "left_ankle": (304, 700),
+            "right_ankle": (314, 700),
+        }
+        return FrameObservation(
+            ts,
+            width,
+            height,
+            [{k: Landmark(x / width, y / height, 0.99, 0.99) for k, (x, y) in coords.items()}],
+        )
+
+    cfg = Config()
+    obs0 = portrait_frame(0.0)
+    obs1 = portrait_frame(0.1)
+    measured = measure_ranges(obs0, cfg)
+    for key in ("head_forward", "head_inclination", "trunk_inclination"):
+        assert measured.quality[key].valid
+        assert measured.values[key] is not None
+
+    side_samples = metric_samples([obs0, obs1], cfg, view="side")
+    all_samples = metric_samples([obs0, obs1], cfg, view="all")
+    for key in ("head_forward", "head_inclination", "trunk_inclination"):
+        assert all(val is not None for _, val in side_samples[key])
+        assert all(val is not None for _, val in all_samples[key])
+
+
