@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
+import itertools
 import logging
 import tempfile
 from copy import deepcopy
 from pathlib import Path
-from zipfile import ZipFile
 
 import cv2
 import numpy as np
@@ -20,14 +20,16 @@ from tango_posture.pose.recovery import (
     FrameIdentity,
     detect_recovery_windows,
     iter_window_frames_reversed,
-    rebase_pose_recovery,
-    recover_clip_tracking_range,
     run_clip_tracking_recovery,
     validate_pose_recovery_payload,
 )
 from tango_posture.references.archives import promote_reference
 from tango_posture.references.coach import interpolate_coach_data, render_coach_frame_overlay
-from tango_posture.references.companions import load_coach_companion, load_report_coach_data, save_coach_companion
+from tango_posture.references.companions import (
+    load_coach_companion,
+    load_report_coach_data,
+    save_coach_companion,
+)
 from tango_posture.references.errors import ImportCancelledError
 from tango_posture.references.pipeline import analyze_clip
 from tango_posture.review import ReportRecord
@@ -242,7 +244,7 @@ def test_reverse_decoding_frame_order_and_monotonic_synthetic_clock(tmp_path):
     assert seen_frames == sorted(seen_frames, reverse=True)
     # Synthetic detector timestamps (and ms clock) strictly increasing
     seen_ms = [c[2] for c in calls]
-    assert all(b > a for a, b in zip(seen_ms, seen_ms[1:]))
+    assert all(b > a for a, b in itertools.pairwise(seen_ms))
     # Prediction written back to original forward identity for frame 5
     f5 = payload["frames"]["5"]
     assert f5["frame_index"] == 5
@@ -619,8 +621,9 @@ def test_disk_spooling_and_cancellation_cleanup():
 
     # Cancellation during reversed iteration triggers ImportCancelledError and removes spool file
     flag = {"cancel": False}
-    with pytest.raises(ImportCancelledError):
-        with iter_window_frames_reversed(
+    with (
+        pytest.raises(ImportCancelledError),
+        iter_window_frames_reversed(
             None,
             identities,
             expected_width=32,
@@ -628,7 +631,8 @@ def test_disk_spooling_and_cancellation_cleanup():
             max_memory_bytes=200,
             cancel_check=lambda: flag["cancel"],
             frame_provider=provider,
-        ) as rev:
-            for ident, _arr in rev:
-                flag["cancel"] = True
+        ) as rev,
+    ):
+        for ident, _arr in rev:
+            flag["cancel"] = True
     assert set(Path(tempfile.gettempdir()).glob("tp_recovery_*.spool")) == spool_before

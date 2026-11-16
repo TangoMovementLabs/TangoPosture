@@ -6,7 +6,6 @@ import logging
 import math
 import os
 import tempfile
-import threading
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
@@ -16,14 +15,12 @@ from typing import Any
 import cv2
 import numpy as np
 
-from ..calibration.models import profile_from_calibration
 from ..config import Config
 from ..domain import FrameObservation, Landmark, PoseEstimator
-from ..models import analysis_model_path, model_manifest, prepare_analysis_model, verify
+from ..models import analysis_model_path, prepare_analysis_model, verify
 from ..pose.mediapipe_backend import MediaPipeEstimator
 from ..quality import reliable
 from ..references.errors import ImportCancelledError
-from ..references.video import VideoProbeInfo, probe_import_video
 
 logger = logging.getLogger(__name__)
 
@@ -294,9 +291,14 @@ def _torso_geometry_ok(pose: Mapping[str, Landmark], confidence: float) -> bool:
     for side in ("left", "right"):
         sh = pose.get(f"{side}_shoulder")
         hp = pose.get(f"{side}_hip")
-        if sh is not None and hp is not None and reliable(sh, confidence) and reliable(hp, confidence):
-            if math.hypot(sh.x - hp.x, sh.y - hp.y) >= 0.04:
-                return True
+        if (
+            sh is not None
+            and hp is not None
+            and reliable(sh, confidence)
+            and reliable(hp, confidence)
+            and math.hypot(sh.x - hp.x, sh.y - hp.y) >= 0.04
+        ):
+            return True
     return False
 
 
@@ -393,9 +395,9 @@ def _window_intersects_pivot(
             max_w = max(max_w, w)
             if abs(dx) > 0.01:
                 signs.append(1 if dx > 0 else -1)
-    if len(hip_widths) >= 3 and max_w > 0.02 and (min_w / max_w < 0.45 or len(set(signs)) > 1):
-        return True
-    return False
+    return bool(
+        len(hip_widths) >= 3 and max_w > 0.02 and (min_w / max_w < 0.45 or len(set(signs)) > 1)
+    )
 
 
 def detect_recovery_windows(
@@ -449,7 +451,15 @@ def detect_recovery_windows(
         gap_pos_start: int | None = None
         gap_affected: set[str] = set()
 
-        def _flush_gap(start_pos: int, end_pos: int, joints: set[str]) -> None:
+        def _flush_gap(
+            start_pos: int,
+            end_pos: int,
+            joints: set[str],
+            *,
+            segment: list[FrameIdentity] = segment,
+            shot_idx: int = shot_idx,
+            track_key: str = track_key,
+        ) -> None:
             gap_t0 = segment[start_pos].source_time
             gap_t1 = segment[end_pos].source_time
             prev_anchor_t = segment[start_pos - 1].source_time if start_pos > 0 else gap_t0
@@ -737,7 +747,7 @@ def iter_window_frames_reversed(
             first_frame_idx = target_indices[0]
             if first_frame_idx > 0:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, float(first_frame_idx))
-                actual_pos = int(round(float(cap.get(cv2.CAP_PROP_POS_FRAMES) or 0.0)))
+                actual_pos = round(float(cap.get(cv2.CAP_PROP_POS_FRAMES) or 0.0))
                 if actual_pos > first_frame_idx:
                     cap.set(cv2.CAP_PROP_POS_FRAMES, 0.0)
                     actual_pos = 0
@@ -772,10 +782,11 @@ def iter_window_frames_reversed(
                     # Check PTS consistency when container provides non-zero moving timestamps
                     if raw_msec > 0.0 and ident.source_time > 0.0:
                         rel_t = raw_sec - (first_pts if first_pts is not None else 0.0)
-                        if abs(rel_t - ident.source_time) > max(time_tol, 0.25):
-                            # Check direct raw_sec too in case first_pts was zero-anchored
-                            if abs(raw_sec - ident.source_time) > max(time_tol, 0.25):
-                                raise ValueError("Frame alignment mismatch")
+                        if (
+                            abs(rel_t - ident.source_time) > max(time_tol, 0.25)
+                            and abs(raw_sec - ident.source_time) > max(time_tol, 0.25)
+                        ):
+                            raise ValueError("Frame alignment mismatch")
 
             if image is None or image.shape[1] != expected_width or image.shape[0] != expected_height:
                 raise ValueError("Frame alignment mismatch")
@@ -869,7 +880,7 @@ def run_backward_window_inference(
             for ident, image in rev_frames:
                 if cancel_check is not None and cancel_check():
                     raise ImportCancelledError("Tracking recovery was cancelled")
-                raw_ms = int(round((t_last - ident.source_time) * 1000.0))
+                raw_ms = round((t_last - ident.source_time) * 1000.0)
                 synthetic_ms = max(prev_ms + 1, raw_ms)
                 prev_ms = synthetic_ms
                 obs = estimator.estimate(image, synthetic_ms / 1000.0)
@@ -1124,13 +1135,13 @@ def _format_frame_status_summary(
     parts: list[str] = []
     if backward_joints:
         focus = next(
-            (j for j in backward_joints if j.endswith("_ankle") or j.endswith("_knee")),
+            (j for j in backward_joints if j.endswith(("_ankle", "_knee"))),
             backward_joints[0],
         )
         parts.append(f"{_human_joint_label(focus)} estimated from backward pass")
     elif interp_joints:
         focus = next(
-            (j for j in interp_joints if j.endswith("_ankle") or j.endswith("_knee")),
+            (j for j in interp_joints if j.endswith(("_ankle", "_knee"))),
             interp_joints[0],
         )
         parts.append(f"{_human_joint_label(focus)} interpolated")
@@ -1451,7 +1462,8 @@ def run_clip_tracking_recovery(
     model_variant = str(coach_data.get("model_variant") or cfg.analysis_model)
     dancer_selection = coach_data.get("dancer_selection") if isinstance(coach_data.get("dancer_selection"), dict) else None
 
-    frames_map = coach_data.get("frames") if isinstance(coach_data.get("frames"), Mapping) else {}
+    raw_frames_obj = coach_data.get("frames")
+    frames_map: Mapping[str, Any] = raw_frames_obj if isinstance(raw_frames_obj, Mapping) else {}
     forward_poses: dict[int, dict[str, Landmark]] = {
         int(k): _extract_raw_pose(entry)
         for k, entry in frames_map.items()
@@ -1550,7 +1562,7 @@ def run_clip_tracking_recovery(
             all_estimates.update(win_estimates)
         except ImportCancelledError:
             raise
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001 - preserve forward tracking on recovery failure
             unresolved_windows += 1
             failure_messages.append(str(exc))
             logger.warning("Tracking recovery failed on window %s: %s", win.window_id, exc)
@@ -1766,7 +1778,7 @@ def validate_pose_recovery_payload(
     while keeping the base forward analytics usable.
     """
     if not isinstance(payload, Mapping):
-        raise ValueError("pose_recovery payload must be a mapping")
+        raise ValueError("pose_recovery payload must be a mapping")  # noqa: TRY004
     if payload.get("schema_version") != POSE_RECOVERY_SCHEMA_VERSION:
         raise ValueError(f"Unsupported pose_recovery schema_version: {payload.get('schema_version')!r}")
     status = payload.get("status")
@@ -1782,9 +1794,12 @@ def validate_pose_recovery_payload(
         raise ValueError("pose_recovery source_width does not match video width")
     if source_height and payload.get("source_height") and int(payload["source_height"]) != int(source_height):
         raise ValueError("pose_recovery source_height does not match video height")
-    if dancer_selection is not None and payload.get("dancer_selection") is not None:
-        if payload.get("dancer_selection") != dict(dancer_selection):
-            raise ValueError("pose_recovery dancer_selection does not match current subject assignment")
+    if (
+        dancer_selection is not None
+        and payload.get("dancer_selection") is not None
+        and payload.get("dancer_selection") != dict(dancer_selection)
+    ):
+        raise ValueError("pose_recovery dancer_selection does not match current subject assignment")
 
     payload_count = payload.get("frame_count")
     if frame_count is not None and isinstance(payload_count, int) and payload_count != frame_count:
@@ -1801,7 +1816,7 @@ def validate_pose_recovery_payload(
         raise ValueError("Invalid pose_recovery windows list")
     for w in windows:
         if not isinstance(w, Mapping):
-            raise ValueError("Invalid pose_recovery window entry")
+            raise ValueError("Invalid pose_recovery window entry")  # noqa: TRY004
         wsf = w.get("window_start_frame")
         wef = w.get("window_end_frame")
         if type(wsf) is not int or type(wef) is not int or wsf < 0 or wef < wsf:
@@ -1829,7 +1844,7 @@ def validate_pose_recovery_payload(
         idx = int(raw_key)
         entry = frames[raw_key]
         if not isinstance(entry, Mapping):
-            raise ValueError("Invalid pose_recovery frame entry")
+            raise ValueError("Invalid pose_recovery frame entry")  # noqa: TRY004
         if idx < 0 or (
             valid_frame_indices is not None and idx not in valid_frame_indices
         ) or (valid_frame_indices is None and frame_count is not None and idx >= frame_count):
@@ -1849,10 +1864,10 @@ def validate_pose_recovery_payload(
                 raise ValueError("pose_recovery frame timestamps disagree with recording timeline")
         landmarks = entry.get("landmarks")
         if not isinstance(landmarks, Mapping):
-            raise ValueError("Invalid pose_recovery landmarks")
+            raise ValueError("Invalid pose_recovery landmarks")  # noqa: TRY004
         for jname, lm in landmarks.items():
             if not isinstance(lm, Mapping):
-                raise ValueError("Invalid pose_recovery landmark record")
+                raise ValueError("Invalid pose_recovery landmark record")  # noqa: TRY004
             origin = lm.get("origin")
             if origin not in VALID_ORIGINS:
                 raise ValueError(f"Invalid landmark origin in pose_recovery: {origin!r}")
@@ -1877,7 +1892,8 @@ def rebase_pose_recovery(
     if payload is None or not isinstance(payload, Mapping):
         return None
     start = max(0, int(start_frame))
-    raw_frames = payload.get("frames") if isinstance(payload.get("frames"), Mapping) else {}
+    raw_frames_obj = payload.get("frames")
+    raw_frames: Mapping[str, Any] = raw_frames_obj if isinstance(raw_frames_obj, Mapping) else {}
     rebased_frames: dict[str, Any] = {}
     for raw_key, entry in raw_frames.items():
         if not str(raw_key).isdigit() or not isinstance(entry, Mapping):
@@ -1890,7 +1906,8 @@ def rebase_pose_recovery(
         rebased_entry["frame_index"] = new_idx
         rebased_frames[str(new_idx)] = rebased_entry
 
-    raw_windows = payload.get("windows") if isinstance(payload.get("windows"), list) else []
+    raw_windows_obj = payload.get("windows")
+    raw_windows: list[Any] = raw_windows_obj if isinstance(raw_windows_obj, list) else []
     rebased_windows: list[dict[str, Any]] = []
     max_new_frame = (end_frame - start - 1) if end_frame is not None else None
     for win in raw_windows:

@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
 from ...calibration.models import METRIC_DETAILS
 from ...config import (
     SETTING_DESCRIPTIONS,
+    SETTING_ENGINE_SCOPES,
     SETTING_GROUPS,
     Config,
     RangeDefault,
@@ -159,36 +160,61 @@ def load_parameter_guides() -> dict[str, dict[str, str]]:
             }
     return guides
 
+_SCOPE_SUMMARIES = {
+    "All": (
+        "Showing all 15 configuration tabs across Common (Both Engines), Single Dancer Engine, "
+        "and Couple Dancer Engine."
+    ),
+    "Common (Both Engines)": (
+        "Shared settings used by both engines: pose models, Auto scene routing, detection confidence, "
+        "music defaults, and Ollama Review coaching."
+    ),
+    "Single Dancer Engine": (
+        "Settings exclusive to the Solo Dancer Engine: side/view calibration, 33-landmark posture alerts, "
+        "embrace/knee heuristics, footwork, gap recovery, normalization, and calibration defaults."
+    ),
+    "Couple Dancer Engine": (
+        "Settings exclusive to the Couple Dancer Engine: two-dancer identity assignment, pair torso axes, "
+        "velocity/coordination lag thresholds, transitions, and turn suggestions."
+    ),
+}
+
 _GROUP_HINTS = {
-    "Quality & calibration": (
-        "Quality controls determine whether evidence is usable, not whether posture is correct. "
-        "Approve reference ranges using example passages, acceptable limits and per-metric views "
-        "in the calibration editor."
+    "Common · Scene Routing": (
+        "Common engine router settings governing Auto detection over the opening clip window and "
+        "co-movement qualification between Single and Couple engines."
     ),
-    "Head & shoulders": (
-        "Fallback descriptive warning controls. A selected calibration or enabled Calibration "
-        "defaults supplies approved ranges instead; missing metrics do not fall back here. "
-        "Review alerts require a selected calibration file."
+    "Common · Detection / Music": (
+        "Shared MediaPipe landmark confidence, continuous observation gap ceiling, overlay line "
+        "smoothing, fallback tempo, and soundtrack beat extraction."
     ),
-    "Embrace & knees": (
-        "Role/embrace recognition runs independently of calibration. Knee-warning thresholds "
+    "Single · Quality / Calibration": (
+        "Single-dancer quality controls determine whether evidence is usable, not whether posture is "
+        "correct. Approve reference ranges using example passages and acceptable limits in Calibration."
+    ),
+    "Single · Head / Shoulders": (
+        "Fallback descriptive warning controls for Single Dancer Engine. A selected calibration or enabled "
+        "Calibration defaults supplies approved ranges instead; Review alerts require a selected calibration file."
+    ),
+    "Single · Embrace / Knees": (
+        "Single-dancer role/embrace recognition runs independently of calibration. Knee-warning thresholds "
         "are fallbacks, replaced by selected calibration ranges or enabled Calibration defaults."
     ),
-    "Torso & hip offset": (
-        "Fallback hip-offset controls, not pink torso-line tilt. Selected calibration ranges "
-        "or enabled Calibration defaults replace these posture limits."
+    "Single · Torso / Footwork": (
+        "Single-dancer fallback hip-offset and slow-tango ankle-lift controls. Selected calibration ranges "
+        "or enabled Calibration defaults replace posture limits; tempo ceiling is compared against Common · Detection / Music."
     ),
-    "Music": (
-        "This fallback tempo is the input, not the Slow tango max BPM cutoff. Library/Review "
-        "analysis does not detect soundtrack BPM or show fallback lift alerts."
+    "Single · Replay / Recovery": (
+        "Single-dancer Review footprint trail, backward lower-limb tracking recovery, and display-only "
+        "skeleton gap interpolation settings."
     ),
-    "Slow tango": (
-        "The BPM ceiling gates the ankle-lift cue, not video playback or footprint detection. "
-        "It is compared with the fallback tempo in Music when no soundtrack BPM is available."
+    "Couple · Tracking / Interpolation": (
+        "Couple-only identity matching innovation/margin gates, continuous tracking span gap limits, "
+        "and pair display-only 2D interpolation."
     ),
-    "Analysis": (
-        "Controls Single, Couple, and Auto opening-window scene detection, two-dancer tracking gates, "
-        "display-only gap interpolation, and couple movement/transition/turn analysis thresholds."
+    "Couple · Axes / Coordination": (
+        "Couple-only center-of-mass velocity regression, start/slow/settle persistence and pairing windows, "
+        "transition smoothness coverage, and optional turn marker suggestions."
     ),
 }
 
@@ -202,6 +228,8 @@ class SettingsScreen(QScrollArea):
         self.range_widgets: dict[str, tuple[QCheckBox, QDoubleSpinBox, QDoubleSpinBox, QComboBox]] = {}
         self.help_toggles: dict[str, QPushButton] = {}
         self.help_panels: dict[str, QFrame] = {}
+        self.scope_buttons: dict[str, QPushButton] = {}
+        self._current_engine_scope = "All"
         self._parameter_guides = load_parameter_guides()
         self.setWidgetResizable(True)
         self.setFrameShape(QFrame.Shape.NoFrame)
@@ -217,7 +245,7 @@ class SettingsScreen(QScrollArea):
         title = QLabel("Application Settings")
         title.setProperty("class", "title")
         subtitle = QLabel(
-            "Configure video analysis, algorithmic geometry parameters, reference comparison, review, and Ollama options."
+            "Configure shared engine routing & models, Solo Dancer posture/footwork, and Couple Axis/Coordination parameters."
         )
         subtitle.setProperty("class", "subtitle")
         title_box.addWidget(title)
@@ -240,6 +268,27 @@ class SettingsScreen(QScrollArea):
         header.addWidget(self.reset_btn)
         layout.addLayout(header)
 
+        scope_bar = QHBoxLayout()
+        scope_bar.setContentsMargins(0, 0, 0, 0)
+        scope_bar.setSpacing(8)
+        scope_lbl = QLabel("Engine scope:")
+        scope_lbl.setStyleSheet(f"color: {COLOR_TEXT_MUTED}; font-weight: 600;")
+        scope_bar.addWidget(scope_lbl)
+        for scope_name in ("All", *SETTING_ENGINE_SCOPES):
+            btn = QPushButton(scope_name)
+            btn.setCheckable(True)
+            btn.setChecked(scope_name == "All")
+            btn.clicked.connect(lambda _checked=False, s=scope_name: self.set_engine_scope(s))
+            self.scope_buttons[scope_name] = btn
+            scope_bar.addWidget(btn)
+        scope_bar.addStretch()
+        layout.addLayout(scope_bar)
+
+        self.scope_summary_label = QLabel(_SCOPE_SUMMARIES["All"])
+        self.scope_summary_label.setWordWrap(True)
+        self.scope_summary_label.setStyleSheet(f"color: {COLOR_TEXT_MUTED}; font-size: 12px;")
+        layout.addWidget(self.scope_summary_label)
+
         self.tabs = QTabWidget()
         self.tabs.setDocumentMode(True)
         cfg = self.bridge.config
@@ -251,7 +300,7 @@ class SettingsScreen(QScrollArea):
                 hint = QLabel(_GROUP_HINTS[group])
                 hint.setWordWrap(True)
                 form.addRow(hint)
-            if group == "Files":
+            if group == "Common · Files / Models":
                 model_hint = QLabel(
                     "Offline analysis uses the model selected below. The Lite model file supplies "
                     "the Lite path; Full and Heavy use their own files. Missing models are downloaded "
@@ -695,9 +744,33 @@ class SettingsScreen(QScrollArea):
         if hasattr(self, "normalization_panel"):
             self.normalization_panel.refresh_library_choices()
 
+    def set_engine_scope(self, scope: str) -> None:
+        resolved = scope if scope in ("All", *SETTING_ENGINE_SCOPES) else "All"
+        self._current_engine_scope = resolved
+        for name, btn in self.scope_buttons.items():
+            btn.blockSignals(True)
+            btn.setChecked(name == resolved)
+            btn.blockSignals(False)
+        self.scope_summary_label.setText(_SCOPE_SUMMARIES[resolved])
+        allowed = None if resolved == "All" else set(SETTING_ENGINE_SCOPES[resolved])
+        first_visible: int | None = None
+        for index in range(self.tabs.count()):
+            visible = allowed is None or self.tabs.tabText(index) in allowed
+            self.tabs.setTabVisible(index, visible)
+            if visible and first_visible is None:
+                first_visible = index
+        cur_idx = self.tabs.currentIndex()
+        if (
+            cur_idx < 0
+            or not self.tabs.isTabVisible(cur_idx)
+        ) and first_visible is not None:
+            self.tabs.setCurrentIndex(first_visible)
+
     def open_measurement_normalization(self, payload: dict[str, Any]) -> None:
         for index in range(self.tabs.count()):
             if self.tabs.tabText(index) == "Measurement normalization":
+                if not self.tabs.isTabVisible(index):
+                    self.set_engine_scope("Single Dancer Engine")
                 self.tabs.setCurrentIndex(index)
                 break
         if hasattr(self, "normalization_panel"):

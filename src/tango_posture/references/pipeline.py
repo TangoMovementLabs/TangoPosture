@@ -4,81 +4,45 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import math
 import time
 from collections.abc import Callable
 from contextlib import suppress
-from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
 from ..archive import file_sha256
-from ..calibration.baseline import calibrate, profile
+from ..calibration.baseline import profile
 from ..calibration.readiness import check_calibration_readiness
 from ..config import Config
 from ..couple import (
     AutoDecisionResult,
     CoupleAnalysisRequest,
     classify_opening_window,
-    extract_single_target_observations,
     resolve_close_embrace_frame_poses,
-    run_couple_analysis,
 )
-from ..couple.tracking import (
-    _pose_torso_mid_norm,
-    _translate_pose,
-    _wide_ankle_span_for_pair,
+from ..couple.tracking import _wide_ankle_span_for_pair
+from ..domain import Calibration, FrameObservation, PoseEstimator
+from ..engines import (
+    CommonEngineContext,
+    build_needs_selection_result,
+    run_couple_dancer_engine,
+    run_solo_dancer_engine,
 )
-from ..domain import (
-    METRIC_VERSION,
-    Calibration,
-    FrameObservation,
-    MetricObservation,
-    PoseEstimator,
-)
-from ..geometry import (
-    AnkleStepTracker,
-    AxisCurveTracker,
-    EmbraceTracker,
-    PoseSmoother,
-    RoleTracker,
-    axis_curve_alignment,
-    calculate,
-    detect_role,
-    head_horizontal_alignment,
-    knee_bend_alignment,
-    knee_geometry_kwargs,
-    pixel,
-    shoulder_geometry_kwargs,
-    shoulder_tension_alignment,
-    torso_axis_alignment,
-)
-from ..metrics import measure
 from ..models import analysis_model_path, model_manifest, prepare_analysis_model, verify
-from ..movement import analyse_movement_observations
 from ..pose.mediapipe_backend import MediaPipeEstimator
-from ..pose.recovery import run_clip_tracking_recovery
 from ..reports import write_markdown_report
 from ..review import write_metadata
-from ..session import Session
 from ..storage import Storage
-from .coach import (
-    _AlertTimers,
-    _build_coach_frame_entry,
-    _movement_note_lines,
-    _serialise_pose,
-    interpolate_coach_data,
-)
+from .coach import _build_coach_frame_entry
 from .companions import save_coach_companion, save_couple_companion, save_movement_companion
 from .constants import MAX_IMPORT_RANGE_SECONDS
-from .coverage import _compute_family_coverage
 from .downloads import download_facebook_reel, download_youtube_video, imports_directory
 from .errors import ImportCancelledError
 from .links import YouTubeClockAlignment, parse_facebook_reel_url, parse_youtube_url
-from .results import ClipAnalysisResult, ImportedClipResult, RunManifest
-from .soundtrack import SoundtrackAnalysisSummary, analyse_video_soundtrack
+from .results import ClipAnalysisResult, ImportedClipResult
+from .soundtrack import analyse_video_soundtrack
 from .video import VideoProbeInfo, iter_virtual_clip_frames, probe_import_video, validate_clip_range
 
 logger = logging.getLogger(__name__)
@@ -321,67 +285,43 @@ def analyze_clip(
         "dropped_frames": 0,
         "timestamp_fallback": False,
     }
+    raw_observations = [(f_idx, f_obs) for f_idx, _, _, f_obs in decoded_frames]
 
     if selection_required:
-        manifest = RunManifest(
-            model_variant=cfg.analysis_model,
+        ctx = CommonEngineContext(
+            probe=probe,
+            cfg=cfg,
+            model_path=model_path,
             model_hash=model_hash,
-            metric_version=METRIC_VERSION,
-            capture_profile=cap_profile,
-            source_sha256=source_sha,
-            source_filename=probe.path.name,
-            width=probe.width,
-            height=probe.height,
-            fps=probe.fps,
-            selected_in=clip_in,
-            selected_out=clip_out,
+            source_sha=source_sha,
+            clip_in=clip_in,
+            clip_out=clip_out,
             clip_duration=clip_duration,
-            analysis_mode=analysis_mode,
-            processed_fps=processed_fps,
-            requested_dancer_mode=requested_mode,
-            resolved_dancer_mode="needs_selection",
-            detector_version="couple_auto_v1",
-        )
-        return ClipAnalysisResult(
-            manifest=manifest,
-            video_path=probe.path,
-            title=clean_title,
-            source_sha256=source_sha,
-            selected_in=clip_in,
-            selected_out=clip_out,
-            clip_duration=clip_duration,
-            analysis_mode=analysis_mode,
+            clean_title=clean_title,
+            cap_profile=cap_profile,
             readiness=readiness,
-            reference=reference if analysis_mode == "posture" else None,
-            calibration_window=(
-                (float(calibration_interval[0]), float(calibration_interval[1]))
-                if analysis_mode == "posture" and calibration_interval is not None
-                else None
-            ),
-            coach_data={},
-            movement_data={},
-            soundtrack=SoundtrackAnalysisSummary(
-                enabled=effective_soundtrack,
-                available=False,
-                status="disabled",
-                reason="Stopped for manual Single/Couple selection",
-            ),
-            coverage={},
-            frame_log=[],
-            scored_frame_log=[],
-            frame_observations=[],
+            decoded_frames=decoded_frames,
+            raw_observations=raw_observations,
+            auto_observations=auto_observations,
+            frame_times=frame_times,
+            auto_decision=auto_decision,
+            requested_mode=requested_mode,
+            resolved_mode="needs_selection",
+            request_obj=request_obj,
             performance=performance,
-            requested_dancer_mode=requested_mode,
-            resolved_dancer_mode="needs_selection",
-            auto_decision=auto_decision.to_dict(),
-            couple_result=None,
-            selection_required=True,
+            processed_fps=processed_fps,
+            analysis_mode=analysis_mode,
+        )
+        return build_needs_selection_result(
+            ctx,
+            reference=reference,
+            calibration_interval=calibration_interval,
+            effective_soundtrack=effective_soundtrack,
         )
 
     resolved_mode = (
         "single" if auto_decision.resolved_mode == "needs_selection" else auto_decision.resolved_mode
     )
-    raw_observations = [(f_idx, f_obs) for f_idx, _, _, f_obs in decoded_frames]
 
     if progress_callback is not None:
         progress_callback(80, 100, "Analysing soundtrack & movement…")
@@ -396,840 +336,50 @@ def analyze_clip(
         video_first_pts_seconds=probe.first_pts_seconds,
     )
 
-    if resolved_mode == "couple":
-        # Dedicated Couple Axis & Coordination Engine (strictly segregated from Single-dancer engine)
-        couple_observations = list(auto_observations) if auto_observations else list(raw_observations)
-        if estimator_factory is None and any(len(obs.poses) == 1 for _, obs in couple_observations):
-            import mediapipe as mp
-
-            pair_det = mp.tasks.vision.PoseLandmarker.create_from_options(
-                mp.tasks.vision.PoseLandmarkerOptions(
-                    base_options=mp.tasks.BaseOptions(
-                        model_asset_path=str(model_path),
-                        delegate=mp.tasks.BaseOptions.Delegate.CPU,
-                    ),
-                    running_mode=mp.tasks.vision.RunningMode.IMAGE,
-                    num_poses=2,
-                    min_pose_detection_confidence=0.35,
-                    min_pose_presence_confidence=0.35,
-                )
-            )
-            obs_by_idx = {f_idx: obs for f_idx, obs in couple_observations}
-            total_frames_n = len(couple_observations)
-            resolved_map: dict[int, FrameObservation] = {}
-            last_split_pos: int | None = None
-            last_primary_mid: tuple[float, float] | None = None
-            last_split_pair: list[dict[str, Any]] | None = None
-            try:
-                for pos, item in enumerate(
-                    iter_virtual_clip_frames(
-                        probe.path,
-                        clip_in,
-                        clip_out,
-                        probe=probe,
-                        cancel_check=cancel_check,
-                    )
-                ):
-                    if cancel_check is not None and cancel_check():
-                        raise ImportCancelledError("Couple analysis was cancelled")
-                    cur_obs = obs_by_idx.get(item.frame_index)
-                    if cur_obs is None:
-                        continue
-                    if len(cur_obs.poses) == 1:
-                        primary_pose = cur_obs.poses[0]
-                        cur_mid = _pose_torso_mid_norm(primary_pose, cfg.confidence)
-                        propagated = False
-                        if (
-                            pos % 3 != 0
-                            and last_split_pos is not None
-                            and (pos - last_split_pos) <= 2
-                            and last_split_pair is not None
-                            and last_primary_mid is not None
-                            and cur_mid is not None
-                        ):
-                            dx = cur_mid[0] - last_primary_mid[0]
-                            dy = cur_mid[1] - last_primary_mid[1]
-                            if math.hypot(dx, dy) <= 0.05:
-                                split_poses = [_translate_pose(p, dx, dy) for p in last_split_pair]
-                                cur_obs = FrameObservation(
-                                    cur_obs.timestamp, cur_obs.width, cur_obs.height, split_poses
-                                )
-                                propagated = True
-                        if not propagated:
-                            split_poses = resolve_close_embrace_frame_poses(
-                                item.image,
-                                primary_pose,
-                                pair_det,
-                                cur_obs.width,
-                                cur_obs.height,
-                                cfg,
-                            )
-                            if len(split_poses) >= 2:
-                                cur_obs = FrameObservation(
-                                    cur_obs.timestamp, cur_obs.width, cur_obs.height, split_poses
-                                )
-                                last_split_pos = pos
-                                last_primary_mid = cur_mid
-                                last_split_pair = split_poses
-                            else:
-                                last_split_pos = None
-                                last_primary_mid = None
-                                last_split_pair = None
-                    elif len(cur_obs.poses) >= 2:
-                        last_split_pos = None
-                        last_primary_mid = None
-                        last_split_pair = None
-                    resolved_map[item.frame_index] = cur_obs
-                    if progress_callback is not None and (pos % 10 == 0 or pos + 1 >= total_frames_n):
-                        pct = min(92, 80 + round(((pos + 1) / max(1, total_frames_n)) * 12))
-                        progress_callback(
-                            pct,
-                            100,
-                            f"Resolving close-embrace couple axes ({pos + 1}/{total_frames_n})…",
-                        )
-            finally:
-                with suppress(Exception):
-                    pair_det.close()
-            if resolved_map:
-                couple_observations = [
-                    (f_idx, resolved_map.get(f_idx, obs)) for f_idx, obs in couple_observations
-                ]
-
-        beat_timestamps: list[float] = []
-        if soundtrack_summary.enabled and soundtrack_summary.frame_states:
-            prev_beat: int | None = None
-            for f_idx, _, _ in frame_times:
-                st = soundtrack_summary.frame_states.get(f_idx)
-                if not st or not st.get("playing"):
-                    prev_beat = None
-                    continue
-                b_num = st.get("beat")
-                if isinstance(b_num, int) and b_num > 0 and b_num != prev_beat:
-                    src_t = st.get("source_time")
-                    if src_t is not None:
-                        beat_timestamps.append(float(src_t))
-                prev_beat = b_num if isinstance(b_num, int) and b_num > 0 else None
-
-        couple_res = run_couple_analysis(
-            couple_observations,
-            cfg,
-            clip_in=clip_in,
-            clip_out=clip_out,
-            video_sha256=source_sha,
-            request=request_obj,
-            auto_decision=auto_decision,
-            soundtrack_beats=beat_timestamps,
-        )
-        couple_result_dict = couple_res.to_dict()
-        total_source_frames = max(probe.frame_count, decoded_frames[-1][0] + 1)
-        empty_obs = [
-            (f_idx, FrameObservation(s_time, probe.width, probe.height, []))
-            for f_idx, s_time, _ in frame_times
-        ]
-        movement_data = analyse_movement_observations(
-            empty_obs,
-            width=probe.width,
-            height=probe.height,
-            fps=probe.fps,
-            frame_count=total_source_frames,
-            sample_stride=1,
-            model_hash=model_hash,
-            source_sha256=source_sha,
-            segment_index=-1,
-            source_member=probe.path.name,
-        )
-        couple_coach_data: dict[str, Any] = {
-            "version": 1,
-            "model_hash": model_hash,
-            "model_variant": cfg.analysis_model,
-            "capture_profile": cap_profile,
-            "source_sha256": source_sha,
-            "width": probe.width,
-            "height": probe.height,
-            "fps": probe.fps,
-            "clip_in": round(clip_in, 4),
-            "clip_out": round(clip_out, 4),
-            "neutral_offset": cfg.head_neutral_offset,
-            "axis_neutral_offset": cfg.axis_neutral_offset,
-            "settings_coaching": False,
-            "couple_analysis": couple_result_dict,
-            "frames": {
-                str(f_idx): {
-                    "timestamp": round(float(s_time), 4),
-                    "clip_timestamp": round(float(c_time), 4),
-                    "poses": [],
-                    "measurement_poses": [],
-                }
-                for f_idx, s_time, c_time in frame_times
-            },
-        }
-        couple_frame_log: list[dict[str, Any]] = [
-            {
-                "frame_index": f_idx,
-                "timestamp": s_time,
-                "clip_timestamp": c_time,
-                "in_calibration_window": False,
-            }
-            for f_idx, s_time, c_time in frame_times
-        ]
-        manifest = RunManifest(
-            model_variant=cfg.analysis_model,
-            model_hash=model_hash,
-            metric_version=METRIC_VERSION,
-            capture_profile=cap_profile,
-            source_sha256=source_sha,
-            source_filename=probe.path.name,
-            width=probe.width,
-            height=probe.height,
-            fps=probe.fps,
-            selected_in=clip_in,
-            selected_out=clip_out,
-            clip_duration=clip_duration,
-            analysis_mode=analysis_mode,
-            processed_fps=processed_fps,
-            requested_dancer_mode=requested_mode,
-            resolved_dancer_mode="couple",
-            detector_version="couple_auto_v1",
-        )
-        return ClipAnalysisResult(
-            manifest=manifest,
-            video_path=probe.path,
-            title=clean_title,
-            source_sha256=source_sha,
-            selected_in=clip_in,
-            selected_out=clip_out,
-            clip_duration=clip_duration,
-            analysis_mode=analysis_mode,
-            readiness=readiness,
-            reference=None,
-            calibration_window=None,
-            coach_data=couple_coach_data,
-            movement_data=movement_data,
-            soundtrack=soundtrack_summary,
-            coverage={},
-            frame_log=couple_frame_log,
-            scored_frame_log=couple_frame_log,
-            frame_observations=decoded_frames,
-            performance=performance,
-            session_id=None,
-            session_summary=None,
-            session_events=None,
-            pose_recovery=None,
-            requested_dancer_mode=requested_mode,
-            resolved_dancer_mode="couple",
-            auto_decision=auto_decision.to_dict(),
-            couple_result=couple_result_dict,
-            selection_required=False,
-        )
-
-    # Single Dancer Engine (identical pre-Couple pipeline unless user pinned an anchor or ROI)
-    single_anchor = anchors[0] if anchors else None
-    if single_anchor is not None or analysis_region is not None:
-        filtered_single = extract_single_target_observations(
-            raw_observations,
-            cfg,
-            anchor=single_anchor,
-            analysis_region=analysis_region,
-        )
-        decoded_frames = [
-            (f_idx, s_time, c_time, f_obs)
-            for (f_idx, s_time, c_time, _), (_, f_obs) in zip(decoded_frames, filtered_single)
-        ]
-
-    active_reference: Calibration | None = reference if analysis_mode == "posture" else None
-    cal_window: tuple[float, float] | None = (
-        (float(calibration_interval[0]), float(calibration_interval[1]))
-        if analysis_mode == "posture" and calibration_interval is not None
-        else None
-    )
-
-    if analysis_mode == "posture" and active_reference is None and cal_window is not None:
-        cal_in, cal_out = cal_window
-        cal_samples: list[MetricObservation] = []
-        cal_head_angles: list[float] = []
-        cal_shoulder_clearances: list[float] = []
-        cal_axis_offsets: list[float] = []
-        for _, source_time, _, frame_obs in decoded_frames:
-            if cal_in - 1e-6 <= source_time <= cal_out + 1e-6:
-                cal_samples.append(measure(frame_obs, cfg, None))
-                if len(frame_obs.poses) == 1:
-                    pose = frame_obs.poses[0]
-                    raw_head = head_horizontal_alignment(
-                        pose, frame_obs.width, frame_obs.height, neutral_offset=0.0
-                    )
-                    if raw_head is not None:
-                        cal_head_angles.append(raw_head[0])
-                    sh_info = shoulder_tension_alignment(
-                        pose,
-                        frame_obs.width,
-                        frame_obs.height,
-                        neutral_clearance=cfg.shoulder_neutral_clearance,
-                        **shoulder_geometry_kwargs(cfg),
-                    )
-                    if sh_info is not None:
-                        cal_shoulder_clearances.append(sh_info[1])
-                    ax_info = axis_curve_alignment(
-                        pose,
-                        frame_obs.width,
-                        frame_obs.height,
-                        facing=cfg.facing,
-                        side=cfg.side,
-                        neutral_offset=cfg.axis_neutral_offset,
-                    )
-                    if ax_info is not None:
-                        cal_axis_offsets.append(ax_info[1])
-        cal_cfg = cfg.model_copy(
-            update={
-                "calibration_duration": max(
-                    float(cal_out - cal_in), float(cfg.calibration_valid_duration)
-                )
-            }
-        )
-        active_reference = calibrate(
-            cal_samples,
-            cal_in,
-            cal_cfg,
-            cap_profile,
-            model_hash,
-            name=f"{title or probe.path.stem} clip reference",
-            review={
-                "label": "imported-clip-interval",
-                "interval": [round(cal_in, 3), round(cal_out, 3)],
-            },
-        )
-        if cal_head_angles:
-            active_reference.quality["head_neutral_offset"] = float(np.median(cal_head_angles))
-        if cal_shoulder_clearances:
-            active_reference.quality["shoulder_neutral_clearance"] = float(
-                np.median(cal_shoulder_clearances)
-            )
-        if cal_axis_offsets:
-            active_reference.quality["axis_neutral_offset"] = float(np.median(cal_axis_offsets))
-
-    role_tracker = RoleTracker(assign_ms=cfg.role_assign_ms, hold_ms=cfg.role_hold_ms)
-    embrace_tracker = EmbraceTracker(
-        closed_threshold=cfg.embrace_closed_threshold,
-        switch_sec=cfg.embrace_hysteresis_seconds,
-    )
-    axis_tracker = AxisCurveTracker(
-        entry=cfg.axis_curve_entry,
-        clear=cfg.axis_curve_clear,
-        entry_duration=cfg.axis_curve_duration,
-        clear_duration=cfg.axis_curve_clear_duration,
-        smoothing=cfg.smoothing,
-        max_gap=cfg.max_gap,
-    )
-    ankle_tracker = AnkleStepTracker(
-        high_lift_ratio=cfg.ankle_high_lift_ratio,
-        max_consecutive_steps=cfg.max_consecutive_high_ankle_steps,
-        slow_tango_max_bpm=cfg.slow_tango_max_bpm,
-        max_gap=cfg.max_gap,
-    )
-
-    session: Session | None = None
-    if active_reference is not None:
-        if storage is not None:
-            storage.save_calibration(active_reference)
-        scored_start = (
-            cal_window[1]
-            if cal_window is not None and cal_window[0] <= clip_in + 1e-3
-            else clip_in
-        )
-        session = Session(
-            active_reference,
-            cfg,
-            storage,
-            scored_start,
-            f"import:{probe.path.name}",
-            {"model_hash": model_hash, "metric_version": METRIC_VERSION},
-        )
-
-    head_smoothed: float | None = None
-    head_last_ts: float | None = None
-    shoulder_smoothed: float | None = None
-    shoulder_last_ts: float | None = None
-    knee_smoothed: float | None = None
-    knee_last_ts: float | None = None
-    relaxed_clearances: list[float] = []
-    frame_log: list[dict[str, Any]] = []
-
-    neutral_offset = (
-        float(active_reference.quality["head_neutral_offset"])
-        if active_reference and "head_neutral_offset" in active_reference.quality
-        else cfg.head_neutral_offset
-    )
-    sh_neutral_base = (
-        float(active_reference.quality["shoulder_neutral_clearance"])
-        if active_reference and "shoulder_neutral_clearance" in active_reference.quality
-        else cfg.shoulder_neutral_clearance
-    )
-    axis_neutral = (
-        float(active_reference.quality["axis_neutral_offset"])
-        if active_reference and "axis_neutral_offset" in active_reference.quality
-        else cfg.axis_neutral_offset
-    )
-    view_range = (
-        tuple(active_reference.quality["view_range"])
-        if active_reference and "view_range" in active_reference.quality
-        else None
-    )
-
-    pose_smoother = PoseSmoother(smoothing_sec=cfg.overlay_smoothing, max_gap=cfg.max_gap)
-    timers = _AlertTimers()
-    coach_pending: dict[int, dict[str, Any]] = {}
-    coach_frame_meta: dict[int, dict[str, Any]] = {}
-
-    for frame_index, source_time, clip_time, frame_obs in decoded_frames:
-        if cancel_check is not None and cancel_check():
-            raise ImportCancelledError("Reference video analysis was cancelled")
-        in_cal = bool(
-            cal_window is not None and cal_window[0] - 1e-6 <= source_time < cal_window[1] - 1e-6
-        )
-        from ..calibration.measurements import measure_profile
-        from ..calibration.models import profile_from_calibration
-
-        range_profile = profile_from_calibration(active_reference) if active_reference is not None else None
-        observation = (
-            measure_profile(frame_obs, cfg, range_profile) if range_profile is not None else
-            measure(frame_obs, cfg, view_range if not in_cal else None)
-        )
-        session_rows: list[dict[str, Any]] = []
-        if session is not None and not in_cal and source_time >= (session.start or clip_in):
-            session_rows = session.update(observation)
-
-        head_angle = None
-        shoulder_elev_pct = None
-        knee_bend_deg = None
-        axis_dev_raw = None
-        upper_body = None
-        raw_role = "NONE"
-        sh_neutral = (
-            max(
-                sh_neutral_base,
-                float(np.percentile(relaxed_clearances, cfg.shoulder_adaptive_percentile)),
-            )
-            if len(relaxed_clearances) >= cfg.shoulder_adaptive_min_samples
-            else sh_neutral_base
-        )
-
-        if len(frame_obs.poses) == 1:
-            pose = frame_obs.poses[0]
-            raw_role = detect_role(pose)
-            metric_tau = max(
-                cfg.min_filter_time_constant, cfg.overlay_smoothing or cfg.smoothing
-            )
-            knee_info = knee_bend_alignment(
-                pose,
-                frame_obs.width,
-                frame_obs.height,
-                side=cfg.side,
-                **knee_geometry_kwargs(cfg),
-            )
-            if knee_info is not None:
-                raw_knee_deg = knee_info[0]
-                if (
-                    knee_smoothed is None
-                    or knee_last_ts is None
-                    or (source_time - knee_last_ts) > cfg.max_gap
-                ):
-                    knee_smoothed = raw_knee_deg
-                else:
-                    dt_kn = max(0.0, source_time - knee_last_ts)
-                    alpha_kn = 1.0 - math.exp(-dt_kn / metric_tau)
-                    knee_smoothed += float(alpha_kn) * (raw_knee_deg - knee_smoothed)
-                knee_last_ts = source_time
-                knee_bend_deg = knee_smoothed
-
-            axis_info = axis_curve_alignment(
-                pose,
-                frame_obs.width,
-                frame_obs.height,
-                facing=cfg.facing,
-                side=cfg.side,
-                neutral_offset=axis_neutral,
-            )
-            if axis_info is not None:
-                axis_dev_raw = axis_info[0]
-
-            head_info = head_horizontal_alignment(
-                pose, frame_obs.width, frame_obs.height, neutral_offset=neutral_offset
-            )
-            if head_info is not None:
-                raw_head_deg = head_info[0]
-                if (
-                    cfg.overlay_smoothing <= 0
-                    or head_smoothed is None
-                    or head_last_ts is None
-                    or (source_time - head_last_ts) > cfg.max_gap
-                ):
-                    head_smoothed = raw_head_deg
-                else:
-                    dt_hd = max(0.0, source_time - head_last_ts)
-                    alpha_hd = 1.0 - math.exp(-dt_hd / metric_tau)
-                    head_smoothed += float(alpha_hd) * (raw_head_deg - head_smoothed)
-                head_last_ts = source_time
-                head_angle = head_smoothed
-
-            sh_info = shoulder_tension_alignment(
-                pose,
-                frame_obs.width,
-                frame_obs.height,
-                neutral_clearance=sh_neutral,
-                **shoulder_geometry_kwargs(cfg),
-            )
-            if sh_info is not None:
-                raw_elev_pct, raw_clear = sh_info[0], sh_info[1]
-                if (
-                    not in_cal
-                    and len(relaxed_clearances) < cfg.shoulder_adaptive_max_samples
-                    and cfg.shoulder_adaptive_min_clearance
-                    <= raw_clear
-                    <= cfg.shoulder_adaptive_max_clearance
-                ):
-                    relaxed_clearances.append(raw_clear)
-                if (
-                    shoulder_smoothed is None
-                    or shoulder_last_ts is None
-                    or (source_time - shoulder_last_ts) > cfg.max_gap
-                ):
-                    shoulder_smoothed = raw_elev_pct
-                else:
-                    dt_sh = max(0.0, source_time - shoulder_last_ts)
-                    alpha_sh = 1.0 - math.exp(-dt_sh / metric_tau)
-                    shoulder_smoothed += float(alpha_sh) * (raw_elev_pct - shoulder_smoothed)
-                shoulder_last_ts = source_time
-                shoulder_elev_pct = shoulder_smoothed
-
-            if all(observation.values.get(m) is not None for m in observation.values):
-                upper_body = {
-                    m: float(v) for m, v in observation.values.items() if v is not None
-                }
-            else:
-                for side_cand in (cfg.side, "left", "right"):
-                    ear_lm = pose.get(f"{side_cand}_ear")
-                    sh_lm = pose.get(f"{side_cand}_shoulder")
-                    hip_lm = pose.get(f"{side_cand}_hip")
-                    if all(
-                        lm is not None
-                        and 0 <= lm.x <= 1
-                        and 0 <= lm.y <= 1
-                        and (lm.visibility is None or lm.visibility >= 0.5)
-                        for lm in (ear_lm, sh_lm, hip_lm)
-                    ):
-                        assert ear_lm is not None and sh_lm is not None and hip_lm is not None
-                        try:
-                            upper_body = calculate(
-                                pixel(ear_lm, frame_obs.width, frame_obs.height),
-                                pixel(sh_lm, frame_obs.width, frame_obs.height),
-                                pixel(hip_lm, frame_obs.width, frame_obs.height),
-                                cfg.facing,
-                            )
-                            break
-                        except ValueError:
-                            upper_body = None
-
-        role = role_tracker.update(raw_role, source_time)
-        embrace_type = embrace_tracker.update(
-            frame_obs.poses[0] if len(frame_obs.poses) == 1 else None,
-            role,
-            source_time,
-        )
-        axis_track = axis_tracker.update(axis_dev_raw, source_time)
-        axis_curve_smoothed = (
-            float(axis_track["smoothed"]) if axis_track["smoothed"] is not None else None
-        )
-        axis_curve_state = str(axis_track["state"])
-        bad_axis = bool(axis_track["alert"])
-
-        quality_reason = next(
-            (q.reason for q in observation.quality.values() if not q.valid), ""
-        )
-        st_state = soundtrack_summary.frame_states.get(frame_index)
-        active_bpm = (
-            float(st_state["bpm"])
-            if st_state and st_state.get("bpm") is not None
-            else cfg.tango_bpm
-        )
-        ankle_track = ankle_tracker.update(
-            frame_obs.poses[0] if len(frame_obs.poses) == 1 else None,
-            source_time,
-            bpm=active_bpm,
-            width=frame_obs.width,
-            height=frame_obs.height,
-        )
-        ankle_lift_ratio = (
-            float(ankle_track["smoothed_ratio"])
-            if ankle_track["smoothed_ratio"] is not None
-            else None
-        )
-        consecutive_high_ankle_steps = int(ankle_track["consecutive_high_steps"] or 0)
-        bad_ankles = bool(ankle_track["alert"])
-
-        display_poses = pose_smoother.update(frame_obs.poses, source_time)
-        if analysis_mode == "movement":
-            torso = (
-                torso_axis_alignment(
-                    frame_obs.poses[0], frame_obs.width, frame_obs.height, cfg.confidence
-                )
-                if len(frame_obs.poses) == 1 else None
-            )
-            coach_entry = {
-                "timestamp": round(float(source_time), 4),
-                "clip_timestamp": round(float(clip_time), 4),
-                "poses": [_serialise_pose(pose) for pose in display_poses if pose],
-                "head_angle": head_angle,
-                "shoulder_elev_pct": shoulder_elev_pct,
-                "knee_bend_deg": knee_bend_deg,
-                "axis_curve_smoothed": axis_curve_smoothed,
-                "torso_axis_tilt": abs(torso[0]) if torso is not None else None,
-            }
-            coach_meta: dict[str, Any] = {}
-        else:
-            coach_entry, coach_meta = _build_coach_frame_entry(
-                cfg=cfg,
-                frame_obs=frame_obs,
-                display_poses=display_poses,
-                source_time=source_time,
-                clip_time=clip_time,
-                head_angle=head_angle,
-                shoulder_elev_pct=shoulder_elev_pct,
-                shoulder_neutral_clearance=sh_neutral,
-                knee_bend_deg=knee_bend_deg,
-                ankle_lift_ratio=ankle_lift_ratio,
-                consecutive_high_ankle_steps=consecutive_high_ankle_steps,
-                bad_ankles=bad_ankles,
-                ankle_high_now=bool(ankle_track.get("high_now")),
-                axis_curve_smoothed=axis_curve_smoothed,
-                axis_curve_state=axis_curve_state,
-                axis_curve_elapsed=float(axis_track.get("elapsed") or 0.0),
-                bad_axis=bad_axis,
-                role=role,
-                embrace_type=embrace_type,
-                upper_body=upper_body,
-                st_state=st_state,
-                quality_reason=quality_reason,
-                timers=timers,
-                session_rows=session_rows,
-                single_pose_ok=len(frame_obs.poses) == 1,
-            )
-        coach_pending[frame_index] = coach_entry
-        coach_entry["measurement_poses"] = [_serialise_pose(pose) for pose in frame_obs.poses]
-        coach_frame_meta[frame_index] = coach_meta
-
-        frame_log.append(
-            {
-                "frame_index": frame_index,
-                "timestamp": source_time,
-                "clip_timestamp": clip_time,
-                "in_calibration_window": in_cal,
-                "head_angle": head_angle,
-                "shoulder_elev_pct": shoulder_elev_pct,
-                "knee_bend_deg": knee_bend_deg,
-                "ankle_lift_ratio": ankle_lift_ratio,
-                "consecutive_high_ankle_steps": consecutive_high_ankle_steps,
-                "ankle_high_alert": bad_ankles,
-                "axis_curve_ratio": axis_curve_smoothed,
-                "axis_curve_state": axis_curve_state,
-                "axis_curve_alert": bad_axis,
-                "role": role,
-                "embrace_type": embrace_type,
-                "upper_body": upper_body,
-                "quality_reason": quality_reason,
-                "beat": st_state.get("beat") if st_state else None,
-                "phrase": st_state.get("phrase") if st_state else None,
-                "bpm": st_state.get("bpm") if st_state else None,
-                "beat_source": st_state.get("source") if st_state else None,
-            }
-        )
-
-    if cancel_check is not None and cancel_check():
-        raise ImportCancelledError("Reference video analysis was cancelled")
-
-    total_source_frames = max(probe.frame_count, decoded_frames[-1][0] + 1)
-    movement_observations = [
-        (frame_index, obs) for frame_index, _, _, obs in decoded_frames
-    ]
-    movement_data = analyse_movement_observations(
-        movement_observations,
-        width=probe.width,
-        height=probe.height,
-        fps=probe.fps,
-        frame_count=total_source_frames,
-        sample_stride=1,
-        model_hash=model_hash,
-        source_sha256=source_sha,
-        segment_index=-1,
-        source_member=probe.path.name,
-    )
-
-    if cancel_check is not None and cancel_check():
-        raise ImportCancelledError("Reference video analysis was cancelled")
-
-    for frame_index, entry in coach_pending.items():
-        meta = coach_frame_meta[frame_index]
-        movement_notes = _movement_note_lines(
-            movement_data, frame_index, probe.fps, cfg.replay_step_history_seconds
-        )
-        if analysis_mode == "movement":
-            entry["notes"] = movement_notes
-        else:
-            entry["lines"] = list(meta["lines"])
-            entry["notes"] = [meta["primary"], *meta["lines"], *movement_notes]
-    coach_data: dict[str, Any] = {
-        "version": 1,
-        "model_hash": model_hash,
-        "model_variant": cfg.analysis_model,
-        "capture_profile": cap_profile,
-        "source_sha256": source_sha,
-        "width": probe.width,
-        "height": probe.height,
-        "fps": probe.fps,
-        "clip_in": round(clip_in, 4),
-        "clip_out": round(clip_out, 4),
-        "neutral_offset": neutral_offset,
-        "axis_neutral_offset": axis_neutral,
-        "settings_coaching": analysis_mode != "movement",
-        "frames": {str(k): v for k, v in coach_pending.items()},
-    }
-
-    should_recover = cfg.replay_recovery_auto if recover_tracking is None else bool(recover_tracking)
-    pose_recovery: dict[str, Any] | None = None
-    if should_recover:
-        try:
-            pose_recovery = run_clip_tracking_recovery(
-                video_path=probe.path,
-                coach_data=coach_data,
-                cfg=cfg,
-                movement_data=movement_data,
-                model_path=model_path if model_path.is_file() else None,
-                estimator_factory=estimator_factory,
-                progress_callback=progress_callback,
-                cancel_check=cancel_check,
-            )
-            coach_data["pose_recovery"] = pose_recovery
-        except ImportCancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001 - fallback preserves forward tracking and base analytics
-            logger.warning("Tracking recovery failed; keeping forward tracking: %s", exc)
-            pose_recovery = {
-                "schema_version": 1,
-                "status": "failed",
-                "status_message": f"Tracking recovery failed ({exc}); keeping forward tracking.",
-                "source_sha256": source_sha,
-                "model_name": cfg.analysis_model,
-                "model_sha256": model_hash,
-                "source_width": probe.width,
-                "source_height": probe.height,
-                "video_fps": round(float(probe.fps), 4),
-                "frame_count": len(decoded_frames),
-                "summary": {
-                    "windows_detected": 0,
-                    "windows_attempted": 0,
-                    "windows_recovered": 0,
-                    "windows_unresolved": 0,
-                    "windows_skipped_budget": 0,
-                    "recovered_frames": 0,
-                    "recovered_joints": 0,
-                    "interpolated_joints": 0,
-                },
-                "windows": [],
-                "frames": {},
-            }
-            coach_data["pose_recovery"] = pose_recovery
-
-    try:
-        coach_data = interpolate_coach_data(
-            coach_data,
-            cfg,
-            pose_recovery=pose_recovery,
-            movement_data=movement_data,
-        )
-    except Exception as exc:  # noqa: BLE001 - display interpolation must never abort base analysis
-        logger.warning("Display pose interpolation failed; keeping forward poses: %s", exc)
-
-    coverage = _compute_family_coverage(
-        clip_duration=clip_duration,
-        total_frames=len(decoded_frames),
-        fps=probe.fps,
-        frame_log=frame_log,
-        movement_data=movement_data,
-        soundtrack=soundtrack_summary,
+    engine_ctx = CommonEngineContext(
+        probe=probe,
         cfg=cfg,
-        evaluate_posture=analysis_mode != "movement",
-    )
-
-    mean_duration = float(np.mean(infer_times)) if infer_times else 0.0
-    processed_fps = 1.0 / mean_duration if mean_duration > 0 else None
-    performance = {
-        "model_hash": model_hash,
-        "model_variant": cfg.analysis_model,
-        "resolution": [probe.width, probe.height],
-        "processed_fps": processed_fps,
-        "dropped_frames": 0,
-        "timestamp_fallback": False,
-    }
-
-    session_summary: dict[str, Any] | None = None
-    session_events: list[dict[str, Any]] | None = None
-    if session is not None:
-        last_ts = decoded_frames[-1][1]
-        session_summary = session.finish(last_ts, "completed", performance)
-        session_events = [asdict(e) for v in session.evaluators.values() for e in v.events]
-
-    clean_title = title.strip() or probe.path.stem
-    scored_frame_log = [
-        row for row in frame_log if not row.get("in_calibration_window", False)
-    ] or frame_log
-
-    manifest = RunManifest(
-        model_variant=cfg.analysis_model,
+        model_path=model_path,
         model_hash=model_hash,
-        metric_version=METRIC_VERSION,
-        capture_profile=cap_profile,
-        source_sha256=source_sha,
-        source_filename=probe.path.name,
-        width=probe.width,
-        height=probe.height,
-        fps=probe.fps,
-        selected_in=clip_in,
-        selected_out=clip_out,
+        source_sha=source_sha,
+        clip_in=clip_in,
+        clip_out=clip_out,
         clip_duration=clip_duration,
-        analysis_mode=analysis_mode,
+        clean_title=clean_title,
+        cap_profile=cap_profile,
+        readiness=readiness,
+        decoded_frames=decoded_frames,
+        raw_observations=raw_observations,
+        auto_observations=auto_observations,
+        frame_times=frame_times,
+        auto_decision=auto_decision,
+        requested_mode=requested_mode,
+        resolved_mode=resolved_mode,
+        request_obj=request_obj,
+        performance=performance,
         processed_fps=processed_fps,
-        requested_dancer_mode=requested_mode,
-        resolved_dancer_mode="single",
-        detector_version="couple_auto_v1",
+        analysis_mode=analysis_mode,
+        soundtrack_summary=soundtrack_summary,
     )
 
-    return ClipAnalysisResult(
-        manifest=manifest,
-        video_path=probe.path,
-        title=clean_title,
-        source_sha256=source_sha,
-        selected_in=clip_in,
-        selected_out=clip_out,
-        clip_duration=clip_duration,
-        analysis_mode=analysis_mode,
-        readiness=readiness,
-        reference=active_reference,
-        calibration_window=cal_window,
-        coach_data=coach_data,
-        movement_data=movement_data,
-        soundtrack=soundtrack_summary,
-        coverage=coverage,
-        frame_log=frame_log,
-        scored_frame_log=scored_frame_log,
-        frame_observations=decoded_frames,
-        performance=performance,
-        session_id=session.id if session is not None else None,
-        session_summary=session_summary,
-        session_events=session_events,
-        pose_recovery=pose_recovery,
-        requested_dancer_mode=requested_mode,
-        resolved_dancer_mode="single",
-        auto_decision=auto_decision.to_dict(),
-        couple_result=None,
-        selection_required=False,
+    if resolved_mode == "couple":
+        return run_couple_dancer_engine(
+            engine_ctx,
+            estimator_factory=estimator_factory,
+            progress_callback=progress_callback,
+            cancel_check=cancel_check,
+        )
+
+    return run_solo_dancer_engine(
+        engine_ctx,
+        reference=reference,
+        calibration_interval=calibration_interval,
+        storage=storage,
+        estimator_factory=estimator_factory,
+        progress_callback=progress_callback,
+        cancel_check=cancel_check,
+        recover_tracking=recover_tracking,
+        build_coach_frame_entry=_build_coach_frame_entry,
     )
 
 

@@ -370,11 +370,36 @@ def test_settings_screen_update(qapp, tmp_path, monkeypatch):
     assert settings_screen.ollama_model.text() == "custom-model"
     assert settings_screen.conf_spin.value() == 0.85
     assert settings_screen.field_widgets["ollama_num_ctx"].value() == 8192
-    assert settings_screen.tabs.count() == 14
+    assert settings_screen.tabs.count() == 15
     assert any(
         settings_screen.tabs.tabText(i) == "Measurement normalization"
         for i in range(settings_screen.tabs.count())
     )
+    settings_screen.set_engine_scope("Common (Both Engines)")
+    common_visible = [
+        settings_screen.tabs.tabText(i)
+        for i in range(settings_screen.tabs.count())
+        if settings_screen.tabs.isTabVisible(i)
+    ]
+    assert all(name.startswith("Common · ") for name in common_visible)
+    assert len(common_visible) == 4
+    settings_screen.set_engine_scope("Couple Dancer Engine")
+    couple_visible = [
+        settings_screen.tabs.tabText(i)
+        for i in range(settings_screen.tabs.count())
+        if settings_screen.tabs.isTabVisible(i)
+    ]
+    assert all(name.startswith("Couple · ") for name in couple_visible)
+    assert len(couple_visible) == 2
+    settings_screen.set_engine_scope("Single Dancer Engine")
+    single_visible = [
+        settings_screen.tabs.tabText(i)
+        for i in range(settings_screen.tabs.count())
+        if settings_screen.tabs.isTabVisible(i)
+    ]
+    assert "Measurement normalization" in single_visible
+    assert len(single_visible) == 9
+    settings_screen.set_engine_scope("All")
     window.close()
 
 

@@ -2160,6 +2160,7 @@ def test_review_targeted_recovery_persists_without_mutating_measured_analytics(q
 
 def test_analytics_recovery_summary_seek_and_library_import_checkbox(qapp, tmp_path, video, monkeypatch):
     from PySide6.QtWidgets import QCheckBox, QDialog, QFileDialog
+
     from tango_posture.desktop_qt.screens.analytics import AnalyticsScreen
     from tango_posture.desktop_qt.screens.library import LibraryScreen
 

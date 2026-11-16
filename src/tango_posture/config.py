@@ -236,15 +236,43 @@ def parse_bool(value: str) -> bool:
 
 
 SETTING_GROUPS = {
-    "Camera & view": (
+    "Common · Files / Models": ("model_path", "analysis_model", "data_dir"),
+    "Common · Scene Routing": (
+        "dancer_analysis.default_dancer_mode",
+        "dancer_analysis.auto_detection_window_s",
+        "dancer_analysis.primary_coverage_min",
+        "dancer_analysis.primary_duration_min_s",
+        "dancer_analysis.second_joint_coverage_min",
+        "dancer_analysis.second_sustained_min_s",
+        "dancer_analysis.brief_second_max_s",
+        "dancer_analysis.together_min_s",
+        "dancer_analysis.together_max_hip_separation_torso_lengths",
+        "dancer_analysis.together_direction_cosine_min",
+    ),
+    "Common · Detection / Music": (
+        "confidence",
+        "max_gap",
+        "overlay_smoothing",
+        "tango_bpm",
+        "dancer_analysis.analyze_soundtrack",
+    ),
+    "Common · Review / Ollama": (
+        "ollama_base_url",
+        "ollama_model",
+        "ollama_timeout",
+        "ollama_temperature",
+        "ollama_num_ctx",
+        "ollama_num_predict",
+        "ollama_max_report_chars",
+        "ollama_instruction",
+    ),
+    "Single · Camera / View": (
         "side",
         "facing",
         "capture_profile",
         "allow_all_angles",
     ),
-    "Files": ("model_path", "analysis_model", "data_dir"),
-    "Quality & calibration": (
-        "confidence",
+    "Single · Quality / Calibration": (
         "min_torso",
         "min_head",
         "max_view_width",
@@ -252,15 +280,13 @@ SETTING_GROUPS = {
         "calibration_suggest_upper_pct",
         "calibration_min_usable_samples",
     ),
-    "Tracking": (
+    "Single · Temporal / Smoothing": (
         "smoothing",
-        "overlay_smoothing",
         "min_filter_time_constant",
         "entry_duration",
         "clear_duration",
-        "max_gap",
     ),
-    "Head & shoulders": (
+    "Single · Head / Shoulders": (
         "head_neutral_offset",
         "head_down_duration",
         "head_down_angle",
@@ -283,7 +309,7 @@ SETTING_GROUPS = {
         "shoulder_recovery_min_pct",
         "shoulder_recovery_ratio",
     ),
-    "Embrace & knees": (
+    "Single · Embrace / Knees": (
         "role_assign_ms",
         "role_hold_ms",
         "embrace_closed_threshold",
@@ -296,22 +322,17 @@ SETTING_GROUPS = {
         "knee_tiebreak_other_max_vis",
         "knee_tiebreak_min_advantage",
     ),
-    "Torso & hip offset": (
+    "Single · Torso / Footwork": (
         "axis_curve_entry",
         "axis_curve_clear",
         "axis_curve_duration",
         "axis_curve_clear_duration",
         "axis_neutral_offset",
-    ),
-    "Slow tango": (
         "slow_tango_max_bpm",
         "ankle_high_lift_ratio",
         "max_consecutive_high_ankle_steps",
     ),
-    "Music": (
-        "tango_bpm",
-    ),
-    "Replay movement": (
+    "Single · Replay / Recovery": (
         "replay_step_history_seconds",
         "replay_joint_interpolation",
         "replay_joint_max_gap",
@@ -322,21 +343,13 @@ SETTING_GROUPS = {
         "replay_show_recovered_joints",
         "replay_recovery_budget_s",
     ),
-    "Analysis": (
-        "dancer_analysis.default_dancer_mode",
-        "dancer_analysis.auto_detection_window_s",
-        "dancer_analysis.primary_coverage_min",
-        "dancer_analysis.primary_duration_min_s",
-        "dancer_analysis.second_joint_coverage_min",
-        "dancer_analysis.second_sustained_min_s",
-        "dancer_analysis.brief_second_max_s",
-        "dancer_analysis.together_min_s",
-        "dancer_analysis.together_max_hip_separation_torso_lengths",
-        "dancer_analysis.together_direction_cosine_min",
+    "Couple · Tracking / Interpolation": (
         "dancer_analysis.identity_max_innovation_torso_lengths",
         "dancer_analysis.identity_margin_torso_lengths",
         "dancer_analysis.max_observation_gap_s",
         "dancer_analysis.display_interpolation_max_gap_s",
+    ),
+    "Couple · Axes / Coordination": (
         "dancer_analysis.velocity_filter_window_s",
         "dancer_analysis.persistence_s",
         "dancer_analysis.pairing_window_s",
@@ -345,18 +358,31 @@ SETTING_GROUPS = {
         "dancer_analysis.slowing_fraction",
         "dancer_analysis.transition_min_coverage",
         "dancer_analysis.secondary_speed_rise",
-        "dancer_analysis.analyze_soundtrack",
         "dancer_analysis.auto_turn_suggestions",
     ),
-    "Review & Ollama": (
-        "ollama_base_url",
-        "ollama_model",
-        "ollama_timeout",
-        "ollama_temperature",
-        "ollama_num_ctx",
-        "ollama_num_predict",
-        "ollama_max_report_chars",
-        "ollama_instruction",
+}
+
+SETTING_ENGINE_SCOPES: dict[str, tuple[str, ...]] = {
+    "Common (Both Engines)": (
+        "Common · Files / Models",
+        "Common · Scene Routing",
+        "Common · Detection / Music",
+        "Common · Review / Ollama",
+    ),
+    "Single Dancer Engine": (
+        "Single · Camera / View",
+        "Single · Quality / Calibration",
+        "Single · Temporal / Smoothing",
+        "Single · Head / Shoulders",
+        "Single · Embrace / Knees",
+        "Single · Torso / Footwork",
+        "Single · Replay / Recovery",
+        "Measurement normalization",
+        "Calibration defaults",
+    ),
+    "Couple Dancer Engine": (
+        "Couple · Tracking / Interpolation",
+        "Couple · Axes / Coordination",
     ),
 }
 
