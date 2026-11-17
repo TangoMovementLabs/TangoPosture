@@ -1,5 +1,6 @@
 import csv
 import json
+import os
 import socket
 import sqlite3
 from contextlib import closing
@@ -92,7 +93,7 @@ def test_sample_export(tmp_path, reference, cfg):
 
 
 def test_clear_database_preserves_schema_files_and_future_sessions(tmp_path, reference, cfg):
-    root = tmp_path / "data with # and ?"
+    root = tmp_path / ("data with # and !" if os.name == "nt" else "data with # and ?")
     db, _, _, out = run_session(root, reference, cfg)
     try:
         schema = [tuple(row) for row in db.db.execute("SELECT * FROM sqlite_master")]
