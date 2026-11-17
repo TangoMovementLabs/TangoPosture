@@ -26,7 +26,7 @@ from .models import (
     SampleQualityStatus,
     TrackedDancerSample,
 )
-from .overlay import render_couple_frame_overlay
+from .overlay import render_couple_frame_overlay, smooth_couple_frame_overlays
 from .tracking import (
     CoupleTrackingOutput,
     canonical_xy,
@@ -66,5 +66,6 @@ __all__ = [
     "render_couple_frame_overlay",
     "resolve_close_embrace_frame_poses",
     "run_couple_analysis",
+    "smooth_couple_frame_overlays",
     "track_couple_frames",
 ]

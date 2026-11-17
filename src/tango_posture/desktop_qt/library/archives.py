@@ -24,7 +24,7 @@ from ...archive import (
     rename_archive,
 )
 from ...config import Config
-from ...couple.overlay import render_couple_frame_overlay
+from ...couple.overlay import render_couple_frame_overlay, smooth_couple_frame_overlays
 from ...movement import render_floor_guide, render_movement_overlay
 from ...pose.recovery import rebase_pose_recovery
 from ...references.archives import (
@@ -72,6 +72,7 @@ def _unique_archive_path(folder: Path, name: str, suffix: str) -> Path:
 
 def _extract_couple_overlay_state(
     couple_data: dict[str, Any],
+    cfg: Config | None = None,
 ) -> tuple[dict[int, dict[str, Any]], list[dict[str, Any]], float, str, str]:
     ann = couple_data.get("annotations") or {}
     a_label = str(ann.get("dancer_a_name") or "A")
@@ -88,10 +89,23 @@ def _extract_couple_overlay_state(
         for k, v in by_frame.items():
             if str(k).lstrip("-").isdigit() and isinstance(v, dict):
                 by_idx[int(k)] = v
-    fo_list = couple_data.get("frame_overlays") or []
-    if isinstance(fo_list, list):
+    raw_fo_list = couple_data.get("frame_overlays") or []
+    fo_list = (
+        smooth_couple_frame_overlays(
+            [fo for fo in raw_fo_list if isinstance(fo, dict)],
+            tau_s=max(float(cfg.overlay_smoothing), 0.14) if cfg is not None else 0.20,
+            max_gap_s=(
+                float(cfg.dancer_analysis.display_interpolation_max_gap_s)
+                if cfg is not None
+                else 0.13
+            ),
+        )
+        if isinstance(raw_fo_list, list) and raw_fo_list
+        else []
+    )
+    if fo_list:
         for fo in fo_list:
-            if isinstance(fo, dict) and isinstance(fo.get("frame_index"), int):
+            if isinstance(fo.get("frame_index"), int):
                 by_idx.setdefault(int(fo["frame_index"]), fo)
     return by_idx, couple_events, couple_clip_in, a_label, b_label
 
@@ -303,7 +317,7 @@ def archive_report(
             couple_clip_in,
             a_label,
             b_label,
-        ) = _extract_couple_overlay_state(couple_data)
+        ) = _extract_couple_overlay_state(couple_data, cfg)
 
     def render(image: Any, index: int, rate: float, *, floor: bool = False) -> Any:
         if cancel_check():
@@ -374,19 +388,40 @@ def archive_report(
             return image
 
         save_overlay_video(source, raw, start, end, frame_transform=raw_frame)
+        raw_reader = VideoReader(raw)
+        try:
+            raw_count = raw_reader.count
+            raw_fps = raw_reader.fps if math.isfinite(raw_reader.fps) and raw_reader.fps > 0 else fps
+        finally:
+            raw_reader.close()
+        raw_end = start + raw_count - 1
         save_overlay_video(source, overlay, start, end, frame_transform=render)
         save_overlay_video(
             source, lines, start, end,
             frame_transform=lambda image, index, rate: render(image, index, rate, floor=True),
         )
         raw_sha = file_sha256(raw)
-        indexed_coach = _rebase_coach_data(coach, start, end, raw_sha)
-        indexed_movement = _rebase_movement_data(movement, start, end, raw_sha, fps)
-        timestamps = (
-            record.timestamps if len(record.timestamps) == end - start + 1
-            else [frame / fps for frame in range(start, end + 1)]
+        safe_fps = raw_fps if math.isfinite(raw_fps) and raw_fps > 0 else 30.0
+        if (
+            len(record.timestamps) == raw_count
+            and all(math.isfinite(val) and val >= 0.0 for val in record.timestamps)
+            and all(earlier < later for earlier, later in pairwise(record.timestamps))
+        ):
+            timestamps = [float(val) for val in record.timestamps]
+        else:
+            timestamps = [round((start + idx) / safe_fps, 6) for idx in range(raw_count)]
+        indexed_coach = _rebase_coach_data(
+            coach,
+            start,
+            raw_end,
+            raw_sha,
+            timestamps=timestamps,
+            ensure_complete_count=raw_count if is_couple_archive else None,
         )
-        indexed_couple = _rebase_couple_data(couple_data, start, end, raw_sha)
+        indexed_movement = _rebase_movement_data(movement, start, raw_end, raw_sha, safe_fps)
+        indexed_couple = _rebase_couple_data(couple_data, start, raw_end, raw_sha)
+        if indexed_couple is not None and indexed_coach is not None:
+            indexed_coach["couple_analysis"] = indexed_couple
         dancer_analysis = (
             _build_couple_dancer_analysis(indexed_couple, raw_sha)
             if indexed_couple is not None

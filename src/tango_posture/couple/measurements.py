@@ -26,6 +26,7 @@ from .models import (
     PairedFrameSample,
     TrackedDancerSample,
 )
+from .overlay import smooth_couple_frame_overlays
 from .tracking import CoupleTrackingOutput, canonical_xy, track_couple_frames
 
 
@@ -659,6 +660,8 @@ def _turn_events_from_annotations_and_candidates(
     annotations: CoupleAnnotations,
     auto_turn_suggestions: bool,
     pivot_candidates: list[dict[str, Any]],
+    *,
+    turn_exit_match_window_s: float = 3.0,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Build paired turn duration, exit timing, pivot behavior, and embrace opening events."""
     items = [item for item in annotations.items if not item.deleted]
@@ -687,7 +690,7 @@ def _turn_events_from_annotations_and_candidates(
         en = turn_ends[end_idx]
         duration_s = en.timestamp - st.timestamp
 
-        # Match closest exit after turn_start (prefer within +-2s of turn_end)
+        # Match closest exit after turn_start within turn_exit_match_window_s of turn_end
         exit_idx: int | None = None
         best_dt = math.inf
         for je, ex in enumerate(exits):
@@ -695,7 +698,7 @@ def _turn_events_from_annotations_and_candidates(
                 continue
             if ex.timestamp >= st.timestamp - 0.10:
                 dt = abs(ex.timestamp - en.timestamp)
-                if dt < best_dt and dt <= 3.0:
+                if dt < best_dt and dt <= float(turn_exit_match_window_s):
                     best_dt = dt
                     exit_idx = je
         exit_item = exits[exit_idx] if exit_idx is not None else None
@@ -794,6 +797,71 @@ def _turn_events_from_annotations_and_candidates(
     return turns, turn_summary
 
 
+def _extract_finite_series_samples(
+    entries: list[dict[str, Any]] | list[tuple[float, float | None]],
+) -> list[tuple[float, float]]:
+    samples: list[tuple[float, float]] = []
+    for item in entries:
+        if isinstance(item, dict):
+            status = item.get("status")
+            if status is not None and status not in ("measured", "user_confirmed", ""):
+                continue
+            raw_t = item.get("timestamp")
+            raw_v = item.get("value")
+        elif isinstance(item, tuple) and len(item) == 2:
+            raw_t, raw_v = item
+        else:
+            continue
+        if not isinstance(raw_t, (int, float)) or not isinstance(raw_v, (int, float)):
+            continue
+        tf = float(raw_t)
+        vf = float(raw_v)
+        if math.isfinite(tf) and math.isfinite(vf):
+            samples.append((tf, vf))
+    samples.sort(key=lambda pair: pair[0])
+    return samples
+
+
+def compute_torso_tilt_pearson_correlation(
+    series_a: list[dict[str, Any]] | list[tuple[float, float | None]],
+    series_b: list[dict[str, Any]] | list[tuple[float, float | None]],
+    *,
+    min_samples: int = 3,
+) -> tuple[float | None, int, str]:
+    """Compute Pearson correlation ``r`` between Dancer A and B torso tilts on aligned samples."""
+    pts_a = _extract_finite_series_samples(series_a)
+    pts_b = _extract_finite_series_samples(series_b)
+    pairs: list[tuple[float, float]] = []
+    ia = 0
+    ib = 0
+    while ia < len(pts_a) and ib < len(pts_b):
+        ta, va = pts_a[ia]
+        tb, vb = pts_b[ib]
+        if abs(ta - tb) <= 1e-4 + 1e-9:
+            pairs.append((va, vb))
+            ia += 1
+            ib += 1
+        elif ta < tb:
+            ia += 1
+        else:
+            ib += 1
+
+    if len(pairs) < max(2, int(min_samples)):
+        return (None, len(pairs), "insufficient_paired_samples")
+
+    arr_a = np.array([va for va, _ in pairs], dtype=float)
+    arr_b = np.array([vb for _, vb in pairs], dtype=float)
+    da = arr_a - float(np.mean(arr_a))
+    db = arr_b - float(np.mean(arr_b))
+    norm_a = float(np.linalg.norm(da))
+    norm_b = float(np.linalg.norm(db))
+    if norm_a <= 1e-9 or norm_b <= 1e-9:
+        return (None, len(pairs), "zero_variance")
+    r_val = float(np.dot(da, db) / (norm_a * norm_b))
+    r_clamped = max(-1.0, min(1.0, r_val))
+    return (round(r_clamped, 4), len(pairs), "")
+
+
 def _compute_summaries_from_events_and_series(
     *,
     series: dict[str, list[dict[str, Any]]],
@@ -890,11 +958,25 @@ def _compute_summaries_from_events_and_series(
             "status": "measured" if vals else "unavailable",
         }
 
+    r_val, r_cnt, r_reason = compute_torso_tilt_pearson_correlation(
+        series.get("torso_tilt_a") or [],
+        series.get("torso_tilt_b") or [],
+    )
     posture = {
         "torso_tilt_a": _angle_summary("torso_tilt_a", "A", "a_torso_coverage"),
         "torso_tilt_b": _angle_summary("torso_tilt_b", "B", "b_torso_coverage"),
         "couple_midpoint_tilt": _angle_summary("couple_midpoint_tilt", "pair", "pair_torso_coverage"),
         "torso_separation": _angle_summary("torso_separation", "pair", "pair_torso_coverage"),
+        "torso_tilt_pearson_r": {
+            "measure": "torso_tilt_pearson_r",
+            "subject": "pair",
+            "value": r_val,
+            "sample_count": r_cnt,
+            "coverage": float(coverage.get("pair_torso_coverage", 0.0)),
+            "unit": "r",
+            "status": "measured" if r_val is not None else "unavailable",
+            "reason": r_reason,
+        },
         "head_pitch_a": _angle_summary("head_pitch_a", "A", "a_head_coverage"),
         "head_pitch_b": _angle_summary("head_pitch_b", "B", "b_head_coverage"),
     }
@@ -1001,7 +1083,10 @@ def _apply_annotations_to_candidates(
     # Turns & exit
     auto_turns_flag = bool(cfg.dancer_analysis.auto_turn_suggestions)
     turns, turn_summary = _turn_events_from_annotations_and_candidates(
-        annotations, auto_turns_flag, pivot_candidates
+        annotations,
+        auto_turns_flag,
+        pivot_candidates,
+        turn_exit_match_window_s=float(cfg.dancer_analysis.turn_exit_match_window_s),
     )
     paired = [e for e in paired if e.get("event_type") != "turn"] + turns
     paired.sort(key=lambda e: float(e.get("timestamp", 0.0)))
@@ -1328,8 +1413,21 @@ def run_couple_analysis(
                     else None
                 ),
                 "travel_axis_unit": [round(u_travel[0], 5), round(u_travel[1], 5)],
+                "min_landmark_visibility": float(da_cfg.overlay_min_landmark_visibility),
             }
         )
+
+    overlay_tau_s = (
+        float(cfg.overlay_smoothing)
+        if abs(float(cfg.overlay_smoothing) - 0.20) > 1e-9
+        and abs(float(da_cfg.overlay_smoothing_s) - 0.20) <= 1e-9
+        else float(da_cfg.overlay_smoothing_s)
+    )
+    frame_overlays = smooth_couple_frame_overlays(
+        frame_overlays,
+        tau_s=overlay_tau_s,
+        max_gap_s=float(da_cfg.axis_bridge_max_gap_s),
+    )
 
     # §4.1 Motion event candidates
     motion_candidates = (

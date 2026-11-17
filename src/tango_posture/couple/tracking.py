@@ -155,6 +155,7 @@ def _are_near_duplicate_poses(
     width: int,
     height: int,
     confidence: float,
+    max_dist_tl: float = 0.18,
 ) -> bool:
     """Return True only when two detections share nearly coincident joint coordinates."""
     dists: list[float] = []
@@ -169,7 +170,7 @@ def _are_near_duplicate_poses(
         return False
     scale = a.torso_length_px or b.torso_length_px or max(20.0, 0.15 * max(1, height))
     median_dist = float(np.median(dists))
-    return median_dist < 0.18 * scale
+    return median_dist < float(max_dist_tl) * scale
 
 
 def filter_and_deduplicate_poses(
@@ -198,9 +199,12 @@ def filter_and_deduplicate_poses(
         return candidates
 
     kept: list[PoseCandidate] = []
+    dup_thresh = float(cfg.dancer_analysis.duplicate_pose_max_distance_torso_lengths)
     for cand in sorted(candidates, key=lambda c: c.confidence, reverse=True):
         if any(
-            _are_near_duplicate_poses(cand, prev, obs.width, obs.height, float(cfg.confidence))
+            _are_near_duplicate_poses(
+                cand, prev, obs.width, obs.height, float(cfg.confidence), max_dist_tl=dup_thresh
+            )
             for prev in kept
         ):
             continue
@@ -353,11 +357,14 @@ def _fixed_scale_for_track(
 def _enforce_fixed_scale_eligibility(
     sample: TrackedDancerSample | None,
     fixed_scale_px: float | None,
+    *,
+    min_ratio: float = 0.45,
+    max_ratio: float = 2.20,
 ) -> TrackedDancerSample | None:
     if sample is None or not sample.torso_eligible or sample.torso_length_px is None or fixed_scale_px is None:
         return sample
     ratio = sample.torso_length_px / max(1e-6, fixed_scale_px)
-    if 0.45 <= ratio <= 2.2:
+    if float(min_ratio) <= ratio <= float(max_ratio):
         return sample
     return replace(
         sample,
@@ -396,7 +403,13 @@ def track_couple_frames(
     max_innov = float(da_cfg.identity_max_innovation_torso_lengths)
     margin_min = float(da_cfg.identity_margin_torso_lengths)
     max_gap = float(da_cfg.max_observation_gap_s)
-    shot_cut_min_disp = max(1.5, 2.0 * max_innov)
+    shot_cut_max_gap = float(da_cfg.shot_cut_max_frame_gap_s)
+    cfg_jump = float(da_cfg.shot_cut_jump_torso_lengths)
+    shot_cut_min_disp = (
+        max(cfg_jump, 2.0 * max_innov)
+        if abs(cfg_jump - 1.50) <= 1e-9
+        else cfg_jump
+    )
     shot_cut_frac = 0.6
 
     pending_anchors = sorted(anchors or [], key=lambda a: a.timestamp)
@@ -414,7 +427,7 @@ def track_couple_frames(
         default_scale = max(20.0, 0.22 * max(1, obs.height))
         candidates = filter_and_deduplicate_poses(obs, cfg, analysis_region)
 
-        shot_cut = prev_ts is not None and (t <= prev_ts or (t - prev_ts) > 1.5)
+        shot_cut = prev_ts is not None and (t <= prev_ts or (t - prev_ts) > shot_cut_max_gap)
         long_gap = prev_ts is not None and (t - prev_ts) > max_gap
         prev_ts = t
 
@@ -665,10 +678,16 @@ def track_couple_frames(
         else (fixed_a or fixed_b)
     )
 
+    min_scale_ratio = float(da_cfg.fixed_scale_min_ratio)
+    max_scale_ratio = float(da_cfg.fixed_scale_max_ratio)
     adjusted_frames: list[PairedFrameSample] = []
     for pf in paired_frames:
-        adj_a = _enforce_fixed_scale_eligibility(pf.dancer_a, fixed_a)
-        adj_b = _enforce_fixed_scale_eligibility(pf.dancer_b, fixed_b)
+        adj_a = _enforce_fixed_scale_eligibility(
+            pf.dancer_a, fixed_a, min_ratio=min_scale_ratio, max_ratio=max_scale_ratio
+        )
+        adj_b = _enforce_fixed_scale_eligibility(
+            pf.dancer_b, fixed_b, min_ratio=min_scale_ratio, max_ratio=max_scale_ratio
+        )
         adjusted_frames.append(
             PairedFrameSample(
                 timestamp=pf.timestamp,
@@ -954,7 +973,8 @@ def resolve_close_embrace_frame_poses(
 
     tilt_l = abs(math.degrees(math.atan2(cand_l.shoulder_px[0] - cand_l.hip_px[0], cand_l.shoulder_px[1] - cand_l.hip_px[1])))
     tilt_r = abs(math.degrees(math.atan2(cand_r.shoulder_px[0] - cand_r.hip_px[0], cand_r.shoulder_px[1] - cand_r.hip_px[1])))
-    if tilt_l > 25.0 or tilt_r > 25.0:
+    max_tilt_deg = float(cfg.dancer_analysis.close_embrace_max_tilt_deg)
+    if tilt_l > max_tilt_deg or tilt_r > max_tilt_deg:
         return [primary_pose]
 
     head_lx = _pose_head_x(pose_l, conf)

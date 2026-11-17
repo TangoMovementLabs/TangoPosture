@@ -69,7 +69,7 @@ from ...couple.models import (
     CoupleAnnotations,
     PlannedTransitionMark,
 )
-from ...couple.overlay import render_couple_frame_overlay
+from ...couple.overlay import render_couple_frame_overlay, smooth_couple_frame_overlays
 from ...movement import render_floor_guide, render_movement_overlay, validate_movement_analysis
 from ...pose.recovery import recover_clip_tracking_range
 from ...references.coach import (
@@ -713,6 +713,7 @@ class ReviewScreen(QWidget):
         return self._analysis_thread is not None and self._analysis_thread.is_alive()
 
     def refresh(self) -> None:
+        self._invalidate_smoothed_couple_overlays()
         cfg_recovery_auto = bool(self.bridge.config.replay_recovery_auto)
         if cfg_recovery_auto != self._last_cfg_recovery_auto:
             self._last_cfg_recovery_auto = cfg_recovery_auto
@@ -1486,6 +1487,9 @@ class ReviewScreen(QWidget):
 
         return time_pattern.sub(link_time, markdown)
 
+    def _invalidate_smoothed_couple_overlays(self) -> None:
+        self._smoothed_couple_overlays_cache: tuple[int, tuple[float, float], list[dict[str, Any]]] | None = None
+
     def _resolve_couple_frame_overlay(self, frame_index: int) -> dict[str, Any] | None:
         if not isinstance(self._couple_result, dict):
             return None
@@ -1496,15 +1500,31 @@ class ReviewScreen(QWidget):
                 cand = by_frame.get(str(frame_index))
                 if isinstance(cand, dict):
                     return cand
-        frame_overlays = self._couple_result.get("frame_overlays")
-        if isinstance(frame_overlays, list) and frame_overlays:
+        raw_overlays = self._couple_result.get("frame_overlays")
+        if isinstance(raw_overlays, list) and raw_overlays:
+            cfg = self.bridge.config
+            key_sig = (
+                id(self._couple_result),
+                (
+                    max(float(cfg.overlay_smoothing), 0.14),
+                    float(cfg.dancer_analysis.display_interpolation_max_gap_s),
+                ),
+            )
+            cache = getattr(self, "_smoothed_couple_overlays_cache", None)
+            if cache is None or cache[:2] != key_sig:
+                smoothed = smooth_couple_frame_overlays(
+                    [item for item in raw_overlays if isinstance(item, dict)],
+                    tau_s=key_sig[1][0],
+                    max_gap_s=key_sig[1][1],
+                )
+                cache = (key_sig[0], key_sig[1], smoothed)
+                self._smoothed_couple_overlays_cache = cache
+            frame_overlays = cache[2]
             for item in frame_overlays:
-                if isinstance(item, dict) and item.get("frame_index") == frame_index:
+                if item.get("frame_index") == frame_index:
                     return item
             if 0 <= frame_index < len(frame_overlays):
-                cand = frame_overlays[frame_index]
-                if isinstance(cand, dict):
-                    return cand
+                return frame_overlays[frame_index]
         return None
 
     def _render_primary_frame(

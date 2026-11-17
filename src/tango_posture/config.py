@@ -79,6 +79,17 @@ class DancerAnalysisConfig(BaseModel):
     slowing_fraction: float = Field(default=0.25, gt=0.0, lt=1.0)
     transition_min_coverage: float = Field(default=0.75, gt=0.0, le=1.0)
     secondary_speed_rise: float = Field(default=0.12, gt=0.0)
+    axis_smoothing_s: float = Field(default=0.25, ge=0.0)
+    overlay_smoothing_s: float = Field(default=0.20, ge=0.0)
+    axis_bridge_max_gap_s: float = Field(default=0.25, ge=0.0)
+    overlay_min_landmark_visibility: float = Field(default=0.50, ge=0.0, le=1.0)
+    duplicate_pose_max_distance_torso_lengths: float = Field(default=0.18, gt=0.0)
+    fixed_scale_min_ratio: float = Field(default=0.45, gt=0.0, lt=1.0)
+    fixed_scale_max_ratio: float = Field(default=2.20, gt=1.0)
+    shot_cut_max_frame_gap_s: float = Field(default=1.50, gt=0.0)
+    shot_cut_jump_torso_lengths: float = Field(default=1.50, gt=0.0)
+    turn_exit_match_window_s: float = Field(default=3.00, gt=0.0)
+    close_embrace_max_tilt_deg: float = Field(default=25.0, gt=0.0, le=90.0)
     analyze_soundtrack: bool = False
     auto_turn_suggestions: bool = False
 
@@ -88,6 +99,8 @@ class DancerAnalysisConfig(BaseModel):
             raise ValueError("brief_second_max_s must be below second_sustained_min_s")
         if self.stop_speed >= self.start_speed:
             raise ValueError("stop_speed must be below start_speed")
+        if self.fixed_scale_min_ratio >= self.fixed_scale_max_ratio:
+            raise ValueError("fixed_scale_min_ratio must be below fixed_scale_max_ratio")
         return self
 
 
@@ -348,8 +361,18 @@ SETTING_GROUPS = {
         "dancer_analysis.identity_margin_torso_lengths",
         "dancer_analysis.max_observation_gap_s",
         "dancer_analysis.display_interpolation_max_gap_s",
+        "dancer_analysis.duplicate_pose_max_distance_torso_lengths",
+        "dancer_analysis.fixed_scale_min_ratio",
+        "dancer_analysis.fixed_scale_max_ratio",
+        "dancer_analysis.shot_cut_max_frame_gap_s",
+        "dancer_analysis.shot_cut_jump_torso_lengths",
+        "dancer_analysis.close_embrace_max_tilt_deg",
     ),
     "Couple · Axes / Coordination": (
+        "dancer_analysis.axis_smoothing_s",
+        "dancer_analysis.overlay_smoothing_s",
+        "dancer_analysis.axis_bridge_max_gap_s",
+        "dancer_analysis.overlay_min_landmark_visibility",
         "dancer_analysis.velocity_filter_window_s",
         "dancer_analysis.persistence_s",
         "dancer_analysis.pairing_window_s",
@@ -358,6 +381,7 @@ SETTING_GROUPS = {
         "dancer_analysis.slowing_fraction",
         "dancer_analysis.transition_min_coverage",
         "dancer_analysis.secondary_speed_rise",
+        "dancer_analysis.turn_exit_match_window_s",
         "dancer_analysis.auto_turn_suggestions",
     ),
 }
@@ -574,6 +598,39 @@ SETTING_DESCRIPTIONS: dict[str, str] = {
     "dancer_analysis.secondary_speed_rise": (
         "Minimum rebound speed rise in pair torso lengths per second during slowing to count a secondary peak."
     ),
+    "dancer_analysis.axis_smoothing_s": (
+        "Zero-phase EMA smoothing time constant (seconds) for Couple Torso Axis charts in Analytics."
+    ),
+    "dancer_analysis.overlay_smoothing_s": (
+        "Zero-phase EMA smoothing time constant (seconds) for Couple torso/midpoint axis video overlays."
+    ),
+    "dancer_analysis.axis_bridge_max_gap_s": (
+        "Maximum dropout gap (seconds) linearly bridged across Couple axis curves and overlays for display."
+    ),
+    "dancer_analysis.overlay_min_landmark_visibility": (
+        "Minimum landmark visibility threshold required to draw Couple torso/ankle overlay markers."
+    ),
+    "dancer_analysis.duplicate_pose_max_distance_torso_lengths": (
+        "Maximum median joint separation (in torso lengths) below which a redundant pose detection is suppressed."
+    ),
+    "dancer_analysis.fixed_scale_min_ratio": (
+        "Minimum observed-to-fixed torso length ratio allowed for Couple torso measurement eligibility."
+    ),
+    "dancer_analysis.fixed_scale_max_ratio": (
+        "Maximum observed-to-fixed torso length ratio allowed for Couple torso measurement eligibility."
+    ),
+    "dancer_analysis.shot_cut_max_frame_gap_s": (
+        "Frame-to-frame time gap ceiling (seconds) above which Couple tracking inserts a shot-cut break."
+    ),
+    "dancer_analysis.shot_cut_jump_torso_lengths": (
+        "Minimum hip jump displacement (in torso lengths) that triggers a Couple tracking shot-cut break."
+    ),
+    "dancer_analysis.turn_exit_match_window_s": (
+        "Maximum time window (seconds) around turn end for pairing a Couple turn exit marker."
+    ),
+    "dancer_analysis.close_embrace_max_tilt_deg": (
+        "Maximum individual torso tilt (degrees) accepted when splitting a merged close-embrace detection."
+    ),
     "dancer_analysis.analyze_soundtrack": (
         "Extract optional soundtrack beat candidates for step timing alignment by default."
     ),
@@ -691,8 +748,12 @@ ENV_MAP: dict[str, tuple[str, Callable[[str], float | int | bool]]] = {
 def startup_config_path(explicit: Path | None) -> Path | None:
     if explicit is not None:
         return explicit
-    settings = Path("settings.toml")
-    return settings if settings.exists() else None
+    candidates = [path for path in (Path("config.toml"), Path("settings.toml")) if path.exists()]
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+    return max(candidates, key=lambda path: path.stat().st_mtime_ns)
 
 
 def load(

@@ -149,10 +149,10 @@ def render_markdown_report(
     total_duration = max(0.0, end_t - start_t)
 
     # Role analysis (Leader vs Follower)
-    leader_spans = _contiguous_spans(frame_log, lambda f: f["role"] == "LEADER", cfg.max_gap)
-    follower_spans = _contiguous_spans(frame_log, lambda f: f["role"] == "FOLLOWER", cfg.max_gap)
-    leader_frames = sum(1 for f in frame_log if f["role"] == "LEADER")
-    follower_frames = sum(1 for f in frame_log if f["role"] == "FOLLOWER")
+    leader_spans = _contiguous_spans(frame_log, lambda f: f.get("role") == "LEADER", cfg.max_gap)
+    follower_spans = _contiguous_spans(frame_log, lambda f: f.get("role") == "FOLLOWER", cfg.max_gap)
+    leader_frames = sum(1 for f in frame_log if f.get("role") == "LEADER")
+    follower_frames = sum(1 for f in frame_log if f.get("role") == "FOLLOWER")
     if leader_frames > follower_frames and leader_frames > 0:
         dominant_role = "LEADER (left arm raised, right arm horizontal)"
     elif follower_frames > leader_frames and follower_frames > 0:
@@ -163,10 +163,10 @@ def render_markdown_report(
         dominant_role = "NONE DETECTED (arms neither in Leader nor Follower embrace)"
 
     # Head horizontal alignment analysis
-    head_angles = [f["head_angle"] for f in frame_log if f["head_angle"] is not None]
+    head_angles = [float(f["head_angle"]) for f in frame_log if f.get("head_angle") is not None]
     down_spans = _contiguous_spans(
         frame_log,
-        lambda f: f["head_angle"] is not None and f["head_angle"] < cfg.head_down_angle,
+        lambda f: f.get("head_angle") is not None and float(f["head_angle"]) < cfg.head_down_angle,
         cfg.max_gap,
     )
     confirmed_head_down = [
@@ -423,6 +423,48 @@ def render_markdown_report(
                 ]
             )
 
+        couple_ctx = import_context.get("couple_result")
+        if isinstance(couple_ctx, dict) or import_context.get("resolved_dancer_mode") == "couple":
+            couple_dict = couple_ctx if isinstance(couple_ctx, dict) else {}
+            ann = couple_dict.get("annotations") or {}
+            a_name = str(ann.get("dancer_a_name") or "Dancer A")
+            b_name = str(ann.get("dancer_b_name") or "Dancer B")
+            c_sums = couple_dict.get("summaries") or {}
+            posture_sums = c_sums.get("posture") or {}
+            coord_sums = c_sums.get("coordination") or {}
+
+            def _fmt_couple_posture(pkey: str, label: str) -> str:
+                item = posture_sums.get(pkey)
+                if not isinstance(item, dict) or item.get("median_deg") is None:
+                    return f"- **{label}**: unavailable"
+                cov = float(item.get("coverage") or 0.0) * 100.0
+                return (
+                    f"- **{label}**: median `{float(item['median_deg']):+.1f} deg` "
+                    f"(IQR `{float(item.get('iqr_deg') or 0.0):.1f} deg`, {cov:.0f}% coverage)"
+                )
+
+            def _fmt_couple_lag(ckey: str, label: str) -> str:
+                item = coord_sums.get(ckey)
+                if not isinstance(item, dict) or item.get("value") is None:
+                    reason = str(item.get("reason") or "unavailable") if isinstance(item, dict) else "unavailable"
+                    return f"- **{label}**: unavailable ({reason})"
+                return f"- **{label}**: `{float(item['value']):+.0f} ms` ({int(item.get('count') or 0)} paired events)"
+
+            lines.extend(
+                [
+                    "### Couple Axis & Coordination Summary",
+                    "",
+                    _fmt_couple_posture("torso_tilt_a", f"{a_name} torso axis tilt"),
+                    _fmt_couple_posture("torso_tilt_b", f"{b_name} torso axis tilt"),
+                    _fmt_couple_posture("couple_midpoint_tilt", "Couple midpoint axis tilt"),
+                    _fmt_couple_posture("torso_separation", "Torso axis separation"),
+                    _fmt_couple_lag("start_lag_ms", "Start lag (B - A)"),
+                    _fmt_couple_lag("slow_lag_ms", "Slowing lag (B - A)"),
+                    _fmt_couple_lag("settle_lag_ms", "Settle lag (B - A)"),
+                    "",
+                ]
+            )
+
     lines.extend(
         [
             "### Detected Leader / Follower Embrace Intervals",
@@ -650,7 +692,7 @@ def render_markdown_report(
         )
         lines.append("| --- | --- | --- | --- | --- | --- | --- |")
         for s, e, items in confirmed_head_down:
-            angles = [float(x["head_angle"]) for x in items if x["head_angle"] is not None]
+            angles = [float(x["head_angle"]) for x in items if x.get("head_angle") is not None]
             trigger_t = s + cfg.head_down_duration
             p_num, b_num = items[0].get("phrase"), items[0].get("beat")
             beat_tag = f" (P{p_num} B{b_num}/8)" if p_num and b_num else ""
@@ -779,7 +821,7 @@ def render_markdown_report(
         lines.append("| Start Time | End Time | Duration | Worst Angle | Note |")
         lines.append("| --- | --- | --- | --- | --- |")
         for s, e, items in transient_head_down:
-            angles = [float(x["head_angle"]) for x in items if x["head_angle"] is not None]
+            angles = [float(x["head_angle"]) for x in items if x.get("head_angle") is not None]
             lines.append(
                 f"| `{_fmt_time(s)}` | `{_fmt_time(e)}` | `{e - s:.2f}s` | `{min(angles):+.1f} deg` | "
                 f"Transient downward head tilt (recovered before `{cfg.head_down_duration:.1f}s` threshold) |"

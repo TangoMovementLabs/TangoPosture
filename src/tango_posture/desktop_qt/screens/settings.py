@@ -91,6 +91,17 @@ _FLOAT_RANGES = {
     "dancer_analysis.slowing_fraction": (0.01, 0.99),
     "dancer_analysis.transition_min_coverage": (0.05, 1.0),
     "dancer_analysis.secondary_speed_rise": (0.01, 5.0),
+    "dancer_analysis.axis_smoothing_s": (0.0, 5.0),
+    "dancer_analysis.overlay_smoothing_s": (0.0, 5.0),
+    "dancer_analysis.axis_bridge_max_gap_s": (0.0, 3.0),
+    "dancer_analysis.overlay_min_landmark_visibility": (0.0, 1.0),
+    "dancer_analysis.duplicate_pose_max_distance_torso_lengths": (0.01, 2.0),
+    "dancer_analysis.fixed_scale_min_ratio": (0.1, 0.99),
+    "dancer_analysis.fixed_scale_max_ratio": (1.05, 10.0),
+    "dancer_analysis.shot_cut_max_frame_gap_s": (0.1, 30.0),
+    "dancer_analysis.shot_cut_jump_torso_lengths": (0.2, 10.0),
+    "dancer_analysis.turn_exit_match_window_s": (0.1, 30.0),
+    "dancer_analysis.close_embrace_max_tilt_deg": (5.0, 90.0),
 }
 
 _INT_RANGES = {
@@ -253,6 +264,9 @@ class SettingsScreen(QScrollArea):
         header.addLayout(title_box)
         header.addStretch()
 
+        self.save_config_btn = QPushButton("Save Settings")
+        self.save_config_btn.setProperty("class", "primary")
+        self.save_config_btn.clicked.connect(self._save_settings)
         self.toggle_all_guides_btn = QPushButton("Expand All Guides")
         self.toggle_all_guides_btn.setCheckable(True)
         self.toggle_all_guides_btn.clicked.connect(self._toggle_all_guides)
@@ -262,6 +276,7 @@ class SettingsScreen(QScrollArea):
         self.import_btn.clicked.connect(self._import_toml)
         self.reset_btn = QPushButton("Reset Defaults")
         self.reset_btn.clicked.connect(self._reset_defaults)
+        header.addWidget(self.save_config_btn)
         header.addWidget(self.toggle_all_guides_btn)
         header.addWidget(self.export_btn)
         header.addWidget(self.import_btn)
@@ -385,11 +400,11 @@ class SettingsScreen(QScrollArea):
         actions_row = QHBoxLayout()
         actions_row.setContentsMargins(0, 0, 0, 0)
         actions_row.setSpacing(8)
-        self.apply_btn = QPushButton("Apply Settings")
+        self.apply_btn = QPushButton("Save Settings")
         self.apply_btn.setFixedHeight(38)
         self.apply_btn.clicked.connect(self._save_settings)
         actions_row.addWidget(self.apply_btn)
-        self.save_btn = QPushButton("Apply && Save settings.toml")
+        self.save_btn = QPushButton("Apply && Save config.toml / settings.toml")
         self.save_btn.setProperty("class", "primary")
         self.save_btn.setFixedHeight(38)
         self.save_btn.clicked.connect(self._save_toml)
@@ -545,6 +560,19 @@ class SettingsScreen(QScrollArea):
             "dancer_analysis.slowing_fraction": "Slowing drop fraction",
             "dancer_analysis.transition_min_coverage": "Transition minimum coverage",
             "dancer_analysis.secondary_speed_rise": "Secondary speed peak rise (pair torso lengths/s)",
+            "dancer_analysis.axis_smoothing_s": "Couple axis chart smoothing (seconds)",
+            "dancer_analysis.overlay_smoothing_s": "Couple overlay smoothing (seconds)",
+            "dancer_analysis.axis_bridge_max_gap_s": "Couple axis display bridge max gap (seconds)",
+            "dancer_analysis.overlay_min_landmark_visibility": "Couple overlay min landmark visibility",
+            "dancer_analysis.duplicate_pose_max_distance_torso_lengths": (
+                "Duplicate pose suppression threshold (torso lengths)"
+            ),
+            "dancer_analysis.fixed_scale_min_ratio": "Fixed scale min ratio",
+            "dancer_analysis.fixed_scale_max_ratio": "Fixed scale max ratio",
+            "dancer_analysis.shot_cut_max_frame_gap_s": "Shot-cut max frame gap (seconds)",
+            "dancer_analysis.shot_cut_jump_torso_lengths": "Shot-cut hip jump threshold (torso lengths)",
+            "dancer_analysis.turn_exit_match_window_s": "Turn exit match window (seconds)",
+            "dancer_analysis.close_embrace_max_tilt_deg": "Close-embrace max torso tilt (degrees)",
             "dancer_analysis.analyze_soundtrack": "Analyze soundtrack beats by default",
             "dancer_analysis.auto_turn_suggestions": "Suggest turn markers automatically",
             "ollama_base_url": "Ollama server address",
@@ -656,6 +684,8 @@ class SettingsScreen(QScrollArea):
         bpm = self.field_widgets["tango_bpm"]
         ollama_url = self.field_widgets["ollama_base_url"]
         ollama_model = self.field_widgets["ollama_model"]
+        couple_axis_smooth = self.field_widgets["dancer_analysis.axis_smoothing_s"]
+        couple_overlay_smooth = self.field_widgets["dancer_analysis.overlay_smoothing_s"]
         assert isinstance(side, QComboBox)
         assert isinstance(facing, QComboBox)
         assert isinstance(confidence, QDoubleSpinBox)
@@ -665,6 +695,8 @@ class SettingsScreen(QScrollArea):
         assert isinstance(bpm, QDoubleSpinBox)
         assert isinstance(ollama_url, QLineEdit)
         assert isinstance(ollama_model, QLineEdit)
+        assert isinstance(couple_axis_smooth, QDoubleSpinBox)
+        assert isinstance(couple_overlay_smooth, QDoubleSpinBox)
         self.side_combo = side
         self.facing_combo = facing
         self.conf_spin = confidence
@@ -674,6 +706,8 @@ class SettingsScreen(QScrollArea):
         self.bpm_spin = bpm
         self.ollama_url = ollama_url
         self.ollama_model = ollama_model
+        self.couple_axis_smooth_spin = couple_axis_smooth
+        self.couple_overlay_smooth_spin = couple_overlay_smooth
 
     def _collect_settings(self) -> Config:
         data = self.bridge.config.model_dump(exclude={"axis_curve"})
@@ -709,8 +743,18 @@ class SettingsScreen(QScrollArea):
         except (TypeError, ValueError, ValidationError) as error:
             self.bridge.status_message.emit(f"Could not apply settings: {error}")
             return False
-        self.bridge.update_config(cfg)
+        destination = Path("config.toml").resolve()
+        try:
+            self.bridge.save_settings(cfg, destination)
+        except OSError as error:
+            self.bridge.update_config(cfg)
+            self._apply_config(cfg)
+            self.bridge.status_message.emit(
+                f"Settings applied in memory (could not write {destination.name}: {error})."
+            )
+            return True
         self._apply_config(cfg)
+        self.bridge.status_message.emit(f"Settings saved to {destination}")
         return True
 
     def _reset_defaults(self) -> None:

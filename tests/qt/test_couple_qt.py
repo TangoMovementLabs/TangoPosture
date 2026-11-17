@@ -630,6 +630,11 @@ def test_video_analysis_local_couple_saves_tpr_archive(qapp, tmp_path, monkeypat
         assert saved_analytics is not None
         assert saved_analytics["dancer_analysis"]["active_mode"] == "couple"
         assert "couple" in saved_analytics["dancer_analysis"]["runs"]
+        labels_in_results = [
+            screen.results_table.item(r, 0).text()
+            for r in range(screen.results_table.rowCount())
+        ]
+        assert "Torso tilt Pearson r (A vs B)" in labels_in_results
     finally:
         window.close()
 
@@ -754,5 +759,469 @@ def test_review_couple_local_video_saves_tpr_even_when_hidden(qapp, tmp_path, mo
         assert saved_analytics is not None
         assert saved_analytics["dancer_analysis"]["active_mode"] == "couple"
         assert "couple" in saved_analytics["dancer_analysis"]["runs"]
+    finally:
+        window.close()
+
+
+def test_library_import_and_analyze_couple_video_creates_tpr_archive(qapp, tmp_path, monkeypatch):
+    from tango_posture.archive import read_manifest
+    from tango_posture.references.archives import reference_directory
+    from tango_posture.references.pipeline import analyse_imported_clip
+
+    cfg = Config(data_dir=str(tmp_path / "data"))
+    local_vid = _write_video(tmp_path / "LibraryCouple.avi", fps=15.0, duration_s=1.2)
+
+    class _FakeCoupleEstimator:
+        def estimate(self, image, ts):
+            return FrameObservation(
+                ts,
+                image.shape[1],
+                image.shape[0],
+                [_pose(0.32, shoulder_dx=0.025), _pose(0.56, shoulder_dx=-0.020)],
+            )
+
+        def close(self) -> None:
+            return None
+
+    orig_import = analyse_imported_clip
+    monkeypatch.setattr(
+        "tango_posture.references.worker.analyse_imported_clip",
+        lambda **kw: orig_import(**{**kw, "estimator_factory": _FakeCoupleEstimator}),
+    )
+
+    window = MainWindow(cfg)
+    try:
+        window.router.navigate(Route.LIBRARY)
+        qapp.processEvents()
+        lib = window.screens[Route.LIBRARY]
+        lib.import_reference_cb.setChecked(True)
+        lib._start_import(
+            local_vid,
+            0.0,
+            1.2,
+            "Library Couple Import",
+            dancer_request={"requested_mode": "couple", "forced_override": True},
+            analyse_soundtrack=False,
+        )
+
+        deadline = time.monotonic() + 10.0
+        while lib.has_active_jobs() and time.monotonic() < deadline:
+            qapp.processEvents()
+            time.sleep(0.02)
+        qapp.processEvents()
+
+        tprs = list(reference_directory(cfg.data_dir).glob("*.tpr"))
+        assert len(tprs) == 1
+        saved_tpr = tprs[0]
+        manifest = read_manifest(saved_tpr)
+        assert manifest["kind"] == "reference"
+        saved_analytics = read_analytics(saved_tpr, 0)
+        assert saved_analytics is not None
+        assert saved_analytics["dancer_analysis"]["active_mode"] == "couple"
+        assert "couple" in saved_analytics["dancer_analysis"]["runs"]
+    finally:
+        window.close()
+
+
+def test_analytics_couple_axis_charts_populate_seek_and_export(qapp, tmp_path):
+    cfg = Config(data_dir=str(tmp_path / "data"))
+    practice_dir = Path(cfg.data_dir) / "practice"
+    dual_arch, _, _ = _make_archive_with_runs(
+        practice_dir / "AxesCouple.tp",
+        cfg,
+        include_single=False,
+        include_couple=True,
+        couple_run_id="axes-couple-42",
+    )
+
+    window = MainWindow(cfg)
+    try:
+        window.router.navigate(Route.ANALYTICS)
+        qapp.processEvents()
+        analytics = window.screens[Route.ANALYTICS]
+        axes_idx = next(
+            i
+            for i in range(analytics.session_combo.count())
+            if "AxesCouple" in analytics.session_combo.itemText(i)
+        )
+        analytics.session_combo.setCurrentIndex(axes_idx)
+        qapp.processEvents()
+
+        expected_keys = (
+            "torso_tilt_a",
+            "torso_tilt_b",
+            "couple_midpoint_tilt",
+            "torso_separation",
+        )
+        assert set(analytics.couple_axis_charts) >= set(expected_keys)
+        for key in expected_keys:
+            chart = analytics.couple_axis_charts[key]
+            assert chart.isEnabled(), f"Expected couple axis chart {key} to be enabled"
+            assert chart.reference_line == pytest.approx(0.0)
+            assert analytics.couple_axis_export_buttons[key].isEnabled()
+            assert "Median:" in analytics.couple_axis_coverage_labels[key].text()
+
+        assert "Alice" in analytics.couple_axis_title_labels["torso_tilt_a"].text()
+        assert "Bruno" in analytics.couple_axis_title_labels["torso_tilt_b"].text()
+
+        # Clicking / seeking from a couple axis chart routes to Review with run_id + timestamp
+        seen_nav: list[tuple[Route, object]] = []
+        orig_nav = window.router.navigate
+
+        def capture_nav(route: Route, payload: object = None):
+            seen_nav.append((route, payload))
+            return orig_nav(route, payload)
+
+        window.router.navigate = capture_nav  # type: ignore[method-assign]
+        analytics.couple_axis_charts["torso_tilt_a"].seek_requested.emit(0.75)
+        qapp.processEvents()
+
+        assert seen_nav and seen_nav[-1][0] is Route.REVIEW
+        nav_payload = seen_nav[-1][1]
+        assert isinstance(nav_payload, dict)
+        assert nav_payload["archive_path"] == dual_arch
+        assert nav_payload["run_id"] == "axes-couple-42"
+        assert nav_payload["timestamp"] == pytest.approx(0.75)
+
+        out_png = tmp_path / "torso_tilt_a.png"
+        out_svg = tmp_path / "couple_midpoint_tilt.svg"
+        assert analytics.export_couple_axis_chart("torso_tilt_a", out_png) == out_png
+        assert out_png.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+        assert analytics.export_couple_axis_chart("couple_midpoint_tilt", out_svg) == out_svg
+        assert "<svg" in out_svg.read_text(encoding="utf-8")
+    finally:
+        window.close()
+
+
+def test_couple_axis_smoothing_reduces_jitter_and_updates_when_settings_saved(
+    qapp, tmp_path, monkeypatch
+):
+    import tomllib
+
+    from tango_posture.config import startup_config_path
+    from tango_posture.couple.overlay import smooth_couple_frame_overlays
+
+    monkeypatch.chdir(tmp_path)
+    cfg = Config(data_dir=str(tmp_path / "data"), smoothing=0.05, overlay_smoothing=0.05)
+
+    # 1. Overlay smoothing removes high-frequency alternating jitter in torso tilts & midpoints
+    jitter_overlays = [
+        {
+            "frame_index": i,
+            "timestamp": round(i * 0.05, 4),
+            "tilt_a_deg": 8.0 if i % 2 == 0 else -8.0,
+            "tilt_b_deg": -6.0 if i % 2 == 0 else 6.0,
+            "couple_midpoint_tilt_deg": 5.0 if i % 2 == 0 else -5.0,
+            "torso_separation_deg": 14.0 if i % 2 == 0 else 2.0,
+            "pair_hip_norm": [0.40 + (0.04 if i % 2 == 0 else -0.04), 0.60],
+            "pair_shoulder_norm": [0.40 + (0.04 if i % 2 == 0 else -0.04), 0.36],
+        }
+        for i in range(16)
+    ]
+    smoothed_overlays = smooth_couple_frame_overlays(jitter_overlays, tau_s=0.25, max_gap_s=0.20)
+    raw_deltas = [
+        abs(jitter_overlays[i + 1]["tilt_a_deg"] - jitter_overlays[i]["tilt_a_deg"])
+        for i in range(len(jitter_overlays) - 1)
+    ]
+    sm_deltas = [
+        abs(smoothed_overlays[i + 1]["tilt_a_deg"] - smoothed_overlays[i]["tilt_a_deg"])
+        for i in range(len(smoothed_overlays) - 1)
+    ]
+    assert max(sm_deltas) < max(raw_deltas) * 0.25
+
+    # 2. Analytics Couple Axis charts smooth alternating jitter and refresh when Settings saves config.toml
+    raw_vid = _write_video(tmp_path / "JitterRaw.avi", fps=20.0, duration_s=1.0)
+    arch = Path(cfg.data_dir) / "practice" / "JitterCouple.tp"
+    timestamps = [round(i * 0.05, 4) for i in range(20)]
+    report = tmp_path / "jitter_rep.md"
+    report.write_text("# Jitter\n", encoding="utf-8")
+    append_segment(arch, report, raw_vid, None, timestamps)
+    vsha = file_sha256(raw_vid)
+
+    couple_res = _build_couple_result(vsha, cfg, run_id="jitter-couple-1")
+    couple_res["series"]["torso_tilt_a"] = [
+        {
+            "timestamp": ts,
+            "value": 10.0 if idx % 2 == 0 else -10.0,
+            "status": "measured",
+            "reason": "",
+        }
+        for idx, ts in enumerate(timestamps)
+    ]
+    store_analytics(
+        arch,
+        0,
+        {
+            "model_hash": "qt-jitter-test",
+            "capture_profile": "default",
+            "max_gap": cfg.max_gap,
+            "frame_timestamps": timestamps,
+            "frames": [],
+            "coach_data": {"width": 160, "height": 120, "frames": {}},
+            "movement_data": {"steps": [], "pivots": []},
+        },
+        expected_video_sha256=vsha,
+        dancer_analysis_run={
+            "run_id": "jitter-couple-1",
+            "requested_mode": "couple",
+            "resolved_mode": "couple",
+            "auto_decision": couple_res.get("auto_decision"),
+            "couple_result": couple_res,
+        },
+    )
+
+    window = MainWindow(cfg)
+    try:
+        window.router.navigate(Route.ANALYTICS)
+        qapp.processEvents()
+        analytics = window.screens[Route.ANALYTICS]
+        idx = next(
+            i for i in range(analytics.session_combo.count())
+            if "JitterCouple" in analytics.session_combo.itemText(i)
+        )
+        analytics.session_combo.setCurrentIndex(idx)
+        qapp.processEvents()
+
+        chart_a = analytics.couple_axis_charts["torso_tilt_a"]
+        vals_initial = [v for _, v in chart_a.data.points if v is not None]
+        spread_initial = max(vals_initial) - min(vals_initial)
+        # Already much smoother than raw 20 deg alternating peak-to-peak swing
+        assert spread_initial < 14.0
+
+        # Save stronger smoothing in Settings -> writes config.toml and refreshes Analytics live
+        window.router.navigate(Route.SETTINGS)
+        qapp.processEvents()
+        settings = window.screens[Route.SETTINGS]
+        settings.smooth_spin.setValue(0.65)
+        settings.save_config_btn.click()
+        qapp.processEvents()
+
+        cfg_file = tmp_path / "config.toml"
+        assert cfg_file.is_file()
+        assert tomllib.loads(cfg_file.read_text(encoding="utf-8"))["smoothing"] == pytest.approx(0.65)
+        assert startup_config_path(None) is not None
+
+        vals_after = [v for _, v in analytics.couple_axis_charts["torso_tilt_a"].data.points if v is not None]
+        spread_after = max(vals_after) - min(vals_after)
+        assert spread_after < spread_initial
+    finally:
+        window.close()
+
+
+def _pixmap_rgb_array(pixmap) -> np.ndarray:
+    from PySide6.QtGui import QImage
+
+    img = pixmap.toImage().convertToFormat(QImage.Format.Format_RGB888)
+    raw = np.frombuffer(img.constBits(), dtype=np.uint8, count=img.sizeInBytes())
+    return raw.reshape(img.height(), img.bytesPerLine())[:, : img.width() * 3].reshape(
+        img.height(), img.width(), 3
+    ).copy()
+
+
+def test_analysis_screen_draws_xy_region_lines_on_preview_update(qapp, tmp_path):
+    cfg = Config(data_dir=str(tmp_path / "data"))
+    local_vid = _write_video(tmp_path / "RegionPreview.avi", fps=20.0, duration_s=0.5)
+
+    window = MainWindow(cfg)
+    try:
+        window.router.navigate(Route.ANALYSIS)
+        qapp.processEvents()
+        screen: AnalysisScreen = window.screens[Route.ANALYSIS]  # type: ignore[assignment]
+
+        # 1. Even before a video frame is loaded, toggling region draws X/Y lines on a synthetic preview
+        assert screen._preview_frame_bgr is None
+        screen.options_widget.use_region_cb.setChecked(True)
+        qapp.processEvents()
+        pm_synth = screen.preview_label.pixmap()
+        assert pm_synth is not None and not pm_synth.isNull()
+        rgb_synth = _pixmap_rgb_array(pm_synth)
+        # Active box / cyan X&Y lines create brighter non-uniform pixels over dark (28,28,28) background
+        assert int(rgb_synth.max()) > 150
+
+        screen.options_widget.use_region_cb.setChecked(False)
+        qapp.processEvents()
+        pm_cleared = screen.preview_label.pixmap()
+        assert pm_cleared is None or pm_cleared.isNull()
+
+        # 2. With a real local video frame loaded, toggling use_region_cb and changing X/Y updates live
+        screen.local_radio.setChecked(True)
+        screen._set_local_video(local_vid)
+        qapp.processEvents()
+
+        pm_base = screen.preview_label.pixmap()
+        assert pm_base is not None and not pm_base.isNull()
+        rgb_base = _pixmap_rgb_array(pm_base)
+
+        screen.options_widget.use_region_cb.setChecked(True)
+        screen.options_widget.x_min_spin.setValue(0.20)
+        screen.options_widget.y_min_spin.setValue(0.25)
+        screen.options_widget.x_max_spin.setValue(0.80)
+        screen.options_widget.y_max_spin.setValue(0.75)
+        qapp.processEvents()
+
+        rgb_first = _pixmap_rgb_array(screen.preview_label.pixmap())
+        assert not np.array_equal(rgb_base, rgb_first)
+
+        # Exterior top-left pixel (outside [0.20..0.80, 0.25..0.75]) is dimmed compared to interior
+        assert int(rgb_first[2, 2].sum()) < int(rgb_base[2, 2].sum())
+
+        # Full-span vertical X line near x=0.20 and horizontal Y line near y=0.25 show drawn cyan lines
+        h, w = rgb_first.shape[:2]
+        x_col_first = round(0.20 * (w - 1))
+        y_row_first = round(0.25 * (h - 1))
+        band_first = rgb_first[4, max(0, x_col_first - 1) : min(w, x_col_first + 2)]
+        y_band_first = rgb_first[max(0, y_row_first - 1) : min(h, y_row_first + 2), 4]
+        assert int(band_first.max()) > int(rgb_first[4, 2].max()) + 80
+        assert int(y_band_first.max()) > int(rgb_first[2, 4].max()) + 80
+
+        # Moving X min / Y max shifts the drawn lines immediately
+        screen.options_widget.x_min_spin.setValue(0.35)
+        screen.options_widget.y_max_spin.setValue(0.60)
+        qapp.processEvents()
+
+        rgb_second = _pixmap_rgb_array(screen.preview_label.pixmap())
+        assert not np.array_equal(rgb_first, rgb_second)
+        x_col_second = round(0.35 * (w - 1))
+        band_second = rgb_second[4, max(0, x_col_second - 1) : min(w, x_col_second + 2)]
+        assert int(band_second.max()) > int(rgb_second[4, 2].max()) + 80
+        # Previously drawn line at x=0.20 is no longer lit at top margin (now dimmed exterior)
+        old_band_after = rgb_second[4, max(0, x_col_first - 1) : min(w, x_col_first + 2)]
+        assert int(old_band_after.max()) < int(band_first.max()) - 80
+    finally:
+        window.close()
+
+
+def test_couple_analytics_pearson_r_and_couple_settings_parameters(qapp, tmp_path, monkeypatch):
+    import tomllib
+
+    monkeypatch.chdir(tmp_path)
+    cfg = Config(data_dir=str(tmp_path / "data"))
+    raw_vid = _write_video(tmp_path / "PearsonRaw.avi", fps=20.0, duration_s=1.0)
+    arch = Path(cfg.data_dir) / "practice" / "PearsonCouple.tp"
+    timestamps = [round(i * 0.05, 4) for i in range(20)]
+    report = tmp_path / "pearson_rep.md"
+    report.write_text("# Pearson\n", encoding="utf-8")
+    append_segment(arch, report, raw_vid, None, timestamps)
+    vsha = file_sha256(raw_vid)
+
+    couple_res = _build_couple_result(vsha, cfg, run_id="pearson-couple-1")
+    couple_res["series"]["torso_tilt_a"] = [
+        {"timestamp": ts, "value": float(idx - 10) + (2.0 if idx % 2 == 0 else -2.0), "status": "measured", "reason": ""}
+        for idx, ts in enumerate(timestamps)
+    ]
+    couple_res["series"]["torso_tilt_b"] = [
+        {"timestamp": ts, "value": float(idx - 10) * 1.5, "status": "measured", "reason": ""}
+        for idx, ts in enumerate(timestamps)
+    ]
+    store_analytics(
+        arch,
+        0,
+        {
+            "model_hash": "qt-pearson-test",
+            "capture_profile": "default",
+            "max_gap": cfg.max_gap,
+            "frame_timestamps": timestamps,
+            "frames": [],
+            "coach_data": {"width": 160, "height": 120, "frames": {}},
+            "movement_data": {"steps": [], "pivots": []},
+        },
+        expected_video_sha256=vsha,
+        dancer_analysis_run={
+            "run_id": "pearson-couple-1",
+            "requested_mode": "couple",
+            "resolved_mode": "couple",
+            "auto_decision": couple_res.get("auto_decision"),
+            "couple_result": couple_res,
+        },
+    )
+
+    window = MainWindow(cfg)
+    try:
+        window.router.navigate(Route.ANALYTICS)
+        qapp.processEvents()
+        analytics = window.screens[Route.ANALYTICS]
+        idx = next(
+            i for i in range(analytics.session_combo.count())
+            if "PearsonCouple" in analytics.session_combo.itemText(i)
+        )
+        analytics.session_combo.setCurrentIndex(idx)
+        qapp.processEvents()
+
+        # Pearson correlation shown in dedicated prominent card, banner, coverage label, both tables, and CSV
+        assert analytics.couple_pearson_value_label.text().startswith("Pearson r = +")
+        assert "Paired samples:" in analytics.couple_pearson_detail_label.text()
+        assert "In-phase parallel sway" in analytics.couple_pearson_detail_label.text()
+        assert "Torso tilt Pearson r:" in analytics.couple_run_info_label.text()
+        assert "Pearson r(A,B):" in analytics.couple_axis_coverage_labels["torso_tilt_a"].text()
+        coord_tbl = analytics._couple_summary_tables["coordination"]
+        assert any(
+            coord_tbl.item(row, 0).text() == "torso tilt pearson r"
+            for row in range(coord_tbl.rowCount())
+        )
+        posture_tbl = analytics._couple_summary_tables["posture_axes"]
+        r_row = next(
+            row for row in range(posture_tbl.rowCount())
+            if posture_tbl.item(row, 0).text() == "torso tilt pearson r"
+        )
+        initial_r = float(posture_tbl.item(r_row, 1).text())
+        assert initial_r > 0.85
+
+        csv_out = tmp_path / "pearson.csv"
+        analytics.export_couple_csv_file(csv_out)
+        csv_rows = list(csv.DictReader(io.StringIO(csv_out.read_text(encoding="utf-8"))))
+        assert any(
+            row["row_type"] == "summary" and row["measure"] == "torso_tilt_pearson_r" and row["unit"] == "r"
+            for row in csv_rows
+        )
+
+        # Legacy archive with coach_data.couple_analysis (without dancer_analysis) also loads Pearson r
+        legacy_arch = Path(cfg.data_dir) / "practice" / "LegacyCoachCouple.tp"
+        append_segment(legacy_arch, report, raw_vid, None, timestamps)
+        store_analytics(
+            legacy_arch,
+            0,
+            {
+                "model_hash": "qt-legacy-couple",
+                "capture_profile": "default",
+                "max_gap": cfg.max_gap,
+                "frame_timestamps": timestamps,
+                "frames": [],
+                "coach_data": {"width": 160, "height": 120, "frames": {}, "couple_analysis": couple_res},
+                "movement_data": {"steps": [], "pivots": []},
+            },
+            expected_video_sha256=vsha,
+        )
+        analytics.refresh()
+        legacy_idx = next(
+            i for i in range(analytics.session_combo.count())
+            if "LegacyCoachCouple" in analytics.session_combo.itemText(i)
+        )
+        analytics.session_combo.setCurrentIndex(legacy_idx)
+        qapp.processEvents()
+        assert analytics.couple_pearson_value_label.text().startswith("Pearson r = +")
+        analytics.session_combo.setCurrentIndex(
+            next(i for i in range(analytics.session_combo.count()) if "PearsonCouple" in analytics.session_combo.itemText(i))
+        )
+        qapp.processEvents()
+
+        # Updating Couple parameters in Settings persists to config.toml and refreshes live Pearson r
+        window.router.navigate(Route.SETTINGS)
+        qapp.processEvents()
+        settings = window.screens[Route.SETTINGS]
+        settings.couple_axis_smooth_spin.setValue(0.80)
+        settings.field_widgets["dancer_analysis.shot_cut_jump_torso_lengths"].setValue(2.10)
+        settings.save_config_btn.click()
+        qapp.processEvents()
+
+        saved_toml = tomllib.loads((tmp_path / "config.toml").read_text(encoding="utf-8"))
+        assert saved_toml["dancer_analysis"]["axis_smoothing_s"] == pytest.approx(0.80)
+        assert saved_toml["dancer_analysis"]["shot_cut_jump_torso_lengths"] == pytest.approx(2.10)
+
+        r_row_after = next(
+            row for row in range(posture_tbl.rowCount())
+            if posture_tbl.item(row, 0).text() == "torso tilt pearson r"
+        )
+        after_r = float(posture_tbl.item(r_row_after, 1).text())
+        assert after_r >= initial_r
     finally:
         window.close()

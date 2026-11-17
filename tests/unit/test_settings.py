@@ -239,6 +239,17 @@ def test_dancer_analysis_settings_round_trip_and_validation():
             default_dancer_mode="couple",
             auto_detection_window_s=15.0,
             primary_coverage_min=0.70,
+            axis_smoothing_s=0.40,
+            overlay_smoothing_s=0.35,
+            axis_bridge_max_gap_s=0.30,
+            overlay_min_landmark_visibility=0.60,
+            duplicate_pose_max_distance_torso_lengths=0.22,
+            fixed_scale_min_ratio=0.50,
+            fixed_scale_max_ratio=2.00,
+            shot_cut_max_frame_gap_s=2.00,
+            shot_cut_jump_torso_lengths=1.80,
+            turn_exit_match_window_s=4.50,
+            close_embrace_max_tilt_deg=30.0,
             analyze_soundtrack=True,
             auto_turn_suggestions=True,
         )
@@ -250,5 +261,7 @@ def test_dancer_analysis_settings_round_trip_and_validation():
         DancerAnalysisConfig(brief_second_max_s=1.5, second_sustained_min_s=1.5)
     with pytest.raises(ValueError):
         DancerAnalysisConfig(start_speed=0.10, stop_speed=0.15)
+    with pytest.raises(ValueError):
+        DancerAnalysisConfig(fixed_scale_min_ratio=0.9, fixed_scale_max_ratio=1.0)
     with pytest.raises(ValueError):
         AnalysisRegion(x_min=0.8, y_min=0.1, x_max=0.4, y_max=0.9)

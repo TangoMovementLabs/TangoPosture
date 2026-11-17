@@ -664,6 +664,9 @@ def analyse_imported_clip(
         "soundtrack": soundtrack_summary.to_metadata_dict(),
         "pivot_count": len(movement_data.get("pivots", [])),
         "step_count": len(movement_data.get("steps", [])),
+        "requested_dancer_mode": clip_result.requested_dancer_mode,
+        "resolved_dancer_mode": clip_result.resolved_dancer_mode,
+        "couple_result": clip_result.couple_result,
     }
 
     report_path = write_markdown_report(

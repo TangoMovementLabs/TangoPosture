@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import csv
 import math
+from itertools import pairwise
 from pathlib import Path
 from xml.sax.saxutils import escape
 
-from PySide6.QtCore import QPointF, QRectF, Qt, Signal
+from PySide6.QtCore import QEvent, QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QImage, QMouseEvent, QPainter, QPaintEvent, QPen
 from PySide6.QtWidgets import (
+    QToolTip,
     QWidget,
 )
 
@@ -43,10 +45,14 @@ class MetricChart(QWidget):
         self.intervals: list[tuple[float, float]] = []
         self.playhead_timestamp: float | None = None
         self.states: dict[float, str] = {}
+        self.unit: str = ""
+        self._hover_point: tuple[float, float] | None = None
+        self.hover_hint_text: str = ""
         self.x_zoom = 1.0
         self.x_pan = 0.0
         self.setMinimumHeight(155)
         self.setEnabled(False)
+        self.setMouseTracking(True)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setAccessibleName("Persisted smoothed delta chart")
 
@@ -60,6 +66,7 @@ class MetricChart(QWidget):
         reference_line: float | None = None,
         intervals: list[tuple[float, float]] | None = None,
         states: dict[float, str] | None = None,
+        unit: str = "",
     ) -> None:
         self.data, self.time_end, self.origin_timestamp = data, time_end, origin_timestamp
         self.bounds = bounds
@@ -70,6 +77,10 @@ class MetricChart(QWidget):
         )
         self.intervals = intervals or []
         self.states = states or {}
+        self.unit = unit.strip()
+        self._hover_point = None
+        self.hover_hint_text = ""
+        self.setToolTip("")
         if data is None or not data.segments or self.time_end <= 0:
             self.x_zoom = 1.0
             self.x_pan = 0.0
@@ -130,6 +141,62 @@ class MetricChart(QWidget):
             )
         super().mousePressEvent(event)
 
+    def _nearest_sample_for_pos(self, pos: QPointF) -> tuple[float, float] | None:
+        if self.data is None or not self.data.segments or self.time_end <= 0.0 or not self.isEnabled():
+            return None
+        left = 62.0
+        right = float(max(63, self.width() - 20))
+        top = 12.0
+        bottom = float(max(13, self.height() - 38))
+        if not (left <= pos.x() <= right and top <= pos.y() <= bottom):
+            return None
+        view_start, view_end = self._view_window()
+        span = max(view_end - view_start, 1e-9)
+        target_t = view_start + ((pos.x() - left) / max(1.0, right - left)) * span
+        best: tuple[float, float] | None = None
+        best_dt = math.inf
+        for segment in self.data.segments:
+            for ts, val in segment:
+                if not (view_start <= ts <= view_end):
+                    continue
+                dt = abs(ts - target_t)
+                if dt < best_dt:
+                    best_dt = dt
+                    best = (ts, val)
+        return best
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        nearest = self._nearest_sample_for_pos(event.position())
+        if nearest is None:
+            if self._hover_point is not None or self.hover_hint_text:
+                self._hover_point = None
+                self.hover_hint_text = ""
+                self.setToolTip("")
+                QToolTip.hideText()
+                self.update()
+        else:
+            ts_rel, val = nearest
+            abs_t = self.origin_timestamp + ts_rel
+            unit_suffix = f" {self.unit}" if self.unit else ""
+            hint = f"t = {abs_t:.2f} s · {val:.3g}{unit_suffix}"
+            changed = self._hover_point != nearest or self.hover_hint_text != hint
+            self._hover_point = nearest
+            self.hover_hint_text = hint
+            self.setToolTip(hint)
+            QToolTip.showText(event.globalPosition().toPoint(), hint, self)
+            if changed:
+                self.update()
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event: QEvent) -> None:
+        if self._hover_point is not None or self.hover_hint_text:
+            self._hover_point = None
+            self.hover_hint_text = ""
+            self.setToolTip("")
+            QToolTip.hideText()
+            self.update()
+        super().leaveEvent(event)
+
     def _y_range(self) -> tuple[float, float] | None:
         if self.data is None or not self.data.segments:
             return None
@@ -166,6 +233,59 @@ class MetricChart(QWidget):
         low, high = min(values), max(values)
         padding = max((high - low) * 0.1, 0.001)
         return low - padding, high + padding
+
+    def _point_state(self, timestamp: float, value: float) -> str:
+        state = self.states.get(timestamp, "")
+        if self.bounds is not None and state in ("DEVIATION", "PENDING"):
+            low_b, high_b = min(self.bounds[0], self.bounds[1]), max(self.bounds[0], self.bounds[1])
+            if low_b <= value <= high_b:
+                return "WITHIN_REFERENCE"
+        return state
+
+    def _segment_pieces(
+        self,
+        t0: float,
+        v0: float,
+        t1: float,
+        v1: float,
+    ) -> list[tuple[float, float, float, float, str]]:
+        """Split a segment at calibration bounds so in-range portions draw green."""
+        if self.bounds is None or not self.states:
+            color = STATE_COLORS.get(self._point_state(t1, v1), "#69B9CF")
+            return [(t0, v0, t1, v1, color)]
+        low_b, high_b = min(self.bounds[0], self.bounds[1]), max(self.bounds[0], self.bounds[1])
+        dv = v1 - v0
+        cuts: list[float] = [0.0, 1.0]
+        if abs(dv) > 1e-12:
+            for bound in (low_b, high_b):
+                u = (bound - v0) / dv
+                if 1e-9 < u < 1.0 - 1e-9:
+                    cuts.append(u)
+        cuts = sorted(set(cuts))
+        raw_s0 = self.states.get(t0, "")
+        raw_s1 = self.states.get(t1, "")
+        if "DEVIATION" in (raw_s0, raw_s1):
+            out_state = "DEVIATION"
+        elif "PENDING" in (raw_s0, raw_s1):
+            out_state = "PENDING"
+        else:
+            out_state = self._point_state(t1, v1) or "WITHIN_REFERENCE"
+        out_color = STATE_COLORS.get(out_state, "#69B9CF")
+        in_color = STATE_COLORS["WITHIN_REFERENCE"]
+        pieces: list[tuple[float, float, float, float, str]] = []
+        for u0, u1 in pairwise(cuts):
+            if u1 - u0 <= 1e-9:
+                continue
+            ta = t0 + u0 * (t1 - t0)
+            va = v0 + u0 * dv
+            tb = t0 + u1 * (t1 - t0)
+            vb = v0 + u1 * dv
+            vm = 0.5 * (va + vb)
+            color = in_color if (low_b - 1e-9) <= vm <= (high_b + 1e-9) else out_color
+            pieces.append((ta, va, tb, vb, color))
+        return pieces or [
+            (t0, v0, t1, v1, in_color if (low_b - 1e-9) <= v1 <= (high_b + 1e-9) else out_color)
+        ]
 
     def _paint_chart(
         self,
@@ -281,32 +401,57 @@ class MetricChart(QWidget):
         painter.save()
         painter.setClipRect(plot)
         for segment in self.data.segments:
-            previous: QPointF | None = None
             prev_t: float | None = None
+            prev_v: float | None = None
             single_point = len(segment) == 1
             for timestamp, value in segment:
                 current = point(timestamp, value)
                 if (
                     prev_t is not None
-                    and previous is not None
+                    and prev_v is not None
                     and not (
                         (prev_t < view_start and timestamp < view_start)
                         or (prev_t > view_end and timestamp > view_end)
                     )
                 ):
-                        painter.setPen(QPen(QColor(STATE_COLORS.get(
-                            self.states.get(timestamp, ""), "#69B9CF",
-                        )), 1.5))
-                        painter.drawLine(previous, current)
+                    for ta, va, tb, vb, piece_color in self._segment_pieces(
+                        prev_t, prev_v, timestamp, value
+                    ):
+                        painter.setPen(QPen(QColor(piece_color), 1.5))
+                        painter.drawLine(point(ta, va), point(tb, vb))
                 if view_start <= timestamp <= view_end and (dot_radius > 0.0 or single_point):
-                    painter.setPen(QPen(QColor(STATE_COLORS.get(
-                        self.states.get(timestamp, ""), "#69B9CF",
-                    )), 1.5))
+                    dot_color = STATE_COLORS.get(self._point_state(timestamp, value), "#69B9CF")
+                    painter.setPen(QPen(QColor(dot_color), 1.5))
                     radius = max(dot_radius, 1.5) if single_point else dot_radius
                     painter.drawEllipse(current, radius, radius)
-                previous = current
                 prev_t = timestamp
+                prev_v = value
         painter.restore()
+        if include_playhead and self._hover_point is not None and self.time_end > 0:
+            hover_t, hover_val = self._hover_point
+            if view_start <= hover_t <= view_end:
+                hp = point(hover_t, hover_val)
+                painter.save()
+                painter.setClipRect(plot)
+                painter.setPen(QPen(QColor(220, 226, 232, 130), 1.0, Qt.PenStyle.DashLine))
+                painter.drawLine(QPointF(hp.x(), plot.top()), QPointF(hp.x(), plot.bottom()))
+                dot_color = STATE_COLORS.get(self._point_state(hover_t, hover_val), "#69B9CF")
+                painter.setBrush(QColor(dot_color))
+                painter.setPen(QPen(QColor("#FFFFFF"), 1.5))
+                painter.drawEllipse(hp, 4.0, 4.0)
+                if self.hover_hint_text:
+                    metrics = painter.fontMetrics()
+                    text_w = metrics.horizontalAdvance(self.hover_hint_text) + 12.0
+                    text_h = float(metrics.height()) + 6.0
+                    bx = min(max(plot.left() + 4.0, hp.x() + 8.0), max(plot.left() + 4.0, plot.right() - text_w - 4.0))
+                    by = max(plot.top() + 4.0, min(hp.y() - text_h - 6.0, plot.bottom() - text_h - 4.0))
+                    badge = QRectF(bx, by, text_w, text_h)
+                    painter.setBrush(QColor(20, 24, 31, 225))
+                    painter.setPen(QPen(QColor(COLOR_BORDER), 1.0))
+                    painter.drawRoundedRect(badge, 4.0, 4.0)
+                    painter.setPen(QColor(COLOR_TEXT_PRIMARY))
+                    painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, self.hover_hint_text)
+                painter.restore()
         if include_playhead and self.playhead_timestamp is not None and self.time_end > 0:
             elapsed = max(0.0, min(self.time_end, self.playhead_timestamp - self.origin_timestamp))
             if view_start <= elapsed <= view_end:
@@ -496,20 +641,26 @@ class MetricChart(QWidget):
         dot_radius = 2.0 if px_per_point >= 4.0 else 1.2 if px_per_point >= 2.0 else 0.0
 
         for segment in self.data.segments:
-            prev_xy: tuple[float, float] | None = None
+            prev_t: float | None = None
+            prev_v: float | None = None
             single_point = len(segment) == 1
             for timestamp, value in segment:
-                color = STATE_COLORS.get(self.states.get(timestamp, ""), "#69B9CF")
+                dot_color = STATE_COLORS.get(self._point_state(timestamp, value), "#69B9CF")
                 cx, cy = px(timestamp), py(value)
-                if prev_xy is not None:
-                    parts.append(
-                        f'<line x1="{prev_xy[0]:.2f}" y1="{prev_xy[1]:.2f}" '
-                        f'x2="{cx:.2f}" y2="{cy:.2f}" stroke="{color}" stroke-width="1.5"/>'
-                    )
+                if prev_t is not None and prev_v is not None:
+                    for ta, va, tb, vb, piece_color in self._segment_pieces(
+                        prev_t, prev_v, timestamp, value
+                    ):
+                        parts.append(
+                            f'<line x1="{px(ta):.2f}" y1="{py(va):.2f}" '
+                            f'x2="{px(tb):.2f}" y2="{py(vb):.2f}" '
+                            f'stroke="{piece_color}" stroke-width="1.5"/>'
+                        )
                 if dot_radius > 0.0 or single_point:
                     r = max(dot_radius, 1.5) if single_point else dot_radius
-                    parts.append(f'<circle cx="{cx:.2f}" cy="{cy:.2f}" r="{r:g}" fill="{color}"/>')
-                prev_xy = (cx, cy)
+                    parts.append(f'<circle cx="{cx:.2f}" cy="{cy:.2f}" r="{r:g}" fill="{dot_color}"/>')
+                prev_t = timestamp
+                prev_v = value
 
         parts.append("</g>")
         return "\n".join(parts)

@@ -106,10 +106,17 @@ def export_couple_csv(
         "torso_tilt_b",
         "couple_midpoint_tilt",
         "torso_separation",
+        "torso_tilt_pearson_r",
         "head_pitch_a",
         "head_pitch_b",
     ):
         item = posture.get(pkey) or {}
+        if pkey == "torso_tilt_pearson_r":
+            val = item.get("value")
+            unit = item.get("unit", "r")
+        else:
+            val = item.get("median_deg")
+            unit = "degrees"
         writer.writerow(
             [
                 "summary",
@@ -118,11 +125,11 @@ def export_couple_csv(
                 run_id,
                 pkey,
                 item.get("subject", "pair"),
-                _fmt_val(item.get("median_deg")),
-                "degrees",
+                _fmt_val(val),
+                unit,
                 item.get("status", "unavailable"),
                 "",
-                f"coverage={item.get('coverage', 0.0)}",
+                item.get("reason") or f"coverage={item.get('coverage', 0.0)}",
             ]
         )
 

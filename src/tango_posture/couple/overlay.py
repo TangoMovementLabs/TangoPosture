@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import math
 from typing import Any
 
@@ -138,6 +139,7 @@ def _draw_dancer(
     *,
     show_steps: bool,
     tilt_deg: float | None = None,
+    min_vis: float = 0.5,
 ) -> None:
     """Draw strictly the Couple-mode torso axis geometry (shoulder/hip bars, vertical ref, torso axis)."""
     height, width = image.shape[:2]
@@ -145,7 +147,6 @@ def _draw_dancer(
     if not landmarks:
         return
     interpolated = bool(dancer_data.get("interpolated_display", False))
-    min_vis = 0.5
 
     ls = landmarks.get("left_shoulder")
     rs = landmarks.get("right_shoulder")
@@ -203,12 +204,15 @@ def render_couple_frame_overlay(
     dancer_a_name: str = "A",
     dancer_b_name: str = "B",
     active_events: list[dict[str, Any]] | None = None,
+    min_vis: float | None = None,
 ) -> np.ndarray:
     """Draw Couple axis overlay (Dancer A/B torso axes, pair midpoint axis, and active events)."""
     out = frame_bgr.copy()
     if overlay_data is None:
         return out
     height, width = out.shape[:2]
+    raw_vis = overlay_data.get("min_landmark_visibility", 0.5) if min_vis is None else min_vis
+    resolved_min_vis = float(raw_vis if raw_vis is not None else 0.5)
 
     tilt_a = overlay_data.get("tilt_a_deg")
     tilt_b = overlay_data.get("tilt_b_deg")
@@ -220,6 +224,7 @@ def render_couple_frame_overlay(
             dancer_a_name or "A",
             show_steps=show_steps_turns,
             tilt_deg=float(tilt_a) if isinstance(tilt_a, int | float) else None,
+            min_vis=resolved_min_vis,
         )
     if show_dancer_b and overlay_data.get("dancer_b"):
         _draw_dancer(
@@ -229,6 +234,7 @@ def render_couple_frame_overlay(
             dancer_b_name or "B",
             show_steps=show_steps_turns,
             tilt_deg=float(tilt_b) if isinstance(tilt_b, int | float) else None,
+            min_vis=resolved_min_vis,
         )
 
     y_cursor = 28
@@ -257,8 +263,12 @@ def render_couple_frame_overlay(
         mid_tilt = overlay_data.get("couple_midpoint_tilt_deg")
         sep_deg = overlay_data.get("torso_separation_deg")
         if pair_hip and pair_sh:
-            a_hip, a_sh = _dancer_midpoints_px(overlay_data.get("dancer_a"), width, height)
-            b_hip, b_sh = _dancer_midpoints_px(overlay_data.get("dancer_b"), width, height)
+            a_hip, a_sh = _dancer_midpoints_px(
+                overlay_data.get("dancer_a"), width, height, min_vis=resolved_min_vis
+            )
+            b_hip, b_sh = _dancer_midpoints_px(
+                overlay_data.get("dancer_b"), width, height, min_vis=resolved_min_vis
+            )
             if a_hip and b_hip:
                 _draw_dashed_line(out, a_hip, b_hip, COLOR_COUPLE_MID_BGR, thickness=1, dash_px=6, gap_px=6)
             if a_sh and b_sh:
@@ -303,3 +313,225 @@ def render_couple_frame_overlay(
                 cv2.LINE_AA,
             )
     return out
+
+
+_SMOOTHED_OVERLAY_LANDMARKS = (
+    "left_shoulder",
+    "right_shoulder",
+    "left_hip",
+    "right_hip",
+    "left_ankle",
+    "right_ankle",
+)
+
+
+def _zero_phase_ema_optional(
+    timestamps: list[float],
+    values: list[float | None],
+    *,
+    tau_s: float,
+    max_gap_s: float,
+) -> list[float | None]:
+    """Bridge brief display gaps and apply zero-phase forward-backward EMA smoothing."""
+    n = len(values)
+    if n == 0:
+        return []
+    out: list[float | None] = [
+        float(v) if v is not None and math.isfinite(float(v)) else None for v in values
+    ]
+    # Bridge brief bracketed display gaps linearly so lines don't blink on single-frame dropouts
+    prev_valid: int | None = None
+    i = 0
+    while i < n:
+        if out[i] is not None:
+            if prev_valid is not None and i - prev_valid > 1:
+                dt_gap = timestamps[i] - timestamps[prev_valid]
+                if 0.0 < dt_gap <= max_gap_s + 1e-9:
+                    v0 = out[prev_valid]
+                    v1 = out[i]
+                    assert v0 is not None and v1 is not None
+                    for k in range(prev_valid + 1, i):
+                        frac = (timestamps[k] - timestamps[prev_valid]) / max(dt_gap, 1e-9)
+                        out[k] = v0 + frac * (v1 - v0)
+            prev_valid = i
+        i += 1
+
+    if tau_s <= 1e-4:
+        return out
+
+    # Partition into contiguous finite runs separated by > smooth_gap_s or None
+    smooth_gap_s = max(float(max_gap_s), 0.50)
+    runs: list[list[int]] = []
+    current_run: list[int] = []
+    for idx, val in enumerate(out):
+        if val is None:
+            if current_run:
+                runs.append(current_run)
+                current_run = []
+            continue
+        if current_run and (timestamps[idx] - timestamps[current_run[-1]]) > smooth_gap_s + 1e-9:
+            runs.append(current_run)
+            current_run = []
+        current_run.append(idx)
+    if current_run:
+        runs.append(current_run)
+
+    safe_tau = max(float(tau_s), 1e-3)
+    for run in runs:
+        if len(run) < 2:
+            continue
+        fwd = [float(out[run[0]])]  # type: ignore[arg-type]
+        for k in range(1, len(run)):
+            dt = max(1e-4, timestamps[run[k]] - timestamps[run[k - 1]])
+            alpha = 1.0 - math.exp(-dt / safe_tau)
+            raw_v = float(out[run[k]])  # type: ignore[arg-type]
+            fwd.append(fwd[-1] + alpha * (raw_v - fwd[-1]))
+        bwd = [0.0] * len(run)
+        bwd[-1] = fwd[-1]
+        for k in range(len(run) - 2, -1, -1):
+            dt = max(1e-4, timestamps[run[k + 1]] - timestamps[run[k]])
+            alpha = 1.0 - math.exp(-dt / safe_tau)
+            bwd[k] = bwd[k + 1] + alpha * (fwd[k] - bwd[k + 1])
+        for k, idx in enumerate(run):
+            out[idx] = bwd[k]
+    return out
+
+
+def smooth_couple_frame_overlays(
+    frame_overlays: list[dict[str, Any]],
+    *,
+    tau_s: float = 0.16,
+    max_gap_s: float = 0.50,
+) -> list[dict[str, Any]]:
+    """Apply display-only zero-phase smoothing and gap bridging to Couple overlay geometry."""
+    if not frame_overlays:
+        return []
+    smoothed = copy.deepcopy(frame_overlays)
+    n = len(smoothed)
+    timestamps: list[float] = []
+    for idx, fo in enumerate(smoothed):
+        ts = fo.get("timestamp") if isinstance(fo, dict) else None
+        t_val = float(ts) if isinstance(ts, (int, float)) and not isinstance(ts, bool) and math.isfinite(ts) else idx / 30.0
+        if timestamps and t_val <= timestamps[-1]:
+            t_val = timestamps[-1] + 1.0 / 30.0
+        timestamps.append(t_val)
+
+    for dancer_key in ("dancer_a", "dancer_b"):
+        for lm_key in _SMOOTHED_OVERLAY_LANDMARKS:
+            xs: list[float | None] = []
+            ys: list[float | None] = []
+            vis_list: list[float | None] = []
+            for fo in smoothed:
+                d_data = fo.get(dancer_key) if isinstance(fo, dict) else None
+                lms = d_data.get("landmarks") if isinstance(d_data, dict) else None
+                coords = lms.get(lm_key) if isinstance(lms, dict) else None
+                if (
+                    isinstance(coords, (list, tuple))
+                    and len(coords) >= 2
+                    and _lm_vis(list(coords)) >= 0.5
+                    and isinstance(coords[0], (int, float))
+                    and isinstance(coords[1], (int, float))
+                    and math.isfinite(float(coords[0]))
+                    and math.isfinite(float(coords[1]))
+                ):
+                    xs.append(float(coords[0]))
+                    ys.append(float(coords[1]))
+                    vis_list.append(_lm_vis(list(coords)))
+                else:
+                    xs.append(None)
+                    ys.append(None)
+                    vis_list.append(None)
+
+            sm_x = _zero_phase_ema_optional(timestamps, xs, tau_s=tau_s, max_gap_s=max_gap_s)
+            sm_y = _zero_phase_ema_optional(timestamps, ys, tau_s=tau_s, max_gap_s=max_gap_s)
+            for idx, fo in enumerate(smoothed):
+                if sm_x[idx] is None or sm_y[idx] is None or not isinstance(fo, dict):
+                    continue
+                was_missing = xs[idx] is None
+                d_data = fo.get(dancer_key)
+                if not isinstance(d_data, dict):
+                    d_data = {
+                        "landmarks": {},
+                        "interpolated_display": True,
+                        "quality_status": "estimated",
+                    }
+                    fo[dancer_key] = d_data
+                elif was_missing:
+                    d_data["interpolated_display"] = True
+                lms = d_data.setdefault("landmarks", {})
+                if isinstance(lms, dict):
+                    vis = vis_list[idx] if vis_list[idx] is not None else 0.75
+                    lms[lm_key] = [round(sm_x[idx], 5), round(sm_y[idx], 5), round(vis, 3)]  # type: ignore[arg-type]
+
+    # Populate missing pair midpoint endpoints from smoothed dancer landmarks, then smooth pair points
+    def _dancer_mid_norm(d_data: Any, k1: str, k2: str) -> tuple[float, float] | None:
+        if not isinstance(d_data, dict):
+            return None
+        lms = d_data.get("landmarks") or {}
+        c1, c2 = lms.get(k1), lms.get(k2)
+        if (
+            isinstance(c1, (list, tuple))
+            and isinstance(c2, (list, tuple))
+            and len(c1) >= 2
+            and len(c2) >= 2
+            and _lm_vis(list(c1)) >= 0.5
+            and _lm_vis(list(c2)) >= 0.5
+        ):
+            return (0.5 * (float(c1[0]) + float(c2[0])), 0.5 * (float(c1[1]) + float(c2[1])))
+        return None
+
+    for pair_key, k1, k2 in (
+        ("pair_hip_norm", "left_hip", "right_hip"),
+        ("pair_shoulder_norm", "left_shoulder", "right_shoulder"),
+    ):
+        pxs: list[float | None] = []
+        pys: list[float | None] = []
+        for fo in smoothed:
+            pt = fo.get(pair_key) if isinstance(fo, dict) else None
+            if (
+                isinstance(pt, (list, tuple))
+                and len(pt) >= 2
+                and isinstance(pt[0], (int, float))
+                and isinstance(pt[1], (int, float))
+                and math.isfinite(float(pt[0]))
+                and math.isfinite(float(pt[1]))
+            ):
+                pxs.append(float(pt[0]))
+                pys.append(float(pt[1]))
+            else:
+                ma = _dancer_mid_norm(fo.get("dancer_a") if isinstance(fo, dict) else None, k1, k2)
+                mb = _dancer_mid_norm(fo.get("dancer_b") if isinstance(fo, dict) else None, k1, k2)
+                if ma is not None and mb is not None:
+                    pxs.append(0.5 * (ma[0] + mb[0]))
+                    pys.append(0.5 * (ma[1] + mb[1]))
+                else:
+                    pxs.append(None)
+                    pys.append(None)
+        sm_px = _zero_phase_ema_optional(timestamps, pxs, tau_s=tau_s, max_gap_s=max_gap_s)
+        sm_py = _zero_phase_ema_optional(timestamps, pys, tau_s=tau_s, max_gap_s=max_gap_s)
+        for idx, fo in enumerate(smoothed):
+            if isinstance(fo, dict) and sm_px[idx] is not None and sm_py[idx] is not None:
+                fo[pair_key] = [round(sm_px[idx], 6), round(sm_py[idx], 6)]  # type: ignore[arg-type]
+
+    for angle_key in (
+        "tilt_a_deg",
+        "tilt_b_deg",
+        "couple_midpoint_tilt_deg",
+        "torso_separation_deg",
+    ):
+        raw_vals: list[float | None] = [
+            float(fo[angle_key])
+            if isinstance(fo, dict)
+            and isinstance(fo.get(angle_key), (int, float))
+            and not isinstance(fo.get(angle_key), bool)
+            and math.isfinite(float(fo[angle_key]))
+            else None
+            for fo in smoothed
+        ]
+        sm_vals = _zero_phase_ema_optional(timestamps, raw_vals, tau_s=tau_s, max_gap_s=max_gap_s)
+        for idx in range(n):
+            val = sm_vals[idx]
+            if isinstance(smoothed[idx], dict):
+                smoothed[idx][angle_key] = round(val, 2) if val is not None else None
+
+    return smoothed

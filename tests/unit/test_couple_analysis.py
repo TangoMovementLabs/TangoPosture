@@ -646,4 +646,79 @@ def test_planned_reversal_exclusion_annotations_rebuild_archive_companion_and_cs
     rows = list(csv.DictReader(io.StringIO(csv_text)))
     assert any(r["row_type"] == "summary" and r["measure"] == "start_lag_ms" and r["run_id"] == "run-rev-1" for r in rows)
     assert any(r["row_type"] == "summary" and r["measure"] == "planned_reversals" and r["value"] == "1" for r in rows)
+    assert any(r["row_type"] == "summary" and r["measure"] == "torso_tilt_pearson_r" for r in rows)
     assert any(r["row_type"] == "event" for r in rows)
+
+
+def test_torso_tilt_pearson_correlation_and_couple_threshold_params():
+    from tango_posture.couple.measurements import compute_torso_tilt_pearson_correlation
+
+    # 1. Exact positive, negative, zero-variance, and insufficient-sample cases
+    pos_a = [{"timestamp": i * 0.1, "value": float(i - 5), "status": "measured"} for i in range(10)]
+    pos_b = [{"timestamp": i * 0.1, "value": float(2 * i - 3), "status": "measured"} for i in range(10)]
+    neg_b = [{"timestamp": i * 0.1, "value": float(-2 * i + 4), "status": "measured"} for i in range(10)]
+    flat_b = [{"timestamp": i * 0.1, "value": 5.0, "status": "measured"} for i in range(10)]
+
+    r_pos, n_pos, reason_pos = compute_torso_tilt_pearson_correlation(pos_a, pos_b)
+    assert r_pos == pytest.approx(1.0, abs=1e-4)
+    assert n_pos == 10
+    assert reason_pos == ""
+
+    r_neg, n_neg, _ = compute_torso_tilt_pearson_correlation(pos_a, neg_b)
+    assert r_neg == pytest.approx(-1.0, abs=1e-4)
+    assert n_neg == 10
+
+    r_flat, _, reason_flat = compute_torso_tilt_pearson_correlation(pos_a, flat_b)
+    assert r_flat is None
+    assert reason_flat == "zero_variance"
+
+    r_few, n_few, reason_few = compute_torso_tilt_pearson_correlation(pos_a[:2], pos_b[:2])
+    assert r_few is None
+    assert n_few == 2
+    assert reason_few == "insufficient_paired_samples"
+
+    # 2. Full couple run populates torso_tilt_pearson_r & stores overlay visibility parameter
+    cfg = Config()
+    cfg.dancer_analysis.overlay_min_landmark_visibility = 0.65
+    cfg.dancer_analysis.overlay_smoothing_s = 0.30
+    cfg.dancer_analysis.axis_bridge_max_gap_s = 0.30
+    cfg.dancer_analysis.turn_exit_match_window_s = 5.0
+    cfg.dancer_analysis.shot_cut_max_frame_gap_s = 0.50
+
+    obs = []
+    for i in range(12):
+        t = i * 0.1
+        tilt_step = 0.01 * math.sin(i * 0.7)
+        pa = _make_person_pose(hip_x=0.35, shoulder_dx=tilt_step, torso_dy=0.25)
+        pb = _make_person_pose(hip_x=0.55, shoulder_dx=-tilt_step, torso_dy=0.25)
+        obs.append((i, _obs(t, [pa, pb])))
+
+    anns = CoupleAnnotations(
+        items=[
+            CoupleAnnotationItem(annotation_id="ts", event_type="turn_start", subject="pair", timestamp=0.1, status="user_confirmed"),
+            CoupleAnnotationItem(annotation_id="te", event_type="turn_end", subject="pair", timestamp=0.4, status="user_confirmed"),
+            CoupleAnnotationItem(annotation_id="ex", event_type="exit", subject="pair", timestamp=4.6, status="user_confirmed"),
+        ]
+    )
+    res = run_couple_analysis(
+        obs,
+        cfg,
+        clip_in=0.0,
+        clip_out=1.2,
+        request=CoupleAnalysisRequest(requested_mode="couple", forced_override=True, annotations=anns),
+    ).to_dict()
+
+    pearson_summary = res["summaries"]["posture"]["torso_tilt_pearson_r"]
+    assert pearson_summary["status"] == "measured"
+    assert pearson_summary["value"] == pytest.approx(-1.0, abs=0.02)
+    assert res["frame_overlays"][0]["min_landmark_visibility"] == pytest.approx(0.65)
+    # Turn exit matched 4.2 s after turn_end because turn_exit_match_window_s = 5.0 s (> default 3.0 s)
+    assert res["summaries"]["turns"]["median_exit_minus_turn_end_ms"] == pytest.approx(4200.0, abs=1.0)
+
+    # Custom shot_cut_max_frame_gap_s triggers break cleanly
+    gap_obs = [
+        (0, _obs(0.0, [_make_person_pose(hip_x=0.35), _make_person_pose(hip_x=0.55)])),
+        (1, _obs(0.8, [_make_person_pose(hip_x=0.36), _make_person_pose(hip_x=0.56)])),
+    ]
+    gap_tracked = track_couple_frames(gap_obs, cfg)
+    assert gap_tracked.frames[1].shot_cut is True

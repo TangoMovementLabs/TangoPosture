@@ -5,6 +5,7 @@ import json
 import socket
 import sqlite3
 import xml.etree.ElementTree as ET
+from itertools import pairwise
 from zipfile import ZipFile
 
 import pytest
@@ -23,12 +24,14 @@ from tango_posture.calibration.models import (
 from tango_posture.config import Config, RangeDefault
 from tango_posture.desktop_qt.analytics.data import (
     FRAME_METRICS,
+    _evaluate_series,
     compare_archive_with_calibration,
     load_archive_dataset,
     load_session,
     session_payload,
 )
-from tango_posture.desktop_qt.router import Router
+from tango_posture.desktop_qt.components.metric_chart import STATE_COLORS, MetricChart
+from tango_posture.desktop_qt.router import Route, Router
 from tango_posture.desktop_qt.screens.analytics import AnalyticsScreen
 from tango_posture.desktop_qt.service_bridge import ServiceBridge
 from tango_posture.domain import (
@@ -525,3 +528,152 @@ def test_analytics_defaults_and_tpc_include_head_forward_inclination_and_trunk(t
         target = cal_profile.metrics[key]
         assert profile_comp.metrics[key].bounds == (target.lower, target.upper)
         assert profile_comp.metrics[key].reference_line == pytest.approx(target.median)
+
+
+def test_analytics_in_range_points_and_boundary_segments_are_not_red_or_orange(qapp):
+    cfg = Config(smoothing=0.0001, entry_duration=0.4, clear_duration=0.6, max_gap=0.5)
+    bounds = (-0.10, 0.10)
+    # Leaves range long enough to trigger DEVIATION (0.8s..1.4s), then re-enters inside [-0.10, 0.10]
+    raw_points = [
+        (0.0, 0.0),
+        (0.2, 0.05),
+        (0.4, 0.15),
+        (0.6, 0.18),
+        (0.8, 0.20),
+        (1.0, 0.22),
+        (1.2, 0.04),  # re-entered while clear_duration hysteresis is still running
+        (1.4, 0.02),
+    ]
+    data, states, _ = _evaluate_series(
+        "head_forward", raw_points, cfg, 0.0, cfg.max_gap, bounds=bounds
+    )
+    for ts, val in data.points:
+        assert val is not None
+        if bounds[0] <= val <= bounds[1]:
+            assert states[ts] == "WITHIN_REFERENCE"
+        else:
+            assert states[ts] in ("PENDING", "DEVIATION")
+
+    chart = MetricChart()
+    chart.set_data(data, 1.4, 0.0, bounds=bounds, reference_line=0.0, states=states)
+    assert len(data.segments) == 1
+    for (t0, v0), (t1, v1) in zip(data.segments[0][:-1], data.segments[0][1:], strict=True):
+        pieces = chart._segment_pieces(t0, v0, t1, v1)
+        assert pieces
+        for _ta, va, _tb, vb, color in pieces:
+            vm = 0.5 * (va + vb)
+            if bounds[0] + 1e-6 < vm < bounds[1] - 1e-6:
+                assert color == STATE_COLORS["WITHIN_REFERENCE"]
+            elif vm > bounds[1] + 1e-6 or vm < bounds[0] - 1e-6:
+                assert color in (STATE_COLORS["PENDING"], STATE_COLORS["DEVIATION"])
+
+    svg = chart.svg_fragment(title="Head Forward", subtitle="Calibration")
+    root = ET.fromstring(svg)
+    y_limits = chart._y_range()
+    assert y_limits is not None
+    low_y, high_y = y_limits
+    plot_top = 46.0 + 12.0
+    plot_height = (240.0 - 46.0) - 50.0
+    plot_bottom = plot_top + plot_height
+    y_upper_bound = plot_bottom - (bounds[1] - low_y) / (high_y - low_y) * plot_height
+    y_lower_bound = plot_bottom - (bounds[0] - low_y) / (high_y - low_y) * plot_height
+    band_min_y = min(y_upper_bound, y_lower_bound)
+    band_max_y = max(y_upper_bound, y_lower_bound)
+    for line in root.findall(".//line"):
+        stroke = line.attrib.get("stroke", "")
+        if stroke in (STATE_COLORS["DEVIATION"], STATE_COLORS["PENDING"]):
+            y1 = float(line.attrib["y1"])
+            y2 = float(line.attrib["y2"])
+            assert not (band_min_y + 0.5 < y1 < band_max_y - 0.5 and band_min_y + 0.5 < y2 < band_max_y - 0.5)
+    chart.close()
+
+
+def test_metric_chart_hover_shows_timestamp_and_value_and_settings_refresh(
+    qapp, tmp_path, monkeypatch
+):
+    from PySide6.QtCore import QEvent, QPointF, Qt
+    from PySide6.QtGui import QMouseEvent
+
+    from tango_posture.desktop_qt.analytics.data import MetricData
+    from tango_posture.desktop_qt.shell import MainWindow
+
+    monkeypatch.chdir(tmp_path)
+
+    # 1. Hovering over a MetricChart shows timestamp (s) and value in hover hint & tooltip
+    chart = MetricChart()
+    chart.resize(640, 240)
+    points = [(0.0, 5.0), (1.0, 12.5), (2.0, 7.0)]
+    chart.set_data(
+        MetricData(points, [points], {}, 0, 0),
+        time_end=2.0,
+        origin_timestamp=10.0,
+        unit="degrees",
+    )
+    assert chart.hasMouseTracking()
+    plot_left = 62.0
+    plot_right = float(chart.width() - 20)
+    mid_pos = QPointF(plot_left + 0.5 * (plot_right - plot_left), 100.0)
+    move_ev = QMouseEvent(
+        QEvent.Type.MouseMove,
+        mid_pos,
+        chart.mapToGlobal(mid_pos),
+        Qt.MouseButton.NoButton,
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+    )
+    chart.mouseMoveEvent(move_ev)
+    assert "11.00 s" in chart.hover_hint_text
+    assert "12.5 degrees" in chart.hover_hint_text
+    assert chart.toolTip() == chart.hover_hint_text
+    # Ensure paint with hover badge does not crash
+    img = chart.grab()
+    assert img.width() == 640
+
+    chart.leaveEvent(QEvent(QEvent.Type.Leave))
+    assert chart.hover_hint_text == ""
+    assert chart.toolTip() == ""
+    chart.close()
+
+    # 2. Updating & saving Settings persists config.toml + settings.toml and refreshes Analytics charts
+    cfg = Config(data_dir=str(tmp_path / "data"), smoothing=0.0001, max_gap=0.5)
+    capture_profile = profile(cfg, 640, 480, "video")
+    timestamps = [round(i * 0.2, 2) for i in range(8)]
+    observations = [_full_pose_observation(ts, ear_dx=(i % 2) * 35.0) for i, ts in enumerate(timestamps)]
+    tpr_path = reference_directory(cfg.data_dir) / "SettingsRefreshRef.tpr"
+    _make_pose_archive(
+        tpr_path, tmp_path / "rep.md", timestamps, observations, capture_profile, is_reference=True
+    )
+
+    window = MainWindow(cfg)
+    try:
+        analytics = window.screens[Route.ANALYTICS] if False else None  # typing resolved at runtime
+        window.router.navigate(Route.ANALYTICS)
+        qapp.processEvents()
+        analytics = window.screens[Route.ANALYTICS]
+        assert isinstance(analytics, AnalyticsScreen)
+        idx = next(
+            i for i in range(analytics.session_combo.count())
+            if "(Reference .tpr)" in analytics.session_combo.itemText(i)
+        )
+        analytics.session_combo.setCurrentIndex(idx)
+        qapp.processEvents()
+
+        before_vals = [v for _, v in analytics.charts["head_forward"].data.points if v is not None]
+        before_jitter = sum(abs(b - a) for a, b in pairwise(before_vals))
+
+        window.router.navigate(Route.SETTINGS)
+        qapp.processEvents()
+        settings = window.screens[Route.SETTINGS]
+        settings.smooth_spin.setValue(0.60)
+        settings.save_config_btn.click()
+        qapp.processEvents()
+
+        assert (tmp_path / "config.toml").is_file()
+        assert (tmp_path / "settings.toml").is_file()
+        assert window.bridge.config.smoothing == pytest.approx(0.60)
+
+        after_vals = [v for _, v in analytics.charts["head_forward"].data.points if v is not None]
+        after_jitter = sum(abs(b - a) for a, b in pairwise(after_vals))
+        assert after_jitter < before_jitter * 0.7
+    finally:
+        window.close()

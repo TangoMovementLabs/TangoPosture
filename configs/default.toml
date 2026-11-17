@@ -101,6 +101,17 @@ stop_speed = 0.10
 slowing_fraction = 0.25
 transition_min_coverage = 0.75
 secondary_speed_rise = 0.12
+axis_smoothing_s = 0.25
+overlay_smoothing_s = 0.20
+axis_bridge_max_gap_s = 0.25
+overlay_min_landmark_visibility = 0.50
+duplicate_pose_max_distance_torso_lengths = 0.18
+fixed_scale_min_ratio = 0.45
+fixed_scale_max_ratio = 2.20
+shot_cut_max_frame_gap_s = 1.50
+shot_cut_jump_torso_lengths = 1.50
+turn_exit_match_window_s = 3.00
+close_embrace_max_tilt_deg = 25.0
 analyze_soundtrack = false
 auto_turn_suggestions = false
 

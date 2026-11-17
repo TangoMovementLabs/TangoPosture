@@ -500,13 +500,35 @@ def load_archive_dataset(path: Path, index: int, cfg: Config | None = None) -> S
     if payload is None:
         raise ValueError("No stored analytics for this recording. Analyze it in Review.")
     has_session = isinstance(payload.get("session"), dict)
+    cfg_max_gap = finite_number(cfg.max_gap) if cfg is not None else None
     if has_session:
         dataset = load_archive_session(path, index)
+        if cfg_max_gap is not None and cfg_max_gap > 0 and cfg_max_gap != dataset.max_gap:
+            rebuilt_metrics = {
+                key: MetricData(
+                    metric.points,
+                    _segments_from_points(metric.points, cfg_max_gap),
+                    metric.summary,
+                    metric.event_count,
+                    metric.open_event_count,
+                )
+                for key, metric in dataset.metrics.items()
+            }
+            dataset = SessionData(
+                dataset.identifier,
+                dataset.status,
+                rebuilt_metrics,
+                dataset.active_duration,
+                cfg_max_gap,
+                dataset.origin_timestamp,
+                dataset.events,
+            )
     else:
+        resolved_gap = cfg_max_gap if cfg_max_gap is not None and cfg_max_gap > 0 else finite_number(payload.get("max_gap"))
         dataset = SessionData(
             f"{path.name}:{index:02d}", "archived",
             {key: MetricData([], [], {}, 0, 0) for key in METRICS},
-            None, finite_number(payload.get("max_gap")), 0.0, [],
+            None, resolved_gap, 0.0, [],
         )
     coach = payload.get("coach_data")
     entries = coach.get("frames", {}) if isinstance(coach, dict) else {}
@@ -586,6 +608,14 @@ def load_archive_dataset(path: Path, index: int, cfg: Config | None = None) -> S
                     if isinstance(couple_entry.get("auto_decision"), dict)
                     else raw_cr.get("auto_decision")
                 )
+    if couple_result is None and isinstance(coach, dict) and isinstance(coach.get("couple_analysis"), dict):
+        couple_result = coach["couple_analysis"]
+        couple_run_id = str(couple_result.get("run_id") or "")
+        if isinstance(couple_result.get("auto_decision"), dict):
+            auto_decision = couple_result["auto_decision"]
+        dancer_mode = "couple"
+        if "couple" not in available_modes:
+            available_modes.append("couple")
     if not available_modes:
         available_modes = ["single"]
 
@@ -628,6 +658,11 @@ def _evaluate_series(
     if max_gap is not None and max_gap > 0:
         run_cfg = run_cfg.model_copy(update={"max_gap": max_gap})
     evaluator = Evaluator(metric, baseline, run_cfg, bounds=bounds)
+    norm_bounds = (
+        (min(bounds[0], bounds[1]), max(bounds[0], bounds[1]))
+        if bounds is not None
+        else None
+    )
     smoothed_points: list[Point] = []
     states: dict[float, str] = {}
     last_t: float | None = None
@@ -637,8 +672,24 @@ def _evaluate_series(
         last_t = rel_t
         row = evaluator.update(rel_t, raw)
         smoothed = finite_number(row["smoothed"])
+        state = str(row["state"])
+        if smoothed is not None and state in ("DEVIATION", "PENDING"):
+            if norm_bounds is not None:
+                in_range = norm_bounds[0] <= smoothed <= norm_bounds[1]
+            elif evaluator.threshold is not None:
+                diff = smoothed - baseline
+                if metric != "head_forward":
+                    diff = wrapped(diff)
+                mag = diff if metric == "head_forward" else abs(diff)
+                in_range = mag <= evaluator.threshold.entry
+            else:
+                in_range = False
+            if in_range:
+                # Analytics visualizes instantaneous compliance against [lower, upper];
+                # post-deviation clearing hysteresis must not paint in-range samples red/orange.
+                state = "WITHIN_REFERENCE"
         smoothed_points.append((rel_t, smoothed))
-        states[rel_t] = str(row["state"])
+        states[rel_t] = state
     segments = _segments_from_points(smoothed_points, max_gap)
     events = [
         PersistedEvent(

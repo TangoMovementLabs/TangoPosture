@@ -149,8 +149,7 @@ class ServiceBridge(QObject):
         self.status_message.emit(f"Calibration defaults saved to {destination}")
         return True
 
-    def save_settings(self, cfg: Config, destination: Path) -> None:
-        payload = export_toml(cfg).encode("utf-8")
+    def _write_toml_atomic(self, destination: Path, payload: bytes) -> None:
         output = QSaveFile(str(destination))
         if not output.open(QIODevice.OpenModeFlag.WriteOnly):
             raise OSError(output.errorString())
@@ -160,6 +159,14 @@ class ServiceBridge(QObject):
             raise OSError(error)
         if not output.commit():
             raise OSError(output.errorString())
+
+    def save_settings(self, cfg: Config, destination: Path) -> None:
+        payload = export_toml(cfg).encode("utf-8")
+        self._write_toml_atomic(destination, payload)
+        sibling_names = {"settings.toml": "config.toml", "config.toml": "settings.toml"}
+        sibling_name = sibling_names.get(destination.name)
+        if sibling_name is not None:
+            self._write_toml_atomic(destination.with_name(sibling_name), payload)
         self.update_config(cfg)
 
     def list_references(self) -> list[ReferenceSummary]:

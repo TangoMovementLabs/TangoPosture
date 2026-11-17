@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from ...config import Config
-from ...couple.overlay import render_couple_frame_overlay
+from ...couple.overlay import render_couple_frame_overlay, smooth_couple_frame_overlays
 from ...movement import render_floor_guide, render_movement_overlay
 from ...references.coach import interpolate_coach_data, render_coach_frame_overlay
 from ...references.errors import ImportCancelledError
@@ -242,17 +242,21 @@ def render_review_overlays(
             for k, v in by_frame.items():
                 if str(k).lstrip("-").isdigit() and isinstance(v, dict):
                     couple_by_idx[int(k)] = v
-        fo_list = analysis.couple_result.get("frame_overlays") or []
-        if isinstance(fo_list, list):
+        raw_fo_list = analysis.couple_result.get("frame_overlays") or []
+        if isinstance(raw_fo_list, list) and raw_fo_list:
+            fo_list = smooth_couple_frame_overlays(
+                [fo for fo in raw_fo_list if isinstance(fo, dict)],
+                tau_s=max(float(cfg.overlay_smoothing), 0.14),
+                max_gap_s=float(cfg.dancer_analysis.display_interpolation_max_gap_s),
+            )
             for pos, fo in enumerate(fo_list):
-                if isinstance(fo, dict):
-                    fidx = fo.get("frame_index")
-                    if isinstance(fidx, int) and fidx not in couple_by_idx:
-                        couple_by_idx[fidx] = fo
-                    if pos not in couple_by_idx and not any(
-                        isinstance(x, dict) and x.get("frame_index") == pos for x in fo_list
-                    ):
-                        couple_by_idx[pos] = fo
+                fidx = fo.get("frame_index")
+                if isinstance(fidx, int) and fidx not in couple_by_idx:
+                    couple_by_idx[fidx] = fo
+                if pos not in couple_by_idx and not any(
+                    x.get("frame_index") == pos for x in fo_list
+                ):
+                    couple_by_idx[pos] = fo
 
     def render(image: Any, index: int, fps: float, *, floor: bool) -> Any:
         if cancel_check():

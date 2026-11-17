@@ -32,13 +32,21 @@ from ...archive import read_analytics, read_manifest
 from ...calibration.baseline import load_calibration_file
 from ...calibration.models import METRIC_DETAILS, RangeProfile
 from ...couple.csv_export import export_couple_csv
+from ...couple.measurements import (
+    compute_torso_tilt_pearson_correlation,
+    rebuild_couple_result_with_annotations,
+)
+from ...couple.overlay import _zero_phase_ema_optional
 from ...domain import Calibration
 from ...replay import time_label
 from ..analytics.data import (
     FRAME_METRICS,
     ComparisonResult,
     MetricComparison,
+    MetricData,
     SessionData,
+    _interval_summary,
+    _segments_from_points,
     compare_archive_with_calibration,
     finite_number,
     load_archive_dataset,
@@ -54,6 +62,12 @@ from ..service_bridge import (
 from ..theme import COLOR_BASE, COLOR_BORDER, COLOR_TEXT_MUTED, COLOR_TEXT_PRIMARY
 
 ALL_CHART_METRICS = (*METRIC_DETAILS, *FRAME_METRICS)
+COUPLE_AXIS_METRICS: dict[str, tuple[str, str, float]] = {
+    "torso_tilt_a": ("Dancer A — Torso Axis Tilt", "deg", 0.0),
+    "torso_tilt_b": ("Dancer B — Torso Axis Tilt", "deg", 0.0),
+    "couple_midpoint_tilt": ("Couple — Midpoint Axis Tilt", "deg", 0.0),
+    "torso_separation": ("Couple — Torso Axis Separation", "deg", 0.0),
+}
 
 
 def _seconds(value: object) -> str:
@@ -235,7 +249,10 @@ class AnalyticsScreen(QWidget):
         self.analytics_mode_tabs.addTab(scroll, "Posture & calibration metrics")
         self.analytics_mode_tabs.addTab(couple_view, "Couple analysis")
         layout.addWidget(self.analytics_mode_tabs, 1)
-        self.bridge.config_changed.connect(lambda _cfg: self.refresh())
+        self.bridge.config_changed.connect(self._on_config_changed)
+        self.refresh()
+
+    def _on_config_changed(self, _cfg: object = None) -> None:
         self.refresh()
 
     def _clear(self, message: str) -> None:
@@ -382,11 +399,14 @@ class AnalyticsScreen(QWidget):
         except (OSError, sqlite3.Error, ValueError, BadZipFile) as exc:
             message = f"Analytics unavailable: {exc}"
         index = _find_combo_data(self.session_combo, selected) if selected else 0
-        self.session_combo.setCurrentIndex(max(0, index))
+        resolved_index = max(0, index)
+        restored = self.session_combo.itemData(resolved_index)
+        same_selection = selected is not None and restored == selected
+        self.session_combo.setCurrentIndex(resolved_index)
         self.session_combo.blockSignals(False)
         self._clear(message)
         if self.session_combo.currentData():
-            self._select_session()
+            self._select_session(preserve_tab=same_selection)
 
     def load_archive(
         self,
@@ -456,7 +476,7 @@ class AnalyticsScreen(QWidget):
             return cal
         return None
 
-    def _select_session(self) -> None:
+    def _select_session(self, _combo_index: int = -1, *, preserve_tab: bool = False) -> None:
         selected = self.session_combo.currentData()
         self._clear("Select a Library recording or reference to inspect analytics.")
         if not selected:
@@ -488,11 +508,18 @@ class AnalyticsScreen(QWidget):
         except (OSError, sqlite3.Error, ValueError, TypeError, KeyError, BadZipFile) as exc:
             self.recordings = []
             self.bridge.status_message.emit(f"Session video navigation unavailable: {exc}")
-        self._active_couple_result = dataset.couple_result
+        couple_res = dataset.couple_result
+        if isinstance(couple_res, dict):
+            couple_res = rebuild_couple_result_with_annotations(
+                couple_res,
+                couple_res.get("annotations") or {},
+                self.bridge.config,
+            )
+        self._active_couple_result = couple_res
         self._active_couple_run_id = dataset.couple_run_id
-        self.export_couple_csv_btn.setEnabled(isinstance(dataset.couple_result, dict))
-        self._populate_couple_analysis(dataset.couple_result)
-        if dataset.couple_result is not None and (
+        self.export_couple_csv_btn.setEnabled(isinstance(couple_res, dict))
+        self._populate_couple_analysis(couple_res)
+        if not preserve_tab and couple_res is not None and (
             dataset.dancer_mode == "couple" or self.mode_filter_combo.currentData() == "couple"
         ):
             self.analytics_mode_tabs.setCurrentIndex(1)
@@ -564,6 +591,7 @@ class AnalyticsScreen(QWidget):
                 bounds=comp_item.bounds,
                 reference_line=comp_item.reference_line,
                 states=comp_item.states,
+                unit=_metric_unit(metric),
             )
             enabled = chart.isEnabled()
             self.export_buttons[metric].setEnabled(enabled)
@@ -977,6 +1005,8 @@ class AnalyticsScreen(QWidget):
         return ["single"]
 
     def _build_couple_analytics_view(self) -> QWidget:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
         panel = QWidget()
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -988,8 +1018,68 @@ class AnalyticsScreen(QWidget):
         header.addWidget(self.couple_run_info_label, 1)
         layout.addLayout(header)
 
+        self.couple_pearson_card = QFrame()
+        self.couple_pearson_card.setObjectName("couplePearsonCard")
+        self.couple_pearson_card.setProperty("class", "card")
+        pearson_layout = QVBoxLayout(self.couple_pearson_card)
+        pearson_layout.setContentsMargins(14, 12, 14, 12)
+        pearson_layout.setSpacing(4)
+        pearson_hdr = QHBoxLayout()
+        pearson_title = QLabel("Torso Axis Tilt — Pearson Correlation (Dancer A vs Dancer B)")
+        pearson_title.setStyleSheet("font-weight: 600;")
+        pearson_hdr.addWidget(pearson_title, 1)
+        self.couple_pearson_value_label = QLabel("Pearson r: Unavailable")
+        self.couple_pearson_value_label.setObjectName("couplePearsonValueLabel")
+        self.couple_pearson_value_label.setStyleSheet("font-size: 16pt; font-weight: 700;")
+        pearson_hdr.addWidget(self.couple_pearson_value_label)
+        pearson_layout.addLayout(pearson_hdr)
+        self.couple_pearson_detail_label = QLabel(
+            "Select a Couple recording to measure synchronized torso tilt correlation."
+        )
+        self.couple_pearson_detail_label.setObjectName("couplePearsonDetailLabel")
+        self.couple_pearson_detail_label.setProperty("class", "muted")
+        self.couple_pearson_detail_label.setWordWrap(True)
+        pearson_layout.addWidget(self.couple_pearson_detail_label)
+        layout.addWidget(self.couple_pearson_card)
+
+        self.couple_axis_charts: dict[str, MetricChart] = {}
+        self.couple_axis_title_labels: dict[str, QLabel] = {}
+        self.couple_axis_coverage_labels: dict[str, QLabel] = {}
+        self.couple_axis_export_buttons: dict[str, QPushButton] = {}
+        for key, (default_label, unit, _ref) in COUPLE_AXIS_METRICS.items():
+            card = QFrame()
+            card.setProperty("class", "card")
+            card_layout = QVBoxLayout(card)
+            card_header = QHBoxLayout()
+            title_lbl = QLabel(f"{default_label} ({unit})")
+            title_lbl.setStyleSheet("font-weight: 600;")
+            card_header.addWidget(title_lbl, 1)
+            export_btn = QPushButton("Export Chart…")
+            export_btn.setEnabled(False)
+            export_btn.clicked.connect(
+                lambda _checked=False, mkey=key: self.export_couple_axis_chart(mkey)
+            )
+            card_header.addWidget(export_btn)
+            card_layout.addLayout(card_header)
+
+            cov_lbl = QLabel("Coverage: Unknown")
+            cov_lbl.setWordWrap(True)
+            card_layout.addWidget(cov_lbl)
+
+            chart = MetricChart()
+            chart.setObjectName(f"coupleAxisChart_{key}")
+            chart.seek_requested.connect(self._seek_to_couple_event)
+            card_layout.addWidget(chart)
+            layout.addWidget(card)
+
+            self.couple_axis_charts[key] = chart
+            self.couple_axis_title_labels[key] = title_lbl
+            self.couple_axis_coverage_labels[key] = cov_lbl
+            self.couple_axis_export_buttons[key] = export_btn
+
         self.couple_panes = QTabWidget()
         self.couple_panes.setObjectName("coupleAnalyticsPanes")
+        self.couple_panes.setMinimumHeight(340)
         self._couple_summary_tables: dict[str, QTableWidget] = {}
         self._couple_event_tables: dict[str, QTableWidget] = {}
 
@@ -1030,14 +1120,116 @@ class AnalyticsScreen(QWidget):
             self.couple_panes.addTab(pane, title)
 
         layout.addWidget(self.couple_panes, 1)
-        return panel
+        scroll.setWidget(panel)
+        return scroll
+
+    def _extract_couple_axis_points(
+        self, couple_result: dict[str, Any], key: str
+    ) -> list[tuple[float, float | None]]:
+        series = couple_result.get("series") or {}
+        entries = series.get(key) if isinstance(series, dict) else None
+        points: list[tuple[float, float | None]] = []
+        last_t: float | None = None
+        if isinstance(entries, list) and entries:
+            for item in entries:
+                if not isinstance(item, dict):
+                    continue
+                ts = finite_number(item.get("timestamp"))
+                if ts is None or (last_t is not None and ts <= last_t):
+                    continue
+                last_t = ts
+                points.append((ts, finite_number(item.get("value"))))
+            if points:
+                return points
+
+        overlay_keys = {
+            "torso_tilt_a": ("tilt_a_deg",),
+            "torso_tilt_b": ("tilt_b_deg",),
+            "couple_midpoint_tilt": ("couple_midpoint_tilt_deg",),
+            "torso_separation": ("torso_separation_deg",),
+        }[key]
+        overlays = couple_result.get("frame_overlays")
+        if isinstance(overlays, list) and overlays:
+            last_t = None
+            for item in overlays:
+                if not isinstance(item, dict):
+                    continue
+                ts = finite_number(item.get("timestamp"))
+                if ts is None or (last_t is not None and ts <= last_t):
+                    continue
+                last_t = ts
+                val = next(
+                    (finite_number(item.get(k)) for k in overlay_keys if finite_number(item.get(k)) is not None),
+                    None,
+                )
+                points.append((ts, val))
+            if points:
+                return points
+
+        sample_keys = {
+            "torso_tilt_a": ("torso_tilt_a_deg",),
+            "torso_tilt_b": ("torso_tilt_b_deg",),
+            "couple_midpoint_tilt": ("couple_midpoint_tilt_deg", "pair_axis_tilt_deg"),
+            "torso_separation": ("torso_separation_deg",),
+        }[key]
+        samples = couple_result.get("samples")
+        if isinstance(samples, list) and samples:
+            last_t = None
+            for item in samples:
+                if not isinstance(item, dict):
+                    continue
+                ts = finite_number(item.get("timestamp"))
+                if ts is None or (last_t is not None and ts <= last_t):
+                    continue
+                last_t = ts
+                val = next(
+                    (finite_number(item.get(k)) for k in sample_keys if finite_number(item.get(k)) is not None),
+                    None,
+                )
+                points.append((ts, val))
+        return points
+
+    def _smooth_couple_axis_points(
+        self, points: list[tuple[float, float | None]], max_gap: float
+    ) -> list[tuple[float, float | None]]:
+        if not points:
+            return []
+        cfg = self.bridge.config
+        da_cfg = cfg.dancer_analysis
+        tau_s = (
+            float(cfg.smoothing)
+            if abs(float(da_cfg.axis_smoothing_s) - 0.25) <= 1e-9
+            and abs(float(cfg.smoothing) - 0.25) > 1e-9
+            else float(da_cfg.axis_smoothing_s)
+        )
+        if tau_s > 0.0:
+            tau_s = max(tau_s, float(cfg.min_filter_time_constant))
+        bridge_gap = float(da_cfg.axis_bridge_max_gap_s)
+        timestamps = [float(t) for t, _ in points]
+        raw_vals = [v for _, v in points]
+        smoothed_vals = _zero_phase_ema_optional(
+            timestamps,
+            raw_vals,
+            tau_s=tau_s,
+            max_gap_s=bridge_gap,
+        )
+        return list(zip(timestamps, smoothed_vals, strict=True))
 
     def _populate_couple_analysis(self, couple_result: dict[str, Any] | None) -> None:
         for table in (*self._couple_summary_tables.values(), *self._couple_event_tables.values()):
             table.setRowCount(0)
+        for key, (default_label, unit, _ref) in COUPLE_AXIS_METRICS.items():
+            self.couple_axis_title_labels[key].setText(f"{default_label} ({unit})")
+            self.couple_axis_charts[key].set_data(None)
+            self.couple_axis_coverage_labels[key].setText("Coverage: Unknown")
+            self.couple_axis_export_buttons[key].setEnabled(False)
         if not isinstance(couple_result, dict):
             self.couple_run_info_label.setText(
                 "No Couple run available on this recording."
+            )
+            self.couple_pearson_value_label.setText("Pearson r: Unavailable")
+            self.couple_pearson_detail_label.setText(
+                "Select a Couple recording to measure synchronized torso tilt correlation."
             )
             return
 
@@ -1045,6 +1237,8 @@ class AnalyticsScreen(QWidget):
         ann = couple_result.get("annotations") or {}
         name_a = str(ann.get("dancer_a_name") or "Dancer A")
         name_b = str(ann.get("dancer_b_name") or "Dancer B")
+        self.couple_axis_title_labels["torso_tilt_a"].setText(f"{name_a} — Torso Axis Tilt (deg)")
+        self.couple_axis_title_labels["torso_tilt_b"].setText(f"{name_b} — Torso Axis Tilt (deg)")
         dec = couple_result.get("auto_decision") or {}
         dec_txt = (
             f"{dec.get('requested_mode', 'auto')} -> {dec.get('resolved_mode', 'couple')}"
@@ -1302,6 +1496,132 @@ class AnalyticsScreen(QWidget):
                     pos_tbl.setItem(r, 3, QTableWidgetItem(", ".join(detail_parts) or "—"))
                     pos_tbl.setItem(r, 4, QTableWidgetItem(str(mp.get("status", "unavailable"))))
 
+        extracted_axes = {
+            key: self._extract_couple_axis_points(couple_result, key)
+            for key in COUPLE_AXIS_METRICS
+        }
+        all_axis_ts = [ts for pts in extracted_axes.values() for ts, _ in pts]
+        origin_ts = min(all_axis_ts) if all_axis_ts else float(couple_result.get("clip_in") or 0.0)
+        end_ts = max(all_axis_ts) if all_axis_ts else float(couple_result.get("clip_out") or origin_ts)
+        raw_gap = (
+            self.dataset.max_gap
+            if self.dataset is not None and self.dataset.max_gap is not None
+            else self.bridge.config.dancer_analysis.max_observation_gap_s
+        )
+        max_gap = float(raw_gap) if raw_gap is not None and raw_gap > 0 else self.bridge.config.max_gap
+        smoothed_axes = {
+            key: self._smooth_couple_axis_points(
+                [(ts - origin_ts, val) for ts, val in extracted_axes[key]],
+                max_gap,
+            )
+            for key in COUPLE_AXIS_METRICS
+        }
+
+        pearson_r, pearson_n, pearson_reason = compute_torso_tilt_pearson_correlation(
+            smoothed_axes["torso_tilt_a"],
+            smoothed_axes["torso_tilt_b"],
+        )
+        pos_sum_map = summaries.get("posture") if isinstance(summaries, dict) else None
+        if (
+            pearson_r is None
+            and not smoothed_axes["torso_tilt_a"]
+            and not smoothed_axes["torso_tilt_b"]
+            and isinstance(pos_sum_map, dict)
+            and isinstance(pos_sum_map.get("torso_tilt_pearson_r"), dict)
+        ):
+            stored_pr = pos_sum_map["torso_tilt_pearson_r"]
+            pearson_r = finite_number(stored_pr.get("value"))
+            pearson_n = int(stored_pr.get("sample_count") or 0)
+            pearson_reason = str(stored_pr.get("reason") or "")
+
+        pr_item = {
+            "measure": "torso_tilt_pearson_r",
+            "subject": "pair",
+            "value": pearson_r,
+            "sample_count": pearson_n,
+            "coverage": float((couple_result.get("coverage") or {}).get("pair_torso_coverage", 0.0)),
+            "unit": "r",
+            "status": "measured" if pearson_r is not None else "unavailable",
+            "reason": pearson_reason,
+        }
+        if isinstance(couple_result, dict):
+            sum_root = couple_result.setdefault("summaries", {})
+            if isinstance(sum_root, dict):
+                pos_root = sum_root.setdefault("posture", {})
+                if isinstance(pos_root, dict):
+                    pos_root["torso_tilt_pearson_r"] = pr_item
+        self._append_summary_row(self._couple_summary_tables["coordination"], "torso_tilt_pearson_r", pr_item)
+        self._append_summary_row(self._couple_summary_tables["posture_axes"], "torso_tilt_pearson_r", pr_item)
+
+        if pearson_r is not None:
+            self.couple_pearson_value_label.setText(f"Pearson r = {pearson_r:+.3f}")
+            if pearson_r >= 0.25:
+                interp = "In-phase parallel sway (Dancer A and Dancer B tend to tilt in the same direction)."
+            elif pearson_r <= -0.25:
+                interp = "Counter-balance / opposite lean (one tilts forward/right as the other leans opposite)."
+            else:
+                interp = "Weak or independent torso tilt coupling across paired frames."
+            cov_pct = (finite_number(pr_item["coverage"]) or 0.0) * 100.0
+            self.couple_pearson_detail_label.setText(
+                f"Paired samples: {pearson_n} · Pair torso coverage: {cov_pct:.0f}% · {interp}"
+            )
+        else:
+            self.couple_pearson_value_label.setText("Pearson r: Unavailable")
+            reason_txt = pearson_reason.replace("_", " ") if pearson_reason else "insufficient paired samples"
+            self.couple_pearson_detail_label.setText(
+                f"Paired samples: {pearson_n} · Reason: {reason_txt}"
+            )
+
+        pearson_banner = (
+            f" · Torso tilt Pearson r: {pearson_r:+.3f} (n={pearson_n})"
+            if pearson_r is not None
+            else " · Torso tilt Pearson r: Unavailable"
+        )
+        self.couple_run_info_label.setText(
+            f"Run {rid[:12]} · {name_a} & {name_b} · Mode: {dec_txt}{pearson_banner}{scene_note}"
+        )
+
+        for key, (_default_label, unit, ref_val) in COUPLE_AXIS_METRICS.items():
+            rel_pts = smoothed_axes[key]
+            time_end = max(0.0, end_ts - origin_ts, rel_pts[-1][0] if rel_pts else 0.0)
+            segments = _segments_from_points(rel_pts, max_gap)
+            summary_map = _interval_summary(rel_pts, max_gap)
+            metric_data = MetricData(rel_pts, segments, summary_map, 0, 0)
+            chart = self.couple_axis_charts[key]
+            chart.set_data(metric_data, time_end, origin_ts, reference_line=ref_val, unit=unit)
+            self.couple_axis_export_buttons[key].setEnabled(chart.isEnabled())
+
+            pearson_suffix = (
+                f" · Pearson r(A,B): {pearson_r:+.3f}"
+                if pearson_r is not None and key in ("torso_tilt_a", "torso_tilt_b", "torso_separation")
+                else ""
+            )
+            pos_item = pos_sum_map.get(key) if isinstance(pos_sum_map, dict) else None
+            med = finite_number(pos_item.get("median_deg")) if isinstance(pos_item, dict) else None
+            if med is not None and isinstance(pos_item, dict):
+                iqr = finite_number(pos_item.get("iqr_deg")) or 0.0
+                cov = finite_number(pos_item.get("coverage")) or 0.0
+                cnt = int(pos_item.get("sample_count") or 0)
+                self.couple_axis_coverage_labels[key].setText(
+                    f"Median: {med:+.1f}° · IQR: {iqr:.1f}° · Ref: {ref_val:.1f}° · "
+                    f"Coverage: {cov:.0%} ({cnt} samples){pearson_suffix}"
+                )
+            elif segments:
+                valid_count = sum(1 for _, v in rel_pts if v is not None)
+                cov_ratio = finite_number(summary_map.get("valid_coverage"))
+                cov_txt = f"{cov_ratio:.0%}" if cov_ratio is not None else "Unknown"
+                self.couple_axis_coverage_labels[key].setText(
+                    f"Measured samples: {valid_count}/{len(rel_pts)} · "
+                    f"Coverage: {cov_txt} · Ref: {ref_val:.1f}°{pearson_suffix}"
+                )
+            else:
+                reason = (
+                    str(pos_item.get("reason") or "Unavailable (torso landmarks occluded)")
+                    if isinstance(pos_item, dict)
+                    else "Unavailable"
+                )
+                self.couple_axis_coverage_labels[key].setText(f"Unavailable: {reason}")
+
     def _append_summary_row(self, table: QTableWidget, name: str, item: dict[str, Any]) -> None:
         r = table.rowCount()
         table.insertRow(r)
@@ -1356,4 +1676,57 @@ class AnalyticsScreen(QWidget):
         csv_text = export_couple_csv(couple, path.stem, index)
         destination.write_text(csv_text, encoding="utf-8")
         self.bridge.status_message.emit(f"Exported Couple CSV to {destination.name}")
+        return destination
+
+    def export_couple_axis_chart(
+        self, metric: str, destination: Path | None = None
+    ) -> Path | None:
+        """Export a Couple axis chart to PNG, SVG, CSV, or JSON."""
+        if metric not in COUPLE_AXIS_METRICS:
+            raise ValueError(f"Unsupported couple axis chart metric: {metric!r}")
+        chart = self.couple_axis_charts.get(metric)
+        if chart is None or not chart.isEnabled():
+            self.bridge.status_message.emit(f"Couple axis chart {metric} has no active data to export.")
+            return None
+        title = self.couple_axis_title_labels[metric].text()
+        source_stem = self._current_source[0].stem if self._current_source else "couple_analytics"
+        if destination is None:
+            chosen, _ = QFileDialog.getSaveFileName(
+                self,
+                f"Export {title}",
+                f"{source_stem}_{metric}.png",
+                "PNG Image (*.png);;SVG Vector (*.svg);;CSV Table (*.csv);;JSON Data (*.json)",
+            )
+            if not chosen:
+                return None
+            destination = Path(chosen)
+        destination = Path(destination)
+        subtitle_parts = [
+            f"Archive: {self._current_source[0].name}" if self._current_source else "Couple analysis",
+            self.couple_axis_coverage_labels[metric].text(),
+        ]
+        subtitle = " · ".join(p for p in subtitle_parts if p)
+        if destination.suffix.lower() == ".json":
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "metric": metric,
+                "title": title,
+                "unit": COUPLE_AXIS_METRICS[metric][1],
+                "archive": str(self._current_source[0].name) if self._current_source else "",
+                "segment_index": self._current_source[1] if self._current_source else 0,
+                "run_id": self._active_couple_run_id or "",
+                "reference_line": chart.reference_line,
+                "summary": chart.data.summary if chart.data else {},
+                "samples": [
+                    {
+                        "timestamp_s": ts,
+                        "value": val,
+                    }
+                    for ts, val in (chart.data.points if chart.data else [])
+                ],
+            }
+            destination.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        else:
+            chart.export_to_file(destination, title=title, subtitle=subtitle)
+        self.bridge.status_message.emit(f"Exported {metric} chart to {destination.name}")
         return destination

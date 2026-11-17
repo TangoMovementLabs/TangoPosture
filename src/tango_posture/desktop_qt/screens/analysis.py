@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
 
 from ...archive import extract_segment_video, read_analytics, read_manifest, store_analytics
 from ...config import Config
+from ...couple.measurements import compute_torso_tilt_pearson_correlation
 from ...couple.models import CoupleAnalysisRequest, CoupleAnnotations, DancerAnchor
 from ...references.errors import ImportCancelledError
 from ...references.pipeline import analyze_clip
@@ -121,6 +122,7 @@ class AnalysisScreen(QWidget):
         self._mark_mode: str = "none"
         self._preview_frame_bgr: np.ndarray | None = None
         self._preview_timestamp: float = 0.0
+        self._showing_synthetic_preview: bool = False
 
         self.destroyed.connect(lambda: self._shutdown())
         app = QApplication.instance()
@@ -362,6 +364,7 @@ class AnalysisScreen(QWidget):
         self.archive_radio.toggled.connect(self._on_source_kind_toggled)
         self.archive_combo.currentIndexChanged.connect(self._on_archive_changed)
         self.segment_combo.currentIndexChanged.connect(self._on_segment_changed)
+        self.options_widget.options_changed.connect(self._render_preview_pixmap)
 
         self.refresh()
 
@@ -522,10 +525,53 @@ class AnalysisScreen(QWidget):
 
     def _render_preview_pixmap(self) -> None:
         frame = self._preview_frame_bgr
+        use_region = self.options_widget.use_region_cb.isChecked()
         if frame is None or frame.size == 0:
-            return
-        canvas = frame.copy()
+            if not use_region:
+                if self._showing_synthetic_preview:
+                    self._showing_synthetic_preview = False
+                    self.preview_label.setText("Select an archive recording or local video to preview.")
+                return
+            self._showing_synthetic_preview = True
+            canvas = np.full((240, 384, 3), 28, dtype=np.uint8)
+        else:
+            self._showing_synthetic_preview = False
+            canvas = frame.copy()
         h, w = canvas.shape[:2]
+        if use_region:
+            x_min = float(self.options_widget.x_min_spin.value())
+            y_min = float(self.options_widget.y_min_spin.value())
+            x_max = float(self.options_widget.x_max_spin.value())
+            y_max = float(self.options_widget.y_max_spin.value())
+            x0 = max(0, min(w - 1, round(x_min * (w - 1))))
+            x1 = max(0, min(w - 1, round(x_max * (w - 1))))
+            y0 = max(0, min(h - 1, round(y_min * (h - 1))))
+            y1 = max(0, min(h - 1, round(y_max * (h - 1))))
+            if x1 > x0 and y1 > y0:
+                dimmed = (canvas.astype(np.float32) * 0.42).astype(np.uint8)
+                dimmed[y0 : y1 + 1, x0 : x1 + 1] = canvas[y0 : y1 + 1, x0 : x1 + 1]
+                canvas = dimmed
+            line_color = (110, 220, 255)
+            line_t = max(1, min(6, round(max(h, w) / 480)))
+            box_t = max(2, min(8, round(max(h, w) / 320)))
+            font_scale = max(0.48, min(1.4, max(h, w) / 720.0))
+            font_t = max(1, round(font_scale * 2.0))
+            cv2.line(canvas, (x0, 0), (x0, h - 1), line_color, line_t, cv2.LINE_AA)
+            cv2.line(canvas, (x1, 0), (x1, h - 1), line_color, line_t, cv2.LINE_AA)
+            cv2.line(canvas, (0, y0), (w - 1, y0), line_color, line_t, cv2.LINE_AA)
+            cv2.line(canvas, (0, y1), (w - 1, y1), line_color, line_t, cv2.LINE_AA)
+            cv2.rectangle(canvas, (x0, y0), (x1, y1), (70, 215, 130), box_t, cv2.LINE_AA)
+            label = f"X: {x_min:.2f}..{x_max:.2f}  Y: {y_min:.2f}..{y_max:.2f}"
+            cv2.putText(
+                canvas,
+                label,
+                (max(6, min(max(6, w - round(260 * font_scale)), x0 + 8)), max(20, min(h - 10, y0 + round(26 * font_scale)))),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                font_scale,
+                (70, 215, 130),
+                font_t,
+                cv2.LINE_AA,
+            )
         for did, anchor in self._anchors.items():
             if anchor.hip_xy is not None:
                 px = max(0, min(w - 1, round(anchor.hip_xy[0] * w)))
@@ -975,6 +1021,94 @@ class AnalysisScreen(QWidget):
                 self.results_table.setItem(r, 0, QTableWidgetItem(key.replace("_", " ")))
                 self.results_table.setItem(r, 1, QTableWidgetItem(val_text))
                 self.results_table.setItem(r, 2, QTableWidgetItem(str(item.get("status") or "")))
+
+            summaries = couple_result.get("summaries") or {}
+            if isinstance(summaries, dict) and summaries:
+                pos_sum = summaries.get("posture") or {}
+                pearson_item = pos_sum.get("torso_tilt_pearson_r") if isinstance(pos_sum, dict) else None
+                if not isinstance(pearson_item, dict):
+                    series = couple_result.get("series") or {}
+                    pr_val, _pr_n, _pr_reason = compute_torso_tilt_pearson_correlation(
+                        series.get("torso_tilt_a") or [],
+                        series.get("torso_tilt_b") or [],
+                    )
+                    pearson_item = {
+                        "value": pr_val,
+                        "status": "measured" if pr_val is not None else "unavailable",
+                    }
+                pr_val = pearson_item.get("value")
+                pr_txt = f"{float(pr_val):+.3f} r" if isinstance(pr_val, (int, float)) else "Unavailable"
+                self._append_couple_result_row(
+                    "Torso tilt Pearson r (A vs B)",
+                    pr_txt,
+                    str(pearson_item.get("status") or "unavailable"),
+                )
+
+                coord_sum = summaries.get("coordination") or {}
+                if isinstance(coord_sum, dict):
+                    for ckey, clabel in (
+                        ("start_lag_ms", "Start lag (B - A)"),
+                        ("slow_lag_ms", "Slowing lag (B - A)"),
+                        ("settle_lag_ms", "Settle lag (B - A)"),
+                    ):
+                        citem = coord_sum.get(ckey)
+                        if isinstance(citem, dict):
+                            cval = citem.get("value")
+                            cunit = str(citem.get("unit") or "ms")
+                            self._append_couple_result_row(
+                                clabel,
+                                f"{float(cval):+.1f} {cunit}" if isinstance(cval, (int, float)) else "Unavailable",
+                                str(citem.get("status") or "unavailable"),
+                            )
+
+                if isinstance(pos_sum, dict):
+                    for pkey, plabel in (
+                        ("torso_tilt_a", "Dancer A torso tilt median"),
+                        ("torso_tilt_b", "Dancer B torso tilt median"),
+                        ("couple_midpoint_tilt", "Couple midpoint tilt median"),
+                        ("torso_separation", "Couple torso separation median"),
+                    ):
+                        pitem = pos_sum.get(pkey)
+                        if isinstance(pitem, dict):
+                            pval = pitem.get("median_deg")
+                            self._append_couple_result_row(
+                                plabel,
+                                f"{float(pval):+.1f} deg" if isinstance(pval, (int, float)) else "Unavailable",
+                                str(pitem.get("status") or "unavailable"),
+                            )
+
+                trans_sum = summaries.get("transitions") or {}
+                if isinstance(trans_sum, dict) and trans_sum:
+                    peaks = trans_sum.get("secondary_speed_peaks")
+                    revs = trans_sum.get("unintended_reversals")
+                    trans_txt = (
+                        f"peaks={peaks}, reversals={revs}"
+                        if peaks is not None or revs is not None
+                        else "Unavailable"
+                    )
+                    self._append_couple_result_row(
+                        "Transitions (unintended cues)",
+                        trans_txt,
+                        str(trans_sum.get("status") or "unavailable"),
+                    )
+
+                turn_sum = summaries.get("turns") or {}
+                if isinstance(turn_sum, dict) and turn_sum:
+                    tcnt = int(turn_sum.get("turn_count") or 0)
+                    tdur = turn_sum.get("median_turn_duration_s")
+                    dur_part = f" (median {float(tdur):.2f} s)" if isinstance(tdur, (int, float)) else ""
+                    self._append_couple_result_row(
+                        "Turns recorded",
+                        f"{tcnt}{dur_part}",
+                        str(turn_sum.get("status") or "unavailable"),
+                    )
+
+    def _append_couple_result_row(self, metric_label: str, value_text: str, status_text: str) -> None:
+        row = self.results_table.rowCount()
+        self.results_table.insertRow(row)
+        self.results_table.setItem(row, 0, QTableWidgetItem(metric_label))
+        self.results_table.setItem(row, 1, QTableWidgetItem(value_text))
+        self.results_table.setItem(row, 2, QTableWidgetItem(status_text))
 
     def _open_in_review(self) -> None:
         if isinstance(self._last_archive_path, Path):
