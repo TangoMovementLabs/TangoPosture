@@ -623,6 +623,7 @@ def test_promoted_excerpt_has_matching_video_and_cached_frame_indices(qapp, tmp_
 @pytest.mark.parametrize("responsive", [False, True])
 def test_guided_holds_require_a_repeatable_change_before_continuing(qapp, tmp_path, responsive):
     from dataclasses import replace
+
     from tango_posture.calibration.camera_session import evaluate_metric_repeat_check
     from tango_posture.calibration.measurements import measure_ranges
 
