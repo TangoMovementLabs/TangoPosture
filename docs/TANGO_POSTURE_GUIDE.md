@@ -6,6 +6,158 @@ Tango Posture Coach is a local Python desktop companion for observing posture al
 
 > **Experimental movement observation, not medical assessment or a judgement of artistic tango quality.** The software measures 2D image-plane projections of estimated body landmarks and heuristic movement cues. It cannot measure physical force, partner connection, anatomical joint torque, or artistic musicality, and it cannot replace a teacher's eye.
 
+## Start here: reading measurements without a technical background
+
+Documentation reviewed against the working tree on **17 November 2026**. Numerical examples below are invented teaching examples, not results from a recorded dancer. Existing uncommitted application changes are included in the source review; this documentation update does not change application behavior.
+
+A **landmark** is a dot the detector places on a body part. A **metric** is a number calculated from those dots. A **trace** is that number plotted over time. An **event** is a moment such as an apparent foot contact. A **summary** combines several samples or events. None is a grade for your dancing.
+
+Read a result in this order: **which dancer → what was measured → unit and sign → usable coverage → number of examples → video at that moment**. A missing value is not zero. A smooth drawing can contain estimated joints even where a measurement is unavailable.
+
+| Term | Plain meaning | Example |
+| --- | --- | --- |
+| Degrees (`deg`, `°`) | An angle | 0° is the stated reference direction; 10° is a small tilt away from it. |
+| Milliseconds (`ms`) | Thousandths of a second | 150 ms = 0.15 seconds. At 30 frames/s, a frame lasts about 33 ms; decimal output does not establish millisecond accuracy. |
+| Torso lengths | Image distance divided by a reference torso length | 20 pixels / 100 pixels = 0.20 torso lengths. This is not 20 cm. |
+| Coverage | Fraction of sampled frames meeting a particular measurement's gates | 80 usable pair-hip frames / 100 sampled frames = 80%. It is not 80% accuracy, and frame coverage is not necessarily time coverage. |
+| Median | Middle of sorted values | For 50, 100, 300 ms, median = 100 ms. |
+| IQR | 75th percentile minus 25th percentile; spread of the middle half | For 0, 100, 200, 300, 400 ms, IQR = 300 − 100 = 200 ms. Smaller means more consistent, not necessarily better. |
+| Count | Number actually used | One lag gives IQR 0 in this implementation; that does not establish repeatable timing. |
+| Baseline change | Current summary minus the selected example-passage summary | Median tilt 8° versus baseline 5° gives +3°. It compares clip median with baseline median, not first frame with last frame. |
+| Measured | Computed from eligible observations | Still depends on estimated landmark locations and camera view. |
+| Estimated | A detector suggestion | An apparent foot contact needs checking in the video. |
+| User confirmed | A person marked or accepted an event | Confirmation records review, not physical ground truth. |
+| Unavailable / UNKNOWN | Insufficient usable evidence | A hidden shoulder can prevent torso tilt even while hip travel is available. |
+
+For a first review, choose a short clip with a fixed camera, verify the dancer identities, inspect coverage, and review just one question. For example: “Do our starts occur at similar times?” Compare repeated passages filmed from a similar view before interpreting a trend.
+
+## Every solo posture metric, with an example
+
+These are the eight calibration metrics and four coaching traces. Similar names do not make their values interchangeable. A range you approve is a comparison choice, not a universal ideal posture.
+
+| Metric | What the number means | Worked example and interpretation |
+| --- | --- | --- |
+| `head_pitch` | Ear-to-nose pitch relative to image horizontal, using the head helper's facing/front-view handling; raw angle without neutral subtraction | −12° means the nose is below the helper's horizontal reference. This can reflect camera angle and anatomy as well as movement. |
+| `head_forward` | Ear displacement forward of shoulder, perpendicular to trunk, divided by torso length; positive follows configured facing | Forward displacement 12 px / torso 120 px = +0.10. It does not mean the head moved 10 cm. |
+| `head_inclination` | Shoulder-to-ear direction relative to the trunk | A 10° value means the head segment inclines 10° toward the configured forward side relative to the trunk. |
+| `shoulder_clearance` | Vertical ear-to-shoulder gap divided by the helper's anatomical scale | Gap 24 px / scale 30 px = 0.80. Smaller means less visible clearance, not a direct muscle-tension measurement. |
+| `hip_offset` | Signed hip displacement from the ankle-to-head reference line, divided by that line's length | A posterior offset of 8 px / axis 400 px = +0.02. The corresponding unsmoothed percent is 2%. |
+| `torso_axis_tilt` | Unsigned tilt from vertical of hip-midpoint to shoulder-midpoint line | A line leaning 8° left or right gives magnitude 8°. Requires both hips and shoulders. |
+| `trunk_inclination` | Signed trunk angle from vertical with configured facing | A 6° lean toward the selected facing direction gives +6°. It may use different torso landmarks from the midpoint metric. |
+| `knee_flexion` | Bend of the least-bent qualifying knee, subject to visibility tie-breaking | Interior joint angle 170° means 180 − 170 = 10° flexion. If reliable knees bend 10° and 25°, normally 10° is reported. |
+| `head_angle` | Head pitch after subtracting `head_neutral_offset` | Raw −20° minus neutral −12° = −8°. Do not compare −8° directly with a raw `head_pitch` range. |
+| `shoulder_elev_pct` | Reduction in clearance relative to effective neutral clearance | Neutral 1.0, current 0.8: 100 × (1.0 − 0.8) / 1.0 = 20% raised. This is a geometry proxy. |
+| `knee_bend_deg` | Smoothed knee bend trace | A brief jump from 10° to 30° is softened over time; the smoothed trace need not equal the raw sample. |
+| `axis_curve_smoothed` | Smoothed hip-offset percentage | Raw offset 0.02 corresponds to 2% before smoothing. Despite the name, this is not a measurement of spinal curvature. |
+
+**Other observations:** an embrace label comes from an arm-compactness heuristic; a leader/follower label comes from arm geometry. Neither proves a social role or physical connection. A high-ankle cue compares visible lift with body scale and configured tempo rules. Changing camera angle can change these observations without changing the movement itself.
+
+## Couple metrics: a practical guide with worked examples
+
+### First identify A and B
+
+A and B are tracking identities, not automatic proof of leader and follower. Confirm the same person keeps each label, especially when partners overlap or swap screen positions. A camera cut or uncertain identity interrupts usable motion segments. Rotating the camera, zooming, or walking toward it changes the image projection.
+
+Couple outputs cover five groups: **coordination, step/music timing, transitions, posture, and turns**. Inspect those groups separately. There is no validated overall “connection” or “tango quality” score.
+
+### 1. Travel and coordination: who starts, slows, and settles first?
+
+The program projects hip travel onto one chosen direction and divides by a fixed torso scale. A user-drawn direction can set that axis; otherwise the dominant observed travel direction is inferred. Positive velocity follows that axis; negative velocity goes the other way. A curve around the room cannot be fully described by one straight axis.
+
+| Output | Meaning | Example |
+| --- | --- | --- |
+| `velocity_a`, `velocity_b` | Signed hip travel per second, in each dancer's fixed torso lengths | A moves 40 px in one second with 100 px torso scale: approximately +0.40 torso lengths/s during steady motion. Actual velocity uses a local regression, not just two endpoints. |
+| `velocity_pair` | Signed travel of the two-hip midpoint, divided by fixed pair scale | Pair midpoint travels 30 px/s with 120 px scale: +0.25 pair torso lengths/s. It is not simply the mean of independently normalized A/B velocities. |
+| `start_lag_ms` | Median matched start time B minus start time A | A starts at 2.00 s and B at 2.15 s: +150 ms; B starts later. |
+| `slow_lag_ms` | Same signed difference for slowing events | B slows at 4.90 s, A at 5.00 s: −100 ms; B slows earlier. |
+| `settle_lag_ms` | Same signed difference for settling below the stop threshold | Both settle at 6.00 s: 0 ms for that matched pair. |
+| `{start,slow,settle}_paired_count` | Number of matched A/B event pairs | Three A starts matched to three B starts gives 3, not 6. |
+| `{start,slow,settle}_unpaired_count` | Unmatched events across both dancers | Two unmatched A starts and one unmatched B start gives 3. This may mean missing detection, not missing coordination. |
+
+Starts and settles require speed threshold crossings and persistence. Slowing uses a reduction from the running median of active speeds. Motion already underway when the clip begins may have no start event. Events pair by nearest time within the configured pairing window, one-to-one, without crossing an intervening recorded break. Pairing does not prove cause and effect or that A “led” B.
+
+For lags +100, +150, +200 ms, median = +150 ms and IQR = 50 ms. The sign describes order; the spread describes consistency. Deliberate timing differences can be part of the dance. With no matched pairs, the lag is unavailable.
+
+### 2. Steps and music: when did the visible contact occur?
+
+An automatic **contact** is an apparent foot placement inferred from movement and settling. Video does not measure weight transfer or floor force. Soundtrack beats are estimates unless manually supplied or confirmed. Confirm the intended musical pulse before judging offsets.
+
+| Output | Meaning | Example |
+| --- | --- | --- |
+| `contact_count` (A or B) | Number of contact events | 8 apparent contacts can include detector mistakes; replay them. |
+| `matched_count` | Contacts assigned a nearest musical target | 8 contacts with targets can yield 8 matches. Current code has no maximum distance gate, so a match alone does not prove closeness. |
+| `beat_offset_ms` / `median_beat_offset_ms` | Contact time minus nearest target time, individually / median | Contact 10.10 s, target 10.00 s → +100 ms (later). Contact 9.90 s → −100 ms (earlier). |
+| `iqr_beat_offset_ms` | Middle-half spread of contact offsets | Offsets −100, 0, 100, 200, 300 ms → IQR 200 ms. |
+| `beat_fraction` / `median_beat_fraction` | Offset divided by target interval | +100 ms with a 500 ms interval → +0.20. With half-beat subdivision (250 ms), the same offset → +0.40. |
+
+Beat subdivision inserts targets between beats; beat offset shifts the whole target grid. Manual beats take precedence when supplied. Starts can also carry per-event beat offsets, but step summaries aggregate contacts. No usable target means no numeric beat offset, even if contacts exist. A summary marked user confirmed can currently contain other estimated events; inspect individual events.
+
+### 3. Transitions: what happened while slowing or changing direction?
+
+| Output | Meaning | Example |
+| --- | --- | --- |
+| `secondary_speed_peaks` | Count of detected speed rises during inspected transitions, excluding matching planned settling/pause marks | Pair speed falls to 0.10 then rises to 0.30 torso lengths/s: rise 0.20. It becomes a cue only if configured threshold and persistence checks pass. |
+| `unintended_reversals` | Reversals relative to the implementation's dominant motion sign without a matching planned-reversal mark | Travel changes from positive to sufficiently negative for long enough. “Unintended” means unannotated here; the software cannot know intention. |
+| `planned_pauses`, `planned_reversals`, `settling_steps` | Counts of user-supplied marks | Marking a deliberate settling step helps distinguish it from an unexplained speed rise. Counts record annotations, not independent confirmation. |
+| Transition `coverage` | Mean usable pair-hip frame fraction across inspected windows | Windows with 80% and 100% coverage give mean 90%, regardless of their relative duration. |
+| Transition `status` | Whether the summary passed the implemented coverage logic | A low-coverage window may be unavailable. Zero cues is not proof the entire passage was clean. |
+
+Windows usually run from slowing to a later settle, or a bounded fallback end; planned windows and a whole-clip reversal fallback also exist. Windows can overlap, so cue totals should not be treated as guaranteed counts of distinct physical incidents. See the audit for persistence and empty-window edge cases.
+
+### 4. Posture: the two axes and the line between their midpoints
+
+An **axis** here is a drawn line. It is not a measured balance axis or centre of mass. Couple torso signs are **screen-based**: shoulders right of hips means positive tilt; left means negative. This differs from solo facing-relative trunk inclination.
+
+| Output | Meaning | Example |
+| --- | --- | --- |
+| `torso_tilt_a`, `torso_tilt_b` | Signed hip-to-shoulder angle from image vertical | A +10°, B −10° means their axes lean opposite screen directions. |
+| `couple_midpoint_tilt` | Tilt of line joining the average hip position to average shoulder position | With equal torso lengths and symmetric +10°/−10° tilts, midpoint tilt is 0°. It can hide individual lean; inspect A and B too. In general it is not the arithmetic mean of angles. |
+| `torso_separation` | Absolute shortest angular difference between torso tilts | +10° and −10° → 20°. +10° and +15° → 5°. It is not the distance between partners or embrace openness. |
+| `head_pitch_a`, `head_pitch_b` | Head helper output with configured neutral offset subtracted | Raw −20° minus neutral −12° → −8°. Despite these names, couple values are neutral-adjusted, unlike solo calibration `head_pitch`. |
+| `torso_tilt_pearson_r` | Correlation of simultaneous A/B tilt changes, from −1 to +1 | A [0,1,2], B [10,11,12] → +1, despite a constant 10° difference. B [12,11,10] → −1. |
+
+Correlation asks whether the two traces rise and fall together. It does not measure equal angles, timing lag, connection, or dance quality. Near zero means little linear association, not “no coordination.” It requires at least three aligned valid samples; if either trace is constant, it is unavailable (`zero_variance`), not zero. Alignment tolerance is 0.0001 s; it does not search for delayed matching motion.
+
+Each angle summary includes `median_deg`, `iqr_deg`, `baseline_change_deg`, `sample_count`, `coverage`, and `status`. Baseline change needs at least three finite samples in selected baseline passages. Example: clip median separation 12°, baseline median 8° → +4°. A small IQR can mean stable projection, but cannot establish good posture.
+
+Coverage is reported separately for A/B hips, torsos and heads, and for pair hips and torsos. If A torso coverage is 90% and B is 80%, pair coverage is their simultaneous usable overlap, not automatically 85% or 72%. Hidden shoulders can leave hip travel available while midpoint tilt and separation disappear.
+
+### 5. Turns: duration, exit timing, and annotations
+
+| Output | Meaning | Example |
+| --- | --- | --- |
+| `turn_count` | Number of assembled turns, including enabled automatic suggestions | Two marked turns plus one non-overlapping suggestion → 3; inspect provenance. |
+| `median_turn_duration_s`, `iqr_turn_duration_s` | Median and middle-half spread of end minus start | Start 3.0 s, end 4.2 s → duration 1.2 s. |
+| `median_exit_minus_turn_end_ms`, `iqr_exit_minus_turn_end_ms` | Exit time minus turn-end time, summarized over matched exits | Exit 4.4 s after end 4.2 s → +200 ms. Exit 4.0 s → −200 ms. |
+| `overlap_count` | Turns whose matched exit happens before turn end | The −200 ms example contributes one overlap. This is a temporal label, not an error verdict. |
+| `pivot_behavior_a`, `pivot_behavior_b`, `embrace_opening` | Human annotations attached to turns | “Stepping pivot” or a description of opening records the reviewer’s observation; no physical embrace-opening angle is calculated here. |
+
+A missing exit makes exit timing unavailable, not zero. Automatic suggestions come from per-dancer pivot candidates. The summary can combine suggestions with confirmed turns. Current turn assembly pairs chronologically without checking matching subjects; review overlapping A/B marks carefully until the audit recommendation is implemented.
+
+### A complete couple example
+
+In a 10-second clip, 240 of 300 frames have both hips usable: pair-hip coverage is 80%. A starts at 2.00 s; B at 2.12 s, so lag is +120 ms. Their torso medians are +8° and −6°; a frame with those values has 14° separation. A contact at 3.10 s against a 3.00 s beat gives +100 ms, or +0.20 of a 500 ms target interval. A turn from 5.00 to 6.50 s lasts 1.50 s; an exit at 6.40 s gives −100 ms and an overlap.
+
+These observations support specific replay questions: “Did B begin later?”, “Were we leaning in opposite screen directions?”, “Was the early exit intentional?” They do not support “our connection was 80%” or “this turn was wrong.”
+
+## Movement, music, and quality fields beyond the posture charts
+
+| Field family | How to read it | Example |
+| --- | --- | --- |
+| Step `time`, `frame`, `side` | Candidate placement timestamp, frame index, left/right foot | Frame 30 at steady 30 frames/s is about 1 s; use saved timestamps for variable-rate clips. |
+| Step `x/y`, `hx/hy`, `tx/ty`, `ax/ay` | Image-pixel centre, heel, toe and ankle positions | x=200 locates the footprint horizontally; it is not distance travelled. |
+| Step `angle_deg`, `length_px` | Heel-to-toe image direction and visible foot length | 40 px is foot projection length, not stride length. Image y points downward in these footprint coordinates. |
+| Step `confidence`, pivot `quality` | Landmark-based detector quality summaries | 0.9 is not a calibrated 90% probability of a correct contact or pivot. |
+| Pivot `net_rotation_deg`, `mean_rate_deg_s` | Estimated heading change and change per second across the detected interval | About 60° over 0.5 s gives about 120°/s. Trimming and endpoint handling can affect displayed interval arithmetic. |
+| Pivot `direction`, `support_side` | Detector clockwise/anticlockwise convention and relatively stationary foot proxy | `left` means left foot met an anchoring rule, not that weight was proven to be on it. |
+| BPM, beat count, phrase count | Estimated tempo and soundtrack counters | 120 BPM means one nominal beat every 0.5 s. Counted phrases are detector groupings, not proof of musical phrasing. |
+| `% in range`, `% pending`, `% out of range` | Comparison states after temporal filtering | Pending means a threshold crossing has not yet lasted long enough. Inspect unavailable coverage separately; percentages are not a dance score. |
+| Normalized measurement | A value transformed using a selected calibration/normalization profile | A value on a reference scale is not automatically interchangeable with raw degrees; inspect the selected transform and unit. |
+
+Formula sources: `geometry.py`, `metrics.py`, `calibration/measurements.py`, `movement.py`, and `couple/measurements.py`. For implementation limitations and proposed fixes, read [the technical debt audit](TECHNICAL_DEBT_AND_REDESIGN.md).
+
+---
+
 ## Quick Contents
 
 1. [Quick Start & Desktop Workspaces](#1-quick-start-desktop-workspaces)
@@ -119,7 +271,7 @@ Archive-driven quantitative charting and comparison across the entire clip:
 
 #### Settings & Database Maintenance
 
-- **Settings**: Organizes all **72 editable settings** and **8 Calibration defaults rows** across tabs. Click **▸ Explanation & example** beside any setting (or **Expand All Guides**) to read what the parameter controls and view a concrete numerical example. Changes apply when you save via **Apply & Save settings.toml**, **Export TOML…**, **Import TOML…**, or **Reset Defaults**.
+- **Settings**: Organizes engine-scoped settings and **8 Calibration defaults rows** across tabs. Click **▸ Explanation & example** beside any setting (or **Expand All Guides**) to read what the parameter controls and view a concrete numerical example. Changes apply when you save via **Apply & Save settings.toml**, **Export TOML…**, **Import TOML…**, or **Reset Defaults**.
 - **Database maintenance**: Performs explicit, user-confirmed cleanup of the local SQLite database (`tango.sqlite3`) without touching `.tp`, `.tpr`, or `.tpc` archives.
 
 ---
@@ -151,7 +303,7 @@ These eight metrics are approved in `.tpc` profiles, configurable under **Calibr
 
 | Metric Key | UI Label | Unit | Required Landmarks & Formula Summary |
 | --- | --- | --- | --- |
-| `head_pitch` | Head pitch (ear-to-nose) | `degrees` | Raw image-plane angle from ear to nose relative to horizontal (`atan2(dy, dx)`). Zero = level horizontal ear-to-nose vector. |
+| `head_pitch` | Head pitch (ear-to-nose) | `degrees` | Raw head-helper pitch relative to horizontal, with facing-independent horizontal distance and a front-view ear-span fallback. Zero = level helper reference; no neutral offset is subtracted. |
 | `head_forward` | Head-forward offset | `torso_lengths` | Forward projection of the shoulder-to-ear vector `h = E - S` onto trunk normal `n = f * (t_y, -t_x)`, divided by torso length `L = length(S - H)`: `dot(h, n) / L`. Positive values indicate the ear lies farther toward `facing`. |
 | `head_inclination` | Head inclination | `degrees` | Angle of shoulder-to-ear vector `h` relative to trunk vector `t = (S - H) / L`: `degrees(atan2(dot(h, n), dot(h, t)))`. |
 | `shoulder_clearance` | Ear-to-shoulder clearance | `normalized_clearance` | Minimum vertical gap `gap = (shoulder.y - ear.y) * H` across usable sides divided by anatomical reference scale `S`. Smaller values mean the shoulder sits closer to the ear. |
@@ -272,7 +424,7 @@ To separate stable posture trends from single-frame detector jitter without hidi
   - Any timestamp gap larger than `max_gap` (default `0.5s`) resets filter continuity cleanly.
 - **Display-Only Joint Interpolation (`replay_joint_interpolation`, `replay_joint_max_gap`)**:
   - Fills visual skeleton gaps between reliable bracketing frames (`linear` or `quadratic` with linear fallback up to `3.0s`; `0` disables filling).
-  - **Strict separation invariant**: Interpolated joints populate *only* Review drawing (`display_poses`). Raw `measurement_poses`, calibration statistics, `Not measured` status, and Analytics charts **never** read synthetic interpolated points.
+  - **Display-completion boundary**: Review gap filling populates drawing data (`display_poses`) rather than measurement inputs. This does not guarantee that all upstream observations are fresh detections: close-embrace split-pose propagation currently lacks explicit origin metadata. See the technical debt audit.
 
 ### Hysteresis State Machine (`Evaluator`)
 

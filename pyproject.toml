@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tango-posture"
-version = "0.2.3"
-description = "Local, reference-relative side-view movement observation"
+version = "0.5.0"
+description = "Analysis for Single and Couple Dancer"
 requires-python = ">=3.11,<3.12"
 license = "Apache-2.0"
 dependencies = [

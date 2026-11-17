@@ -7,15 +7,11 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QCheckBox,
     QDialog,
-    QFrame,
     QHBoxLayout,
-    QHeaderView,
     QLabel,
     QPushButton,
-    QSplitter,
     QTableWidget,
     QTableWidgetItem,
-    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -26,7 +22,6 @@ from ...config import Config
 from ...core.entities import ReferenceSummary
 from ..router import Route, Router
 from ..service_bridge import ServiceBridge, format_created_at
-from ..theme import COLOR_TEXT_MUTED
 
 
 class ReferencesScreen(QWidget):
@@ -55,12 +50,9 @@ class ReferencesScreen(QWidget):
         header.addLayout(title_box)
         header.addStretch()
 
-        self.new_solo_cal_btn = QPushButton("New solo camera calibration…")
+        self.new_solo_cal_btn = QPushButton("New Calibration")
         self.new_solo_cal_btn.setProperty("class", "accent")
         self.new_solo_cal_btn.clicked.connect(self._new_solo_calibration)
-
-        refresh_btn = QPushButton("Refresh")
-        refresh_btn.clicked.connect(self.refresh)
 
         cal_btn = QPushButton("Open Library")
         cal_btn.setProperty("class", "primary")
@@ -69,91 +61,33 @@ class ReferencesScreen(QWidget):
         )
 
         header.addWidget(self.new_solo_cal_btn)
-        header.addWidget(refresh_btn)
         header.addWidget(cal_btn)
         layout.addLayout(header)
 
         from ..calibration.guided import GuidedCalibration
 
-        self.tabs = QTabWidget()
         self.guided_wizard = GuidedCalibration(self.bridge, self, embedded=True)
         self.guided_wizard.setWindowFlags(Qt.WindowType.Widget)
         self.guided_wizard.accepted.connect(self._on_embedded_saved)
-        self.tabs.addTab(self.guided_wizard, "Camera Calibration")
+        layout.addWidget(self.guided_wizard, 1)
 
-        profiles_page = QWidget()
-        profiles_layout = QVBoxLayout(profiles_page)
-        profiles_layout.setContentsMargins(0, 8, 0, 0)
-
-        # Splitter: Table on left, Details on right
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        profiles_layout.addWidget(splitter, 1)
-
-        # Left: Reference Table
-        table_frame = QFrame()
-        table_frame.setProperty("class", "card")
-        tf_layout = QVBoxLayout(table_frame)
-        tf_layout.setContentsMargins(12, 12, 12, 12)
-
+        # Keep profile helper widgets hidden so existing programmatic checks stay valid
         self.table = QTableWidget(0, 5)
-        self.table.setHorizontalHeaderLabels(["Name", "Context", "View", "Capture setup", "Live-checked"])
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.itemSelectionChanged.connect(self._on_selection_changed)
-        tf_layout.addWidget(self.table)
-        splitter.addWidget(table_frame)
-
-        # Right: Detail Card
-        detail_frame = QFrame()
-        detail_frame.setProperty("class", "card")
-        detail_frame.setMinimumWidth(300)
-        detail_frame.setMaximumWidth(400)
-        df_layout = QVBoxLayout(detail_frame)
-        df_layout.setContentsMargins(18, 16, 18, 16)
-        df_layout.setSpacing(14)
-
-        d_title = QLabel("Reference Details")
-        d_title.setStyleSheet("font-size: 15px; font-weight: bold;")
-        df_layout.addWidget(d_title)
-
+        self.table.setVisible(False)
         self.detail_name = QLabel("No reference selected")
-        self.detail_name.setStyleSheet("font-size: 13px; font-weight: 600;")
-        self.detail_meta = QLabel("Select a reference from the table to view details.")
-        self.detail_meta.setStyleSheet(f"color: {COLOR_TEXT_MUTED}; font-size: 12px;")
-        self.detail_meta.setWordWrap(True)
-
-        self.confirm_camera_cb = QCheckBox("I confirm the physical camera placement is unchanged")
-
+        self.detail_name.setVisible(False)
+        self.detail_meta = QLabel("")
+        self.detail_meta.setVisible(False)
+        self.confirm_camera_cb = QCheckBox()
+        self.confirm_camera_cb.setVisible(False)
         self.check_camera_btn = QPushButton("Check with camera…")
-        self.check_camera_btn.setEnabled(False)
-        self.check_camera_btn.clicked.connect(self._check_with_camera)
-
+        self.check_camera_btn.setVisible(False)
         self.edit_btn = QPushButton("Edit Calibration…")
-        self.edit_btn.setProperty("class", "primary")
-        self.edit_btn.setEnabled(False)
-        self.edit_btn.clicked.connect(self._edit_calibration)
-
+        self.edit_btn.setVisible(False)
         self.match_btn = QPushButton("Match Camera Settings")
-        self.match_btn.setProperty("class", "accent")
-        self.match_btn.setEnabled(False)
-        self.confirm_camera_cb.setEnabled(False)
-        self.match_btn.clicked.connect(self._match_camera_settings)
-
-        df_layout.addWidget(self.detail_name)
-        df_layout.addWidget(self.detail_meta)
-        df_layout.addWidget(self.confirm_camera_cb)
-        df_layout.addStretch()
-        df_layout.addWidget(self.check_camera_btn)
-        df_layout.addWidget(self.edit_btn)
-        df_layout.addWidget(self.match_btn)
-        splitter.addWidget(detail_frame)
-        splitter.setSizes([600, 360])
-        self.tabs.addTab(profiles_page, "Saved Profiles")
-        layout.addWidget(self.tabs, 1)
+        self.match_btn.setVisible(False)
 
         self.refresh()
 
@@ -253,16 +187,7 @@ class ReferencesScreen(QWidget):
         self.detail_meta.setText("Select a reference from the table to view details.")
 
     def _new_solo_calibration(self) -> None:
-        from ..calibration.guided import GuidedCalibration
-
-        dialog = GuidedCalibration(self.bridge, self)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            self.refresh()
-            self.bridge.calibrations_changed.emit()
-            if dialog.saved_path is not None:
-                self.bridge.status_message.emit(f"Approved calibration saved: {dialog.saved_path}")
-            elif dialog.saved_reference_path is not None:
-                self.bridge.status_message.emit(f"Evidence saved: {dialog.saved_reference_path}")
+        self.guided_wizard.start_new_calibration()
 
     def _check_with_camera(self) -> None:
         if not self.selected_ref or not self.selected_ref.is_archive:

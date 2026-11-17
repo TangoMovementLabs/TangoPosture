@@ -1,5 +1,10 @@
 # TangoPosture Dual-Engine Architecture: The Complete Guide for Dummies
 
+**Reading guide, updated 17 November 2026:** Start with the [beginner metric manual](TANGO_POSTURE_GUIDE.md) for what the numbers mean. This document explains the current processing pipeline; the [audit](TECHNICAL_DEBT_AND_REDESIGN.md) separates remaining limitations from proposed redesign. Detailed class relationships are in the [UML guide](UML_CLASS_DIAGRAMS_FOR_DUMMIES.md).
+
+**Important boundaries:** separate engine entry points do not mean complete dependency isolation: couple measurements reuse the movement detector for contacts and pivots. `CommonEngineContext` is shallowly frozen, not deeply immutable. Display interpolation is distinct from upstream close-embrace propagation, which currently lacks explicit origin metadata. Read the audit before treating all supplied “raw” observations as fresh detections.
+
+
 > **Who is this guide for?**  
 > Whether you are a tango teacher, a curious developer opening the codebase for the first time, or a future maintainer trying to understand *what every box, arrow, function, and class does*, this guide explains the **entire TangoPosture architecture from scratch** — using everyday analogies, concrete numerical frame-by-frame examples, and exact file pointers.
 
@@ -153,7 +158,7 @@ flowchart TD
 | **`C2`** | **A / B Identity Association & Torso Normalization** | Matches who is Dancer A vs. Dancer B across every frame (`track_couple_frames`) using motion prediction, and measures fixed torso rulers (`fixed_scale_a_px`, `fixed_scale_b_px`). | Keeps Dancer A on the leader track and Dancer B on the follower track without ID flipping even when crossing paths. |
 | **`C3`** | **Torso Axes A, B, Midpoint & Separation** (`couple/measurements.py`) | Computes `tilt_a_deg`, `tilt_b_deg`, `couple_midpoint_tilt_deg`, and `torso_separation_deg = abs(tilt_a - tilt_b)`. | Frame `30`: Dancer A leans `+3.2°`, Dancer B leans `+2.4°` -> Midpoint is `+2.8°` and Torso Separation is `0.8°` (very connected!). |
 | **`C4`** | **Travel Velocity & Coordination Lags** | Computes centered linear-regression travel speed along `travel_axis_unit` and pairs timing events (`start_lag_ms`, `slow_lag_ms`, `settle_lag_ms`), transitions, and turns. | Leader starts walking at `2.00s`, Follower starts at `2.12s` -> `start_lag_ms = +120 ms`. |
-| **`C5` -> `OUT_C` -> `ARCH2` -> `REV_C`** | **Archive Shell + Couple Overlay -> Archive -> Review UI** | `_build_couple_movement_shell` creates an empty validated movement JSON shell locally (zero `movement.py` import!), saves to `dancer_analysis.runs["couple"]`, and `couple/overlay.py` draws amber/teal/violet axes in `ReviewScreen`. | Opening Review shows **A axis (amber)**, **B axis (teal)**, **Couple midpoint (violet)**, **hip/shoulder bridges**, and lag/transition tabs — zero tangled Solo stick limbs! |
+| **`C5` -> `OUT_C` -> `ARCH2` -> `REV_C`** | **Archive Shell + Couple Overlay -> Archive -> Review UI** | `_build_couple_movement_shell` creates an empty validated movement JSON shell locally (no direct movement import in this shell builder), saves to `dancer_analysis.runs["couple"]`, and `couple/overlay.py` draws amber/teal/violet axes in `ReviewScreen`. | Opening Review shows **A axis (amber)**, **B axis (teal)**, **Couple midpoint (violet)**, **hip/shoulder bridges**, and lag/transition tabs — zero tangled Solo stick limbs! |
 
 ---
 
@@ -223,7 +228,7 @@ sequenceDiagram
 2. During Pass 1 frame decode in `PL`, on keyframes `idx = 0, 3, 6... 447` (`idx % 3 == 0`) where the pair hugged into `1` pose, `PL` immediately runs `resolve_close_embrace_frame_poses` and splits them into `[pose_l, pose_r]`. On frames `1, 2, 4, 5...`, torso shift is `< 0.05` so `_translate_pose` shifts both skeletons smoothly by `(dx, dy)` in microseconds.
 3. `PL` extracts beats and calls `KE.run_couple_dancer_engine(ctx)`.
 4. `KE` checks `not any(len(obs.poses) >= 2 ...)` -> `False`! Paired poses are already present, so `_resolve_close_embrace_fallback` is **skipped** (no second video decode!).
-5. `KE` runs `run_couple_analysis` (computing `tilt_a_deg`, `tilt_b_deg`, `couple_midpoint_tilt_deg`, `torso_separation_deg`, velocities, `start_lag_ms`) and calls `_build_couple_movement_shell` locally (zero Solo `movement.py` imports!).
+5. `KE` runs `run_couple_analysis` (computing `tilt_a_deg`, `tilt_b_deg`, `couple_midpoint_tilt_deg`, `torso_separation_deg`, velocities, `start_lag_ms`) and calls `_build_couple_movement_shell` locally (no direct movement import in the shell builder; measurements still reuse movement.py).
 6. `KE` returns `ClipAnalysisResult(resolved_dancer_mode="couple", couple_result=...)` -> `UI` saves into `dancer_analysis.runs["couple"]`.
 
 ##### Trace Example 3: Ambiguous Practice-Hall Clip (`requested_mode = "auto"`)
@@ -238,7 +243,7 @@ sequenceDiagram
 
 ### 4.1 What Is Inside the `CommonEngineContext` Suitcase?
 
-Defined in `src/tango_posture/engines/common.py` (`131` lines), `CommonEngineContext` is a frozen read-only package containing:
+Defined in `src/tango_posture/engines/common.py` (`131` lines), `CommonEngineContext` is a shallowly frozen package (nested data remains mutable) containing:
 - **Settings & Video Info**: `cfg` (`Config`), `probe` (`VideoProbeInfo`: width, height, fps, frame count, file path), `clip_in` / `clip_out` / `clip_duration`, `processed_fps`, `clean_title`, `cap_profile`.
 - **AI Model Provenance**: `model_path`, `model_hash`, `readiness` (`CalibrationReadiness`), `performance` timing metrics.
 - **Decoded Frames**: `decoded_frames`, `raw_observations`, `auto_observations` (including in-pass close-embrace splits), `frame_times`.
@@ -398,7 +403,7 @@ Concrete frame example (`t = 3.50s`):
 - **Travel Speed & Coordination Lags**: Uses centred linear regression over half-window `velocity_filter_window_s` (`0.15s`) projected along `travel_axis_unit`. If Dancer A crosses `start_speed` (`0.20 tl/s`) at `t = 4.00s` and Dancer B crosses at `t = 4.09s` (within `pairing_window_s=0.50s`), `CoupleEvent` logs `start_lag_ms = +90.0 ms`. Also detects `slow` / `settle` (`< stop_speed=0.10`), transitions, and optional turn cues.
 
 ### Step 4: Archive Compatibility Shell With Zero Solo Coupling (`_build_couple_movement_shell`)
-- `.tpr` archive readers still validate `movement.json` on load. Previously `engines/couple.py` imported Solo `movement.analyse_movement_observations` just to build an empty dictionary! Now `_build_couple_movement_shell` constructs the schema-valid empty shell locally (`pivots=[]`, `steps=[]`, `hip_frames=[]`, exact `_MOVEMENT_DETECTOR_FINGERPRINT`), guaranteeing **zero imports from `movement.py`**.
+- `.tpr` archive readers still validate `movement.json` on load. Previously `engines/couple.py` imported Solo `movement.analyse_movement_observations` just to build an empty dictionary! Now `_build_couple_movement_shell` constructs the schema-valid empty shell locally (`pivots=[]`, `steps=[]`, `hip_frames=[]`, exact `_MOVEMENT_DETECTOR_FINGERPRINT`), avoiding a direct import in the shell builder. Couple measurements still import and call the shared movement detector.
 
 ### Step 5: Clean Purpose-Built Overlays (`couple/overlay.py`)
 `render_couple_frame_overlay` draws cleanly:
@@ -446,31 +451,13 @@ In `src/tango_posture/config.py` (`SETTING_GROUPS` & `SETTING_ENGINE_SCOPES`) an
 
 ## Chapter 9: Technical Debt Scorecard, Verification & Future Roadmap
 
-### 9.1 Technical Debt Resolved
+### Current audit and improvement plan
 
-| Technical Debt Item | Before | After (Current Architecture) |
-| :--- | :--- | :--- |
-| **Giant Pre-Flight Monolith** | `pipeline.py` (~1,566 lines) mixed pre-flight decode, Solo trackers, and Couple close-embrace passes in one function. | Split cleanly into `pipeline.py` (`768`), `engines/common.py` (`131`), `engines/solo.py` (`788`), `engines/couple.py` (`325`), and `engines/__init__.py` (`19`). |
-| **Monolithic `run_solo_dancer_engine`** | One ~620-line function handling ROI filtering, calibration, scoring, movement, recovery, and packaging. | Decomposed into 4 modular stages: `_filter_solo_target_frames`, `_resolve_solo_calibration`, `_evaluate_solo_frames`, `_recover_and_complete_solo_coach_data`. |
-| **Couple Importing Solo `movement.py` & Double Decode** | `engines/couple.py` imported `analyse_movement_observations` and re-decoded the full clip even for explicit Couple runs. | Zero `movement.py` imports via `_build_couple_movement_shell`; single-pass `idx % 3 == 0` close-embrace keyframes + `(dx, dy)` propagation inside `pipeline.py`. |
-| **Missing Solo Limbs & `coach.py` Bloat** | Display limb completion lived inline in `coach.py` (`1,687` lines), clamped pivots to `0.20s`, respected false cuts, failed on boundary empty frames, `[0,1]` border landmarks, missing head primary shoulder, and persistent low-conf limbs; `CalibrationEditor` omitted recovery/movement args. | Extracted `pose/display_completion.py` (`767` lines, cutting `coach.py` to `1,163` lines); hardened all 5 cases; updated `CalibrationEditor` (`1,367` lines) to pass `pose_recovery` & `movement_data`; covered by `test_interpolate_coach_data_recovers_whole_frame_boundary_dropout_and_near_edge_limbs`. |
-| **Audio-Mux Export Truncation** | `save_overlay_video` passed `-shortest` to `ffmpeg`, clipping the final frame on audio-muxed exports. | Removed `-shortest` in `src/tango_posture/replay.py` so exact frame counts are preserved. |
-| **Mixed Flat Settings Tabs** | 14 ungrouped tabs mixed Single, Couple, and Common settings. | Reorganized into 15 tabs under `SETTING_ENGINE_SCOPES` (`Common`, `Single`, `Couple`) with scope filter buttons in `SettingsScreen`. |
-| **Lint & Static Typing Backlog** | 55 `ruff` errors and `mypy` union-attribute errors across recovery/tests. | `0` `ruff` errors (`src` and `tests`) and `0` `mypy` errors across `117` source files. |
+Reviewed 17 November 2026. The engine split is implemented, but it does not eliminate shared movement dependencies, mutable nested data, or compatibility-shell debt. The [technical debt audit](TECHNICAL_DEBT_AND_REDESIGN.md) records source evidence, risks, prioritized changes, migration strategy and acceptance checks. It replaces the previous historical scorecard and undated test totals.
 
-### 9.2 Verified Check Results (Latest Run)
+The first priorities are pose provenance, transition persistence, subject-safe turn matching and accurate evidence statuses. Then store reproducible settings, extract pure services, simplify the Qt presenters and evolve archive contracts. These are proposals, not completed fixes.
 
-- **Lint (`uv run ruff check src tests`)**: **All checks passed!** (`0` errors)
-- **Type Check (`python3.11 -m mypy src/tango_posture`)**: **Success: no issues found in 117 source files**
-- **Unit Tests** (`test_pose_interpolation.py`, `test_pose_recovery.py`, `test_couple_analysis.py`, `test_reference_import.py`, `test_settings.py`, `test_review.py`): **97 passed in 1.50s**
-- **Offscreen Qt Tests** (`test_review_playback.py`, `test_couple_qt.py`, `test_calibration_editor.py`, `test_shell.py`, `test_measurement_normalization_qt.py`): **114 passed in 12.75s**
-
-### 9.3 Remaining Next-Phase Re-engineering Roadmap
-
-1. **Split `ReviewScreen` (`src/tango_posture/desktop_qt/screens/review.py` — `3,411` lines)** into mode-specific presenters (`SoloReviewPresenter`, `CoupleReviewPresenter`) plus `ReviewPlaybackController`.
-2. **Modularize Remaining Large Domains**: `pose/recovery.py` (`1,985`), `movement.py` (`1,886`), remaining `references/coach.py` (`1,163` -> range comparison & HUD overlay), `couple/measurements.py` (`1,559`), and `desktop_qt/screens/analytics.py` (`1,359`).
-3. **Archive Schema v2 (`src/tango_posture/archive.py` — `886` lines)**: Eliminate empty Solo compatibility shells from Couple archives once validators read `dancer_analysis.runs["couple"]` + `frame_timestamps` natively.
-4. **Scoped TOML Tables (`[engine.common]`, `[engine.solo]`, `[engine.couple]`)** in `src/tango_posture/config.py` with automatic migration from legacy flat keys.
+See the audit's verification section for checks actually run during this update. Historical lint/type/test counts are not a guarantee for the current working tree.
 
 ---
 
@@ -606,7 +593,7 @@ classDiagram
 6. **`DecodedClipFrame`** (`src/tango_posture/references/video.py`): **One Conveyor-Belt Video Slice**. Holds `frame_index`, `source_time` (time in original file), `clip_time` (time since clip trim start), and raw BGR pixel `image` for `PoseEstimator`.
 7. **`SoundtrackAnalysisSummary`** (`src/tango_posture/references/soundtrack.py`): **The Song Beat Sheet**. Tells both engines if music beats were found (`status="detected"`), tempo (`estimated_bpm`), total `counted_beats`, `phrase_count`, and per-frame `frame_states`.
 8. **`CalibrationReadiness`** (`src/tango_posture/calibration/readiness.py`): **The Pre-Flight Green Light**. Answers whether posture review has everything needed (`ready=True`, `mode="existing_reference" | "clip_interval" | "movement"`) before running heavy work.
-9. **`CommonEngineContext`** (`src/tango_posture/engines/common.py`): **The Locked Suitcase Between Control Tower and Workshops**. Frozen read-only handoff holding `probe`, `cfg`, `decoded_frames`, `auto_observations`, `auto_decision`, `resolved_mode`, and `soundtrack_summary` so Solo and Couple engines start cleanly without re-probing anything.
+9. **`CommonEngineContext`** (`src/tango_posture/engines/common.py`): **The Locked Suitcase Between Control Tower and Workshops**. Shallowly frozen handoff (nested lists/dictionaries remain mutable) holding `probe`, `cfg`, `decoded_frames`, `auto_observations`, `auto_decision`, `resolved_mode`, and `soundtrack_summary` so Solo and Couple engines start cleanly without re-probing anything.
 10. **`RunManifest`** (`src/tango_posture/references/results.py`): **The Shipping Label on Every Analysis Run**. Stamps `model_variant`, `model_hash`, `metric_version`, `width/height/fps`, `requested_dancer_mode`, and `resolved_dancer_mode` so `.tpr` archives know *how* they were produced.
 11. **`ClipAnalysisResult`** (`src/tango_posture/references/results.py`): **The Unified In-Memory Output Box**. Both `run_solo_dancer_engine`, `run_couple_dancer_engine`, and `build_needs_selection_result` return this exact class (Solo populates `coach_data`/`movement_data`/`session_summary`; Couple populates `couple_result`).
 12. **`ImportedClipResult`** (`src/tango_posture/references/results.py`): **The On-Disk Archive Receipt**. Returned once `ClipAnalysisResult` has been written into a permanent `.tpr` archive folder (`report_path`, `metadata_path`, `movement_path`, `coach_path`, optional YouTube/Facebook links).

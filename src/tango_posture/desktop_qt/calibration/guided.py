@@ -11,19 +11,23 @@ from tempfile import TemporaryDirectory
 from typing import Any
 
 import cv2
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
     QFormLayout,
+    QFrame,
+    QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QScrollArea,
+    QSplitter,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
@@ -56,6 +60,7 @@ from ..practice.worker import (
     discover_cameras,
 )
 from ..service_bridge import ServiceBridge, numpy_to_qimage
+from ..theme import COLOR_BASE, COLOR_BORDER, COLOR_TEXT_MUTED, COLOR_TEXT_PRIMARY
 from .editor import CalibrationEditor
 
 
@@ -125,72 +130,126 @@ class GuidedCalibration(QDialog):
 
     def _setup_ui(self, profile_name: str) -> None:
         root = QVBoxLayout(self)
-        root.setContentsMargins(16, 16, 16, 16)
+        root.setContentsMargins(0 if self._embedded else 16, 0 if self._embedded else 16, 0 if self._embedded else 16, 0 if self._embedded else 16)
         root.setSpacing(10)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        root.addWidget(splitter, 1)
+
+        # Left column: Live Camera Stage
+        left_card = QFrame()
+        left_card.setProperty("class", "card")
+        left_layout = QVBoxLayout(left_card)
+        left_layout.setContentsMargins(14, 14, 14, 14)
+        left_layout.setSpacing(10)
 
         self.status_banner = QLabel(
             "Camera is off. Click Start camera preview to check framing before recording."
         )
         self.status_banner.setWordWrap(True)
-        root.addWidget(self.status_banner)
+        self.status_banner.setStyleSheet(
+            f"background-color: {COLOR_BASE}; border: 1px solid {COLOR_BORDER}; "
+            f"border-radius: 6px; padding: 8px 10px; color: {COLOR_TEXT_PRIMARY}; font-size: 12px;"
+        )
+        left_layout.addWidget(self.status_banner)
 
         self.preview_stage = VideoStage("Camera preview is off. Start preview to verify your setup.")
-        self.preview_stage.setMinimumHeight(320)
-        root.addWidget(self.preview_stage, 1)
+        self.preview_stage.setMinimumSize(460, 340)
+        left_layout.addWidget(self.preview_stage, 1)
 
         self.orientation_label = QLabel("")
-        root.addWidget(self.orientation_label)
+        self.orientation_label.setStyleSheet(f"color: {COLOR_TEXT_MUTED}; font-size: 11px;")
+        self.orientation_label.setWordWrap(True)
+        left_layout.addWidget(self.orientation_label)
+        splitter.addWidget(left_card)
+
+        # Right column: Guided Controls Card
+        right_card = QFrame()
+        right_card.setProperty("class", "card")
+        right_card.setMinimumWidth(360)
+        right_card.setMaximumWidth(480)
+        right_layout = QVBoxLayout(right_card)
+        right_layout.setContentsMargins(14, 14, 14, 14)
+        right_layout.setSpacing(10)
 
         self.stack = QStackedWidget()
-        root.addWidget(self.stack)
+        right_layout.addWidget(self.stack, 1)
+        splitter.addWidget(right_card)
+        splitter.setSizes([640, 400])
 
         # Page 0: Camera Setup
         setup_page = QWidget()
         setup_layout = QVBoxLayout(setup_page)
+        setup_layout.setContentsMargins(0, 0, 0, 0)
+        setup_layout.setSpacing(12)
+
+        setup_title = QLabel("1. Camera & File Setup")
+        setup_title.setStyleSheet("font-size: 15px; font-weight: bold;")
+        setup_layout.addWidget(setup_title)
+
         form = QFormLayout()
+        form.setSpacing(10)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
 
         self.name_input = QLineEdit(profile_name)
-        form.addRow("Profile name:", self.name_input)
+        self.name_input.textChanged.connect(self._update_filename_preview)
+        form.addRow("Calibration name:", self.name_input)
 
-        cam_row = QHBoxLayout()
+        self.filename_preview = QLabel("")
+        self.filename_preview.setWordWrap(True)
+        self.filename_preview.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.filename_preview.setStyleSheet(
+            f"background-color: {COLOR_BASE}; border: 1px solid {COLOR_BORDER}; "
+            f"border-radius: 6px; padding: 8px; color: {COLOR_TEXT_PRIMARY}; font-size: 12px;"
+        )
+        form.addRow("Output files:", self.filename_preview)
+
         self.camera_combo = QComboBox()
         self.camera_combo.addItem(f"Camera {self._cfg.camera}", self._cfg.camera)
         self.camera_combo.currentIndexChanged.connect(self._on_camera_changed)
-        cam_row.addWidget(self.camera_combo, 1)
+        form.addRow("Camera:", self.camera_combo)
+        setup_layout.addLayout(form)
+
+        cam_btns = QHBoxLayout()
         self.scan_cameras_btn = QPushButton("Scan cameras")
         self.scan_cameras_btn.clicked.connect(self._scan_cameras)
-        cam_row.addWidget(self.scan_cameras_btn)
+        cam_btns.addWidget(self.scan_cameras_btn)
         self.start_preview_btn = QPushButton("Start camera preview")
+        self.start_preview_btn.setProperty("class", "primary")
         self.start_preview_btn.clicked.connect(self._start_preview)
         self.preview = self.start_preview_btn
-        cam_row.addWidget(self.start_preview_btn)
+        cam_btns.addWidget(self.start_preview_btn, 1)
         self.retry_camera_btn = QPushButton("Retry camera")
         self.retry_camera_btn.setVisible(False)
         self.retry_camera_btn.clicked.connect(self._start_preview)
-        cam_row.addWidget(self.retry_camera_btn)
-        form.addRow("Camera:", cam_row)
+        cam_btns.addWidget(self.retry_camera_btn)
+        setup_layout.addLayout(cam_btns)
 
-        toggles_row = QHBoxLayout()
+        opts_box = QGroupBox("Options")
+        opts_layout = QVBoxLayout(opts_box)
+        opts_layout.setSpacing(6)
         self.mirror_cb = QCheckBox("Mirror preview (display only)")
         self.mirror_cb.setChecked(self._cfg.mirror)
         self.mirror_cb.toggled.connect(self._update_orientation_indicator)
-        toggles_row.addWidget(self.mirror_cb)
+        opts_layout.addWidget(self.mirror_cb)
 
         self.speak_cb = QCheckBox("Speak instructions")
         self.speak_cb.setChecked(self._cfg.solo_camera.speak_instructions)
-        toggles_row.addWidget(self.speak_cb)
-        toggles_row.addStretch(1)
-        form.addRow("Options:", toggles_row)
+        opts_layout.addWidget(self.speak_cb)
 
-        setup_layout.addLayout(form)
+        self.auto_start_cb = QCheckBox("Auto-start when landmarks settle")
+        self.auto_start_cb.setChecked(True)
+        opts_layout.addWidget(self.auto_start_cb)
+        setup_layout.addWidget(opts_box)
 
         setup_note = QLabel(
             "Place the camera level at practice height and step back until your head and shoes fit. "
-            "The app will guide you by voice and detect your side/facing automatically. "
-            "Begin records local video and pose landmarks for review; microphone and beat tracking stay off."
+            "The app will guide you by voice and detect your side/facing automatically."
         )
         setup_note.setWordWrap(True)
+        setup_note.setStyleSheet(f"color: {COLOR_TEXT_MUTED}; font-size: 11px;")
         setup_layout.addWidget(setup_note)
+        setup_layout.addStretch(1)
 
         setup_btns = QHBoxLayout()
         self.begin_btn = QPushButton("Begin")
@@ -198,106 +257,145 @@ class GuidedCalibration(QDialog):
         self.begin_btn.setEnabled(False)
         self.begin_btn.clicked.connect(self._begin_capture)
         self.start = self.begin_btn
-        setup_btns.addWidget(self.begin_btn)
+        setup_btns.addWidget(self.begin_btn, 1)
         setup_cancel = QPushButton("Cancel")
         setup_cancel.clicked.connect(self.reject)
         setup_cancel.setVisible(not self._embedded)
         setup_btns.addWidget(setup_cancel)
-        setup_btns.addStretch(1)
         setup_layout.addLayout(setup_btns)
         self.stack.addWidget(setup_page)
 
         # Page 1: Guided Capture
         capture_page = QWidget()
         cap_layout = QVBoxLayout(capture_page)
+        cap_layout.setContentsMargins(0, 0, 0, 0)
+        cap_layout.setSpacing(12)
+
         self.phase_label = QLabel("Ready")
-        self.phase_label.setStyleSheet("font-weight: bold; font-size: 14px;")
+        self.phase_label.setStyleSheet("font-size: 15px; font-weight: bold;")
         cap_layout.addWidget(self.phase_label)
 
         self.instruction_label = QLabel("")
         self.instruction_label.setWordWrap(True)
-        self.instruction_label.setStyleSheet("font-size: 15px;")
+        self.instruction_label.setStyleSheet(
+            f"background-color: {COLOR_BASE}; border: 1px solid {COLOR_BORDER}; "
+            f"border-radius: 6px; padding: 12px; color: {COLOR_TEXT_PRIMARY}; font-size: 14px;"
+        )
         cap_layout.addWidget(self.instruction_label)
 
         self.hint_label = QLabel("")
         self.hint_label.setWordWrap(True)
+        self.hint_label.setStyleSheet(f"color: {COLOR_TEXT_MUTED}; font-size: 12px;")
         cap_layout.addWidget(self.hint_label)
+        cap_layout.addStretch(1)
 
-        cap_btns = QHBoxLayout()
+        cap_grid = QGridLayout()
+        cap_grid.setSpacing(8)
         self.pause_btn = QPushButton("Pause")
         self.pause_btn.clicked.connect(self._toggle_pause)
-        cap_btns.addWidget(self.pause_btn)
+        cap_grid.addWidget(self.pause_btn, 0, 0)
 
         self.repeat_btn = QPushButton("Repeat instruction")
         self.repeat_btn.clicked.connect(self._repeat_instruction)
-        cap_btns.addWidget(self.repeat_btn)
+        cap_grid.addWidget(self.repeat_btn, 0, 1)
 
         self.retry_hold_btn = QPushButton("Retry hold")
         self.retry_hold_btn.clicked.connect(self._retry_hold)
-        cap_btns.addWidget(self.retry_hold_btn)
+        cap_grid.addWidget(self.retry_hold_btn, 1, 0)
 
         self.skip_view_btn = QPushButton("Skip view")
         self.skip_view_btn.clicked.connect(self._skip_view)
-        cap_btns.addWidget(self.skip_view_btn)
+        cap_grid.addWidget(self.skip_view_btn, 1, 1)
 
         self.start_take_btn = QPushButton("Start take")
         self.start_take_btn.setVisible(False)
         self.start_take_btn.clicked.connect(self._start_walking_take)
-        cap_btns.addWidget(self.start_take_btn)
+        cap_grid.addWidget(self.start_take_btn, 2, 0)
 
         self.end_take_btn = QPushButton("End take")
         self.end_take_btn.setVisible(False)
         self.end_take_btn.clicked.connect(self._end_walking_take)
-        cap_btns.addWidget(self.end_take_btn)
+        cap_grid.addWidget(self.end_take_btn, 2, 1)
 
         self.walk_returned_btn = QPushButton("Ready for pass 2")
         self.walk_returned_btn.setVisible(False)
         self.walk_returned_btn.clicked.connect(self._confirm_walk_return)
-        cap_btns.addWidget(self.walk_returned_btn)
+        cap_grid.addWidget(self.walk_returned_btn, 3, 0, 1, 2)
 
         cap_cancel = QPushButton("Cancel")
         cap_cancel.clicked.connect(self.reject)
-        cap_btns.addWidget(cap_cancel)
-        cap_btns.addStretch(1)
-        cap_layout.addLayout(cap_btns)
+        cap_grid.addWidget(cap_cancel, 4, 0, 1, 2)
+        cap_layout.addLayout(cap_grid)
         self.stack.addWidget(capture_page)
 
         # Page 2: Checks, Walking & Review Summary
+        review_scroll = QScrollArea()
+        review_scroll.setWidgetResizable(True)
+        review_scroll.setFrameShape(QFrame.Shape.NoFrame)
         review_page = QWidget()
         rev_layout = QVBoxLayout(review_page)
+        rev_layout.setContentsMargins(0, 0, 4, 0)
+        rev_layout.setSpacing(10)
+
+        rev_title = QLabel("Review & Save")
+        rev_title.setStyleSheet("font-size: 15px; font-weight: bold;")
+        rev_layout.addWidget(rev_title)
+
         self.review_summary = QLabel("")
         self.review_summary.setWordWrap(True)
+        self.review_summary.setStyleSheet(
+            f"background-color: {COLOR_BASE}; border: 1px solid {COLOR_BORDER}; "
+            f"border-radius: 6px; padding: 10px; color: {COLOR_TEXT_PRIMARY}; font-size: 12px;"
+        )
         rev_layout.addWidget(self.review_summary)
 
-        checks_box = QGroupBox("Optional individual measurement checks & solo walking")
+        rev_form = QFormLayout()
+        rev_form.setSpacing(8)
+        self.review_name_input = QLineEdit(profile_name)
+        self.review_name_input.textChanged.connect(self.name_input.setText)
+        self.name_input.textChanged.connect(self.review_name_input.setText)
+        rev_form.addRow("Calibration name:", self.review_name_input)
+
+        self.review_filename_preview = QLabel("")
+        self.review_filename_preview.setWordWrap(True)
+        self.review_filename_preview.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.review_filename_preview.setStyleSheet(
+            f"background-color: {COLOR_BASE}; border: 1px solid {COLOR_BORDER}; "
+            f"border-radius: 6px; padding: 8px; color: {COLOR_TEXT_PRIMARY}; font-size: 12px;"
+        )
+        rev_form.addRow("Output files:", self.review_filename_preview)
+        rev_layout.addLayout(rev_form)
+
+        checks_box = QGroupBox("Optional checks & solo walking")
         checks_layout = QVBoxLayout(checks_box)
         self.check_boxes: dict[str, QCheckBox] = {}
-        cb_row = QHBoxLayout()
-        for cid, spec in CHECK_SPECS.items():
+        cb_grid = QGridLayout()
+        for idx, (cid, spec) in enumerate(CHECK_SPECS.items()):
             cb = QCheckBox(spec.title)
             self.check_boxes[cid] = cb
-            cb_row.addWidget(cb)
-        checks_layout.addLayout(cb_row)
+            cb_grid.addWidget(cb, idx // 2, idx % 2)
+        checks_layout.addLayout(cb_grid)
 
         extra_btns = QHBoxLayout()
-        self.run_checks_btn = QPushButton("Check individual measurements")
+        self.run_checks_btn = QPushButton("Check measurements")
         self.run_checks_btn.clicked.connect(self._run_selected_checks)
         extra_btns.addWidget(self.run_checks_btn)
 
         self.record_walking_btn = QPushButton("Record solo walking")
         self.record_walking_btn.clicked.connect(self._run_walking_plan)
         extra_btns.addWidget(self.record_walking_btn)
-        extra_btns.addStretch(1)
         checks_layout.addLayout(extra_btns)
         rev_layout.addWidget(checks_box)
 
-        save_btns = QHBoxLayout()
+        save_btns = QVBoxLayout()
+        save_btns.setSpacing(6)
         self.open_editor_btn = QPushButton("Review ranges in editor…")
         self.open_editor_btn.setProperty("class", "accent")
         self.open_editor_btn.clicked.connect(self._review_in_editor)
         save_btns.addWidget(self.open_editor_btn)
 
         self.save_views_btn = QPushButton("Save ready profiles")
+        self.save_views_btn.setProperty("class", "primary")
         self.save_views_btn.clicked.connect(self._save_ready_profiles)
         save_btns.addWidget(self.save_views_btn)
 
@@ -309,11 +407,34 @@ class GuidedCalibration(QDialog):
         rev_cancel.clicked.connect(self.reject)
         rev_cancel.setVisible(not self._embedded)
         save_btns.addWidget(rev_cancel)
-        save_btns.addStretch(1)
         rev_layout.addLayout(save_btns)
-        self.stack.addWidget(review_page)
+        rev_layout.addStretch(1)
+        review_scroll.setWidget(review_page)
+        self.stack.addWidget(review_scroll)
 
         self._update_orientation_indicator()
+        self._update_filename_preview()
+
+    def _update_filename_preview(self) -> None:
+        base = self.name_input.text().strip() or "Studio webcam"
+        preview_txt = f"• {base} · Neutral · Front.tpc\n• {base} · Neutral · Side.tpc"
+        self.filename_preview.setText(preview_txt)
+        if hasattr(self, "review_filename_preview"):
+            self.review_filename_preview.setText(preview_txt)
+
+    def start_new_calibration(self) -> None:
+        """Reset state and start a complete new guided camera calibration."""
+        self._speech.cancel_all()
+        self._release_camera()
+        self._paused = False
+        self._collected_frames.clear()
+        self._staged_tpr = None
+        self._published_tpr = None
+        self.saved_path = None
+        self.saved_paths.clear()
+        self.camera_combo.setEnabled(True)
+        self.stack.setCurrentIndex(0)
+        self._start_preview(auto_begin=True)
 
     def _apply_target_profile_defaults(self) -> None:
         if self._target_profile is None:
@@ -383,8 +504,10 @@ class GuidedCalibration(QDialog):
             self._release_camera()
             self._start_preview()
 
-    def _start_preview(self) -> None:
+    def _start_preview(self, *, auto_begin: bool = False) -> None:
         self._release_camera()
+        self._auto_begin_pending = auto_begin
+        self._preview_stable_since: float | None = None
         self._temp_dir = TemporaryDirectory(prefix="tango-solo-cal-")
         temp_root = Path(self._temp_dir.name)
         self._staging_dir = temp_root / "staging"
@@ -456,6 +579,17 @@ class GuidedCalibration(QDialog):
                 ok, reason = check_full_body_framing(obs, self._selected_setup_config())
                 self.begin_btn.setEnabled(ok)
                 self.status_banner.setText(reason)
+                if ok and (getattr(self, "_auto_begin_pending", False) or self.auto_start_cb.isChecked()):
+                    now_m = time.monotonic()
+                    prev_stable = getattr(self, "_preview_stable_since", None)
+                    if prev_stable is None:
+                        self._preview_stable_since = now_m
+                    elif now_m - prev_stable >= self._cfg.solo_camera.stable_time_s:
+                        self._auto_begin_pending = False
+                        self._begin_capture()
+                        return
+                else:
+                    self._preview_stable_since = None
             elif self.stack.currentIndex() == 1 and not self._paused:
                 prev_accepted = len(self._session.accepted_passages)
                 self._session.process_frame(

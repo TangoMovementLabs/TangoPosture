@@ -1,5 +1,49 @@
 # TangoPosture UML Class Diagrams & Object Reference: The Complete Guide for Dummies
 
+## Read this before the diagrams
+
+Reviewed 17 November 2026 against the working tree. These diagrams are selective maps, not an exhaustive generated API specification. A class is a named container for data or behavior; an arrow tells you how containers relate. Follow the named source files when exact fields or signatures matter.
+
+For metric meanings and numerical examples, use the [manual](TANGO_POSTURE_GUIDE.md). For current processing flow, use the [architecture guide](ARCHITECTURE_DUAL_ENGINE_REENGINEERING.md). Proposed new classes/services in the [audit](TECHNICAL_DEBT_AND_REDESIGN.md) are future work and should not be mistaken for implemented APIs.
+
+### The couple result, in plain language
+
+```mermaid
+classDiagram
+    class CoupleAnalysisRequest
+    class CoupleAnnotations
+    class AutoDecisionResult
+    class TrackedDancerSample
+    class PairedFrameSample
+    class CoupleEvent
+    class CoupleAnalysisResult
+    CoupleAnalysisRequest --> CoupleAnnotations : carries user input
+    PairedFrameSample --> TrackedDancerSample : A and B at one time
+    CoupleAnalysisResult --> AutoDecisionResult : records mode decision
+    CoupleAnalysisResult --> CoupleAnalysisRequest : records request
+    CoupleAnalysisResult --> CoupleEvent : serializes events as dictionaries
+```
+
+| Object | Beginner explanation | Concrete example |
+| --- | --- | --- |
+| `CoupleAnalysisRequest` | What to analyze and what the reviewer supplied | Couple mode plus A/B anchors and manual beat marks. |
+| `AutoDecisionResult` | The routing decision and its reasons | Couple, single, or needs selection; this is not a quality score. |
+| `TrackedDancerSample` | One dancer's pose and eligibility flags at one time | A's hips are usable but shoulders are hidden; travel may be possible while torso tilt is unavailable. |
+| `PairedFrameSample` | A and B at the same timestamp, with break flags | A camera cut interrupts a continuous trajectory. |
+| `CoupleEvent` | A timestamped observation or reviewed marker | A starts at 2.00 s; a paired B start at 2.15 s gives `lag_ms=150`. |
+| `CoupleSummaryValue` | A number with count, unit, coverage and status | Median start lag 150 ms across three pairs. Many other summary groups currently remain dictionaries. |
+| `CoupleAnnotations` | Reviewer edits, beats, baselines and planned transitions | Mark a deliberate reversal so it is not counted as unannotated. |
+| `CoupleAnalysisResult` | Saved run evidence, derived series, events, summaries and display data | `automated_candidates` preserves detector proposals; `annotations` stores edits; `events` is their derived combination. |
+
+The measurement functions live in `couple/measurements.py`; the model classes mainly carry data. `rebuild_couple_result_with_annotations` recalculates event-derived results and increments the revision, without rerunning pose detection. It does not recalculate raw travel series when a travel-axis annotation changes. A future revision service should make such dependencies explicit.
+
+**Ownership caveat:** arrows explain relationships, not Python memory safety. A frozen dataclass prevents rebinding its fields but does not freeze contained lists, dictionaries or configuration. Copies made with `dict(...)` share nested objects. Existing annotation rebuilds therefore need the immutability improvements described in the audit.
+
+**Evidence caveat:** `raw_pose` is a pipeline field name; upstream split-pose propagation can supply that field. `display_pose` is used for drawing. Neither naming nor an arrow proves fresh detector evidence; explicit origin metadata is a proposed improvement.
+
+---
+
+
 > **What is this document?**  
 > If you open the TangoPosture source code and wonder *"What are all these objects (`Config`, `Landmark`, `Session`, `CommonEngineContext`, `CoupleAnalysisResult`, `ReviewScreen`...), what data sits inside each one, and how do they connect together?"*, this guide answers every question visually and in plain English — **zero Computer Science degree required**.
 
@@ -34,7 +78,7 @@ A **UML Class Diagram** is just an **org chart for data blueprints**. Every rect
 | **`Protocol <|.. Impl`** | **Realization** | *"Impl fulfills every method promised by the Protocol contract."* | `MediaPipeEstimator` fulfills the `PoseEstimator` contract. |
 
 ### What Do the `<<Stereotypes>>` Mean?
-- **`<<dataclass>>`**: A clean container of fields (often `frozen=True`, meaning read-only so nobody can accidentally tamper with evidence mid-run!).
+- **`<<dataclass>>`**: A clean container of fields (often `frozen=True`, preventing field reassignment, while nested data can still change).
 - **`<<Pydantic BaseModel>>`**: A strict form checker — automatically checks numbers, rejects typos (`extra="forbid"`), rejects `NaN`/`Infinity`, and loads/saves cleanly to JSON or TOML.
 - **`<<Protocol>>`**: An interface rulebook ("I don't care *how* you detect poses, just make sure you have `.estimate()` and `.close()`").
 - **`<<Tracker / Stateful>>`**: An object with memory across time — remembers previous video frames to smooth jitter and prevent flickering alerts.

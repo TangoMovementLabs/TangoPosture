@@ -184,13 +184,7 @@ def _draw_dancer(
         cv2.putText(
             image, f"{label} (hip)", anchor, cv2.FONT_HERSHEY_SIMPLEX, 0.48, color, 2, cv2.LINE_AA
         )
-
-    if show_steps:
-        for side_key in ("left_ankle", "right_ankle"):
-            ank = landmarks.get(side_key)
-            if ank and _lm_vis(ank) >= min_vis:
-                ap = _to_px(ank[0], ank[1], width, height)
-                cv2.circle(image, ap, 4, color, 1 if interpolated else -1, cv2.LINE_AA)
+    _ = show_steps
 
 
 def render_couple_frame_overlay(
@@ -315,6 +309,17 @@ def render_couple_frame_overlay(
     return out
 
 
+_FOOT_OVERLAY_LANDMARKS = frozenset(
+    {
+        "left_ankle",
+        "right_ankle",
+        "left_heel",
+        "right_heel",
+        "left_foot_index",
+        "right_foot_index",
+    }
+)
+
 _SMOOTHED_OVERLAY_LANDMARKS = (
     "left_shoulder",
     "right_shoulder",
@@ -322,6 +327,10 @@ _SMOOTHED_OVERLAY_LANDMARKS = (
     "right_hip",
     "left_ankle",
     "right_ankle",
+    "left_heel",
+    "right_heel",
+    "left_foot_index",
+    "right_foot_index",
 )
 
 
@@ -418,6 +427,9 @@ def smooth_couple_frame_overlays(
 
     for dancer_key in ("dancer_a", "dancer_b"):
         for lm_key in _SMOOTHED_OVERLAY_LANDMARKS:
+            is_foot = lm_key in _FOOT_OVERLAY_LANDMARKS
+            vis_floor = 0.25 if is_foot else 0.5
+            lm_tau_s = min(float(tau_s), 0.02) if is_foot else float(tau_s)
             xs: list[float | None] = []
             ys: list[float | None] = []
             vis_list: list[float | None] = []
@@ -428,7 +440,7 @@ def smooth_couple_frame_overlays(
                 if (
                     isinstance(coords, (list, tuple))
                     and len(coords) >= 2
-                    and _lm_vis(list(coords)) >= 0.5
+                    and _lm_vis(list(coords)) >= vis_floor
                     and isinstance(coords[0], (int, float))
                     and isinstance(coords[1], (int, float))
                     and math.isfinite(float(coords[0]))
@@ -442,8 +454,8 @@ def smooth_couple_frame_overlays(
                     ys.append(None)
                     vis_list.append(None)
 
-            sm_x = _zero_phase_ema_optional(timestamps, xs, tau_s=tau_s, max_gap_s=max_gap_s)
-            sm_y = _zero_phase_ema_optional(timestamps, ys, tau_s=tau_s, max_gap_s=max_gap_s)
+            sm_x = _zero_phase_ema_optional(timestamps, xs, tau_s=lm_tau_s, max_gap_s=max_gap_s)
+            sm_y = _zero_phase_ema_optional(timestamps, ys, tau_s=lm_tau_s, max_gap_s=max_gap_s)
             for idx, fo in enumerate(smoothed):
                 if sm_x[idx] is None or sm_y[idx] is None or not isinstance(fo, dict):
                     continue

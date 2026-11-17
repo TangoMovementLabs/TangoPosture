@@ -48,9 +48,10 @@ def test_calibration_menu_and_home_entry_point(qapp, tmp_path):
     home: HomeScreen = window.screens[Route.HOME]  # type: ignore[assignment]
     ref_screen: ReferencesScreen = window.screens[Route.REFERENCES]  # type: ignore[assignment]
     assert hasattr(ref_screen, "new_solo_cal_btn")
-    assert ref_screen.new_solo_cal_btn.text() == "New solo camera calibration…"
-    assert hasattr(ref_screen, "check_camera_btn")
-    assert ref_screen.check_camera_btn.text() == "Check with camera…"
+    assert ref_screen.new_solo_cal_btn.text() == "New Calibration"
+    assert hasattr(ref_screen, "guided_wizard")
+    assert hasattr(ref_screen.guided_wizard, "filename_preview")
+    assert hasattr(ref_screen.guided_wizard, "review_name_input")
 
     window.router.navigate(Route.HOME)
     qapp.processEvents()
@@ -114,7 +115,7 @@ def test_references_lists_range_profile_and_check_with_camera_prepares_wizard(qa
     assert wizard.check_boxes["head_pitch"].isChecked()
     assert not hasattr(wizard, "side_combo")
     assert not hasattr(wizard, "facing_combo")
-    assert screen.tabs.currentIndex() == 0
+    assert not hasattr(screen, "tabs")
     assert not screen.guided_wizard._camera_active
 
     # Simulated camera error shows actionable message and Retry camera

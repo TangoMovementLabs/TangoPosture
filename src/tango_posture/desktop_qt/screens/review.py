@@ -2896,17 +2896,13 @@ class ReviewScreen(QWidget):
         self.couple_markers_summary.setObjectName("coupleTimelineMarkersLabel")
         layout.addWidget(self.couple_markers_summary)
 
-        layout.addWidget(_section_label("Dancer Labels & Roles"))
+        layout.addWidget(_section_label("Dancer Roles"))
         names_form = QFormLayout()
         names_form.setContentsMargins(0, 0, 0, 0)
         self.dancer_a_name_edit = QLineEdit("Dancer A")
-        self.dancer_a_role_edit = QLineEdit()
         self.dancer_b_name_edit = QLineEdit("Dancer B")
-        self.dancer_b_role_edit = QLineEdit()
-        names_form.addRow("Dancer A name:", self.dancer_a_name_edit)
-        names_form.addRow("Dancer A role:", self.dancer_a_role_edit)
-        names_form.addRow("Dancer B name:", self.dancer_b_name_edit)
-        names_form.addRow("Dancer B role:", self.dancer_b_role_edit)
+        names_form.addRow("Dancer A role:", self.dancer_a_name_edit)
+        names_form.addRow("Dancer B role:", self.dancer_b_name_edit)
         layout.addLayout(names_form)
 
         names_btn_row = QHBoxLayout()
@@ -2917,17 +2913,18 @@ class ReviewScreen(QWidget):
         layout.addLayout(names_btn_row)
 
         layout.addWidget(_section_label("Planned Transitions & Events"))
-        plan_row = QHBoxLayout()
-        mark_rev_btn = QPushButton("Mark Planned Reversal @ frame")
-        mark_pause_btn = QPushButton("Mark Planned Pause")
-        mark_settle_btn = QPushButton("Mark Settling Step")
+        plan_grid = QGridLayout()
+        plan_grid.setSpacing(6)
+        mark_rev_btn = QPushButton("Planned Reversal @ frame")
+        mark_pause_btn = QPushButton("Planned Pause")
+        mark_settle_btn = QPushButton("Settling Step")
         mark_rev_btn.clicked.connect(lambda: self._mark_planned_transition("planned_reversal"))
         mark_pause_btn.clicked.connect(lambda: self._mark_planned_transition("planned_pause"))
         mark_settle_btn.clicked.connect(lambda: self._mark_planned_transition("settling_step"))
-        plan_row.addWidget(mark_rev_btn)
-        plan_row.addWidget(mark_pause_btn)
-        plan_row.addWidget(mark_settle_btn)
-        layout.addLayout(plan_row)
+        plan_grid.addWidget(mark_rev_btn, 0, 0, 1, 2)
+        plan_grid.addWidget(mark_pause_btn, 1, 0)
+        plan_grid.addWidget(mark_settle_btn, 1, 1)
+        layout.addLayout(plan_grid)
 
         ev_edit_form = QFormLayout()
         ev_edit_form.setContentsMargins(0, 0, 0, 0)
@@ -2956,7 +2953,8 @@ class ReviewScreen(QWidget):
         ev_edit_form.addRow("Pivot foot:", self.couple_pivot_behavior_combo)
         layout.addLayout(ev_edit_form)
 
-        ev_btns = QHBoxLayout()
+        ev_btns = QGridLayout()
+        ev_btns.setSpacing(6)
         self.add_couple_event_btn = QPushButton("Add @ frame")
         self.confirm_couple_event_btn = QPushButton("Confirm")
         self.update_couple_event_btn = QPushButton("Update")
@@ -2965,13 +2963,10 @@ class ReviewScreen(QWidget):
         self.confirm_couple_event_btn.clicked.connect(self._confirm_couple_candidate)
         self.update_couple_event_btn.clicked.connect(self._update_couple_event)
         self.delete_couple_event_btn.clicked.connect(self._delete_couple_event)
-        for btn in (
-            self.add_couple_event_btn,
-            self.confirm_couple_event_btn,
-            self.update_couple_event_btn,
-            self.delete_couple_event_btn,
-        ):
-            ev_btns.addWidget(btn)
+        ev_btns.addWidget(self.add_couple_event_btn, 0, 0)
+        ev_btns.addWidget(self.confirm_couple_event_btn, 0, 1)
+        ev_btns.addWidget(self.update_couple_event_btn, 1, 0)
+        ev_btns.addWidget(self.delete_couple_event_btn, 1, 1)
         layout.addLayout(ev_btns)
 
         self.couple_events_table = QTableWidget(0, 5)
@@ -2979,16 +2974,20 @@ class ReviewScreen(QWidget):
         self.couple_events_table.setHorizontalHeaderLabels(
             ["Time (s)", "Event", "Subject", "Status", "Detail"]
         )
-        self.couple_events_table.horizontalHeader().setSectionResizeMode(
-            1, QHeaderView.ResizeMode.Stretch
-        )
+        hdr = self.couple_events_table.horizontalHeader()
+        hdr.setMinimumSectionSize(58)
+        hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
         self.couple_events_table.setSelectionBehavior(
             QTableWidget.SelectionBehavior.SelectRows
         )
         self.couple_events_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.couple_events_table.setMinimumHeight(200)
+        self.couple_events_table.setMinimumHeight(240)
         self.couple_events_table.cellClicked.connect(self._on_couple_event_clicked)
-        layout.addWidget(self.couple_events_table)
+        layout.addWidget(self.couple_events_table, 1)
 
         save_row = QHBoxLayout()
         self.couple_undo_btn = QPushButton("Undo")
@@ -3186,9 +3185,7 @@ class ReviewScreen(QWidget):
 
         ann = res.get("annotations") or {}
         self.dancer_a_name_edit.setText(str(ann.get("dancer_a_name") or "Dancer A"))
-        self.dancer_a_role_edit.setText(str(ann.get("dancer_a_role") or ""))
         self.dancer_b_name_edit.setText(str(ann.get("dancer_b_name") or "Dancer B"))
-        self.dancer_b_role_edit.setText(str(ann.get("dancer_b_role") or ""))
 
         events = [ev for ev in (res.get("events") or []) if isinstance(ev, dict)]
         planned = list(ann.get("planned_transitions") or [])
@@ -3253,9 +3250,7 @@ class ReviewScreen(QWidget):
         self._push_annotation_undo()
         ann = self._current_annotations_model()
         ann.dancer_a_name = self.dancer_a_name_edit.text().strip() or "Dancer A"
-        ann.dancer_a_role = self.dancer_a_role_edit.text().strip()
         ann.dancer_b_name = self.dancer_b_name_edit.text().strip() or "Dancer B"
-        ann.dancer_b_role = self.dancer_b_role_edit.text().strip()
         self._rebuild_local_couple_preview(ann)
         self.couple_evidence_status.setText("Updated dancer labels; click Save Annotations to persist.")
 
