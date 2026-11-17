@@ -71,6 +71,7 @@ class GuidedCalibration(QDialog):
         target_profile: RangeProfile | None = None,
         target_profile_path: Path | None = None,
         camera_discoverer: Callable[..., list[tuple[int, str]]] = discover_cameras,
+        embedded: bool = False,
     ) -> None:
         super().__init__(parent)
         self.bridge = bridge
@@ -78,6 +79,10 @@ class GuidedCalibration(QDialog):
         self._target_profile = target_profile
         self._target_profile_path = target_profile_path
         self._camera_discoverer = camera_discoverer
+        self._embedded = embedded
+        self._detected_side = self._cfg.side
+        self._detected_facing = self._cfg.facing
+        self._last_spoken_hint = ""
         self.setWindowTitle(
             f"Check with camera · {target_profile.name}"
             if target_profile is not None
@@ -105,7 +110,11 @@ class GuidedCalibration(QDialog):
 
         self._speech = SpeechManager(self)
         self._speech.speech_finished.connect(self._on_speech_finished)
-        self._session = SoloCameraSession(self._cfg, now_monotonic=time.monotonic())
+        self._session = SoloCameraSession(
+            self._cfg,
+            now_monotonic=time.monotonic(),
+            auto_detect_side_facing=True,
+        )
 
         self._poll_timer = QTimer(self)
         self._poll_timer.setInterval(40)
@@ -161,18 +170,6 @@ class GuidedCalibration(QDialog):
         cam_row.addWidget(self.retry_camera_btn)
         form.addRow("Camera:", cam_row)
 
-        self.side_combo = QComboBox()
-        self.side_combo.addItems(["left", "right"])
-        self.side_combo.setCurrentText(self._cfg.side)
-        self.side_combo.currentTextChanged.connect(self._update_orientation_indicator)
-        form.addRow("Side seen by camera:", self.side_combo)
-
-        self.facing_combo = QComboBox()
-        self.facing_combo.addItems(["right", "left"])
-        self.facing_combo.setCurrentText(self._cfg.facing)
-        self.facing_combo.currentTextChanged.connect(self._update_orientation_indicator)
-        form.addRow("Facing in recorded image:", self.facing_combo)
-
         toggles_row = QHBoxLayout()
         self.mirror_cb = QCheckBox("Mirror preview (display only)")
         self.mirror_cb.setChecked(self._cfg.mirror)
@@ -189,6 +186,7 @@ class GuidedCalibration(QDialog):
 
         setup_note = QLabel(
             "Place the camera level at practice height and step back until your head and shoes fit. "
+            "The app will guide you by voice and detect your side/facing automatically. "
             "Begin records local video and pose landmarks for review; microphone and beat tracking stay off."
         )
         setup_note.setWordWrap(True)
@@ -203,6 +201,7 @@ class GuidedCalibration(QDialog):
         setup_btns.addWidget(self.begin_btn)
         setup_cancel = QPushButton("Cancel")
         setup_cancel.clicked.connect(self.reject)
+        setup_cancel.setVisible(not self._embedded)
         setup_btns.addWidget(setup_cancel)
         setup_btns.addStretch(1)
         setup_layout.addLayout(setup_btns)
@@ -308,6 +307,7 @@ class GuidedCalibration(QDialog):
 
         rev_cancel = QPushButton("Close")
         rev_cancel.clicked.connect(self.reject)
+        rev_cancel.setVisible(not self._embedded)
         save_btns.addWidget(rev_cancel)
         save_btns.addStretch(1)
         rev_layout.addLayout(save_btns)
@@ -321,10 +321,14 @@ class GuidedCalibration(QDialog):
         prof = self._target_profile
         self.name_input.setText(f"{prof.name} camera check")
         cp = prof.capture_profile
-        if cp.get("side") in ("left", "right"):
-            self.side_combo.setCurrentText(str(cp["side"]))
-        if cp.get("facing") in ("left", "right"):
-            self.facing_combo.setCurrentText(str(cp["facing"]))
+        if cp.get("side") == "left":
+            self._detected_side = "left"
+        elif cp.get("side") == "right":
+            self._detected_side = "right"
+        if cp.get("facing") == "left":
+            self._detected_facing = "left"
+        elif cp.get("facing") == "right":
+            self._detected_facing = "right"
         src = str(cp.get("source", ""))
         if src.startswith("camera:"):
             try:
@@ -339,8 +343,6 @@ class GuidedCalibration(QDialog):
                 self.check_boxes[cid].setChecked(True)
 
     def _update_orientation_indicator(self) -> None:
-        side = self.side_combo.currentText()
-        facing = self.facing_combo.currentText()
         mirror_txt = " · Preview mirrored (display only)" if self.mirror_cb.isChecked() else ""
         res = ""
         if self._camera_meta:
@@ -350,7 +352,7 @@ class GuidedCalibration(QDialog):
             if w and h:
                 res = f" · {w}×{h}" + (f" @ {fps:.0f} fps" if fps else "")
         self.orientation_label.setText(
-            f"Orientation in recorded image: camera sees {side} side, facing {facing}{mirror_txt}{res}"
+            f"Auto-detected orientation: {self._detected_side} side, facing {self._detected_facing}{mirror_txt}{res}"
         )
 
     def _selected_setup_config(self) -> Config:
@@ -358,8 +360,8 @@ class GuidedCalibration(QDialog):
         return Config.model_validate({
             **self._cfg.model_dump(),
             "camera": cam_idx,
-            "side": self.side_combo.currentText(),
-            "facing": self.facing_combo.currentText(),
+            "side": self._detected_side,
+            "facing": self._detected_facing,
             "mirror": False,  # stored landmarks and footage stay unmirrored
             "beat_tracking": False,
         })
@@ -391,6 +393,7 @@ class GuidedCalibration(QDialog):
         cfg = Config.model_validate({**cfg.model_dump(), "data_dir": str(temp_root)})
 
         self._display = QtPracticeDisplay(capture_evidence=True)
+        self._display.disable_settings_coaching = True
         self._worker = QtPracticeWorker(
             cfg,
             self._display,
@@ -406,6 +409,11 @@ class GuidedCalibration(QDialog):
         self.status_banner.setText("Starting camera preview…")
         self._thread.start()
         self._poll_timer.start()
+        if self.speak_cb.isChecked():
+            self._speech.speak(
+                0,
+                "Camera preview started. Step back until your head and shoes fit in the frame, then press Begin.",
+            )
 
     def _on_worker_failed(self, message: str) -> None:
         self._release_camera()
@@ -469,9 +477,12 @@ class GuidedCalibration(QDialog):
             self._display.recording.set()
         self._frozen_cfg = self._selected_setup_config()
         self.camera_combo.setEnabled(False)
-        self.side_combo.setEnabled(False)
-        self.facing_combo.setEnabled(False)
-        self._session = SoloCameraSession(self._frozen_cfg, now_monotonic=time.monotonic())
+        self._last_spoken_hint = ""
+        self._session = SoloCameraSession(
+            self._frozen_cfg,
+            now_monotonic=time.monotonic(),
+            auto_detect_side_facing=True,
+        )
         phases = build_quick_setup_phases()
         self.stack.setCurrentIndex(1)
         prompt_id = self._session.start_plan(
@@ -508,6 +519,17 @@ class GuidedCalibration(QDialog):
         )
         self.instruction_label.setText(self._session.current_instruction)
         self.hint_label.setText(self._session.hint_message)
+        self._detected_side = self._session.cfg.side
+        self._detected_facing = self._session.cfg.facing
+        if (
+            self.speak_cb.isChecked()
+            and self._session.hint_message
+            and self._session.hint_message != self._last_spoken_hint
+            and self._session.state == "Wait for view and pose"
+            and "waiting" in self._session.hint_message.lower()
+        ):
+            self._last_spoken_hint = self._session.hint_message
+            self._speech.speak(0, self._session.hint_message)
 
         is_walking = phase is not None and not phase.requires_stillness
         self.start_take_btn.setVisible(is_walking and self._session.state == "Wait for take")

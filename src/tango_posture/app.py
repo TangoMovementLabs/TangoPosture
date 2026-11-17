@@ -504,6 +504,9 @@ class Application:
             if self.recording:
                 self.stop_recording_requested = True
             else:
+                if self.display is not None:
+                    self.display.recording.clear()
+                    self.display.recording_states.put("idle")
                 self.notice = "No recording is active; camera remains open"
             return True
         return True
@@ -1165,7 +1168,7 @@ class Application:
                 )
                 message = self.notice
                 settings_coaching = self.reference is None and not self.cfg.calibration_defaults and not getattr(
-                    self.display, "capture_evidence", False
+                    self.display, "disable_settings_coaching", False
                 )
                 if not settings_coaching:
                     bad_head = bad_shoulders = bad_knees = bad_axis = bad_ankles = False
@@ -1413,6 +1416,11 @@ class Application:
                         settings_coaching=settings_coaching,
                         shoulder_geometry=shoulder_geometry_kwargs(self.cfg),
                         knee_geometry=knee_geometry_kwargs(self.cfg),
+                        show_head_alignment=getattr(self.display, "show_head_alignment", True),
+                        show_shoulders_height=getattr(self.display, "show_shoulders_height", True),
+                        show_role_detection=getattr(self.display, "show_role_detection", True),
+                        show_embrace_type=getattr(self.display, "show_embrace_type", True),
+                        show_alerts=not getattr(self.display, "suppress_alerts", False),
                     )
                     if self.record_overlay and (not self.calibration_only or calibration_frame):
                         if self.overlay_writer is None:

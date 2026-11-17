@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -72,9 +73,21 @@ class ReferencesScreen(QWidget):
         header.addWidget(cal_btn)
         layout.addLayout(header)
 
+        from ..calibration.guided import GuidedCalibration
+
+        self.tabs = QTabWidget()
+        self.guided_wizard = GuidedCalibration(self.bridge, self, embedded=True)
+        self.guided_wizard.setWindowFlags(Qt.WindowType.Widget)
+        self.guided_wizard.accepted.connect(self._on_embedded_saved)
+        self.tabs.addTab(self.guided_wizard, "Camera Calibration")
+
+        profiles_page = QWidget()
+        profiles_layout = QVBoxLayout(profiles_page)
+        profiles_layout.setContentsMargins(0, 8, 0, 0)
+
         # Splitter: Table on left, Details on right
         splitter = QSplitter(Qt.Orientation.Horizontal)
-        layout.addWidget(splitter, 1)
+        profiles_layout.addWidget(splitter, 1)
 
         # Left: Reference Table
         table_frame = QFrame()
@@ -139,8 +152,18 @@ class ReferencesScreen(QWidget):
         df_layout.addWidget(self.match_btn)
         splitter.addWidget(detail_frame)
         splitter.setSizes([600, 360])
+        self.tabs.addTab(profiles_page, "Saved Profiles")
+        layout.addWidget(self.tabs, 1)
 
         self.refresh()
+
+    def _on_embedded_saved(self) -> None:
+        self.refresh()
+        self.bridge.calibrations_changed.emit()
+
+    def stop_for_navigation(self) -> None:
+        self.guided_wizard._speech.cancel_all()
+        self.guided_wizard._release_camera()
 
     def refresh(self) -> None:
         refs = self.bridge.list_references()

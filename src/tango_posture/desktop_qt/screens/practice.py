@@ -21,13 +21,21 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
     QSplitter,
     QVBoxLayout,
     QWidget,
 )
 
-from ...archive import practice_directory, practice_path
+from ...archive import (
+    _archive_lock,
+    _rewrite_members,
+    practice_directory,
+    practice_path,
+    read_analytics,
+    store_analytics,
+)
 from ...core.entities import ReferenceSummary
 from ...core.session_state import (
     SessionState,
@@ -44,6 +52,8 @@ from ...core.session_state import (
     stop_scoring,
 )
 from ...core.types import SourceKind
+from ...couple import classify_opening_window
+from ...domain import FrameObservation
 from ..components.beat_strip import BeatStrip
 from ..components.video_stage import VideoStage
 from ..practice.worker import PracticeThread, QtPracticeDisplay, QtPracticeWorker
@@ -77,58 +87,74 @@ class PracticeScreen(QWidget):
         self._display: QtPracticeDisplay | None = None
         self._save_pending = False
         self._worker_error: str | None = None
+        self._last_practice_path: Path | None = None
+        self._recorded_frames: list[FrameObservation] = []
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setContentsMargins(20, 18, 20, 18)
         layout.setSpacing(12)
+
+        header = QHBoxLayout()
+        title_col = QVBoxLayout()
+        title_col.setSpacing(2)
+        screen_title = QLabel("Self Practice")
+        screen_title.setProperty("class", "title")
+        screen_sub = QLabel(
+            "Live camera pose detection using the Lite model and .tp practice recording."
+        )
+        screen_sub.setProperty("class", "subtitle")
+        title_col.addWidget(screen_title)
+        title_col.addWidget(screen_sub)
+        header.addLayout(title_col, 1)
+        layout.addLayout(header)
 
         setup_card = QFrame()
         setup_card.setProperty("class", "card")
-        setup_layout = QVBoxLayout(setup_card)
-        setup_layout.setContentsMargins(12, 10, 12, 10)
-        setup_layout.setSpacing(8)
+        setup_layout = QHBoxLayout(setup_card)
+        setup_layout.setContentsMargins(14, 10, 14, 10)
+        setup_layout.setSpacing(10)
 
-        practice_row = QHBoxLayout()
-        practice_row.addWidget(QLabel("Practice:"))
+        setup_layout.addWidget(QLabel("Practice name:"))
         self.session_title = QLineEdit(
             f"Practice_{time.strftime('%Y%m%d_%H%M%S')}"
         )
         self.session_title.setAccessibleName("Practice archive name")
-        practice_row.addWidget(self.session_title, 1)
-        practice_row.addWidget(QLabel("Source:"))
+        setup_layout.addWidget(self.session_title, 1)
+
+        setup_layout.addWidget(QLabel("Mode:"))
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItem("Auto-detect", "auto")
+        self.mode_combo.addItem("Single dancer", "single")
+        self.mode_combo.addItem("Couple", "couple")
+        mode_idx = self.mode_combo.findData(self.bridge.config.dancer_analysis.default_dancer_mode)
+        if mode_idx >= 0:
+            self.mode_combo.setCurrentIndex(mode_idx)
+        setup_layout.addWidget(self.mode_combo)
+
+        self.preview_btn = QPushButton("Start Preview")
+        self.preview_btn.setProperty("class", "primary")
+        self.preview_btn.clicked.connect(self._toggle_preview)
+        setup_layout.addWidget(self.preview_btn)
+
+        self.record_btn = QPushButton("Start Record (R)")
+        self.record_btn.setProperty("class", "accent")
+        self.record_btn.clicked.connect(self._toggle_recording)
+        setup_layout.addWidget(self.record_btn)
+
+        # Keep hidden compatibility widgets without cluttering the UI
         self.source_combo = QComboBox()
         self.source_combo.addItem("Camera", "camera")
-        self.source_combo.addItem("Video file", "video")
-        self.source_combo.currentIndexChanged.connect(self._update_source_controls)
-        practice_row.addWidget(self.source_combo)
+        self.source_combo.setVisible(False)
         self.video_path = QLineEdit()
-        self.video_path.setPlaceholderText("Choose a local video file")
-        self.video_path.setAccessibleName("Local video path")
-        practice_row.addWidget(self.video_path, 1)
+        self.video_path.setVisible(False)
         self.browse_video_btn = QPushButton("Browse...")
-        self.browse_video_btn.clicked.connect(self._browse_video)
-        practice_row.addWidget(self.browse_video_btn)
-        setup_layout.addLayout(practice_row)
-
-        reference_row = QHBoxLayout()
-        reference_row.addWidget(QLabel("Calibration profile:"))
+        self.browse_video_btn.setVisible(False)
         self.reference_combo = QComboBox()
-        self.reference_combo.currentIndexChanged.connect(self._reference_changed)
-        reference_row.addWidget(self.reference_combo, 1)
-        self.confirm_camera_cb = QCheckBox("Camera placement unchanged")
-        self.confirm_camera_cb.setToolTip(
-            "Confirm that the physical camera placement matches the selected reference."
-        )
-        reference_row.addWidget(self.confirm_camera_cb)
-        reference_row.addWidget(QLabel("New profile name:"))
+        self.reference_combo.setVisible(False)
+        self.confirm_camera_cb = QCheckBox()
+        self.confirm_camera_cb.setVisible(False)
         self.reference_name = QLineEdit("My calibration")
-        self.reference_name.setMaximumWidth(180)
-        reference_row.addWidget(self.reference_name)
-        setup_layout.addLayout(practice_row)
-        self._reference_row_widget = QWidget()
-        self._reference_row_widget.setLayout(reference_row)
-        self._reference_row_widget.setVisible(False)
-        setup_layout.addWidget(self._reference_row_widget)
+        self.reference_name.setVisible(False)
         layout.addWidget(setup_card)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -139,119 +165,112 @@ class PracticeScreen(QWidget):
         center_layout.setContentsMargins(0, 0, 0, 0)
         center_layout.setSpacing(10)
 
-        self.ref_info = QLabel("Self Practice mode: live pose detection with Lite model and .tp recording (no alerts).")
-        self.ref_info.setStyleSheet(f"color: {COLOR_TEXT_MUTED}; font-size: 12px;")
-        self.ref_info.setWordWrap(True)
-        center_layout.addWidget(self.ref_info)
-
         self.stage = VideoStage(
-            placeholder_text="Start a preview to open the selected camera or video."
+            placeholder_text="Click Start Preview to open the camera with Lite pose detection."
         )
         center_layout.addWidget(self.stage, 1)
 
-        self.status_label = QLabel("Camera and model are opened only after you start preview.")
-        self.status_label.setWordWrap(True)
-        self.status_label.setStyleSheet(f"color: {COLOR_TEXT_MUTED};")
-        center_layout.addWidget(self.status_label)
-
         controls_card = QFrame()
         controls_card.setProperty("class", "card")
-        controls_layout = QVBoxLayout(controls_card)
-        controls_layout.setContentsMargins(12, 10, 12, 10)
-        controls_layout.setSpacing(8)
+        controls_outer = QVBoxLayout(controls_card)
+        controls_outer.setContentsMargins(14, 10, 14, 10)
+        controls_outer.setSpacing(6)
 
-        control_row = QHBoxLayout()
-        self.preview_btn = QPushButton("Start Preview")
-        self.preview_btn.setProperty("class", "primary")
-        self.preview_btn.clicked.connect(self._toggle_preview)
-        control_row.addWidget(self.preview_btn)
+        controls_layout = QHBoxLayout()
+        controls_layout.setSpacing(14)
 
-        self.calibrate_btn = QPushButton("New Calibration")
-        self.calibrate_btn.clicked.connect(self._calibration_action)
-        control_row.addWidget(self.calibrate_btn)
-
-        self.accept_calibration_btn = QPushButton("Accept Reference")
-        self.accept_calibration_btn.setEnabled(False)
-        self.accept_calibration_btn.clicked.connect(self._accept_calibration)
-        self.accept_calibration_btn.hide()
-        control_row.addWidget(self.accept_calibration_btn)
-
-        self.score_btn = QPushButton("Start Scoring (S)")
-        self.score_btn.setProperty("class", "accent")
-        self.score_btn.clicked.connect(self._start_scoring)
-        self.score_btn.setVisible(False)
-        control_row.addWidget(self.score_btn)
-
-        self.pause_btn = QPushButton("Pause Scoring (P)")
-        self.pause_btn.clicked.connect(self._toggle_pause)
-        self.pause_btn.setVisible(False)
-        control_row.addWidget(self.pause_btn)
-
-        self.stop_score_btn = QPushButton("Stop Scoring (T)")
-        self.stop_score_btn.clicked.connect(self._stop_scoring)
-        self.stop_score_btn.setVisible(False)
-        control_row.addWidget(self.stop_score_btn)
-
-        self.record_btn = QPushButton("Record (R)")
-        self.record_btn.clicked.connect(self._toggle_recording)
-        control_row.addWidget(self.record_btn)
-
-        self.stop_btn = QPushButton("Stop & Save (E)")
-        self.stop_btn.clicked.connect(self._stop_and_save)
-        control_row.addWidget(self.stop_btn)
-        controls_layout.addLayout(control_row)
-
-        option_row = QHBoxLayout()
         self.auto_song_cb = QCheckBox("Automatically record songs")
         self.auto_song_cb.toggled.connect(self._set_auto_recording)
-        option_row.addWidget(self.auto_song_cb)
+        controls_layout.addWidget(self.auto_song_cb)
         self.skeleton_btn = QCheckBox("Skeleton (V)")
         self.skeleton_btn.setChecked(True)
         self.skeleton_btn.toggled.connect(lambda checked: self._request_key("v"))
-        option_row.addWidget(self.skeleton_btn)
+        controls_layout.addWidget(self.skeleton_btn)
         self.axis_btn = QCheckBox("Vertical axis (Y)")
         self.axis_btn.setChecked(True)
         self.axis_btn.toggled.connect(lambda checked: self._request_key("y"))
-        option_row.addWidget(self.axis_btn)
-        option_row.addStretch()
+        controls_layout.addWidget(self.axis_btn)
+        controls_layout.addStretch()
 
-        self.abort_btn = QPushButton("Abort Recording (X)")
-        self.abort_btn.setProperty("class", "danger")
-        self.abort_btn.clicked.connect(self._abort_recording)
-        option_row.addWidget(self.abort_btn)
+        self.status_label = QLabel("Camera is off. Click Start Record (R) or Start Preview.")
+        self.status_label.setStyleSheet(f"color: {COLOR_TEXT_MUTED}; font-size: 12px;")
+        controls_layout.addWidget(self.status_label)
+
         self.close_btn = QPushButton("Close Preview")
         self.close_btn.clicked.connect(self._close_preview)
-        option_row.addWidget(self.close_btn)
-        controls_layout.addLayout(option_row)
+        controls_layout.addWidget(self.close_btn)
+        controls_outer.addLayout(controls_layout)
+
+        overlay_opts = QHBoxLayout()
+        overlay_opts.setSpacing(14)
+        self.head_align_cb = QCheckBox("Head horizontal alignment")
+        self.head_align_cb.setChecked(True)
+        self.head_align_cb.toggled.connect(self._sync_display_options)
+        overlay_opts.addWidget(self.head_align_cb)
+
+        self.shoulders_cb = QCheckBox("Shoulders height")
+        self.shoulders_cb.setChecked(True)
+        self.shoulders_cb.toggled.connect(self._sync_display_options)
+        overlay_opts.addWidget(self.shoulders_cb)
+
+        self.role_cb = QCheckBox("Role detection")
+        self.role_cb.setChecked(True)
+        self.role_cb.toggled.connect(self._sync_display_options)
+        overlay_opts.addWidget(self.role_cb)
+
+        self.embrace_cb = QCheckBox("Embrace type (Open / Close)")
+        self.embrace_cb.setChecked(True)
+        self.embrace_cb.toggled.connect(self._sync_display_options)
+        overlay_opts.addWidget(self.embrace_cb)
+        overlay_opts.addStretch()
+        controls_outer.addLayout(overlay_opts)
+
         center_layout.addWidget(controls_card)
         splitter.addWidget(center)
 
         inspector = QFrame()
         inspector.setProperty("class", "card")
-        inspector.setMinimumWidth(280)
-        inspector.setMaximumWidth(360)
+        inspector.setMinimumWidth(290)
+        inspector.setMaximumWidth(370)
         inspector_layout = QVBoxLayout(inspector)
         inspector_layout.setContentsMargins(16, 14, 16, 14)
-        inspector_layout.setSpacing(14)
+        inspector_layout.setSpacing(12)
 
-        title = QLabel("Live Observations")
+        title = QLabel("Session Status")
         title.setStyleSheet("font-size: 15px; font-weight: bold;")
-        subtitle = QLabel("Evidence from the active capture; unknown values are not scores.")
+        subtitle = QLabel("Lite model pose tracking & recording status (no posture alerts).")
         subtitle.setStyleSheet(f"color: {COLOR_TEXT_MUTED}; font-size: 11px;")
+        subtitle.setWordWrap(True)
         self.beat_strip = BeatStrip()
-        self.notes_box = QLabel("Live observations appear after preview starts.")
+        self.notes_box = QLabel("Start Preview to begin pose detection. Press Record (R) to save a .tp file.")
         self.notes_box.setWordWrap(True)
         self.notes_box.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.notes_box.setStyleSheet(
             f"background-color: {COLOR_BASE}; border: 1px solid {COLOR_BORDER}; "
-            f"border-radius: 4px; padding: 12px; color: {COLOR_TEXT_PRIMARY}; font-size: 12px;"
+            f"border-radius: 6px; padding: 10px; color: {COLOR_TEXT_PRIMARY}; font-size: 12px;"
         )
         inspector_layout.addWidget(title)
         inspector_layout.addWidget(subtitle)
         inspector_layout.addWidget(self.beat_strip)
-        inspector_layout.addWidget(self.notes_box, 1)
+        inspector_layout.addWidget(self.notes_box)
+
+        notes_header = QLabel("Practice Notes")
+        notes_header.setStyleSheet("font-size: 14px; font-weight: bold;")
+        inspector_layout.addWidget(notes_header)
+        self.manual_notes = QPlainTextEdit()
+        self.manual_notes.setPlaceholderText("Add your own notes for this practice session…")
+        self.manual_notes.setStyleSheet(
+            f"background-color: {COLOR_BASE}; border: 1px solid {COLOR_BORDER}; "
+            f"border-radius: 6px; padding: 8px; color: {COLOR_TEXT_PRIMARY}; font-size: 12px;"
+        )
+        inspector_layout.addWidget(self.manual_notes, 1)
+
+        self.save_notes_btn = QPushButton("Save Notes to .tp")
+        self.save_notes_btn.clicked.connect(self._save_manual_notes)
+        inspector_layout.addWidget(self.save_notes_btn)
+
         splitter.addWidget(inspector)
-        splitter.setSizes([720, 320])
+        splitter.setSizes([740, 320])
 
         self._frame_timer = QTimer(self)
         self._frame_timer.setInterval(33)
@@ -259,12 +278,8 @@ class PracticeScreen(QWidget):
         self._shortcuts: list[QShortcut] = []
         for key, action in (
             ("R", self._toggle_recording),
-            ("S", self._start_scoring),
-            ("P", self._toggle_pause),
-            ("E", self._stop_and_save),
             ("V", self.skeleton_btn.toggle),
             ("Y", self.axis_btn.toggle),
-            ("X", self._abort_recording),
         ):
             shortcut = QShortcut(QKeySequence(key), self)
             shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
@@ -333,18 +348,6 @@ class PracticeScreen(QWidget):
 
     def _reference_changed(self, *_args: object) -> None:
         self.confirm_camera_cb.setChecked(False)
-        reference = self._selected_reference()
-        if reference is None:
-            self.ref_info.setText(
-                "No reference selected. Live preview and recording are available; scoring is disabled."
-            )
-        else:
-            self.ref_info.setText(
-                f"Reference: {reference.name} ({reference.side} side, "
-                f"{reference.facing} facing). "
-                + ("Confirm unchanged camera placement before scoring." if reference.scoring_ready else
-                   "Comparison only: use Library > Check camera to enable selected metric alerts.")
-            )
         self._sync_controls()
 
     def _update_source_controls(self, *_args: object) -> None:
@@ -368,15 +371,7 @@ class PracticeScreen(QWidget):
         else:
             self._start_preview()
 
-    def _start_preview(self) -> None:
-        video: Path | None = None
-        if self.source_combo.currentData() == "video":
-            value = self.video_path.text().strip()
-            if not value or not Path(value).is_file():
-                self.status_label.setText("Choose an existing local video file.")
-                return
-            video = Path(value).expanduser().resolve()
-
+    def _start_preview(self, *, auto_record: bool = False) -> None:
         name = self.session_title.text().strip()
         try:
             practice_path(practice_directory(self.bridge.config.data_dir), name)
@@ -386,8 +381,9 @@ class PracticeScreen(QWidget):
 
         self._launch_worker(
             reference=None,
-            video=video,
+            video=None,
             practice_name=name,
+            auto_record=auto_record,
         )
 
     def _launch_worker(
@@ -398,12 +394,16 @@ class PracticeScreen(QWidget):
         practice_name: str | None = None,
         calibration_only: bool = False,
         reference_name: str = "My reference",
+        auto_record: bool = False,
     ) -> None:
         if self.worker_running:
             return
-        display = QtPracticeDisplay()
+        display = QtPracticeDisplay(capture_evidence=True)
+        display.suppress_alerts = True
         if self.auto_song_cb.isChecked() and not calibration_only:
             display.auto_recording.set()
+        if auto_record and not calibration_only:
+            display.recording.set()
         worker = QtPracticeWorker(
             self.bridge.config,
             display,
@@ -420,6 +420,8 @@ class PracticeScreen(QWidget):
         worker.finished.connect(worker.deleteLater)
         thread.finished.connect(self._worker_finished)
         self._display = display
+        self._sync_display_options()
+        self._recorded_frames.clear()
         self._worker = worker
         self._thread = thread
         self._active_reference = reference
@@ -432,6 +434,8 @@ class PracticeScreen(QWidget):
             self.state = close(self.state)
         source = SourceKind.VIDEO if video is not None else SourceKind.CAMERA
         self.state = ready(choose_source(SessionState(), source))
+        if auto_record and not calibration_only:
+            self.state = start_recording(self.state)
         if reference:
             self.state = accept_reference(self.state, reference.id)
         self.stage.clear_frame()
@@ -460,7 +464,6 @@ class PracticeScreen(QWidget):
             return
         self._display.request("a")
         self._calibration_candidate = False
-        self.accept_calibration_btn.setEnabled(False)
         self.status_label.setText("Saving the accepted reference archive...")
 
     def _start_scoring(self) -> None:
@@ -503,14 +506,20 @@ class PracticeScreen(QWidget):
         self._sync_controls()
 
     def _toggle_recording(self) -> None:
-        if self._display is None or self._calibrating:
+        if self._calibrating:
+            return
+        if not self.worker_running:
+            self._start_preview(auto_record=True)
+            return
+        if self._display is None:
             return
         if self.state.recording:
             self._stop_and_save()
             return
+        self._recorded_frames.clear()
         self._display.recording.set()
         self.state = start_recording(self.state)
-        self.status_label.setText("Starting a new recording segment...")
+        self.status_label.setText("Recording started...")
         self._sync_controls()
 
     def _stop_and_save(self) -> None:
@@ -561,6 +570,14 @@ class PracticeScreen(QWidget):
                 self._display.auto_recording.set()
             else:
                 self._display.auto_recording.clear()
+
+    def _sync_display_options(self) -> None:
+        if self._display is None:
+            return
+        self._display.show_head_alignment = self.head_align_cb.isChecked()
+        self._display.show_shoulders_height = self.shoulders_cb.isChecked()
+        self._display.show_role_detection = self.role_cb.isChecked()
+        self._display.show_embrace_type = self.embrace_cb.isChecked()
 
     def _request_key(self, key: str) -> None:
         if self._display is not None and not self._calibrating:
@@ -617,11 +634,27 @@ class PracticeScreen(QWidget):
                 if self.state.recording:
                     self._save_pending = True
                 self.stage.set_badge("SAVING", COLOR_COPPER)
+            elif state == "idle":
+                if self.state.recording:
+                    self.state = abort_unsaved(self.state)
+                self._save_pending = False
+                self.stage.clear_badge()
+                self.status_label.setText("No recording was active; preview remains open.")
+                self._sync_controls()
             elif state == "limit":
                 if self.state.recording:
                     self.state = abort_unsaved(self.state)
+                self._save_pending = False
                 self.status_label.setText("The configured recording limit has been reached.")
                 self._sync_controls()
+
+        while True:
+            try:
+                obs = display.observations.get_nowait()
+            except queue.Empty:
+                break
+            if self.state.recording:
+                self._recorded_frames.append(obs)
 
         while True:
             try:
@@ -631,10 +664,15 @@ class PracticeScreen(QWidget):
             if self.state.recording:
                 self.state = stop_and_save(self.state)
             self._save_pending = False
+            self._last_practice_path = path
+            resolved_mode = self._resolve_and_store_dancer_mode(path, index)
+            if self.manual_notes.toPlainText().strip():
+                self._save_manual_notes()
             self.status_label.setText(
-                f"Recording {index:02d} saved to {path.name}."
+                f"Recording {index:02d} saved to {path.name} ({resolved_mode})."
             )
             self.stage.clear_badge()
+            self._sync_controls()
 
         while True:
             try:
@@ -649,7 +687,6 @@ class PracticeScreen(QWidget):
             except queue.Empty:
                 break
             self._calibration_candidate = True
-            self.accept_calibration_btn.setEnabled(True)
             self.status_label.setText(
                 f"Calibration '{candidate_name}' is ready. Accept it to save the reference."
             )
@@ -694,7 +731,6 @@ class PracticeScreen(QWidget):
         self._active_reference = None
         self._calibrating = False
         self._calibration_candidate = False
-        self.accept_calibration_btn.setEnabled(False)
         if self._calibration_saved:
             self.refresh()
             self.bridge.status_message.emit("Calibration saved and camera released.")
@@ -715,45 +751,66 @@ class PracticeScreen(QWidget):
         if thread is not None:
             thread.deleteLater()
 
+    def _resolve_and_store_dancer_mode(self, path: Path, index: int) -> str:
+        requested = str(self.mode_combo.currentData() or "auto")
+        if requested in ("single", "couple"):
+            resolved = requested
+        elif len(self._recorded_frames) >= 2:
+            decision = classify_opening_window(
+                list(enumerate(self._recorded_frames)),
+                self.bridge.config,
+                clip_in=self._recorded_frames[0].timestamp,
+                clip_out=self._recorded_frames[-1].timestamp,
+            )
+            resolved = "couple" if decision.resolved_mode == "couple" else "single"
+        else:
+            resolved = "single"
+        self._recorded_frames.clear()
+        try:
+            from ...archive import PracticeArchive
+
+            with _archive_lock(path):
+                archive = PracticeArchive(path)
+                try:
+                    existing = read_analytics(archive.folder, index) or {}
+                    updated = {
+                        **existing,
+                        "dancer_mode": resolved,
+                        "requested_dancer_mode": requested,
+                    }
+                finally:
+                    archive.close()
+            store_analytics(path, index, updated)
+        except (OSError, ValueError, KeyError):
+            pass
+        return resolved
+
+    def _save_manual_notes(self) -> None:
+        notes_text = self.manual_notes.toPlainText().strip()
+        if not notes_text:
+            self.status_label.setText("Enter notes before saving.")
+            return
+        if self._last_practice_path is None or not self._last_practice_path.is_file():
+            self.status_label.setText("Notes kept; they will be saved with your next .tp recording.")
+            return
+        with _archive_lock(self._last_practice_path):
+            _rewrite_members(self._last_practice_path, {"notes.md": notes_text.encode("utf-8")})
+        self.status_label.setText(f"Practice notes saved to {self._last_practice_path.name}.")
+
     def _sync_controls(self) -> None:
         running = self.worker_running
         calibrating = running and self._calibrating
         self.preview_btn.setText("Close Preview" if running and not calibrating else "Start Preview")
         self.preview_btn.setEnabled(not calibrating)
-        self.calibrate_btn.setText(
-            "Start Calibration (C)" if calibrating else "New Calibration"
-        )
-        self.calibrate_btn.setEnabled(not running or calibrating)
-        if calibrating and self._calibration_candidate:
-            self.calibrate_btn.setEnabled(False)
-        self.reference_combo.setEnabled(not running)
-        self.confirm_camera_cb.setEnabled(not running)
         self.session_title.setEnabled(not running)
-        self.source_combo.setEnabled(not running)
-        self.reference_name.setEnabled(not running)
-        video_source = self.source_combo.currentData() == "video"
-        self.video_path.setEnabled(not running and video_source)
-        self.browse_video_btn.setEnabled(not running and video_source)
+        self.mode_combo.setEnabled(not running)
         self.auto_song_cb.setEnabled(running and not calibrating)
         active = running and not calibrating
-        self.score_btn.setEnabled(
-            active and self._active_reference is not None and self._active_reference.scoring_ready
-            and self.state.scoring.value == "off"
-        )
-        self.pause_btn.setEnabled(
-            active and self.state.scoring.value in ("active", "paused")
-        )
-        self.pause_btn.setText(
-            "Resume Scoring (P)" if self.state.scoring.value == "paused" else "Pause Scoring (P)"
-        )
-        self.stop_score_btn.setEnabled(active and self.state.scoring.value != "off")
-        self.record_btn.setEnabled(active and not self._save_pending)
+        self.record_btn.setEnabled(not self._save_pending and not calibrating)
         self.record_btn.setText(
-            "Recording..." if self._save_pending else
-            "Stop Recording" if self.state.recording else "Record (R)"
+            "Saving..." if self._save_pending else
+            "Stop Record (R)" if self.state.recording else "Start Record (R)"
         )
-        self.stop_btn.setEnabled(active and self.state.recording and not self._save_pending)
-        self.abort_btn.setEnabled(active and self.state.recording)
         self.close_btn.setEnabled(active)
         self.skeleton_btn.setEnabled(active)
         self.axis_btn.setEnabled(active)

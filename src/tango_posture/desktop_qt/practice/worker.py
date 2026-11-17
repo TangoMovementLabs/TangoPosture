@@ -133,6 +133,12 @@ class QtPracticeDisplay(GuiDisplay):
         self.observations: SimpleQueue[FrameObservation] = SimpleQueue()
         self.prompts: SimpleQueue[str] = SimpleQueue()
         self.stop = False
+        self.show_head_alignment: bool = True
+        self.show_shoulders_height: bool = True
+        self.show_role_detection: bool = True
+        self.show_embrace_type: bool = True
+        self.suppress_alerts: bool = False
+        self.disable_settings_coaching: bool = False
 
     def observe(self, frame: FrameObservation) -> None:
         if self.capture_evidence:

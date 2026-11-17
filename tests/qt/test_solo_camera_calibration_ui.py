@@ -31,6 +31,20 @@ def test_calibration_menu_and_home_entry_point(qapp, tmp_path):
     assert Route.PRACTICE in window.nav_buttons
     assert window.nav_buttons[Route.PRACTICE].text() == "Self Practice"
 
+    practice = window.screens[Route.PRACTICE]
+    assert not hasattr(practice, "stop_btn")
+    assert not hasattr(practice, "abort_btn")
+    assert not hasattr(practice, "calibrate_btn")
+    assert practice.video_path.isHidden()
+    assert hasattr(practice, "manual_notes")
+    assert hasattr(practice, "save_notes_btn")
+    assert practice.record_btn.isEnabled()
+    assert [practice.mode_combo.itemData(i) for i in range(practice.mode_combo.count())] == ["auto", "single", "couple"]
+    assert hasattr(practice, "head_align_cb")
+    assert hasattr(practice, "shoulders_cb")
+    assert hasattr(practice, "role_cb")
+    assert hasattr(practice, "embrace_cb")
+
     home: HomeScreen = window.screens[Route.HOME]  # type: ignore[assignment]
     ref_screen: ReferencesScreen = window.screens[Route.REFERENCES]  # type: ignore[assignment]
     assert hasattr(ref_screen, "new_solo_cal_btn")
@@ -98,8 +112,10 @@ def test_references_lists_range_profile_and_check_with_camera_prepares_wizard(qa
     # Camera stays off until user clicks Start camera preview
     assert not wizard._camera_active
     assert wizard.check_boxes["head_pitch"].isChecked()
-    assert wizard.side_combo.currentText() == "left"
-    assert wizard.facing_combo.currentText() == "right"
+    assert not hasattr(wizard, "side_combo")
+    assert not hasattr(wizard, "facing_combo")
+    assert screen.tabs.currentIndex() == 0
+    assert not screen.guided_wizard._camera_active
 
     # Simulated camera error shows actionable message and Retry camera
     wizard._on_worker_failed("Camera busy")

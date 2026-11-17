@@ -227,6 +227,9 @@ class MainWindow(QMainWindow):
         practice = self.screens.get(Route.PRACTICE)
         if route is not Route.PRACTICE and isinstance(practice, PracticeScreen) and practice.worker_running:
             practice.stop_for_navigation()
+        refs = self.screens.get(Route.REFERENCES)
+        if route is not Route.REFERENCES and isinstance(refs, ReferencesScreen):
+            refs.stop_for_navigation()
         if route in self.nav_buttons:
             self.nav_buttons[route].setChecked(True)
 

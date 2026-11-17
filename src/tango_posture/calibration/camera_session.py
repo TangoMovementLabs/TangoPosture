@@ -313,6 +313,8 @@ def classify_guide_view(
     frame: FrameObservation,
     cfg: Config,
     requested_view: Literal["front", "side"] | None = None,
+    *,
+    strict_facing: bool = True,
 ) -> tuple[GuideView, str]:
     """Classify the single-dancer view for guided capture using strict facial and torso cues."""
     if len(frame.poses) != 1:
@@ -376,6 +378,8 @@ def classify_guide_view(
         dx = nose.x - ear.x
         if abs(dx) < 0.015:
             return "uncertain", "Turn more clearly side-on so your profile direction is clear."
+        if not strict_facing:
+            return "side", ""
         expected_sign = 1.0 if cfg.facing == "right" else -1.0
         if dx * expected_sign > 0:
             return "side", ""
@@ -485,8 +489,15 @@ def evaluate_metric_repeat_check(
 class SoloCameraSession:
     """Qt-independent state machine managing solo camera calibration capture and gating."""
 
-    def __init__(self, cfg: Config, *, now_monotonic: float = 0.0) -> None:
+    def __init__(
+        self,
+        cfg: Config,
+        *,
+        now_monotonic: float = 0.0,
+        auto_detect_side_facing: bool = False,
+    ) -> None:
         self.cfg = cfg.model_copy(deep=True)
+        self.auto_detect_side_facing = auto_detect_side_facing
         self.state: SessionState = "Preview"
         self.active_prompt_id: int = 0
         self.current_instruction: str = ""
@@ -705,7 +716,29 @@ class SoloCameraSession:
 
         phase = self.current_phase
         req_view = phase.view if phase is not None else None
-        detected_view, view_hint = classify_guide_view(frame, self.cfg, requested_view=req_view)
+        detected_view, view_hint = classify_guide_view(
+            frame,
+            self.cfg,
+            requested_view=req_view,
+            strict_facing=not self.auto_detect_side_facing,
+        )
+        if self.auto_detect_side_facing and detected_view == "side":
+            pose = frame.poses[0]
+            nose = pose.get("nose")
+            le = pose.get("left_ear")
+            re = pose.get("right_ear")
+            ear = le if (le is not None and reliable(le, self.cfg.confidence)) else re
+            if nose is not None and ear is not None:
+                detected_facing: Literal["left", "right"] = "right" if (nose.x - ear.x) > 0 else "left"
+                detected_side: Literal["left", "right"] = (
+                    "left"
+                    if (le is not None and (re is None or (le.visibility or 0.0) >= (re.visibility or 0.0)))
+                    else "right"
+                )
+                if self.cfg.facing != detected_facing or self.cfg.side != detected_side:
+                    self.cfg = self.cfg.model_copy(
+                        update={"facing": detected_facing, "side": detected_side}
+                    )
         view_matches = req_view is not None and detected_view == req_view
         obs = measure_ranges(frame, self.cfg)
         framing_ok = view_matches or (req_view is None and check_full_body_framing(frame, self.cfg)[0])
