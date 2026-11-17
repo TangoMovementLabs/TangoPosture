@@ -79,6 +79,9 @@ class DancerAnalysisConfig(BaseModel):
     slowing_fraction: float = Field(default=0.25, gt=0.0, lt=1.0)
     transition_min_coverage: float = Field(default=0.75, gt=0.0, le=1.0)
     secondary_speed_rise: float = Field(default=0.12, gt=0.0)
+    calibration_smoothing_s: float = Field(default=0.25, gt=0.0)
+    calibration_entry_duration_s: float = Field(default=1.5, gt=0.0)
+    calibration_clear_duration_s: float = Field(default=0.75, gt=0.0)
     axis_smoothing_s: float = Field(default=0.25, ge=0.0)
     overlay_smoothing_s: float = Field(default=0.20, ge=0.0)
     axis_bridge_max_gap_s: float = Field(default=0.25, ge=0.0)
@@ -368,6 +371,11 @@ SETTING_GROUPS = {
         "dancer_analysis.shot_cut_jump_torso_lengths",
         "dancer_analysis.close_embrace_max_tilt_deg",
     ),
+    "Couple · Temporal / Smoothing": (
+        "dancer_analysis.calibration_smoothing_s",
+        "dancer_analysis.calibration_entry_duration_s",
+        "dancer_analysis.calibration_clear_duration_s",
+    ),
     "Couple · Axes / Coordination": (
         "dancer_analysis.axis_smoothing_s",
         "dancer_analysis.overlay_smoothing_s",
@@ -407,6 +415,7 @@ SETTING_ENGINE_SCOPES: dict[str, tuple[str, ...]] = {
     "Couple Dancer Engine": (
         "Couple · Tracking / Interpolation",
         "Couple · Axes / Coordination",
+        "Couple · Temporal / Smoothing",
     ),
 }
 
@@ -436,6 +445,10 @@ for _fields in SETTING_GROUPS.values():
         SETTING_MAP[_field] = (_field, _setting_parser(_field))
 
 SETTING_DESCRIPTIONS: dict[str, str] = {
+    "dancer_analysis.calibration_smoothing_s": "Smoothing time constant in seconds for couple charts compared with approved calibration ranges.",
+    "dancer_analysis.calibration_entry_duration_s": "Seconds outside an approved couple range before a pending deviation becomes an alert.",
+    "dancer_analysis.calibration_clear_duration_s": "Seconds back inside an approved couple range before an alert clears.",
+
     "side": "Anatomical side selected for side-view measurements.",
     "facing": "Direction faced in the original, unmirrored image.",
     "capture_profile": "Name identifying the camera and capture setup.",

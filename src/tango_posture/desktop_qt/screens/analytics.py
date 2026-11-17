@@ -30,7 +30,8 @@ from PySide6.QtWidgets import (
 
 from ...archive import read_analytics, read_manifest
 from ...calibration.baseline import load_calibration_file
-from ...calibration.models import METRIC_DETAILS, RangeProfile
+from ...calibration.couple import compare_couple_series
+from ...calibration.models import METRIC_DETAILS, RangeProfile, profile_from_calibration
 from ...couple.csv_export import export_couple_csv
 from ...couple.measurements import (
     compute_torso_tilt_pearson_correlation,
@@ -535,8 +536,16 @@ class AnalyticsScreen(QWidget):
         cal_error = ""
         try:
             calibration = self._resolve_selected_calibration()
+            range_profile = (
+                profile_from_calibration(calibration) if isinstance(calibration, Calibration)
+                else calibration if isinstance(calibration, RangeProfile) else None
+            )
+            single_calibration = (
+                None if range_profile and range_profile.source.get("dancer_mode") == "couple"
+                else calibration
+            )
             comparison = compare_archive_with_calibration(
-                path, index, dataset, self.bridge.config, calibration
+                path, index, dataset, self.bridge.config, single_calibration
             )
         except (OSError, ValueError, TypeError, KeyError, BadZipFile) as exc:
             cal_error = str(exc)
@@ -600,6 +609,7 @@ class AnalyticsScreen(QWidget):
                 self._format_coverage_label(metric, comp_item, calibration_selected)
             )
         self.export_charts_btn.setEnabled(any_chart_enabled)
+        self._populate_couple_analysis(self._active_couple_result)
 
     def _format_coverage_label(
         self,
@@ -1581,15 +1591,43 @@ class AnalyticsScreen(QWidget):
             f"Run {rid[:12]} · {name_a} & {name_b} · Mode: {dec_txt}{pearson_banner}{scene_note}"
         )
 
+        targets = {}
+        calibration_note = ""
+        try:
+            selected = self._resolve_selected_calibration()
+            profile = profile_from_calibration(selected) if isinstance(selected, Calibration) else selected
+            if isinstance(profile, RangeProfile) and profile.source.get("dancer_mode") == "couple":
+                targets = profile.metrics
+                calibration_note = f" · Calibration: {profile.name}"
+        except (OSError, ValueError, TypeError, KeyError, BadZipFile) as error:
+            calibration_note = f" · Calibration unavailable: {error}"
+        self.couple_run_info_label.setText(self.couple_run_info_label.text() + calibration_note)
+
         for key, (_default_label, unit, ref_val) in COUPLE_AXIS_METRICS.items():
             rel_pts = smoothed_axes[key]
+            target = targets.get(key)
+            states: dict[float, str] = {}
+            if target is not None:
+                rel_pts, states = compare_couple_series(
+                    key, [(ts - origin_ts, value) for ts, value in extracted_axes[key]],
+                    target, self.bridge.config,
+                )
             time_end = max(0.0, end_ts - origin_ts, rel_pts[-1][0] if rel_pts else 0.0)
             segments = _segments_from_points(rel_pts, max_gap)
             summary_map = _interval_summary(rel_pts, max_gap)
             metric_data = MetricData(rel_pts, segments, summary_map, 0, 0)
             chart = self.couple_axis_charts[key]
-            chart.set_data(metric_data, time_end, origin_ts, reference_line=ref_val, unit=unit)
+            chart.set_data(
+                metric_data, time_end, origin_ts,
+                bounds=(target.lower, target.upper) if target else None,
+                reference_line=target.median if target else ref_val, states=states, unit=unit,
+            )
             self.couple_axis_export_buttons[key].setEnabled(chart.isEnabled())
+            if target:
+                self.couple_axis_title_labels[key].setText(
+                    self.couple_axis_title_labels[key].text()
+                    + f" · Range: {target.lower:g} … {target.upper:g}°"
+                )
 
             pearson_suffix = (
                 f" · Pearson r(A,B): {pearson_r:+.3f}"

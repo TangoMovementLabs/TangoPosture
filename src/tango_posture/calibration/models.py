@@ -29,6 +29,14 @@ METRIC_DETAILS = {
 }
 
 
+COUPLE_METRIC_DETAILS = {
+    "torso_tilt_a": ("Dancer A", "Torso axis tilt · dancer A", "degrees"),
+    "torso_tilt_b": ("Dancer B", "Torso axis tilt · dancer B", "degrees"),
+    "couple_midpoint_tilt": ("Couple", "Couple midpoint axis tilt", "degrees"),
+    "torso_separation": ("Couple", "Couple axis separation", "degrees"),
+}
+ALL_METRIC_DETAILS = {**METRIC_DETAILS, **COUPLE_METRIC_DETAILS}
+
 STEPS = ("Head", "Shoulders", "Hips", "Torso", "Knees")
 
 PRACTICE_CONTEXTS = ("Neutral posture", "Solo walking", "Close embrace", "Pivot")
@@ -108,7 +116,7 @@ class RangeProfile(BaseModel):
         ):
             raise ValueError("Calibration aspect ratio does not match the recorded dimensions")
         for key, target in self.metrics.items():
-            if key not in METRIC_DETAILS or target.unit != METRIC_DETAILS[key][2]:
+            if key not in ALL_METRIC_DETAILS or target.unit != ALL_METRIC_DETAILS[key][2]:
                 raise ValueError(f"Unknown metric or incompatible unit: {key}")
         return self
 

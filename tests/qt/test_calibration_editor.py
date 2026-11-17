@@ -1128,3 +1128,65 @@ def test_opening_portrait_giro_reference_auto_links_and_switches_to_all_view(qap
 
 
 
+
+
+@pytest.mark.parametrize("cache_location", ["run", "coach"])
+def test_couple_calibration_ranges_save_and_reopen(qapp, tmp_path, cached_reference, cache_location):
+    from tango_posture.calibration.models import COUPLE_METRIC_DETAILS
+
+    analytics = read_analytics(cached_reference, 0)
+    result = {
+        "series": {
+            key: [
+                {"timestamp": i / 10, "value": i / 10, "status": "measured"}
+                for i in range(40)
+            ]
+            for key in COUPLE_METRIC_DETAILS
+        },
+        "frame_overlays": [],
+    }
+    # The couple engine deliberately leaves single-dancer measurement poses empty.
+    analytics["frames"] = [{"timestamp": i / 10} for i in range(40)]
+    analytics["coach_data"] = {
+        "width": 640, "height": 480,
+        "frames": {
+            str(i): {"timestamp": i / 10, "poses": [], "measurement_poses": []}
+            for i in range(40)
+        },
+    }
+    if cache_location == "coach":
+        analytics["coach_data"]["couple_analysis"] = result
+        store_analytics(cached_reference, 0, analytics)
+    else:
+        store_analytics(cached_reference, 0, analytics, dancer_analysis_run={
+            "resolved_mode": "couple", "couple_result": result,
+        })
+    editor = CalibrationEditor(cached_reference, Config(data_dir=str(tmp_path)), couple=True)
+    assert editor.step_combo.count() == 3
+    assert editor.view_combo.currentText() == "all"
+    assert editor._stats["samples"] == 40
+    assert not editor.confirm_identity.isChecked()
+    assert not editor.defaults_button.isEnabled()
+    editor.confirm_identity.setChecked(True)
+    for step in editor.steps:
+        editor.step_combo.setCurrentText(step)
+        for index in range(editor.metric_combo.count()):
+            editor.metric_combo.setCurrentIndex(index)
+            editor.lower_spin.setValue(1)
+            editor.upper_spin.setValue(3)
+            editor._approve()
+    assert set(editor.approved) == set(COUPLE_METRIC_DETAILS)
+    assert editor.chart.states[0] == "DEVIATION"
+    editor._save()
+    assert editor.saved_path is not None
+    saved = read_range_profile(editor.saved_path)
+    assert saved.source["dancer_mode"] == "couple"
+    reopened = CalibrationEditor(editor.saved_path, Config(data_dir=str(tmp_path)))
+    assert reopened.couple
+    assert set(reopened.approved) == set(COUPLE_METRIC_DETAILS)
+    reopened.reject()
+
+
+def test_couple_calibration_requires_couple_analysis(qapp, cached_reference):
+    with pytest.raises(ValueError, match="Couple mode"):
+        CalibrationEditor(cached_reference, Config(), couple=True)

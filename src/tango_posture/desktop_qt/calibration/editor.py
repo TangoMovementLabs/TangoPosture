@@ -40,6 +40,7 @@ from ...archive import (
 )
 from ...calibration.archives import read_range_profile, save_range_profile
 from ...calibration.evidence import (
+    cached_couple_result,
     cached_evidence,
     contiguous_pose_run_end,
     dancer_frames,
@@ -49,6 +50,7 @@ from ...calibration.evidence import (
 )
 from ...calibration.measurements import metric_samples
 from ...calibration.models import (
+    COUPLE_METRIC_DETAILS,
     METRIC_DETAILS,
     PRACTICE_CONTEXTS,
     STEPS,
@@ -193,6 +195,7 @@ class CalibrationEditor(QDialog):
         base_profile: RangeProfile | None = None,
         bridge: ServiceBridge | None = None,
         source_reference: Path | None = None,
+        couple: bool = False,
     ) -> None:
         super().__init__(parent)
         suffix = path.suffix.lower()
@@ -207,10 +210,14 @@ class CalibrationEditor(QDialog):
             self.setWindowTitle("Review evidence & approve calibration ranges")
         else:
             raise ValueError("Create a .tpr reference before approving calibration ranges")
+        self.couple = couple or bool(base_profile and base_profile.source.get("dancer_mode") == "couple")
+        self.metric_details = COUPLE_METRIC_DETAILS if self.couple else METRIC_DETAILS
+        self.steps = ("Dancer A", "Dancer B", "Couple") if self.couple else STEPS
+        self._couple_result = None
         self.resize(1180, 800)
         self.cfg = cfg.model_copy(deep=True)
         self.bridge = bridge
-        self.evidence = cached_evidence(tpr_path)
+        self.evidence = cached_evidence(tpr_path, couple=True) if self.couple else cached_evidence(tpr_path)
         self._source_hash = self.evidence.source["archive_sha256"]
         self.holds = holds or {}
         self.base_profile = base_profile
@@ -252,7 +259,7 @@ class CalibrationEditor(QDialog):
                     and is_static_pose_run(self.evidence.frames, frame_index)
                 )
 
-            anchors = descriptor.get("dancer_anchors")
+            anchors = None if self.couple else descriptor.get("dancer_anchors")
             if anchors is not None:
                 if not isinstance(anchors, list) or not anchors:
                     raise ValueError("Invalid saved reference dancer selection")
@@ -268,7 +275,7 @@ class CalibrationEditor(QDialog):
                     if not _is_stale_static_anchor(anchor["frame"]):
                         filtered[anchor["frame"]] = anchor["dancer"]
                 self._anchors = filtered or {0: 0}
-            if self._editing_profile_path is not None and base_profile is not None:
+            if not self.couple and self._editing_profile_path is not None and base_profile is not None:
                 profile_anchors = base_profile.source.get("dancer_anchors")
                 if isinstance(profile_anchors, list) and profile_anchors:
                     restored: dict[int, int] = {}
@@ -295,6 +302,9 @@ class CalibrationEditor(QDialog):
             analytics = read_analytics(self._archive.folder, 0)
             if analytics is None:
                 raise ValueError("Reference analysis is missing; analyze it in Review first")
+            if self.couple:
+                self._couple_result = cached_couple_result(analytics)
+                self.setWindowTitle("Couple calibration · review evidence & approve ranges")
             raw_coach = analytics.get("coach_data")
             has_coach_frames = isinstance(raw_coach, dict) and bool(raw_coach.get("frames"))
             coach: dict[str, Any]
@@ -405,7 +415,7 @@ class CalibrationEditor(QDialog):
         video_layout.addWidget(self.scrubber)
         selection = QHBoxLayout()
         self.dancer_spin = QSpinBox()
-        self.dancer_spin.setRange(1, max(len(frame.poses) for frame in self.evidence.frames))
+        self.dancer_spin.setRange(1, max(1, max(len(frame.poses) for frame in self.evidence.frames)))
         self.dancer_spin.setValue(min(self._anchors.items())[1] + 1)
         self.dancer_spin.valueChanged.connect(self._restart_track)
         restart = QPushButton("Select dancer / restart track here")
@@ -452,7 +462,7 @@ class CalibrationEditor(QDialog):
         inspector.setMaximumWidth(360)
         controls = QVBoxLayout(inspector)
         self.step_combo = QComboBox()
-        self.step_combo.addItems(STEPS)
+        self.step_combo.addItems(self.steps)
         self.metric_combo = QComboBox()
         self.step_combo.currentTextChanged.connect(self._change_step)
         self.metric_combo.currentIndexChanged.connect(self._change_metric)
@@ -463,7 +473,7 @@ class CalibrationEditor(QDialog):
         controls.addWidget(self.metric_hint)
         options = QFormLayout()
         self.view_combo = QComboBox()
-        self.view_combo.addItems(["side", "front", "all"])
+        self.view_combo.addItems(["all"] if self.couple else ["side", "front", "all"])
         options.addRow("Applicable view:", self.view_combo)
         self.passages_input = QLineEdit()
         self.passages_input.setPlaceholderText("Example seconds: 0-3; 5-9")
@@ -515,9 +525,9 @@ class CalibrationEditor(QDialog):
         controls.addWidget(approve)
         controls.addWidget(skip)
         controls.addWidget(self.approve_all_button)
-        next_step = QPushButton("Next: head → shoulders → hips → torso → knees")
+        next_step = QPushButton("Next: " + " → ".join(self.steps))
         next_step.clicked.connect(
-            lambda: self.step_combo.setCurrentIndex((self.step_combo.currentIndex() + 1) % len(STEPS))
+            lambda: self.step_combo.setCurrentIndex((self.step_combo.currentIndex() + 1) % len(self.steps))
         )
         controls.addWidget(next_step)
         self.approved_label = QLabel("No metrics approved")
@@ -528,7 +538,7 @@ class CalibrationEditor(QDialog):
         save.clicked.connect(self._save)
         controls.addWidget(save)
         self.defaults_button = QPushButton("Use approved ranges as Settings defaults...")
-        self.defaults_button.setEnabled(bridge is not None)
+        self.defaults_button.setEnabled(bridge is not None and not self.couple)
         self.defaults_button.clicked.connect(self._use_defaults)
         controls.addWidget(self.defaults_button)
         inspector_scroll = QScrollArea()
@@ -558,11 +568,18 @@ class CalibrationEditor(QDialog):
             self.view_combo.blockSignals(True)
             self.view_combo.setCurrentText("all")
             self.view_combo.blockSignals(False)
+        if self.couple:
+            self.dancer_spin.setEnabled(False)
+            restart.setEnabled(False)
+            save_selection.setEnabled(False)
+            self.auto_link_button.setEnabled(False)
+            self.confirm_identity.setText("I confirm dancer A and B identities throughout these passages")
+            self.confirm_identity.setChecked(False)
         self._recompute()
         if self.approved:
             self._approved_coach_data = self._evaluate_approved(self.approved)
             self._update_approved_label()
-        self._change_step(STEPS[0])
+        self._change_step(self.steps[0])
         self._seek_frame(0)
         self.finished.connect(self._release)
 
@@ -601,7 +618,7 @@ class CalibrationEditor(QDialog):
             self.approved_label.setText("No metrics approved")
         else:
             self.approved_label.setText(
-                "Approved: " + ", ".join(METRIC_DETAILS[k][1] for k in self.approved)
+                "Approved: " + ", ".join(self.metric_details[k][1] for k in self.approved)
             )
 
     def _refresh_metric_combo_labels(self) -> None:
@@ -609,8 +626,8 @@ class CalibrationEditor(QDialog):
         try:
             for index in range(self.metric_combo.count()):
                 key = self.metric_combo.itemData(index)
-                if key in METRIC_DETAILS:
-                    label = METRIC_DETAILS[key][1]
+                if key in self.metric_details:
+                    label = self.metric_details[key][1]
                     self.metric_combo.setItemText(
                         index, f"{label} ✓" if key in self.approved else label
                     )
@@ -663,6 +680,14 @@ class CalibrationEditor(QDialog):
         )
 
     def _samples_for_view(self, view_mode: str) -> dict[str, list[tuple[float, float | None]]]:
+        if self.couple:
+            assert self._couple_result is not None
+            series = self._couple_result["series"]
+            return {
+                key: [(float(row["timestamp"]), row.get("value") if row.get("status") in
+                       ("measured", "user_confirmed") else None) for row in series[key]]
+                for key in self.metric_details
+            }
         cached = self._samples_by_view.get(view_mode)
         if cached is not None:
             return cached
@@ -674,6 +699,12 @@ class CalibrationEditor(QDialog):
     def _recompute(self, *_args: object, suggest: bool = True) -> None:
         from ...calibration.evidence import Evidence
 
+        if self.couple:
+            self._selected_frames = self.evidence.frames
+            self._samples = self._samples_for_view("all")
+            if self.metric_combo.currentData():
+                self._update_stats(suggest=suggest)
+            return
         anchors = sorted(self._anchors.items())
         frames: list[FrameObservation] = []
         if anchors[0][0] > 0:
@@ -699,7 +730,7 @@ class CalibrationEditor(QDialog):
     def _change_step(self, step: str) -> None:
         self.metric_combo.blockSignals(True)
         self.metric_combo.clear()
-        for key, (group, label, _unit) in METRIC_DETAILS.items():
+        for key, (group, label, _unit) in self.metric_details.items():
             if group == step:
                 self.metric_combo.addItem(label, key)
         self.metric_combo.blockSignals(False)
@@ -890,7 +921,7 @@ class CalibrationEditor(QDialog):
                 else f"Observed {lo_pct:g}th–{hi_pct:g}th%"
             )
             self.stats_label.setText(
-                f"Median: {stats['median']:.4g} {METRIC_DETAILS[key][2]}\n"
+                f"Median: {stats['median']:.4g} {self.metric_details[key][2]}\n"
                 f"{pct_label}: {stats['p10']:.4g} … {stats['p90']:.4g}\n"
                 f"Usable: {stats['valid_duration']:.2f} / {stats['selected_duration']:.2f}s "
                 f"({stats['samples']} samples)\nInside edited range: {stats['inside_fraction']:.1%}"
@@ -1026,7 +1057,7 @@ class CalibrationEditor(QDialog):
         clean = {name: val for name, val in stats.items() if name not in ("minimum_time", "maximum_time")}
         return ApprovedRange.model_validate({
             **clean,
-            "unit": METRIC_DETAILS[key][2],
+            "unit": self.metric_details[key][2],
             "view": view_mode,
             "passages": passages,
             "camera_check_passed": camera_check_passed,
@@ -1113,7 +1144,7 @@ class CalibrationEditor(QDialog):
             if existing_first.passages:
                 fallback_passage = list(existing_first.passages)
 
-        for key, (step_name, label, _unit) in METRIC_DETAILS.items():
+        for key, (step_name, label, _unit) in self.metric_details.items():
             if key == current_key and self._stats is not None:
                 try:
                     updated[key] = self._build_approved_range(
@@ -1187,7 +1218,7 @@ class CalibrationEditor(QDialog):
         self._seek_frame(self.scrubber.value())
         if skipped:
             self.status_label.setText(
-                f"Approved {len(updated)}/{len(METRIC_DETAILS)} metrics. "
+                f"Approved {len(updated)}/{len(self.metric_details)} metrics. "
                 f"Skipped (insufficient samples): {', '.join(skipped)}"
             )
         else:
@@ -1214,6 +1245,18 @@ class CalibrationEditor(QDialog):
         self._seek_frame(self.scrubber.value())
 
     def _evaluate_approved(self, approved: dict[str, ApprovedRange]) -> dict[str, Any]:
+        if self.couple:
+            samples = {key: dict(rows) for key, rows in self._samples_for_view("all").items()}
+            return {"frames": {
+                str(index): {"calibration_rows": [
+                    {"metric": key, "state": (
+                        "UNKNOWN" if (val := samples[key].get(frame.timestamp)) is None else
+                        "WITHIN_REFERENCE" if target.lower <= val <= target.upper else "DEVIATION"
+                    )}
+                    for key, target in approved.items()
+                ]}
+                for index, frame in enumerate(self._selected_frames)
+            }}
         data = {
             "width": self.evidence.frames[0].width,
             "height": self.evidence.frames[0].height,
@@ -1241,7 +1284,8 @@ class CalibrationEditor(QDialog):
             raise ValueError("Approve at least one metric; skipped metrics will remain unavailable")
         name = self.name_input.text().strip()
         source: dict[str, Any] = {
-            **self.evidence.source, "dancer_at_track_start": self.dancer_spin.value() - 1,
+            **self.evidence.source, "dancer_mode": "couple" if self.couple else "single",
+            "dancer_at_track_start": self.dancer_spin.value() - 1,
             "track_start_frame": self._track_start,
             "dancer_anchors": [
                 {"frame": frame, "dancer": dancer} for frame, dancer in sorted(self._anchors.items())
@@ -1344,7 +1388,7 @@ class CalibrationEditor(QDialog):
                 show_pivots=True, show_steps=True,
                 step_history_seconds=self.cfg.replay_step_history_seconds,
             )
-            if self._approved_coach_data is not None:
+            if self._approved_coach_data is not None and not self.couple:
                 entry = self._approved_coach_data["frames"][str(index)]
                 image = render_approved_feedback(
                     image, self._selected_frames[index], self.cfg, self.approved,
@@ -1357,6 +1401,12 @@ class CalibrationEditor(QDialog):
                     position = (round(hip.x * width), round(hip.y * height))
                     color = (90, 230, 150) if number == self.dancer_spin.value() else (230, 200, 150)
                     cv2.putText(image, str(number), position, cv2.FONT_HERSHEY_SIMPLEX, 1, color, 3)
+            if self.couple and self._couple_result is not None:
+                from ...couple.overlay import render_couple_frame_overlay
+
+                overlays = self._couple_result.get("frame_overlays", [])
+                overlay = next((row for row in overlays if row.get("frame_index") == index), None)
+                image = render_couple_frame_overlay(self._reader.frame(index), overlay)
             self.stage.set_frame(numpy_to_qimage(image))
             self.chart.set_playhead(frame.timestamp)
             self.time_label.setText(f"{frame.timestamp:.3f}s · frame {index}")

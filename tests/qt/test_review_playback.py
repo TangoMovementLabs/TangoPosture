@@ -1993,8 +1993,10 @@ def _make_recovery_archive(tmp_path, video, *, with_recovery: bool = True):
     return archive_path
 
 
-def test_settings_replay_recovery_options_sync_to_review(qapp):
+def test_settings_replay_recovery_options_sync_to_review(qapp, tmp_path, monkeypatch):
     from tango_posture.desktop_qt.screens.settings import SettingsScreen
+
+    monkeypatch.chdir(tmp_path)  # Save Settings writes config.toml in the CWD
 
     cfg = Config(replay_recovery_auto=True, replay_show_recovered_joints=True)
     bridge = ServiceBridge(cfg)
@@ -2030,6 +2032,36 @@ def test_settings_replay_recovery_options_sync_to_review(qapp):
     finally:
         review.close()
         settings.close()
+
+
+def test_review_single_matches_calibration_editor_interpolation_display(qapp, tmp_path, video):
+    """Review must draw the same solid/dotted skeleton as the calibration editor (estimates on)."""
+    archive_path = _make_recovery_archive(tmp_path, video, with_recovery=True)
+    cfg = Config(data_dir=str(tmp_path), max_gap=0.05, replay_show_recovered_joints=True)
+    widget = ReviewScreen(ServiceBridge(cfg), Router())
+    try:
+        widget.load_archive(archive_path)
+        assert widget.show_estimates_cb.isChecked()
+        assert not widget.forward_only_cb.isChecked()
+        blank = np.zeros((48, 64, 3), dtype=np.uint8)
+        expected = render_coach_frame_overlay(
+            blank, widget._display_coach_data(), 5, cfg,
+            verbose_skeleton=True, show_vertical_axis=False, show_footer=False,
+            lines_only=True, show_estimates=True, forward_only=False,
+        )
+        shown = widget._render_primary_frame(blank, 5, 0.5, fps=10.0)
+        # Review (no calibration) draws exactly the editor's lines_only provenance skeleton.
+        assert np.array_equal(shown[..., 1], expected[..., 1])
+    finally:
+        widget.close()
+
+
+def test_review_screen_default_checkbox_follows_config(qapp):
+    widget = ReviewScreen(ServiceBridge(Config()), Router())
+    try:
+        assert widget.show_estimates_cb.isChecked() == Config().replay_show_recovered_joints
+    finally:
+        widget.close()
 
 
 def test_review_recovery_survives_calibration_error_and_toggles(qapp, tmp_path, video, monkeypatch):

@@ -372,7 +372,7 @@ def test_settings_screen_update(qapp, tmp_path, monkeypatch):
     assert settings_screen.ollama_model.text() == "custom-model"
     assert settings_screen.conf_spin.value() == 0.85
     assert settings_screen.field_widgets["ollama_num_ctx"].value() == 8192
-    assert settings_screen.tabs.count() == 15
+    assert settings_screen.tabs.count() == 16
     assert any(
         settings_screen.tabs.tabText(i) == "Measurement normalization"
         for i in range(settings_screen.tabs.count())
@@ -392,7 +392,7 @@ def test_settings_screen_update(qapp, tmp_path, monkeypatch):
         if settings_screen.tabs.isTabVisible(i)
     ]
     assert all(name.startswith("Couple · ") for name in couple_visible)
-    assert len(couple_visible) == 2
+    assert len(couple_visible) == 3
     settings_screen.set_engine_scope("Single Dancer Engine")
     single_visible = [
         settings_screen.tabs.tabText(i)

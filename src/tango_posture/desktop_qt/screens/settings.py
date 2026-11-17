@@ -173,7 +173,7 @@ def load_parameter_guides() -> dict[str, dict[str, str]]:
 
 _SCOPE_SUMMARIES = {
     "All": (
-        "Showing all 15 configuration tabs across Common (Both Engines), Single Dancer Engine, "
+        "Showing all 16 configuration tabs across Common (Both Engines), Single Dancer Engine, "
         "and Couple Dancer Engine."
     ),
     "Common (Both Engines)": (

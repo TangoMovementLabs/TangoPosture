@@ -38,7 +38,8 @@ from PySide6.QtWidgets import (
 
 from ...archive import PracticeArchive, _archive_lock, read_analytics, rename_archive
 from ...calibration.archives import read_range_profile
-from ...calibration.models import METRIC_DETAILS, RangeProfile
+from ...calibration.models import ALL_METRIC_DETAILS as METRIC_DETAILS
+from ...calibration.models import RangeProfile
 from ...couple.models import CoupleAnalysisRequest
 from ...references.archives import promote_reference, reference_directory, reference_path
 from ...references.constants import MAX_IMPORT_RANGE_SECONDS
@@ -450,9 +451,18 @@ class LibraryScreen(QWidget):
                 )
                 actions_layout.addWidget(analyze_btn)
             if p["path"].suffix.lower() == ".tpr":
-                calibrate_btn = QPushButton("Create calibration")
-                calibrate_btn.clicked.connect(lambda _, path=p["path"]: self._calibrate_reference(path))
-                actions_layout.addWidget(calibrate_btn)
+                if "Single" in mode_badge or not mode_badge:
+                    calibrate_btn = QPushButton("Edit calibration")
+                    calibrate_btn.clicked.connect(
+                        lambda _, path=p["path"]: self._calibrate_reference(path)
+                    )
+                    actions_layout.addWidget(calibrate_btn)
+                if "Couple" in mode_badge:
+                    couple_btn = QPushButton("Create couple calibration")
+                    couple_btn.clicked.connect(
+                        lambda _, path=p["path"]: self._calibrate_reference(path, couple=True)
+                    )
+                    actions_layout.addWidget(couple_btn)
             elif p["path"].suffix.lower() == ".tp":
                 promote_btn = QPushButton("Promote to Reference")
                 promote_btn.clicked.connect(lambda _, path=p["path"]: self._promote(path))
@@ -479,11 +489,11 @@ class LibraryScreen(QWidget):
         except (OSError, ValueError, TypeError, KeyError, RuntimeError) as error:
             self.import_status.setText(f"Cannot edit calibration: {error}")
 
-    def _calibrate_reference(self, path: Path) -> None:
+    def _calibrate_reference(self, path: Path, *, couple: bool = False) -> None:
         from ..calibration.editor import CalibrationEditor
 
         try:
-            editor = CalibrationEditor(path, self.bridge.config, self, bridge=self.bridge)
+            editor = CalibrationEditor(path, self.bridge.config, self, bridge=self.bridge, couple=couple)
             if editor.exec() == QDialog.DialogCode.Accepted:
                 self.refresh()
                 self.import_status.setText(f"Approved calibration saved: {editor.saved_path}")
@@ -732,6 +742,8 @@ class LibraryScreen(QWidget):
                 return "Couple"
             if has_s:
                 return "Single"
+        if (analytics.get("coach_data") or {}).get("couple_analysis"):
+            return "Couple"
         return "Single"
 
     def _start_import(

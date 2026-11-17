@@ -19,7 +19,7 @@ from PySide6.QtWidgets import (
 )
 
 from ...calibration.archives import read_range_profile
-from ...calibration.models import METRIC_DETAILS
+from ...calibration.models import ALL_METRIC_DETAILS as METRIC_DETAILS
 from ...config import Config
 from ...core.entities import ReferenceSummary
 from ..router import Route, Router

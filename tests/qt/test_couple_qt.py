@@ -1225,3 +1225,74 @@ def test_couple_analytics_pearson_r_and_couple_settings_parameters(qapp, tmp_pat
         assert after_r >= initial_r
     finally:
         window.close()
+
+
+def test_couple_calibration_chart_bounds_and_temporal_settings(qapp, tmp_path, monkeypatch):
+    from tango_posture.calibration.baseline import profile as capture_profile
+    from tango_posture.calibration.models import ApprovedRange, Passage, RangeProfile
+
+    cfg = Config(data_dir=str(tmp_path / "data"))
+    cfg.dancer_analysis.calibration_smoothing_s = 0.01
+    cfg.dancer_analysis.calibration_entry_duration_s = 0.2
+    _make_archive_with_runs(
+        Path(cfg.data_dir) / "practice" / "Calibrated.tp", cfg,
+        include_single=False, include_couple=True,
+    )
+    target = ApprovedRange(
+        lower=-1, upper=1, unit="degrees", view="all",
+        passages=[Passage(start=0, end=2)], median=0, p10=-1, p90=1,
+        valid_duration=2, selected_duration=2, samples=40, inside_fraction=1,
+    )
+    profile = RangeProfile(
+        name="Couple limits", context="Close embrace", model_hash="a" * 64,
+        capture_profile=capture_profile(cfg, 160, 120, "video"),
+        source={"dancer_mode": "couple"}, metrics={"torso_tilt_a": target},
+    )
+    window = MainWindow(cfg)
+    try:
+        window.router.navigate(Route.ANALYTICS)
+        analytics = window.screens[Route.ANALYTICS]
+        idx = next(i for i in range(analytics.session_combo.count())
+                   if "Calibrated" in analytics.session_combo.itemText(i))
+        analytics.session_combo.setCurrentIndex(idx)
+        result = analytics._active_couple_result
+        result["series"]["torso_tilt_a"] = [
+            {"timestamp": i / 10, "value": 10, "status": "measured"} for i in range(20)
+        ]
+        monkeypatch.setattr(analytics, "_resolve_selected_calibration", lambda: profile.calibration())
+        analytics._apply_calibration_reference()
+        chart = analytics.couple_axis_charts["torso_tilt_a"]
+        assert chart.bounds == (-1, 1)
+        assert chart.reference_line == 0
+        assert chart.states[0] == "PENDING"
+        assert chart.states[0.2] == "DEVIATION"
+        assert analytics.couple_axis_charts["torso_tilt_b"].bounds is None
+        assert "Couple limits" in analytics.couple_run_info_label.text()
+        monkeypatch.setattr(analytics, "_resolve_selected_calibration", lambda: None)
+        analytics._apply_calibration_reference()
+        assert chart.bounds is None
+        assert not chart.states
+    finally:
+        window.close()
+
+
+@pytest.mark.parametrize("couple", [False, True])
+def test_reference_calibration_button_matches_engine(qapp, tmp_path, couple):
+    from tango_posture.references.archives import promote_reference
+
+    cfg = Config(data_dir=str(tmp_path / "data"))
+    source, _, _ = _make_archive_with_runs(
+        Path(cfg.data_dir) / "practice" / "Source.tp", cfg,
+        include_single=not couple, include_couple=couple,
+    )
+    promote_reference(source, Path(cfg.data_dir) / "references" / "Ref.tpr", "Ref")
+    window = MainWindow(cfg)
+    try:
+        window.router.navigate(Route.LIBRARY)
+        lib = window.screens[Route.LIBRARY]
+        row = next(r for r in range(lib.table.rowCount()) if lib.table.item(r, 0).text() == "Ref")
+        labels = [b.text() for b in lib.table.cellWidget(row, 3).findChildren(QPushButton)]
+        assert ("Create couple calibration" in labels) == couple
+        assert ("Edit calibration" in labels) == (not couple)
+    finally:
+        window.close()

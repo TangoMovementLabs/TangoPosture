@@ -24,14 +24,14 @@ class Evidence:
     max_gap: float
 
 
-def cached_evidence(path: Path, index: int = 0) -> Evidence:
+def cached_evidence(path: Path, index: int = 0, *, couple: bool = False) -> Evidence:
     from ..archive import _archive_lock
 
     with _archive_lock(path):
-        return _cached_evidence(path, index)
+        return _cached_evidence(path, index, couple=couple)
 
 
-def _cached_evidence(path: Path, index: int) -> Evidence:
+def _cached_evidence(path: Path, index: int, *, couple: bool = False) -> Evidence:
     from ..archive import file_sha256, read_analytics, read_manifest
 
     manifest = read_manifest(path)
@@ -40,6 +40,8 @@ def _cached_evidence(path: Path, index: int) -> Evidence:
     data = read_analytics(path, index)
     if data is None:
         raise ValueError("No landmark cache. Analyze posture & movement in Review first")
+    if couple:
+        cached_couple_result(data)
     coach = data.get("coach_data") or {}
     capture = data.get("capture_profile") or coach.get("capture_profile") or {}
     if not isinstance(capture, dict):
@@ -58,6 +60,10 @@ def _cached_evidence(path: Path, index: int) -> Evidence:
         raise TypeError("The cache has no measured model identity; reanalyze this recording")
     frames = []
     for i, timestamp in enumerate(timestamps):
+        if couple:
+            # Couple ranges use the identity-tracked series, not single-dancer poses.
+            frames.append(FrameObservation(timestamp, width, height, []))
+            continue
         entry = entries.get(str(i), {})
         if not isinstance(entry, dict):
             raise TypeError("Invalid cached frame")
@@ -84,7 +90,7 @@ def _cached_evidence(path: Path, index: int) -> Evidence:
                 )
             poses.append(pose)
         frames.append(FrameObservation(timestamp, width, height, poses))
-    if not frames or not any(frame.poses for frame in frames):
+    if not frames or (not couple and not any(frame.poses for frame in frames)):
         raise ValueError("No usable landmark cache; reanalyze this recording")
     if "max_gap" not in data:
         raise ValueError("Cached tracking gap limit is missing; reanalyze this recording")
@@ -221,3 +227,24 @@ def dancer_frames(evidence: Evidence, dancer: int, confidence: float) -> list[Fr
             frame.timestamp, frame.width, frame.height, [chosen[1]] if chosen is not None else [],
         ))
     return selected
+
+
+def cached_couple_result(data: dict[str, Any]) -> dict[str, Any]:
+    """Read couple evidence from a saved run or the couple engine's coach cache."""
+    from .models import COUPLE_METRIC_DETAILS
+
+    result = (
+        data.get("dancer_analysis", {}).get("runs", {}).get("couple", {}).get("couple_result")
+        or (data.get("coach_data") or {}).get("couple_analysis")
+    )
+    if result is None:
+        raise ValueError("Analyze this reference in Couple mode in Review first")
+    if not isinstance(result, dict):
+        raise TypeError("Invalid couple analysis cache")
+    series = result.get("series")
+    if not isinstance(series, dict) or any(
+        not isinstance(series.get(key), list) or not series[key]
+        for key in COUPLE_METRIC_DETAILS
+    ):
+        raise ValueError("Couple measurement cache is incomplete; reanalyze in Couple mode")
+    return result
