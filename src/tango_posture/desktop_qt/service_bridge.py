@@ -95,6 +95,7 @@ class ServiceBridge(QObject):
 
     status_message = Signal(str)
     config_changed = Signal(object)
+    calibrations_changed = Signal()
     session_state_changed = Signal(object)  # SessionState
     frame_emitted = Signal(QImage, str)     # video frame, frame note summary
     beat_emitted = Signal(float, int, bool) # bpm, beat_num, is_active

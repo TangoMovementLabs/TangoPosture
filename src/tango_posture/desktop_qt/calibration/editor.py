@@ -196,6 +196,12 @@ class CalibrationEditor(QDialog):
         bridge: ServiceBridge | None = None,
         source_reference: Path | None = None,
         couple: bool = False,
+        metric_passages: dict[str, list[Passage]] | None = None,
+        metric_views: dict[str, str] | None = None,
+        unavailable_reasons: dict[str, str] | None = None,
+        ledger: list[dict[str, Any]] | None = None,
+        default_context: str | None = None,
+        default_name: str | None = None,
     ) -> None:
         super().__init__(parent)
         suffix = path.suffix.lower()
@@ -220,6 +226,15 @@ class CalibrationEditor(QDialog):
         self.evidence = cached_evidence(tpr_path, couple=True) if self.couple else cached_evidence(tpr_path)
         self._source_hash = self.evidence.source["archive_sha256"]
         self.holds = holds or {}
+        self._metric_passages: dict[str, list[Passage]] = dict(metric_passages or {})
+        self._metric_views: dict[str, str] = dict(metric_views or {})
+        self._unavailable_reasons: dict[str, str] = dict(unavailable_reasons or {})
+        self._ledger: list[dict[str, Any]] = list(
+            ledger
+            or (base_profile.camera_checks.get("solo_camera_ledger", []) if base_profile is not None else [])
+        )
+        self._default_context = default_context
+        self._default_name = default_name
         self.base_profile = base_profile
         if base_profile is not None and base_profile.model_hash != self.evidence.model_hash:
             raise ValueError("Reference and camera measurement models differ; reanalyze the reference")
@@ -357,21 +372,26 @@ class CalibrationEditor(QDialog):
 
         layout = QVBoxLayout(self)
         form = QHBoxLayout()
-        default_name = (
-            base_profile.name
+        resolved_name = (
+            self._default_name
+            if self._default_name
+            else base_profile.name
             if self._editing_profile_path is not None and base_profile is not None
             else f"{base_profile.name} camera check"
             if base_profile is not None
             else f"{tpr_path.stem} calibration"
         )
-        self.name_input = QLineEdit(default_name)
+        self.name_input = QLineEdit(resolved_name)
         self.context_combo = QComboBox()
         self.context_combo.addItems(PRACTICE_CONTEXTS)
         self.context_combo.setToolTip(
             "Describes the activity this profile was created for; it does not change "
             "measurement rules or automatically detect the activity."
         )
-        if base_profile is not None:
+        if self._default_context:
+            self.context_combo.setEditable(True)
+            self.context_combo.setCurrentText(self._default_context)
+        elif base_profile is not None:
             self.context_combo.setEditable(True)
             self.context_combo.setCurrentText(base_profile.context)
         form.addWidget(QLabel("Profile name:"))
@@ -746,7 +766,12 @@ class CalibrationEditor(QDialog):
         self.metric_hint.setVisible(bool(hint))
         first, last = self.evidence.frames[0].timestamp, self.evidence.frames[-1].timestamp
         holds = self.holds.get(self.step_combo.currentText())
-        passages = [holds[0]] if holds else [Passage(start=first, end=last + 1 / self._reader.fps)]
+        if key in self._metric_passages:
+            passages = self._metric_passages[key]
+        elif holds:
+            passages = [holds[0]]
+        else:
+            passages = [Passage(start=first, end=last + 1 / self._reader.fps)]
         draft_spec = self._draft_specs.get(key) if key in self._draft_keys else None
         approved = self.approved.get(key)
         target = approved or (
@@ -782,6 +807,15 @@ class CalibrationEditor(QDialog):
                 field.setValue(val)
                 field.blockSignals(False)
             self._update_stats(suggest=False)
+        elif key in self._metric_views:
+            preferred_view = self._metric_views[key]
+            view_changed = self.view_combo.currentText() != preferred_view
+            self.view_combo.blockSignals(True)
+            self.view_combo.setCurrentText(preferred_view)
+            self.view_combo.blockSignals(False)
+            if view_changed:
+                self._recompute(suggest=False)
+            self._update_stats(suggest=True)
         else:
             if self.view_combo.currentText() == "side":
                 min_samples = max(2, int(self.cfg.calibration_min_usable_samples))
@@ -1306,9 +1340,12 @@ class CalibrationEditor(QDialog):
             model_hash=self.evidence.model_hash, capture_profile=self.evidence.capture_profile,
             source=source,
             metrics=self.approved,
-            camera_checks={"holds": {
-                key: [hold.model_dump() for hold in holds] for key, holds in self.holds.items()
-            }},
+            camera_checks={
+                "holds": {
+                    key: [hold.model_dump() for hold in holds] for key, holds in self.holds.items()
+                },
+                **({"solo_camera_ledger": self._ledger} if self._ledger else {}),
+            },
         )
 
     def _use_defaults(self) -> None:

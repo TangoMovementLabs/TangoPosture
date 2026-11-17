@@ -124,7 +124,11 @@ class PracticeScreen(QWidget):
         self.reference_name = QLineEdit("My calibration")
         self.reference_name.setMaximumWidth(180)
         reference_row.addWidget(self.reference_name)
-        setup_layout.addLayout(reference_row)
+        setup_layout.addLayout(practice_row)
+        self._reference_row_widget = QWidget()
+        self._reference_row_widget.setLayout(reference_row)
+        self._reference_row_widget.setVisible(False)
+        setup_layout.addWidget(self._reference_row_widget)
         layout.addWidget(setup_card)
 
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -135,7 +139,7 @@ class PracticeScreen(QWidget):
         center_layout.setContentsMargins(0, 0, 0, 0)
         center_layout.setSpacing(10)
 
-        self.ref_info = QLabel("Select a saved reference to enable scoring.")
+        self.ref_info = QLabel("Self Practice mode: live pose detection with Lite model and .tp recording (no alerts).")
         self.ref_info.setStyleSheet(f"color: {COLOR_TEXT_MUTED}; font-size: 12px;")
         self.ref_info.setWordWrap(True)
         center_layout.addWidget(self.ref_info)
@@ -175,14 +179,17 @@ class PracticeScreen(QWidget):
         self.score_btn = QPushButton("Start Scoring (S)")
         self.score_btn.setProperty("class", "accent")
         self.score_btn.clicked.connect(self._start_scoring)
+        self.score_btn.setVisible(False)
         control_row.addWidget(self.score_btn)
 
         self.pause_btn = QPushButton("Pause Scoring (P)")
         self.pause_btn.clicked.connect(self._toggle_pause)
+        self.pause_btn.setVisible(False)
         control_row.addWidget(self.pause_btn)
 
         self.stop_score_btn = QPushButton("Stop Scoring (T)")
         self.stop_score_btn.clicked.connect(self._stop_scoring)
+        self.stop_score_btn.setVisible(False)
         control_row.addWidget(self.stop_score_btn)
 
         self.record_btn = QPushButton("Record (R)")
@@ -310,6 +317,7 @@ class PracticeScreen(QWidget):
         dialog = GuidedCalibration(self.bridge, self, profile_name=name)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.refresh()
+            self.bridge.calibrations_changed.emit()
             self.status_label.setText(f"Approved calibration saved: {dialog.saved_path}")
 
     def stop_for_navigation(self) -> None:
@@ -376,15 +384,8 @@ class PracticeScreen(QWidget):
             self.status_label.setText(str(error))
             return
 
-        selected = self._selected_reference()
-        if selected and selected.scoring_ready and not self.confirm_camera_cb.isChecked():
-            self.status_label.setText(
-                "Confirm unchanged camera placement for the selected calibration, "
-                "or select No reference to use Settings."
-            )
-            return
         self._launch_worker(
-            reference=selected,
+            reference=None,
             video=video,
             practice_name=name,
         )
@@ -590,7 +591,11 @@ class PracticeScreen(QWidget):
                 display.request("q")
 
         if isinstance(display.notes, str) and display.notes:
-            self.notes_box.setText(display.notes)
+            filtered = "\n".join(
+                line for line in display.notes.splitlines()
+                if "alert" not in line.lower() and "deviation" not in line.lower()
+            )
+            self.notes_box.setText(filtered or "Pose detection active (Lite model)")
             beat = re.search(r"Beat (\d+)/8 \((\d+(?:\.\d+)?) BPM\)", display.notes)
             if beat:
                 self.beat_strip.update_beat(float(beat.group(2)), int(beat.group(1)), True)

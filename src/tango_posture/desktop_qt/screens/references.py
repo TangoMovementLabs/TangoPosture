@@ -6,6 +6,7 @@ from pydantic import ValidationError
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QCheckBox,
+    QDialog,
     QFrame,
     QHBoxLayout,
     QHeaderView,
@@ -41,16 +42,21 @@ class ReferencesScreen(QWidget):
         # Header with actions
         header = QHBoxLayout()
         title_box = QVBoxLayout()
-        title = QLabel("Calibration Profiles")
+        title = QLabel("Self Calibration")
         title.setProperty("class", "title")
         subtitle = QLabel(
-            "Approved .tpc ranges and legacy neutral baselines. Replayable .tpr references are in Library."
+            "Solo camera calibration, approved .tpc ranges, and legacy neutral baselines. "
+            "Replayable .tpr references are in Library."
         )
         subtitle.setProperty("class", "subtitle")
         title_box.addWidget(title)
         title_box.addWidget(subtitle)
         header.addLayout(title_box)
         header.addStretch()
+
+        self.new_solo_cal_btn = QPushButton("New solo camera calibration…")
+        self.new_solo_cal_btn.setProperty("class", "accent")
+        self.new_solo_cal_btn.clicked.connect(self._new_solo_calibration)
 
         refresh_btn = QPushButton("Refresh")
         refresh_btn.clicked.connect(self.refresh)
@@ -61,6 +67,7 @@ class ReferencesScreen(QWidget):
             lambda: self.router.navigate(Route.LIBRARY)
         )
 
+        header.addWidget(self.new_solo_cal_btn)
         header.addWidget(refresh_btn)
         header.addWidget(cal_btn)
         layout.addLayout(header)
@@ -75,12 +82,13 @@ class ReferencesScreen(QWidget):
         tf_layout = QVBoxLayout(table_frame)
         tf_layout.setContentsMargins(12, 12, 12, 12)
 
-        self.table = QTableWidget(0, 4)
-        self.table.setHorizontalHeaderLabels(["Name", "Side", "Camera", "Type"])
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["Name", "Context", "View", "Capture setup", "Live-checked"])
         self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.itemSelectionChanged.connect(self._on_selection_changed)
         tf_layout.addWidget(self.table)
@@ -107,6 +115,10 @@ class ReferencesScreen(QWidget):
 
         self.confirm_camera_cb = QCheckBox("I confirm the physical camera placement is unchanged")
 
+        self.check_camera_btn = QPushButton("Check with camera…")
+        self.check_camera_btn.setEnabled(False)
+        self.check_camera_btn.clicked.connect(self._check_with_camera)
+
         self.edit_btn = QPushButton("Edit Calibration…")
         self.edit_btn.setProperty("class", "primary")
         self.edit_btn.setEnabled(False)
@@ -122,6 +134,7 @@ class ReferencesScreen(QWidget):
         df_layout.addWidget(self.detail_meta)
         df_layout.addWidget(self.confirm_camera_cb)
         df_layout.addStretch()
+        df_layout.addWidget(self.check_camera_btn)
         df_layout.addWidget(self.edit_btn)
         df_layout.addWidget(self.match_btn)
         splitter.addWidget(detail_frame)
@@ -137,9 +150,26 @@ class ReferencesScreen(QWidget):
             name_item = QTableWidgetItem(ref.name)
             name_item.setData(Qt.ItemDataRole.UserRole, ref)
             self.table.setItem(row_idx, 0, name_item)
-            self.table.setItem(row_idx, 1, QTableWidgetItem(ref.side.capitalize()))
-            self.table.setItem(row_idx, 2, QTableWidgetItem(f"Device {ref.camera}"))
-            self.table.setItem(row_idx, 3, QTableWidgetItem(".tpc" if ref.is_archive else "Legacy JSON"))
+            context_txt = "Legacy JSON"
+            view_txt = ref.side.capitalize()
+            setup_txt = f"Device {ref.camera}"
+            live_txt = "0"
+            if ref.is_archive:
+                try:
+                    prof = read_range_profile(ref.path)
+                    context_txt = prof.context
+                    views = sorted({t.view for t in prof.metrics.values()})
+                    view_txt = ", ".join(v.capitalize() for v in views) if views else ref.side.capitalize()
+                    cp = prof.capture_profile
+                    setup_txt = str(cp.get("capture_profile") or cp.get("source") or f"Device {ref.camera}")
+                    live_count = sum(1 for t in prof.metrics.values() if t.camera_check_passed)
+                    live_txt = f"{live_count}/{len(prof.metrics)}"
+                except (OSError, ValueError, TypeError, KeyError):
+                    context_txt = ".tpc"
+            self.table.setItem(row_idx, 1, QTableWidgetItem(context_txt))
+            self.table.setItem(row_idx, 2, QTableWidgetItem(view_txt))
+            self.table.setItem(row_idx, 3, QTableWidgetItem(setup_txt))
+            self.table.setItem(row_idx, 4, QTableWidgetItem(live_txt))
 
         if refs:
             self.table.selectRow(0)
@@ -160,6 +190,7 @@ class ReferencesScreen(QWidget):
             return
         self.selected_ref = ref
         self.edit_btn.setEnabled(ref.is_archive)
+        self.check_camera_btn.setEnabled(ref.is_archive)
         self.match_btn.setEnabled(True)
         self.confirm_camera_cb.setEnabled(True)
         self.detail_name.setText(ref.name)
@@ -191,11 +222,47 @@ class ReferencesScreen(QWidget):
 
     def _clear_selection(self) -> None:
         self.selected_ref = None
+        self.check_camera_btn.setEnabled(False)
         self.edit_btn.setEnabled(False)
         self.match_btn.setEnabled(False)
         self.confirm_camera_cb.setEnabled(False)
         self.detail_name.setText("No reference selected")
         self.detail_meta.setText("Select a reference from the table to view details.")
+
+    def _new_solo_calibration(self) -> None:
+        from ..calibration.guided import GuidedCalibration
+
+        dialog = GuidedCalibration(self.bridge, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.refresh()
+            self.bridge.calibrations_changed.emit()
+            if dialog.saved_path is not None:
+                self.bridge.status_message.emit(f"Approved calibration saved: {dialog.saved_path}")
+            elif dialog.saved_reference_path is not None:
+                self.bridge.status_message.emit(f"Evidence saved: {dialog.saved_reference_path}")
+
+    def _check_with_camera(self) -> None:
+        if not self.selected_ref or not self.selected_ref.is_archive:
+            self.bridge.status_message.emit("Select a .tpc calibration profile first.")
+            return
+        try:
+            range_profile = read_range_profile(self.selected_ref.path)
+        except (OSError, ValueError, TypeError, KeyError) as error:
+            self.bridge.status_message.emit(f"Cannot load calibration profile: {error}")
+            return
+        from ..calibration.guided import GuidedCalibration
+
+        dialog = GuidedCalibration(
+            self.bridge,
+            self,
+            target_profile=range_profile,
+            target_profile_path=self.selected_ref.path,
+        )
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.refresh()
+            self.bridge.calibrations_changed.emit()
+            if dialog.saved_path is not None:
+                self.bridge.status_message.emit(f"Updated calibration saved: {dialog.saved_path}")
 
     def _edit_calibration(self) -> None:
         if not self.selected_ref or not self.selected_ref.is_archive:

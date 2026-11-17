@@ -9,6 +9,7 @@ from tango_posture.config import (
     AnalysisRegion,
     Config,
     DancerAnalysisConfig,
+    SoloCameraCalibrationConfig,
     export_toml,
     load,
 )
@@ -23,6 +24,7 @@ def test_every_setting_has_a_toml_name_and_editor_group():
         "calibration_defaults",
         "measurement_normalization",
         "dancer_analysis",
+        "solo_camera",
         "replay_audio",
         "replay_auto_analyse_movement",
         "view_change_tolerance",
@@ -40,7 +42,11 @@ def test_every_setting_has_a_toml_name_and_editor_group():
         "auto_record_start_delay",
         "auto_record_stop_delay",
         "max_recordings",
-    }) | {f"dancer_analysis.{name}" for name in DancerAnalysisConfig.model_fields}
+    }) | {
+        f"dancer_analysis.{name}" for name in DancerAnalysisConfig.model_fields
+    } | {
+        f"solo_camera.{name}" for name in SoloCameraCalibrationConfig.model_fields
+    }
     fields = [field for group in SETTING_GROUPS.values() for field in group]
     assert len(fields) == len(set(fields))
     assert set(fields) == expected == set(SETTING_MAP)

@@ -36,6 +36,7 @@ from .screens.database import DatabaseScreen
 from .screens.help import HelpScreen
 from .screens.home import HomeScreen
 from .screens.library import LibraryScreen
+from .screens.practice import PracticeScreen
 from .screens.references import ReferencesScreen
 from .screens.review import ReviewScreen
 from .screens.settings import SettingsScreen
@@ -110,7 +111,9 @@ class MainWindow(QMainWindow):
 
         nav_items = [
             (Route.HOME, "Home", "home"),
+            (Route.PRACTICE, "Self Practice", "practice"),
             (Route.LIBRARY, "Library", "library"),
+            (Route.REFERENCES, "Self Calibration", "references"),
             (Route.ANALYSIS, "Video Analysis", "analysis"),
             (Route.REVIEW, "Review", "review"),
             (Route.ANALYTICS, "Analytics", "analytics"),
@@ -147,6 +150,7 @@ class MainWindow(QMainWindow):
         self.stack = QStackedWidget()
         self.screens: dict[Route, QWidget] = {
             Route.HOME: HomeScreen(self.bridge, self.router),
+            Route.PRACTICE: PracticeScreen(self.bridge, self.router),
             Route.REFERENCES: ReferencesScreen(self.bridge, self.router),
             Route.LIBRARY: LibraryScreen(self.bridge, self.router),
             Route.ANALYSIS: AnalysisScreen(self.bridge, self.router),
@@ -220,6 +224,9 @@ class MainWindow(QMainWindow):
         return None
 
     def _on_route_changed(self, route: Route, payload: object) -> None:
+        practice = self.screens.get(Route.PRACTICE)
+        if route is not Route.PRACTICE and isinstance(practice, PracticeScreen) and practice.worker_running:
+            practice.stop_for_navigation()
         if route in self.nav_buttons:
             self.nav_buttons[route].setChecked(True)
 

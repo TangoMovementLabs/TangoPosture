@@ -708,6 +708,7 @@ class ReviewScreen(QWidget):
             app.aboutToQuit.connect(self._release)
         self.refresh()
         self.bridge.config_changed.connect(lambda _cfg: self.refresh())
+        self.bridge.calibrations_changed.connect(self.refresh)
 
     def has_active_jobs(self) -> bool:
         return self._analysis_thread is not None and self._analysis_thread.is_alive()

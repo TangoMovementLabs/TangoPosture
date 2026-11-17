@@ -85,7 +85,7 @@ class HomeScreen(QScrollArea):
         self.ref_summary = QLabel("Ready for comparison")
         self.ref_summary.setStyleSheet(f"color: {COLOR_TEXT_MUTED}; font-size: 12px;")
 
-        ref_btn = QPushButton("Manage References")
+        ref_btn = QPushButton("Open Self Calibration")
         ref_btn.setProperty("class", "accent")
         ref_btn.setFixedHeight(36)
         ref_btn.clicked.connect(lambda: self.router.navigate(Route.REFERENCES))

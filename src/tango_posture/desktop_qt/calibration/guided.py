@@ -1,328 +1,844 @@
-"""Guided camera evidence capture, ending in the shared range approval editor."""
+"""Solo camera self-calibration wizard with readiness-driven capture and staging."""
 
 from __future__ import annotations
 
 import queue
+import shutil
 import time
-from collections import deque
+from collections.abc import Callable
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Any
 
+import cv2
 from PySide6.QtCore import QTimer
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import (
-    QApplication,
+    QCheckBox,
     QComboBox,
     QDialog,
+    QFormLayout,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
+    QMessageBox,
     QPushButton,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
 
-from ...calibration.archives import read_range_profile
-from ...calibration.measurements import metric_samples
-from ...calibration.models import METRIC_DETAILS, PRACTICE_CONTEXTS, STEPS, Passage
-from ...calibration.statistics import repeat_check
+from ...archive import calibration_directory, calibration_path
+from ...calibration.archives import save_range_profile
+from ...calibration.camera_session import (
+    CHECK_SPECS,
+    SoloCameraSession,
+    build_check_phases,
+    build_quick_setup_phases,
+    build_walking_phases,
+    check_full_body_framing,
+    evaluate_metric_repeat_check,
+)
+from ...calibration.evidence import cached_evidence
+from ...calibration.measurements import measure_ranges
+from ...calibration.models import METRIC_DETAILS, ApprovedRange, Passage, RangeProfile
+from ...calibration.statistics import summarize_examples
+from ...config import Config
 from ...domain import FrameObservation
-from ...references.archives import promote_reference, reference_directory
+from ...references.archives import promote_reference, reference_directory, reference_path
 from ..components.video_stage import VideoStage
-from ..practice.worker import PracticeThread, QtPracticeDisplay, QtPracticeWorker
+from ..practice.worker import (
+    PracticeThread,
+    QtPracticeDisplay,
+    QtPracticeWorker,
+    SpeechManager,
+    discover_cameras,
+)
 from ..service_bridge import ServiceBridge, numpy_to_qimage
 from .editor import CalibrationEditor
 
-INSTRUCTIONS = {
-    "Head": ("Look comfortably ahead", "Lower your gaze slightly, without forcing your neck"),
-    "Shoulders": ("Relax your shoulders", "Gently raise your shoulders"),
-    "Hips": ("Stand comfortably with your hips balanced", "Gently shift your hips a little forward"),
-    "Torso": ("Stand comfortably upright", "Incline your torso a little, without forcing"),
-    "Knees": ("Keep your knees comfortably straighter, not locked", "Gently soften and bend your knees"),
-}
-FRAMING = {
-    "Head": "Keep the camera side-on with ear, nose, shoulder and hip visible.",
-    "Shoulders": "Keep your ear, shoulder and hip visible; avoid obscuring the shoulders.",
-    "Hips": "Move back until the ankles, hip and head are visible.",
-    "Torso": (
-        "Keep the camera level and both shoulders and both hips visible for the pink axis. "
-        "Trunk inclination uses a side-on view."
-    ),
-    "Knees": "Move back until both ankles and knees are visible.",
-}
-
 
 class GuidedCalibration(QDialog):
+    """Guided solo camera calibration wizard with readiness gates and atomic profile saving."""
+
     def __init__(
-        self, bridge: ServiceBridge, parent: QWidget | None = None, *,
-        profile_path: Path | None = None,
-        profile_name: str | None = None,
+        self,
+        bridge: ServiceBridge,
+        parent: QWidget | None = None,
+        *,
+        profile_name: str = "Studio webcam",
+        target_profile: RangeProfile | None = None,
+        target_profile_path: Path | None = None,
+        camera_discoverer: Callable[..., list[tuple[int, str]]] = discover_cameras,
     ) -> None:
         super().__init__(parent)
         self.bridge = bridge
-        self._profile_name = profile_name
-        self.base_profile = read_range_profile(profile_path) if profile_path else None
-        self.setWindowTitle("Guided camera calibration & repeat check")
-        self.resize(1000, 780)
-        self._temporary = TemporaryDirectory(prefix="tango-guided-calibration-")
-        self._display = QtPracticeDisplay(capture_evidence=True)
-        self._thread: PracticeThread | None = None
-        self._frames: deque[FrameObservation] = deque(maxlen=3600)
-        self._holds: dict[str, list[Passage]] = {}
-        self._step = 0
-        self._phase = -1
-        self._phase_start: float | None = None
-        self._latest: float | None = None
-        self._countdown = False
-        self._walking = False
-        self._review_requested = False
-        self._begun = False
-        self._closing = False
-        self._error: str | None = None
+        self._cfg = bridge.config.model_copy(deep=True)
+        self._target_profile = target_profile
+        self._target_profile_path = target_profile_path
+        self._camera_discoverer = camera_discoverer
+        self.setWindowTitle(
+            f"Check with camera · {target_profile.name}"
+            if target_profile is not None
+            else "Solo camera calibration"
+        )
+        self.resize(980, 720)
+
         self.saved_path: Path | None = None
-        self._stamp = time.time_ns()
-        layout = QVBoxLayout(self)
-        self.instructions = QLabel(
-            "One dancer only. Frame your full body, then start the camera. "
-            "No pose should hurt; retry or skip any measurement."
+        self.saved_paths: list[Path] = []
+        self.saved_reference_path: Path | None = None
+
+        self._temp_dir: TemporaryDirectory[str] | None = None
+        self._staging_dir: Path | None = None
+        self._staged_tpr: Path | None = None
+        self._published_tpr: Path | None = None
+
+        self._display: QtPracticeDisplay | None = None
+        self._worker: QtPracticeWorker | None = None
+        self._thread: PracticeThread | None = None
+        self._camera_active = False
+        self._paused = False
+        self._frozen_cfg: Config | None = None
+        self._collected_frames: list[FrameObservation] = []
+        self._camera_meta: dict[str, Any] = {}
+
+        self._speech = SpeechManager(self)
+        self._speech.speech_finished.connect(self._on_speech_finished)
+        self._session = SoloCameraSession(self._cfg, now_monotonic=time.monotonic())
+
+        self._poll_timer = QTimer(self)
+        self._poll_timer.setInterval(40)
+        self._poll_timer.timeout.connect(self._poll_worker)
+
+        self._setup_ui(profile_name)
+        self._apply_target_profile_defaults()
+
+    def _setup_ui(self, profile_name: str) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(16, 16, 16, 16)
+        root.setSpacing(10)
+
+        self.status_banner = QLabel(
+            "Camera is off. Click Start camera preview to check framing before recording."
         )
-        self.instructions.setWordWrap(True)
-        layout.addWidget(self.instructions)
-        self.stage = VideoStage()
-        layout.addWidget(self.stage, 1)
-        row = QHBoxLayout()
-        self.context = QComboBox()
-        self.context.addItems(PRACTICE_CONTEXTS)
-        self.context.setToolTip(
-            "Labels the profile. Solo walking adds a walking capture; Pivot does not "
-            "automatically capture or detect pivots."
+        self.status_banner.setWordWrap(True)
+        root.addWidget(self.status_banner)
+
+        self.preview_stage = VideoStage("Camera preview is off. Start preview to verify your setup.")
+        self.preview_stage.setMinimumHeight(320)
+        root.addWidget(self.preview_stage, 1)
+
+        self.orientation_label = QLabel("")
+        root.addWidget(self.orientation_label)
+
+        self.stack = QStackedWidget()
+        root.addWidget(self.stack)
+
+        # Page 0: Camera Setup
+        setup_page = QWidget()
+        setup_layout = QVBoxLayout(setup_page)
+        form = QFormLayout()
+
+        self.name_input = QLineEdit(profile_name)
+        form.addRow("Profile name:", self.name_input)
+
+        cam_row = QHBoxLayout()
+        self.camera_combo = QComboBox()
+        self.camera_combo.addItem(f"Camera {self._cfg.camera}", self._cfg.camera)
+        self.camera_combo.currentIndexChanged.connect(self._on_camera_changed)
+        cam_row.addWidget(self.camera_combo, 1)
+        self.scan_cameras_btn = QPushButton("Scan cameras")
+        self.scan_cameras_btn.clicked.connect(self._scan_cameras)
+        cam_row.addWidget(self.scan_cameras_btn)
+        self.start_preview_btn = QPushButton("Start camera preview")
+        self.start_preview_btn.clicked.connect(self._start_preview)
+        self.preview = self.start_preview_btn
+        cam_row.addWidget(self.start_preview_btn)
+        self.retry_camera_btn = QPushButton("Retry camera")
+        self.retry_camera_btn.setVisible(False)
+        self.retry_camera_btn.clicked.connect(self._start_preview)
+        cam_row.addWidget(self.retry_camera_btn)
+        form.addRow("Camera:", cam_row)
+
+        self.side_combo = QComboBox()
+        self.side_combo.addItems(["left", "right"])
+        self.side_combo.setCurrentText(self._cfg.side)
+        self.side_combo.currentTextChanged.connect(self._update_orientation_indicator)
+        form.addRow("Side seen by camera:", self.side_combo)
+
+        self.facing_combo = QComboBox()
+        self.facing_combo.addItems(["right", "left"])
+        self.facing_combo.setCurrentText(self._cfg.facing)
+        self.facing_combo.currentTextChanged.connect(self._update_orientation_indicator)
+        form.addRow("Facing in recorded image:", self.facing_combo)
+
+        toggles_row = QHBoxLayout()
+        self.mirror_cb = QCheckBox("Mirror preview (display only)")
+        self.mirror_cb.setChecked(self._cfg.mirror)
+        self.mirror_cb.toggled.connect(self._update_orientation_indicator)
+        toggles_row.addWidget(self.mirror_cb)
+
+        self.speak_cb = QCheckBox("Speak instructions")
+        self.speak_cb.setChecked(self._cfg.solo_camera.speak_instructions)
+        toggles_row.addWidget(self.speak_cb)
+        toggles_row.addStretch(1)
+        form.addRow("Options:", toggles_row)
+
+        setup_layout.addLayout(form)
+
+        setup_note = QLabel(
+            "Place the camera level at practice height and step back until your head and shoes fit. "
+            "Begin records local video and pose landmarks for review; microphone and beat tracking stay off."
         )
-        if self.base_profile:
-            self.context.setEditable(True)
-            self.context.setCurrentText(self.base_profile.context)
-        row.addWidget(self.context)
-        self.preview = QPushButton("Start camera preview")
-        self.preview.clicked.connect(self._start_camera)
-        row.addWidget(self.preview)
-        self.start = QPushButton("Begin guided checks")
-        self.start.setEnabled(False)
-        self.start.clicked.connect(self._begin)
-        row.addWidget(self.start)
-        self.retry = QPushButton("Retry step")
-        self.retry.setEnabled(False)
-        self.retry.clicked.connect(self._retry)
-        row.addWidget(self.retry)
-        self.skip = QPushButton("Skip step")
-        self.skip.setEnabled(False)
-        self.skip.clicked.connect(self._skip)
-        row.addWidget(self.skip)
-        self.next = QPushButton("Continue")
-        self.next.setEnabled(False)
-        self.next.clicked.connect(self._next)
-        row.addWidget(self.next)
-        layout.addLayout(row)
-        self.result_label = QLabel()
-        self.result_label.setWordWrap(True)
-        layout.addWidget(self.result_label)
-        self.timer = QTimer(self)
-        self.timer.setInterval(60)
-        self.timer.timeout.connect(self._poll)
-        self.finished.connect(lambda: self._temporary.cleanup())
-        app = QApplication.instance()
-        if app is not None:
-            app.aboutToQuit.connect(self._shutdown)
+        setup_note.setWordWrap(True)
+        setup_layout.addWidget(setup_note)
 
-    def _shutdown(self) -> None:
-        self._closing = True
-        self._display.request("q")
-        if self._thread is not None:
-            self._thread.wait()
+        setup_btns = QHBoxLayout()
+        self.begin_btn = QPushButton("Begin")
+        self.begin_btn.setProperty("class", "accent")
+        self.begin_btn.setEnabled(False)
+        self.begin_btn.clicked.connect(self._begin_capture)
+        self.start = self.begin_btn
+        setup_btns.addWidget(self.begin_btn)
+        setup_cancel = QPushButton("Cancel")
+        setup_cancel.clicked.connect(self.reject)
+        setup_btns.addWidget(setup_cancel)
+        setup_btns.addStretch(1)
+        setup_layout.addLayout(setup_btns)
+        self.stack.addWidget(setup_page)
 
-    def _start_camera(self) -> None:
-        cfg = self.bridge.config.model_copy(update={
-            "data_dir": self._temporary.name, "beat_tracking": False,
-        })
-        worker = QtPracticeWorker(cfg, self._display, practice_name=f"Camera_evidence_{self._stamp}")
-        worker.setParent(self)
-        self._thread = PracticeThread(worker, self)
-        worker.failed.connect(self._failed)
-        worker.finished.connect(worker.deleteLater)
-        self._thread.finished.connect(self._finished_capture)
-        self.preview.setEnabled(False)
-        self.context.setEnabled(False)
-        self.timer.start()
-        self._thread.start()
+        # Page 1: Guided Capture
+        capture_page = QWidget()
+        cap_layout = QVBoxLayout(capture_page)
+        self.phase_label = QLabel("Ready")
+        self.phase_label.setStyleSheet("font-weight: bold; font-size: 14px;")
+        cap_layout.addWidget(self.phase_label)
 
-    def _failed(self, message: str) -> None:
-        self._error = message
-        self.result_label.setText(f"Camera calibration failed: {message}")
+        self.instruction_label = QLabel("")
+        self.instruction_label.setWordWrap(True)
+        self.instruction_label.setStyleSheet("font-size: 15px;")
+        cap_layout.addWidget(self.instruction_label)
 
-    def _speak(self, text: str) -> None:
-        self.instructions.setText(text)
-        self._display.prompts.put(text)
+        self.hint_label = QLabel("")
+        self.hint_label.setWordWrap(True)
+        cap_layout.addWidget(self.hint_label)
 
-    def _begin(self) -> None:
-        if self._latest is None:
+        cap_btns = QHBoxLayout()
+        self.pause_btn = QPushButton("Pause")
+        self.pause_btn.clicked.connect(self._toggle_pause)
+        cap_btns.addWidget(self.pause_btn)
+
+        self.repeat_btn = QPushButton("Repeat instruction")
+        self.repeat_btn.clicked.connect(self._repeat_instruction)
+        cap_btns.addWidget(self.repeat_btn)
+
+        self.retry_hold_btn = QPushButton("Retry hold")
+        self.retry_hold_btn.clicked.connect(self._retry_hold)
+        cap_btns.addWidget(self.retry_hold_btn)
+
+        self.skip_view_btn = QPushButton("Skip view")
+        self.skip_view_btn.clicked.connect(self._skip_view)
+        cap_btns.addWidget(self.skip_view_btn)
+
+        self.start_take_btn = QPushButton("Start take")
+        self.start_take_btn.setVisible(False)
+        self.start_take_btn.clicked.connect(self._start_walking_take)
+        cap_btns.addWidget(self.start_take_btn)
+
+        self.end_take_btn = QPushButton("End take")
+        self.end_take_btn.setVisible(False)
+        self.end_take_btn.clicked.connect(self._end_walking_take)
+        cap_btns.addWidget(self.end_take_btn)
+
+        self.walk_returned_btn = QPushButton("Ready for pass 2")
+        self.walk_returned_btn.setVisible(False)
+        self.walk_returned_btn.clicked.connect(self._confirm_walk_return)
+        cap_btns.addWidget(self.walk_returned_btn)
+
+        cap_cancel = QPushButton("Cancel")
+        cap_cancel.clicked.connect(self.reject)
+        cap_btns.addWidget(cap_cancel)
+        cap_btns.addStretch(1)
+        cap_layout.addLayout(cap_btns)
+        self.stack.addWidget(capture_page)
+
+        # Page 2: Checks, Walking & Review Summary
+        review_page = QWidget()
+        rev_layout = QVBoxLayout(review_page)
+        self.review_summary = QLabel("")
+        self.review_summary.setWordWrap(True)
+        rev_layout.addWidget(self.review_summary)
+
+        checks_box = QGroupBox("Optional individual measurement checks & solo walking")
+        checks_layout = QVBoxLayout(checks_box)
+        self.check_boxes: dict[str, QCheckBox] = {}
+        cb_row = QHBoxLayout()
+        for cid, spec in CHECK_SPECS.items():
+            cb = QCheckBox(spec.title)
+            self.check_boxes[cid] = cb
+            cb_row.addWidget(cb)
+        checks_layout.addLayout(cb_row)
+
+        extra_btns = QHBoxLayout()
+        self.run_checks_btn = QPushButton("Check individual measurements")
+        self.run_checks_btn.clicked.connect(self._run_selected_checks)
+        extra_btns.addWidget(self.run_checks_btn)
+
+        self.record_walking_btn = QPushButton("Record solo walking")
+        self.record_walking_btn.clicked.connect(self._run_walking_plan)
+        extra_btns.addWidget(self.record_walking_btn)
+        extra_btns.addStretch(1)
+        checks_layout.addLayout(extra_btns)
+        rev_layout.addWidget(checks_box)
+
+        save_btns = QHBoxLayout()
+        self.open_editor_btn = QPushButton("Review ranges in editor…")
+        self.open_editor_btn.setProperty("class", "accent")
+        self.open_editor_btn.clicked.connect(self._review_in_editor)
+        save_btns.addWidget(self.open_editor_btn)
+
+        self.save_views_btn = QPushButton("Save ready profiles")
+        self.save_views_btn.clicked.connect(self._save_ready_profiles)
+        save_btns.addWidget(self.save_views_btn)
+
+        self.keep_evidence_btn = QPushButton("Keep evidence only")
+        self.keep_evidence_btn.clicked.connect(self._keep_evidence_only)
+        save_btns.addWidget(self.keep_evidence_btn)
+
+        rev_cancel = QPushButton("Close")
+        rev_cancel.clicked.connect(self.reject)
+        save_btns.addWidget(rev_cancel)
+        save_btns.addStretch(1)
+        rev_layout.addLayout(save_btns)
+        self.stack.addWidget(review_page)
+
+        self._update_orientation_indicator()
+
+    def _apply_target_profile_defaults(self) -> None:
+        if self._target_profile is None:
             return
-        self._display.recording.set()
-        self._begun = True
-        self.start.setEnabled(False)
-        self._countdown = True
-        self._phase_start = self._latest
-        self._speak("Calibration starts in three seconds. Stand comfortably.")
+        prof = self._target_profile
+        self.name_input.setText(f"{prof.name} camera check")
+        cp = prof.capture_profile
+        if cp.get("side") in ("left", "right"):
+            self.side_combo.setCurrentText(str(cp["side"]))
+        if cp.get("facing") in ("left", "right"):
+            self.facing_combo.setCurrentText(str(cp["facing"]))
+        src = str(cp.get("source", ""))
+        if src.startswith("camera:"):
+            try:
+                cam_idx = int(src.partition(":")[2])
+                pos = self.camera_combo.findData(cam_idx)
+                if pos >= 0:
+                    self.camera_combo.setCurrentIndex(pos)
+            except ValueError:
+                pass
+        for cid, spec in CHECK_SPECS.items():
+            if any(m in prof.metrics for m in spec.metrics):
+                self.check_boxes[cid].setChecked(True)
 
-    def _start_step(self) -> None:
-        self._phase = 0
-        self._holds[STEPS[self._step]] = []
-        self._start_phase()
+    def _update_orientation_indicator(self) -> None:
+        side = self.side_combo.currentText()
+        facing = self.facing_combo.currentText()
+        mirror_txt = " · Preview mirrored (display only)" if self.mirror_cb.isChecked() else ""
+        res = ""
+        if self._camera_meta:
+            w = self._camera_meta.get("width", 0)
+            h = self._camera_meta.get("height", 0)
+            fps = self._camera_meta.get("fps", 0.0)
+            if w and h:
+                res = f" · {w}×{h}" + (f" @ {fps:.0f} fps" if fps else "")
+        self.orientation_label.setText(
+            f"Orientation in recorded image: camera sees {side} side, facing {facing}{mirror_txt}{res}"
+        )
 
-    def _start_phase(self) -> None:
-        self.retry.setEnabled(False)
-        self.skip.setEnabled(False)
-        self.next.setEnabled(False)
-        self._phase_start = self._latest
-        group = STEPS[self._step]
-        neutral, changed = INSTRUCTIONS[group]
-        prompt = (
-            neutral, changed, f"Return to your starting posture. {neutral}",
-            f"Fresh repetition. {changed}",
-        )[self._phase]
-        self._speak(f"{group}. {prompt}. Settle for two seconds, then hold for three.")
+    def _selected_setup_config(self) -> Config:
+        cam_idx = int(self.camera_combo.currentData() or 0)
+        return Config.model_validate({
+            **self._cfg.model_dump(),
+            "camera": cam_idx,
+            "side": self.side_combo.currentText(),
+            "facing": self.facing_combo.currentText(),
+            "mirror": False,  # stored landmarks and footage stay unmirrored
+            "beat_tracking": False,
+        })
 
-    def _poll(self) -> None:
-        try:
-            image = self._display.frames.get_nowait()
-        except queue.Empty:
-            pass
+    def _scan_cameras(self) -> None:
+        current = int(self.camera_combo.currentData() or self._cfg.camera)
+        discovered = self._camera_discoverer(configured_index=current)
+        self.camera_combo.blockSignals(True)
+        self.camera_combo.clear()
+        for idx, label in discovered:
+            self.camera_combo.addItem(label, idx)
+        pos = self.camera_combo.findData(current)
+        if pos >= 0:
+            self.camera_combo.setCurrentIndex(pos)
+        self.camera_combo.blockSignals(False)
+
+    def _on_camera_changed(self) -> None:
+        if self._camera_active:
+            self._release_camera()
+            self._start_preview()
+
+    def _start_preview(self) -> None:
+        self._release_camera()
+        self._temp_dir = TemporaryDirectory(prefix="tango-solo-cal-")
+        temp_root = Path(self._temp_dir.name)
+        self._staging_dir = temp_root / "staging"
+        self._staging_dir.mkdir(parents=True, exist_ok=True)
+        cfg = self._selected_setup_config()
+        cfg = Config.model_validate({**cfg.model_dump(), "data_dir": str(temp_root)})
+
+        self._display = QtPracticeDisplay(capture_evidence=True)
+        self._worker = QtPracticeWorker(
+            cfg,
+            self._display,
+            practice_name="solo_calibration_evidence",
+            calibration_only=False,
+        )
+        self._thread = PracticeThread(self._worker, self)
+        self._worker.failed.connect(self._on_worker_failed)
+        self._worker.finished.connect(self._on_worker_finished)
+        self._camera_active = True
+        self.retry_camera_btn.setVisible(False)
+        self.start_preview_btn.setEnabled(False)
+        self.status_banner.setText("Starting camera preview…")
+        self._thread.start()
+        self._poll_timer.start()
+
+    def _on_worker_failed(self, message: str) -> None:
+        self._release_camera()
+        self.retry_camera_btn.setVisible(True)
+        self.start_preview_btn.setEnabled(True)
+        self.begin_btn.setEnabled(False)
+        if "busy" in message.lower() or "open" in message.lower() or "camera" in message.lower():
+            self.status_banner.setText(
+                f"Camera unavailable ({message}). Close any other preview using this camera and click Retry camera."
+            )
         else:
-            self.stage.set_frame(numpy_to_qimage(image))
+            self.status_banner.setText(f"Camera error: {message}")
+        self._session.set_camera_error(message)
+
+    def _on_worker_finished(self) -> None:
+        self._camera_active = False
+        self.start_preview_btn.setEnabled(True)
+
+    def _poll_worker(self) -> None:
+        if self._display is None:
+            return
+        latest_frame = None
         while True:
             try:
-                frame = self._display.observations.get_nowait()
+                latest_frame = self._display.frames.get_nowait()
             except queue.Empty:
                 break
-            self._frames.append(frame)
-            self._latest = frame.timestamp
-        if self._latest is None:
-            return
-        if self._phase_start is None:
-            self.start.setEnabled(not self._begun)
-            return
-        elapsed = self._latest - self._phase_start
-        if self._countdown:
-            self.result_label.setText(f"Countdown: {max(1, 3 - int(elapsed))}")
-            if elapsed >= 3:
-                self._countdown = False
-                self._start_step()
-            return
-        duration = 10 if self._walking else 5
-        self.result_label.setText(f"{'Settle' if elapsed < 2 else 'Capture'} · {max(0, duration - elapsed):.1f}s")
-        if elapsed < duration:
-            return
-        passage = Passage(start=self._phase_start + 2, end=self._latest)
-        if self._walking:
-            self._holds["Walking"] = [passage]
-            self._finish_checks()
-            return
-        group = STEPS[self._step]
-        self._holds[group].append(passage)
-        if self._phase < 3:
-            self._phase += 1
-            self._start_phase()
-            return
-        self._phase_start = None
-        cfg = self.bridge.config
-        single = [FrameObservation(
-            frame.timestamp, frame.width, frame.height,
-            frame.poses if len(frame.poses) == 1 else [],
-        ) for frame in self._frames]
-        samples = metric_samples(single, cfg)
-        messages = []
-        passed_any = False
-        for key, (step, label, _unit) in METRIC_DETAILS.items():
-            if step == group:
-                passed, reason = repeat_check(samples[key], self._holds[group], cfg.max_gap)
-                passed_any |= passed
-                messages.append(f"{label}: {'repeatable' if passed else reason}")
-        self.result_label.setText(
-            "\n".join(messages) + "\n" + FRAMING[group] +
-            "\nThis is a repeatability check, not validation of dance technique."
-        )
-        self.retry.setEnabled(True)
-        self.skip.setEnabled(True)
-        self.next.setEnabled(passed_any)
-
-    def _retry(self) -> None:
-        self._start_step()
-
-    def _skip(self) -> None:
-        self._holds.pop(STEPS[self._step], None)
-        self._next()
-
-    def _next(self) -> None:
-        self.retry.setEnabled(False)
-        self.skip.setEnabled(False)
-        self.next.setEnabled(False)
-        if self._step < len(STEPS) - 1:
-            self._step += 1
-            self._start_step()
-        elif self.context.currentText() == "Solo walking":
-            self._walking = True
-            self._phase_start = self._latest
-            self._speak("Walk naturally in view of the camera for eight seconds. Keep both feet visible.")
-        else:
-            self._finish_checks()
-
-    def _finish_checks(self) -> None:
-        self._phase_start = None
-        self._review_requested = True
-        self._display.request("q")
-        self.instructions.setText("Saving cached camera evidence and releasing the camera…")
-
-    def _finished_capture(self) -> None:
-        self.timer.stop()
-        if self._closing:
-            super().reject()
-            return
-        if self._error is not None or not self._review_requested:
-            self.result_label.setText(self._error or "Camera stopped before the guided checks completed.")
-            return
-        try:
-            source, _index = self._display.saved_segments.get_nowait()
-            destination = reference_directory(self.bridge.config.data_dir) / f"Camera_{self._stamp}.tpr"
-            promote_reference(source, destination, f"Camera evidence {self._stamp}")
-            editor = CalibrationEditor(
-                destination, self.bridge.config, self, holds=self._holds,
-                base_profile=self.base_profile,
-                bridge=self.bridge,
+        if latest_frame is not None:
+            display_img = (
+                cv2.flip(latest_frame, 1) if self.mirror_cb.isChecked() else latest_frame
             )
-            editor.context_combo.setCurrentText(self.context.currentText())
-            if self._profile_name is not None:
-                editor.name_input.setText(self._profile_name)
-            if self.context.currentText() == "Solo walking":
-                editor.pose_combo.setCurrentIndex(4)
-                if self.base_profile is None:
-                    editor._update_stats(suggest=True)
-            if editor.exec() == QDialog.DialogCode.Accepted:
-                self.saved_path = editor.saved_path
-                self.accept()
-            else:
-                self.result_label.setText(
-                    "No calibration profile approved. The camera reference remains in Library."
-                )
-        except (queue.Empty, OSError, ValueError, TypeError, KeyError, RuntimeError) as error:
-            self.result_label.setText(f"Cannot review calibration evidence: {error}")
+            self.preview_stage.set_frame(numpy_to_qimage(display_img))
 
-    def reject(self) -> None:
-        if self._thread is not None and self._thread.isRunning():
-            self._closing = True
-            self._display.request("q")
-            self.instructions.setText("Stopping camera safely…")
+        while not self._display.observations.empty():
+            obs = self._display.observations.get_nowait()
+            self._collected_frames.append(obs)
+            self._camera_meta = {"width": obs.width, "height": obs.height, "fps": self._camera_meta.get("fps", 0.0)}
+            self._update_orientation_indicator()
+            if self.stack.currentIndex() == 0:
+                ok, reason = check_full_body_framing(obs, self._selected_setup_config())
+                self.begin_btn.setEnabled(ok)
+                self.status_banner.setText(reason)
+            elif self.stack.currentIndex() == 1 and not self._paused:
+                prev_accepted = len(self._session.accepted_passages)
+                self._session.process_frame(
+                    obs,
+                    now_monotonic=time.monotonic(),
+                    speak_enabled=self.speak_cb.isChecked(),
+                )
+                if len(self._session.accepted_passages) > prev_accepted:
+                    self._announce_captured_and_prompt()
+                self._sync_capture_ui()
+        if self.stack.currentIndex() == 1 and not self._paused and self._session.check_watchdog(time.monotonic()):
+            self._on_worker_failed(self._session.error_message)
+
+    def _begin_capture(self) -> None:
+        if not self._camera_active:
+            self.status_banner.setText("Start camera preview before beginning capture.")
             return
-        super().reject()
+        if self._display is not None:
+            self._display.recording.set()
+        self._frozen_cfg = self._selected_setup_config()
+        self.camera_combo.setEnabled(False)
+        self.side_combo.setEnabled(False)
+        self.facing_combo.setEnabled(False)
+        self._session = SoloCameraSession(self._frozen_cfg, now_monotonic=time.monotonic())
+        phases = build_quick_setup_phases()
+        self.stack.setCurrentIndex(1)
+        prompt_id = self._session.start_plan(
+            phases,
+            now_monotonic=time.monotonic(),
+            speak_enabled=self.speak_cb.isChecked(),
+        )
+        self._maybe_speak(prompt_id)
+        self._sync_capture_ui()
+
+    def _announce_captured_and_prompt(self) -> None:
+        if self.speak_cb.isChecked():
+            if self._session.state == "Prompt":
+                self._speech.speak(
+                    self._session.active_prompt_id,
+                    f"Captured. {self._session.current_instruction}",
+                )
+            elif self._session.state == "Review":
+                self._speech.speak(0, "Captured. Your standing examples are ready.")
+
+    def _maybe_speak(self, prompt_id: int) -> None:
+        if self.speak_cb.isChecked() and self._session.state == "Prompt":
+            self._speech.speak(prompt_id, self._session.current_instruction)
+
+    def _on_speech_finished(self, prompt_id: int, failed: bool) -> None:
+        self._session.on_speech_finished(prompt_id, now_monotonic=time.monotonic(), failed=failed)
+        self._sync_capture_ui()
+
+    def _sync_capture_ui(self) -> None:
+        phase = self._session.current_phase
+        self.phase_label.setText(
+            f"State: {self._session.state}"
+            + (f" · {phase.view.capitalize()} rep {phase.repetition}" if phase else "")
+        )
+        self.instruction_label.setText(self._session.current_instruction)
+        self.hint_label.setText(self._session.hint_message)
+
+        is_walking = phase is not None and not phase.requires_stillness
+        self.start_take_btn.setVisible(is_walking and self._session.state == "Wait for take")
+        self.end_take_btn.setVisible(is_walking and self._session.state == "Capture take")
+
+        if self._session.state == "Review":
+            self._enter_review()
+
+    def _toggle_pause(self) -> None:
+        self._paused = not self._paused
+        self.pause_btn.setText("Resume" if self._paused else "Pause")
+        if self._paused:
+            self._speech.cancel_all()
+
+    def _repeat_instruction(self) -> None:
+        self._speech.cancel_all()
+        prompt_id = self._session.retry_phase(
+            now_monotonic=time.monotonic(),
+            speak_enabled=self.speak_cb.isChecked(),
+        )
+        self._maybe_speak(prompt_id)
+        self._sync_capture_ui()
+
+    def _retry_hold(self) -> None:
+        self._repeat_instruction()
+
+    def _skip_view(self) -> None:
+        self._speech.cancel_all()
+        prompt_id = self._session.skip_view(
+            now_monotonic=time.monotonic(),
+            speak_enabled=self.speak_cb.isChecked(),
+        )
+        self._maybe_speak(prompt_id)
+        self._sync_capture_ui()
+
+    def _start_walking_take(self) -> None:
+        self._session.start_walking_take(now_monotonic=time.monotonic())
+        self._sync_capture_ui()
+
+    def _end_walking_take(self) -> None:
+        self._session.end_walking_take()
+        self._sync_capture_ui()
+
+    def _confirm_walk_return(self) -> None:
+        self.walk_returned_btn.setVisible(False)
+
+    def _enter_review(self) -> None:
+        self._speech.cancel_all()
+        self._release_camera()
+        self.stack.setCurrentIndex(2)
+        records = self._session.accepted_passages
+        if not records:
+            self.review_summary.setText("No usable holds were captured yet.")
+            return
+        lines = [f"Captured {len(records)} accepted passage(s):"]
+        for rec in records.values():
+            metrics_txt = ", ".join(f"{k} ({v:.2f}s)" for k, v in rec.eligible_metrics.items())
+            lines.append(
+                f"• {rec.phase_id} [{rec.view}]: {rec.passage.start:.2f}s–{rec.passage.end:.2f}s · {metrics_txt}"
+            )
+            for mk, reason in rec.unavailable_reasons.items():
+                lines.append(f"  - {mk} unavailable: {reason}")
+        self.review_summary.setText("\n".join(lines))
+
+    def _run_selected_checks(self) -> None:
+        selected = [cid for cid, cb in self.check_boxes.items() if cb.isChecked()]
+        if not selected:
+            QMessageBox.information(self, "Select checks", "Select at least one measurement check.")
+            return
+        self._start_preview()
+        if self._display is not None:
+            self._display.recording.set()
+        self.stack.setCurrentIndex(1)
+        prompt_id = self._session.start_plan(
+            build_check_phases(selected),
+            now_monotonic=time.monotonic(),
+            speak_enabled=self.speak_cb.isChecked(),
+        )
+        self._maybe_speak(prompt_id)
+        self._sync_capture_ui()
+
+    def _run_walking_plan(self) -> None:
+        self._start_preview()
+        if self._display is not None:
+            self._display.recording.set()
+        self.stack.setCurrentIndex(1)
+        prompt_id = self._session.start_plan(
+            build_walking_phases(),
+            now_monotonic=time.monotonic(),
+            speak_enabled=self.speak_cb.isChecked(),
+        )
+        self._maybe_speak(prompt_id)
+        self._sync_capture_ui()
+
+    def _stage_and_publish_evidence(self) -> Path:
+        """Promote temporary practice capture into staging, verify it, and publish to references/."""
+        if self._published_tpr is not None and self._published_tpr.is_file():
+            return self._published_tpr
+        if self._temp_dir is None:
+            raise ValueError("No captured camera session is available to stage.")
+        temp_root = Path(self._temp_dir.name)
+        practice_files = sorted((temp_root / "practices").glob("*.tp"))
+        if not practice_files:
+            raise ValueError("No recorded practice archive was found in temporary storage.")
+        src_tp = practice_files[-1]
+        base_name = self.name_input.text().strip() or "Solo camera evidence"
+        staged = self._staging_dir / f"{base_name}.tpr" if self._staging_dir else temp_root / f"{base_name}.tpr"
+        if staged.exists():
+            staged.unlink()
+        promote_reference(src_tp, staged, base_name)
+        # Validate ledger passages exist inside evidence timestamps
+        ev = cached_evidence(staged)
+        last_ts = ev.frames[-1].timestamp
+        for rec in self._session.accepted_passages.values():
+            if rec.passage.start >= last_ts:
+                raise ValueError(f"Passage {rec.phase_id} is outside promoted evidence timestamps.")
+        self._staged_tpr = staged
+        ref_dir = reference_directory(self._cfg.data_dir)
+        ref_dir.mkdir(parents=True, exist_ok=True)
+        dest = reference_path(ref_dir, f"{base_name} {int(time.time())}")
+        shutil.copy2(staged, dest)
+        self._published_tpr = dest
+        return dest
+
+    def _ledger_payload(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "phase_id": rec.phase_id,
+                "plan_kind": rec.plan_kind,
+                "view": rec.view,
+                "repetition": rec.repetition,
+                "role": rec.role,
+                "start": rec.passage.start,
+                "end": rec.passage.end,
+                "check_id": rec.check_id,
+                "eligible_metrics": rec.eligible_metrics,
+                "unavailable_reasons": rec.unavailable_reasons,
+            }
+            for rec in self._session.accepted_passages.values()
+        ]
+
+    def _build_metric_drafts(self, view: str, *, context: str) -> tuple[dict[str, list[Passage]], dict[str, str], dict[str, str]]:
+        passages_by_metric: dict[str, list[Passage]] = {}
+        views_by_metric: dict[str, str] = {}
+        reasons: dict[str, str] = {}
+        role_target = "walking" if context == "Solo walking" else "neutral"
+        for rec in self._session.accepted_passages.values():
+            if rec.view != view or rec.role != role_target:
+                continue
+            for mk in rec.eligible_metrics:
+                passages_by_metric.setdefault(mk, []).append(rec.passage)
+                views_by_metric[mk] = view
+            for mk, reason in rec.unavailable_reasons.items():
+                reasons.setdefault(mk, reason)
+        return passages_by_metric, views_by_metric, reasons
+
+    def _review_in_editor(self) -> None:
+        try:
+            tpr = self._stage_and_publish_evidence()
+        except (OSError, ValueError, RuntimeError) as error:
+            QMessageBox.warning(self, "Evidence staging failed", str(error))
+            return
+        cfg = self._frozen_cfg or self._selected_setup_config()
+        views_present = {rec.view for rec in self._session.accepted_passages.values()}
+        default_view = "side" if "side" in views_present else next(iter(views_present), "side")
+        metric_passages, metric_views, reasons = self._build_metric_drafts(
+            default_view, context="Neutral posture"
+        )
+        base_name = self.name_input.text().strip() or "Studio webcam"
+        editor = CalibrationEditor(
+            tpr,
+            cfg,
+            self,
+            bridge=self.bridge,
+            base_profile=self._target_profile,
+            metric_passages=metric_passages,
+            metric_views=metric_views,
+            unavailable_reasons=reasons,
+            ledger=self._ledger_payload(),
+            default_context="Neutral posture",
+            default_name=f"{base_name} · Neutral · {default_view.capitalize()}",
+        )
+        if editor.exec() == QDialog.DialogCode.Accepted and editor.saved_path is not None:
+            self.saved_path = editor.saved_path
+            self.saved_paths.append(editor.saved_path)
+            self.bridge.calibrations_changed.emit()
+            self.accept()
+
+    def _save_ready_profiles(self) -> None:
+        try:
+            tpr = self._stage_and_publish_evidence()
+        except (OSError, ValueError, RuntimeError) as error:
+            QMessageBox.warning(self, "Evidence staging failed", str(error))
+            return
+        cfg = self._frozen_cfg or self._selected_setup_config()
+        ev = cached_evidence(tpr)
+        cal_dir = calibration_directory(self._cfg.data_dir)
+        cal_dir.mkdir(parents=True, exist_ok=True)
+        base_name = self.name_input.text().strip() or "Studio webcam"
+        max_gap = self._session.effective_max_gap()
+
+        # Build samples per view
+        raw_samples: dict[str, list[tuple[float, float | None]]] = {k: [] for k in METRIC_DETAILS}
+        for fr in ev.frames:
+            obs = measure_ranges(fr, cfg)
+            for mk in METRIC_DETAILS:
+                q = obs.quality.get(mk)
+                val = obs.values.get(mk)
+                raw_samples[mk].append((fr.timestamp, val if (q and q.valid) else None))
+
+        targets: list[tuple[str, str]] = []
+        if any(r.view == "front" and r.role == "neutral" for r in self._session.accepted_passages.values()):
+            targets.append(("Neutral posture", "front"))
+        if any(r.view == "side" and r.role == "neutral" for r in self._session.accepted_passages.values()):
+            targets.append(("Neutral posture", "side"))
+        if any(r.role == "walking" for r in self._session.accepted_passages.values()):
+            targets.append(("Solo walking", "side"))
+
+        if not targets:
+            QMessageBox.information(self, "Nothing to save", "No usable holds or walking passes were captured.")
+            return
+
+        written: list[Path] = []
+        failed_names: list[str] = []
+        for context, view in targets:
+            passages_by_metric, _, _ = self._build_metric_drafts(view, context=context)
+            approved: dict[str, ApprovedRange] = {}
+            for mk, passages in passages_by_metric.items():
+                try:
+                    stats = summarize_examples(
+                        raw_samples[mk],
+                        passages,
+                        max_gap,
+                        suggest_lower_pct=cfg.calibration_suggest_lower_pct,
+                        suggest_upper_pct=cfg.calibration_suggest_upper_pct,
+                        min_usable_samples=cfg.calibration_min_usable_samples,
+                    )
+                except ValueError:
+                    continue
+                check_ok = False
+                if context != "Solo walking":
+                    for cid, spec in CHECK_SPECS.items():
+                        if mk in spec.metrics:
+                            holds_4 = [
+                                rec.passage
+                                for pid in (f"{cid}_neutral_a", f"{cid}_changed_a", f"{cid}_neutral_b", f"{cid}_changed_b")
+                                if (rec := self._session.accepted_passages.get(pid)) is not None
+                            ]
+                            if len(holds_4) == 4:
+                                ok, _ = evaluate_metric_repeat_check(
+                                    raw_samples[mk], holds_4, max_gap, expected_sign=spec.expected_sign
+                                )
+                                check_ok = ok
+                approved[mk] = ApprovedRange(
+                    lower=float(stats["lower"]),
+                    upper=float(stats["upper"]),
+                    unit=METRIC_DETAILS[mk][2],
+                    view=view,  # type: ignore[arg-type]
+                    passages=passages,
+                    median=float(stats["median"]),
+                    p10=float(stats["p10"]),
+                    p90=float(stats["p90"]),
+                    valid_duration=float(stats["valid_duration"]),
+                    selected_duration=float(stats["selected_duration"]),
+                    samples=int(stats["samples"]),
+                    inside_fraction=float(stats["inside_fraction"]),
+                    camera_check_passed=check_ok,
+                )
+            if not approved:
+                continue
+            prof_name = f"{base_name} · {'Solo walking' if context == 'Solo walking' else 'Neutral'} · {view.capitalize()}"
+            prof_path = calibration_path(cal_dir, prof_name)
+            profile_obj = RangeProfile(
+                name=prof_name,
+                context=context,
+                model_hash=ev.model_hash,
+                capture_profile=ev.capture_profile,
+                source=ev.source,
+                metrics=approved,
+                camera_checks={"solo_camera_ledger": self._ledger_payload()},
+            )
+            try:
+                save_range_profile(prof_path, profile_obj, overwrite=False)
+                written.append(prof_path)
+            except (OSError, ValueError, FileExistsError) as err:
+                failed_names.append(f"{prof_name}: {err}")
+
+        if written:
+            self.saved_paths.extend(written)
+            self.saved_path = written[-1]
+            self.bridge.calibrations_changed.emit()
+        if failed_names:
+            QMessageBox.warning(
+                self,
+                "Partial save",
+                "Some profiles could not be saved:\n" + "\n".join(failed_names),
+            )
+            return
+        if written:
+            self.accept()
+
+    def _keep_evidence_only(self) -> None:
+        try:
+            tpr = self._stage_and_publish_evidence()
+        except (OSError, ValueError, RuntimeError) as error:
+            QMessageBox.warning(self, "Could not save evidence", str(error))
+            return
+        self.saved_reference_path = tpr
+        self.status_banner.setText(f"Evidence saved to {tpr.name} without creating a profile.")
+        self.accept()
+
+    def _release_camera(self) -> None:
+        self._poll_timer.stop()
+        self._camera_active = False
+        if self._display is not None:
+            if self._display.recording.is_set():
+                self._display.request("e")
+            self._display.request("q")
+            self._display.stop = True
+        if self._thread is not None and self._thread.isRunning():
+            self._thread.quit()
+            self._thread.wait(3000)
+        self._thread = None
+        self._worker = None
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        if self._thread is not None and self._thread.isRunning():
-            self.reject()
-            event.ignore()
-        else:
-            super().closeEvent(event)
+        self._speech.cancel_all()
+        self._release_camera()
+        super().closeEvent(event)
+
+    def reject(self) -> None:
+        self._speech.cancel_all()
+        self._release_camera()
+        super().reject()

@@ -9,6 +9,7 @@ from PySide6.QtCore import QObject, Signal
 
 class Route(StrEnum):
     HOME = "home"
+    PRACTICE = "practice"
     REFERENCES = "references"
     LIBRARY = "library"
     ANALYSIS = "analysis"

@@ -218,6 +218,23 @@ Creating or editing a `.tpc` profile separates **example evidence selection** fr
 > - **Not in profile**: That metric was skipped or not yet approved when the `.tpc` file was created. Open the profile details in **Library** and click **Edit calibration…** to approve and save that metric.
 > - **Not measured**: The metric IS in the profile, so Review checks quality and camera-view gates frame by frame. A transient hidden ear, a side-vs-front camera view mismatch (`max_view_width`), two people entering the frame, or short limb projections can mark individual frames `UNKNOWN` (*Not measured*). Importantly, Review also applies temporal persistence (`entry_duration` default `1.5s`, `clear_duration` default `0.75s`) so momentary frame boundary crossings stay amber/muted rather than flashing false red alerts.
 
+### Solo Camera Self-Calibration (`Calibration` menu)
+
+1. **Camera placement & setup**:
+   - Open **Calibration** from the sidebar (or **Open Calibration** from **Home**) and click **New solo camera calibration…**.
+   - Place the camera level at practice height and step back until your head and shoes fit in frame. Keep the camera fixed when switching between front and side views.
+   - Select your camera device, verify the recorded side and facing direction (**in the recorded image**, even if preview mirroring is enabled), toggle **Speak instructions** if desired, and click **Start camera preview**.
+   - **Begin** unlocks once one dancer is cleanly tracked with full-body head and ankle/shoe landmarks.
+2. **Sample guided instructions**:
+   - *Front hold A*: "Face the camera. Stand as you do when you're ready to walk. Look ahead and let your shoulders settle."
+   - *Front hold B*: "Relax for a moment. Now return to the same ready-to-walk stance."
+   - *Side hold A*: "Turn side-on in the direction shown. Keep the camera where it is. Take up your usual tango stance."
+   - *Side hold B*: "Relax, then return to the same stance. Keep looking in the same direction."
+   - *Solo walking (2 passes)*: "Take up to four natural tango steps across the frame, keeping your shoes visible. Stop at the end."
+3. **Individual measurement checks & saving**:
+   - After standing holds complete, you can run optional **neutral A → changed A → neutral B → changed B** checks (e.g., gentle shoulder raise, gaze drop, knee straighten) to qualify metrics for live feedback, record **Solo walking**, or review and save **Front**, **Side**, and **Solo walking · Side** profiles atomically.
+   - Use **Check with camera…** on any saved `.tpc` profile in **Calibration** to verify or re-check it against a live camera.
+
 ---
 
 ## 4. Tracking Engine, Temporal Smoothing & Movement Analysis

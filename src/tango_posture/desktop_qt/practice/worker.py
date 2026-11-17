@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import sqlite3
+import subprocess
+import sys
+import threading
 from pathlib import Path
 from queue import SimpleQueue
 
@@ -19,6 +22,104 @@ from ...storage import Storage
 PRACTICE_ERRORS = (OSError, ValueError, RuntimeError, ImportError, sqlite3.Error, cv2.error)
 
 
+class SpeechManager(QObject):
+    """Serialized, cancellable speech runner scoped to prompt IDs."""
+
+    speech_finished = Signal(int, bool)  # prompt_id, failed
+
+    def __init__(self, parent: QObject | None = None, *, timeout_s: float = 15.0) -> None:
+        super().__init__(parent)
+        self._timeout_s = timeout_s
+        self._lock = threading.Lock()
+        self._active_proc: subprocess.Popen[bytes] | None = None
+        self._generation = 0
+
+    @staticmethod
+    def is_available() -> bool:
+        return sys.platform == "darwin" and Path("/usr/bin/say").is_file()
+
+    def speak(self, prompt_id: int, text: str) -> None:
+        self.cancel_all()
+        if not text.strip() or not self.is_available():
+            self.speech_finished.emit(prompt_id, not self.is_available())
+            return
+        with self._lock:
+            self._generation += 1
+            gen = self._generation
+
+        def _worker() -> None:
+            failed = False
+            proc: subprocess.Popen[bytes] | None = None
+            try:
+                proc = subprocess.Popen(
+                    ["/usr/bin/say", text],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                with self._lock:
+                    if gen != self._generation:
+                        proc.terminate()
+                        return
+                    self._active_proc = proc
+                rc = proc.wait(timeout=self._timeout_s)
+                if rc != 0:
+                    failed = True
+            except (OSError, subprocess.TimeoutExpired):
+                failed = True
+                if proc is not None:
+                    proc.kill()
+            finally:
+                with self._lock:
+                    if self._active_proc is proc:
+                        self._active_proc = None
+                    still_current = gen == self._generation
+                if still_current:
+                    self.speech_finished.emit(prompt_id, failed)
+
+        threading.Thread(target=_worker, daemon=True, name="solo-cal-speech").start()
+
+    def cancel_all(self) -> None:
+        with self._lock:
+            self._generation += 1
+            proc = self._active_proc
+            self._active_proc = None
+        if proc is not None:
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+
+
+def discover_cameras(max_indices: int = 5, *, configured_index: int = 0) -> list[tuple[int, str]]:
+    """Probe available camera indices cleanly, always preserving configured_index as a fallback."""
+    found: list[tuple[int, str]] = []
+    seen: set[int] = set()
+    indices = [configured_index] + [i for i in range(max_indices) if i != configured_index]
+    for idx in indices:
+        if idx < 0 or idx in seen:
+            continue
+        cap = None
+        try:
+            cap = cv2.VideoCapture(idx)
+            if cap.isOpened():
+                w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+                h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+                fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+                details = f"{w}x{h}" if w > 0 and h > 0 else "connected"
+                if fps > 0:
+                    details += f" @ {fps:.0f} fps"
+                found.append((idx, f"Camera {idx} ({details})"))
+                seen.add(idx)
+        except cv2.error:
+            pass
+        finally:
+            if cap is not None:
+                cap.release()
+    if configured_index not in seen:
+        found.insert(0, (configured_index, f"Camera {configured_index}"))
+    return sorted(found, key=lambda item: item[0])
+
+
 class QtPracticeDisplay(GuiDisplay):
     """Thread-safe mailbox and explicit calibration handoff for Qt."""
 
@@ -31,6 +132,7 @@ class QtPracticeDisplay(GuiDisplay):
         self.capture_evidence = capture_evidence
         self.observations: SimpleQueue[FrameObservation] = SimpleQueue()
         self.prompts: SimpleQueue[str] = SimpleQueue()
+        self.stop = False
 
     def observe(self, frame: FrameObservation) -> None:
         if self.capture_evidence:

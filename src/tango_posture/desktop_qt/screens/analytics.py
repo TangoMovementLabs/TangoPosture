@@ -251,6 +251,7 @@ class AnalyticsScreen(QWidget):
         self.analytics_mode_tabs.addTab(couple_view, "Couple analysis")
         layout.addWidget(self.analytics_mode_tabs, 1)
         self.bridge.config_changed.connect(self._on_config_changed)
+        self.bridge.calibrations_changed.connect(self.refresh)
         self.refresh()
 
     def _on_config_changed(self, _cfg: object = None) -> None:

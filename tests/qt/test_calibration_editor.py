@@ -409,14 +409,14 @@ def test_pivot_context_is_saved_without_changing_approved_ranges(qapp, tmp_path,
 
 
 def test_guided_pivot_context_does_not_start_walking_drill(qapp, tmp_path):
+    from tango_posture.calibration.camera_session import build_quick_setup_phases
+
     dialog = GuidedCalibration(ServiceBridge(Config(data_dir=str(tmp_path))))
     try:
-        dialog.context.setCurrentText("Pivot")
-        assert dialog.context.currentText() == "Pivot"
-        dialog._step = 4
-        dialog._next()
-        assert not dialog._walking
-        assert dialog._review_requested
+        phases = build_quick_setup_phases()
+        assert all(p.plan_kind == "quick" and p.requires_stillness for p in phases)
+        dialog._session.start_plan(phases, now_monotonic=0.0, speak_enabled=False)
+        assert dialog._session.state == "Wait for view and pose"
     finally:
         dialog.reject()
 
@@ -623,31 +623,25 @@ def test_promoted_excerpt_has_matching_video_and_cached_frame_indices(qapp, tmp_
 @pytest.mark.parametrize("responsive", [False, True])
 def test_guided_holds_require_a_repeatable_change_before_continuing(qapp, tmp_path, responsive):
     from dataclasses import replace
+    from tango_posture.calibration.camera_session import evaluate_metric_repeat_check
+    from tango_posture.calibration.measurements import measure_ranges
 
-    dialog = GuidedCalibration(ServiceBridge(Config(data_dir=str(tmp_path))))
+    samples = []
     for index in range(240):
         observation = frame(index / 10)
         if responsive and (8 <= observation.timestamp < 13 or 18 <= observation.timestamp < 23):
             point = observation.poses[0]["nose"]
             observation.poses[0]["nose"] = replace(point, x=point.x + 0.06)
-        dialog._frames.append(observation)
-    dialog._latest = 0
-    dialog._begin()
-    for timestamp in (3, 8, 13, 18, 23):
-        dialog._latest = timestamp
-        dialog._poll()
-    assert len(dialog._holds["Head"]) == 4
-    assert dialog.next.isEnabled() is responsive
-    assert dialog.retry.isEnabled() and dialog.skip.isEnabled()
-    dialog.context.setCurrentText("Solo walking")
-    dialog._step = 4
-    dialog._next()
-    assert dialog._walking
-    dialog._latest = 33
-    dialog._poll()
-    assert dialog._review_requested
-    assert dialog._holds["Walking"][0].start == 25
-    dialog.reject()
+        obs = measure_ranges(observation, Config())
+        samples.append((obs.timestamp, obs.values.get("head_pitch")))
+    holds = [
+        Passage(start=0.0, end=3.0),
+        Passage(start=8.0, end=13.0),
+        Passage(start=13.0, end=18.0),
+        Passage(start=18.0, end=23.0),
+    ]
+    ok, _ = evaluate_metric_repeat_check(samples, holds, max_gap=0.5)
+    assert ok is responsive
 
 
 def test_editing_existing_tpc_profile_preserves_and_adds_metrics(qapp, tmp_path):

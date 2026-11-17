@@ -205,11 +205,14 @@ def test_help_renders_styled_manual_with_hierarchical_contents_and_search(qapp, 
 def test_navigation_buttons_have_icons_and_accessible_labels(qapp):
     window = MainWindow(Config())
 
-    assert len(window.nav_buttons) == 9
+    assert len(window.nav_buttons) == 11
     assert Route.ANALYSIS in window.nav_buttons
     assert window.nav_buttons[Route.ANALYSIS].text() == "Video Analysis"
     assert window.nav_buttons[Route.ANALYTICS].text() == "Analytics"
-    assert Route.REFERENCES not in window.nav_buttons
+    assert Route.REFERENCES in window.nav_buttons
+    assert window.nav_buttons[Route.REFERENCES].text() == "Self Calibration"
+    assert Route.PRACTICE in window.nav_buttons
+    assert window.nav_buttons[Route.PRACTICE].text() == "Self Practice"
     for button in window.nav_buttons.values():
         assert not button.icon().isNull()
         assert button.iconSize().width() == 20
@@ -372,7 +375,7 @@ def test_settings_screen_update(qapp, tmp_path, monkeypatch):
     assert settings_screen.ollama_model.text() == "custom-model"
     assert settings_screen.conf_spin.value() == 0.85
     assert settings_screen.field_widgets["ollama_num_ctx"].value() == 8192
-    assert settings_screen.tabs.count() == 16
+    assert settings_screen.tabs.count() == 17
     assert any(
         settings_screen.tabs.tabText(i) == "Measurement normalization"
         for i in range(settings_screen.tabs.count())
@@ -400,7 +403,7 @@ def test_settings_screen_update(qapp, tmp_path, monkeypatch):
         if settings_screen.tabs.isTabVisible(i)
     ]
     assert "Measurement normalization" in single_visible
-    assert len(single_visible) == 9
+    assert len(single_visible) == 10
     settings_screen.set_engine_scope("All")
     window.close()
 

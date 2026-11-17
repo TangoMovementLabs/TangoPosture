@@ -107,6 +107,30 @@ class DancerAnalysisConfig(BaseModel):
         return self
 
 
+class SoloCameraCalibrationConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    speak_instructions: bool = True
+    stable_time_s: float = Field(default=0.75, gt=0.0)
+    settle_drift_torso_lengths: float = Field(default=0.05, gt=0.0)
+    hold_window_s: float = Field(default=2.5, gt=0.0)
+    min_usable_hold_s: float = Field(default=2.0, gt=0.0)
+    max_usable_gap_s: float = Field(default=0.20, gt=0.0)
+    front_view_width_margin: float = Field(default=0.10, ge=0.0)
+    retry_hint_delay_s: float = Field(default=8.0, gt=0.0)
+    camera_stall_timeout_s: float = Field(default=3.0, gt=0.0)
+    walking_take_limit_s: float = Field(default=8.0, gt=0.0)
+
+    @model_validator(mode="after")
+    def validated_timings(self) -> "SoloCameraCalibrationConfig":
+        if self.min_usable_hold_s > self.hold_window_s:
+            raise ValueError("min_usable_hold_s must not exceed hold_window_s")
+        if self.min_usable_hold_s > self.walking_take_limit_s:
+            raise ValueError("min_usable_hold_s must not exceed walking_take_limit_s")
+        if self.max_usable_gap_s >= self.hold_window_s:
+            raise ValueError("max_usable_gap_s must be smaller than hold_window_s")
+        return self
+
+
 class Config(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
     camera: int = Field(default=0, ge=0)
@@ -202,6 +226,7 @@ class Config(BaseModel):
         default_factory=MeasurementNormalizationConfig
     )
     dancer_analysis: DancerAnalysisConfig = Field(default_factory=DancerAnalysisConfig)
+    solo_camera: SoloCameraCalibrationConfig = Field(default_factory=SoloCameraCalibrationConfig)
     ollama_base_url: str = "http://127.0.0.1:11434"
     ollama_model: str = Field(default="llama3.2", min_length=1)
     ollama_timeout: float = Field(default=120.0, gt=0, le=1800)
@@ -392,6 +417,18 @@ SETTING_GROUPS = {
         "dancer_analysis.turn_exit_match_window_s",
         "dancer_analysis.auto_turn_suggestions",
     ),
+    "Calibration · Solo camera": (
+        "solo_camera.speak_instructions",
+        "solo_camera.stable_time_s",
+        "solo_camera.settle_drift_torso_lengths",
+        "solo_camera.hold_window_s",
+        "solo_camera.min_usable_hold_s",
+        "solo_camera.max_usable_gap_s",
+        "solo_camera.front_view_width_margin",
+        "solo_camera.retry_hint_delay_s",
+        "solo_camera.camera_stall_timeout_s",
+        "solo_camera.walking_take_limit_s",
+    ),
 }
 
 SETTING_ENGINE_SCOPES: dict[str, tuple[str, ...]] = {
@@ -404,6 +441,7 @@ SETTING_ENGINE_SCOPES: dict[str, tuple[str, ...]] = {
     "Single Dancer Engine": (
         "Single · Camera / View",
         "Single · Quality / Calibration",
+        "Calibration · Solo camera",
         "Single · Temporal / Smoothing",
         "Single · Head / Shoulders",
         "Single · Embrace / Knees",
@@ -427,6 +465,8 @@ def _setting_parser(field: str) -> Callable:
         root, sub = field.split(".", 1)
         if root == "dancer_analysis":
             kind = DancerAnalysisConfig.model_fields[sub].annotation
+        elif root == "solo_camera":
+            kind = SoloCameraCalibrationConfig.model_fields[sub].annotation
         else:
             kind = float
     else:
@@ -658,6 +698,16 @@ SETTING_DESCRIPTIONS: dict[str, str] = {
     "ollama_num_predict": "Maximum generated response length in tokens.",
     "ollama_max_report_chars": "Maximum report text sent for local analysis.",
     "ollama_instruction": "Additional instruction accompanying a report.",
+    "solo_camera.speak_instructions": "Speak guided solo camera calibration instructions when speech synthesis is available.",
+    "solo_camera.stable_time_s": "Seconds the requested view and stable pose must be visible after the prompt before capture starts.",
+    "solo_camera.settle_drift_torso_lengths": "Maximum torso midpoint drift in torso lengths allowed during the settle window.",
+    "solo_camera.hold_window_s": "Maximum capture window in seconds for a standing calibration hold attempt.",
+    "solo_camera.min_usable_hold_s": "Minimum usable seconds per metric required to accept a calibration hold or walking pass.",
+    "solo_camera.max_usable_gap_s": "Maximum gap in seconds between adjacent usable observations (capped by max_gap).",
+    "solo_camera.front_view_width_margin": "Width margin in torso lengths above max_view_width required for front-view holds.",
+    "solo_camera.retry_hint_delay_s": "Seconds spent waiting for the requested view or pose before showing an actionable hint.",
+    "solo_camera.camera_stall_timeout_s": "Seconds without a new delivered camera frame before reporting a stalled camera.",
+    "solo_camera.walking_take_limit_s": "Maximum capture duration in seconds for a single solo walking pass.",
 }
 
 
