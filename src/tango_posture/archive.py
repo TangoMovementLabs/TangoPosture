@@ -837,7 +837,7 @@ def _store_analysis(path: Path, analysis: Path) -> None:
 class PracticeArchive:
     def __init__(self, path: Path):
         self.path = path.expanduser().resolve()
-        self.temporary = TemporaryDirectory(prefix="tango-replay-")
+        self.temporary = TemporaryDirectory(prefix="tango-replay-", ignore_cleanup_errors=True)
         self.folder = Path(self.temporary.name)
         self._leases = 1
         self._lease_lock = threading.Lock()

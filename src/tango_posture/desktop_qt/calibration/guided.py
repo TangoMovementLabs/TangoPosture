@@ -508,7 +508,7 @@ class GuidedCalibration(QDialog):
         self._release_camera()
         self._auto_begin_pending = auto_begin
         self._preview_stable_since: float | None = None
-        self._temp_dir = TemporaryDirectory(prefix="tango-solo-cal-")
+        self._temp_dir = TemporaryDirectory(prefix="tango-solo-cal-", ignore_cleanup_errors=True)
         temp_root = Path(self._temp_dir.name)
         self._staging_dir = temp_root / "staging"
         self._staging_dir.mkdir(parents=True, exist_ok=True)
