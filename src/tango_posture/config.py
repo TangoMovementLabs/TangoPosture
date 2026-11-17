@@ -2,9 +2,11 @@ import json
 import tomllib
 from collections.abc import Callable
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from .normalization_models import MeasurementNormalizationConfig
 
 
 class Threshold(BaseModel):
@@ -19,12 +21,123 @@ class Threshold(BaseModel):
         return self
 
 
+class RangeDefault(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    lower: float
+    upper: float
+    unit: str
+    view: Literal["side", "front", "all"]
+
+    @model_validator(mode="after")
+    def ordered(self) -> "RangeDefault":
+        if self.lower > self.upper:
+            raise ValueError("Range minimum must not exceed maximum")
+        return self
+
+
+class AnalysisRegion(BaseModel):
+    """Normalized [0, 1] image region restricting candidate dancer detection."""
+
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    x_min: float = Field(default=0.0, ge=0.0, le=1.0)
+    y_min: float = Field(default=0.0, ge=0.0, le=1.0)
+    x_max: float = Field(default=1.0, ge=0.0, le=1.0)
+    y_max: float = Field(default=1.0, ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def ordered(self) -> "AnalysisRegion":
+        if self.x_min >= self.x_max:
+            raise ValueError("analysis region x_min must be below x_max")
+        if self.y_min >= self.y_max:
+            raise ValueError("analysis region y_min must be below y_max")
+        return self
+
+
+class DancerAnalysisConfig(BaseModel):
+    """Configurable controls for Single, Couple, and Auto opening-window analysis."""
+
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    default_dancer_mode: Literal["auto", "single", "couple"] = "auto"
+    auto_detection_window_s: float = Field(default=10.0, gt=0.0)
+    primary_coverage_min: float = Field(default=0.60, gt=0.0, le=1.0)
+    primary_duration_min_s: float = Field(default=2.0, gt=0.0)
+    second_joint_coverage_min: float = Field(default=0.45, gt=0.0, le=1.0)
+    second_sustained_min_s: float = Field(default=1.5, gt=0.0)
+    brief_second_max_s: float = Field(default=0.5, ge=0.0)
+    together_min_s: float = Field(default=0.4, gt=0.0)
+    together_max_hip_separation_torso_lengths: float = Field(default=2.0, gt=0.0)
+    together_direction_cosine_min: float = Field(default=0.5, ge=-1.0, le=1.0)
+    identity_max_innovation_torso_lengths: float = Field(default=0.75, gt=0.0)
+    identity_margin_torso_lengths: float = Field(default=0.15, ge=0.0)
+    max_observation_gap_s: float = Field(default=0.20, gt=0.0)
+    display_interpolation_max_gap_s: float = Field(default=0.13, ge=0.0)
+    velocity_filter_window_s: float = Field(default=0.15, gt=0.0)
+    persistence_s: float = Field(default=0.15, gt=0.0)
+    pairing_window_s: float = Field(default=0.50, gt=0.0)
+    start_speed: float = Field(default=0.20, gt=0.0)
+    stop_speed: float = Field(default=0.10, ge=0.0)
+    slowing_fraction: float = Field(default=0.25, gt=0.0, lt=1.0)
+    transition_min_coverage: float = Field(default=0.75, gt=0.0, le=1.0)
+    secondary_speed_rise: float = Field(default=0.12, gt=0.0)
+    calibration_smoothing_s: float = Field(default=0.25, gt=0.0)
+    calibration_entry_duration_s: float = Field(default=1.5, gt=0.0)
+    calibration_clear_duration_s: float = Field(default=0.75, gt=0.0)
+    axis_smoothing_s: float = Field(default=0.25, ge=0.0)
+    overlay_smoothing_s: float = Field(default=0.20, ge=0.0)
+    axis_bridge_max_gap_s: float = Field(default=0.25, ge=0.0)
+    overlay_min_landmark_visibility: float = Field(default=0.50, ge=0.0, le=1.0)
+    duplicate_pose_max_distance_torso_lengths: float = Field(default=0.18, gt=0.0)
+    fixed_scale_min_ratio: float = Field(default=0.45, gt=0.0, lt=1.0)
+    fixed_scale_max_ratio: float = Field(default=2.20, gt=1.0)
+    shot_cut_max_frame_gap_s: float = Field(default=1.50, gt=0.0)
+    shot_cut_jump_torso_lengths: float = Field(default=1.50, gt=0.0)
+    turn_exit_match_window_s: float = Field(default=3.00, gt=0.0)
+    close_embrace_max_tilt_deg: float = Field(default=25.0, gt=0.0, le=90.0)
+    analyze_soundtrack: bool = False
+    auto_turn_suggestions: bool = False
+
+    @model_validator(mode="after")
+    def validated_thresholds(self) -> "DancerAnalysisConfig":
+        if self.brief_second_max_s >= self.second_sustained_min_s:
+            raise ValueError("brief_second_max_s must be below second_sustained_min_s")
+        if self.stop_speed >= self.start_speed:
+            raise ValueError("stop_speed must be below start_speed")
+        if self.fixed_scale_min_ratio >= self.fixed_scale_max_ratio:
+            raise ValueError("fixed_scale_min_ratio must be below fixed_scale_max_ratio")
+        return self
+
+
+class SoloCameraCalibrationConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    speak_instructions: bool = True
+    stable_time_s: float = Field(default=0.75, gt=0.0)
+    settle_drift_torso_lengths: float = Field(default=0.05, gt=0.0)
+    hold_window_s: float = Field(default=2.5, gt=0.0)
+    min_usable_hold_s: float = Field(default=2.0, gt=0.0)
+    max_usable_gap_s: float = Field(default=0.20, gt=0.0)
+    front_view_width_margin: float = Field(default=0.10, ge=0.0)
+    retry_hint_delay_s: float = Field(default=8.0, gt=0.0)
+    camera_stall_timeout_s: float = Field(default=3.0, gt=0.0)
+    walking_take_limit_s: float = Field(default=8.0, gt=0.0)
+
+    @model_validator(mode="after")
+    def validated_timings(self) -> "SoloCameraCalibrationConfig":
+        if self.min_usable_hold_s > self.hold_window_s:
+            raise ValueError("min_usable_hold_s must not exceed hold_window_s")
+        if self.min_usable_hold_s > self.walking_take_limit_s:
+            raise ValueError("min_usable_hold_s must not exceed walking_take_limit_s")
+        if self.max_usable_gap_s >= self.hold_window_s:
+            raise ValueError("max_usable_gap_s must be smaller than hold_window_s")
+        return self
+
+
 class Config(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
     camera: int = Field(default=0, ge=0)
     width: int = Field(default=640, gt=0)
     height: int = Field(default=480, gt=0)
     model_path: str = "models/pose_landmarker_lite.task"
+    analysis_model: Literal["lite", "full", "heavy"] = "lite"
     data_dir: str = "data"
     side: Literal["left", "right"] = "left"
     facing: Literal["left", "right"] = "right"
@@ -34,9 +147,13 @@ class Config(BaseModel):
     min_torso: float = Field(default=0.12, gt=0)
     min_head: float = Field(default=0.04, gt=0)
     max_view_width: float = Field(default=0.45, gt=0)
+    calibration_suggest_lower_pct: float = Field(default=10.0, ge=0.0, lt=100.0)
+    calibration_suggest_upper_pct: float = Field(default=90.0, gt=0.0, le=100.0)
+    calibration_min_usable_samples: int = Field(default=2, ge=2)
     view_change_tolerance: float = Field(default=0.15, gt=0)
     smoothing: float = Field(default=0.25, gt=0)
     overlay_smoothing: float = Field(default=0.20, ge=0)
+    min_filter_time_constant: float = Field(default=0.0001, gt=0.0)
     entry_duration: float = Field(default=1.5, gt=0)
     clear_duration: float = Field(default=0.75, gt=0)
     max_gap: float = Field(default=0.5, gt=0)
@@ -59,11 +176,31 @@ class Config(BaseModel):
     shoulder_tension_duration: float = Field(default=1.0, gt=0)
     shoulder_raise_threshold: float = Field(default=10.0, gt=0)
     shoulder_neutral_clearance: float = Field(default=1.05, gt=0)
+    shoulder_visibility_floor: float = Field(default=0.50, ge=0.0, le=1.0)
+    shoulder_ear_hip_scale_factor: float = Field(default=0.26, gt=0.0)
+    shoulder_min_ear_hip_px: float = Field(default=20.0, gt=0.0)
+    shoulder_nose_ear_scale_factor: float = Field(default=0.68, gt=0.0)
+    shoulder_ear_ear_scale_factor: float = Field(default=0.65, gt=0.0)
+    shoulder_width_scale_factor: float = Field(default=0.28, gt=0.0)
+    shoulder_min_ref_scale_px: float = Field(default=8.0, gt=0.0)
+    shoulder_baseline_clamp_floor: float = Field(default=0.20, gt=0.0)
+    shoulder_adaptive_max_samples: int = Field(default=600, ge=1)
+    shoulder_adaptive_min_samples: int = Field(default=15, ge=1)
+    shoulder_adaptive_min_clearance: float = Field(default=0.65, gt=0.0)
+    shoulder_adaptive_max_clearance: float = Field(default=1.50, gt=0.0)
+    shoulder_adaptive_percentile: float = Field(default=75.0, gt=0.0, le=100.0)
+    shoulder_recovery_min_pct: float = Field(default=4.0, ge=0.0)
+    shoulder_recovery_ratio: float = Field(default=0.65, gt=0.0, le=1.0)
     allow_all_angles: bool = False
     embrace_closed_threshold: float = Field(default=0.72, gt=0, le=1.0)
     embrace_hysteresis_seconds: float = Field(default=1.0, ge=0)
     closed_embrace_min_knee_bend: float = Field(default=8.0, ge=0)
     knee_straight_duration: float = Field(default=1.0, gt=0)
+    knee_recovery_margin: float = Field(default=2.5, ge=0.0)
+    knee_visibility_floor: float = Field(default=0.35, ge=0.0, le=1.0)
+    knee_min_segment_px: float = Field(default=10.0, gt=0.0)
+    knee_tiebreak_other_max_vis: float = Field(default=0.60, ge=0.0, le=1.0)
+    knee_tiebreak_min_advantage: float = Field(default=0.15, ge=0.0, le=1.0)
     slow_tango_max_bpm: float = Field(default=115.0, gt=0, le=240)
     ankle_high_lift_ratio: float = Field(default=0.06, gt=0, le=1.0)
     max_consecutive_high_ankle_steps: int = Field(default=2, ge=1)
@@ -72,9 +209,24 @@ class Config(BaseModel):
     axis_curve_duration: float = Field(default=1.5, gt=0)
     axis_curve_clear_duration: float = Field(default=0.75, gt=0)
     axis_neutral_offset: float = Field(default=0.0)
+    # Accept older TOML files; neither replay flag has a runtime consumer.
     replay_audio: bool = False
     replay_auto_analyse_movement: bool = True
     replay_step_history_seconds: float = Field(default=5.0, ge=0.5, le=30.0)
+    replay_joint_interpolation: Literal["linear", "quadratic"] = "linear"
+    replay_joint_max_gap: float = Field(default=3.0, ge=0)
+    replay_recovery_auto: bool = False
+    replay_recovery_max_gap_s: float = Field(default=0.75, ge=0.05, le=2.00)
+    replay_recovery_context_s: float = Field(default=0.50, ge=0.10, le=2.00)
+    replay_pivot_interpolation_max_gap_s: float = Field(default=0.20, ge=0.0, le=1.00)
+    replay_show_recovered_joints: bool = True
+    replay_recovery_budget_s: float = Field(default=12.0, ge=1.0, le=60.0)
+    calibration_defaults: dict[str, RangeDefault] = Field(default_factory=dict)
+    measurement_normalization: MeasurementNormalizationConfig = Field(
+        default_factory=MeasurementNormalizationConfig
+    )
+    dancer_analysis: DancerAnalysisConfig = Field(default_factory=DancerAnalysisConfig)
+    solo_camera: SoloCameraCalibrationConfig = Field(default_factory=SoloCameraCalibrationConfig)
     ollama_base_url: str = "http://127.0.0.1:11434"
     ollama_model: str = Field(default="llama3.2", min_length=1)
     ollama_timeout: float = Field(default=120.0, gt=0, le=1800)
@@ -92,8 +244,20 @@ class Config(BaseModel):
 
     @model_validator(mode="after")
     def durations(self) -> "Config":
+        if self.calibration_defaults:
+            from .calibration.models import METRIC_DETAILS
+
+            for key, target in self.calibration_defaults.items():
+                if key not in METRIC_DETAILS or target.unit != METRIC_DETAILS[key][2]:
+                    raise ValueError(f"Unknown default metric or incompatible unit: {key}")
         if self.calibration_valid_duration > self.calibration_duration:
             raise ValueError("valid calibration duration exceeds capture window")
+        if self.calibration_suggest_lower_pct >= self.calibration_suggest_upper_pct:
+            raise ValueError("calibration_suggest_lower_pct must be below calibration_suggest_upper_pct")
+        if self.shoulder_adaptive_min_samples > self.shoulder_adaptive_max_samples:
+            raise ValueError("shoulder_adaptive_min_samples must not exceed shoulder_adaptive_max_samples")
+        if self.shoulder_adaptive_min_clearance >= self.shoulder_adaptive_max_clearance:
+            raise ValueError("shoulder_adaptive_min_clearance must be below shoulder_adaptive_max_clearance")
         if self.axis_curve is not None:
             if "axis_curve_entry" not in self.model_fields_set:
                 self.axis_curve_entry = self.axis_curve.entry
@@ -113,84 +277,27 @@ def parse_bool(value: str) -> bool:
 
 
 SETTING_GROUPS = {
-    "Camera & view": (
-        "camera",
-        "width",
-        "height",
-        "side",
-        "facing",
-        "capture_profile",
-        "mirror",
-        "allow_all_angles",
+    "Common · Files / Models": ("model_path", "analysis_model", "data_dir"),
+    "Common · Scene Routing": (
+        "dancer_analysis.default_dancer_mode",
+        "dancer_analysis.auto_detection_window_s",
+        "dancer_analysis.primary_coverage_min",
+        "dancer_analysis.primary_duration_min_s",
+        "dancer_analysis.second_joint_coverage_min",
+        "dancer_analysis.second_sustained_min_s",
+        "dancer_analysis.brief_second_max_s",
+        "dancer_analysis.together_min_s",
+        "dancer_analysis.together_max_hip_separation_torso_lengths",
+        "dancer_analysis.together_direction_cosine_min",
     ),
-    "Files": ("model_path", "data_dir"),
-    "Quality & calibration": (
+    "Common · Detection / Music": (
         "confidence",
-        "min_torso",
-        "min_head",
-        "max_view_width",
-        "view_change_tolerance",
-        "calibration_duration",
-        "calibration_valid_duration",
-        "calibration_samples",
-        "offset_mad",
-        "angle_mad",
-    ),
-    "Tracking": (
-        "smoothing",
-        "overlay_smoothing",
-        "entry_duration",
-        "clear_duration",
         "max_gap",
-        "head_forward.entry",
-        "head_forward.clear",
-        "head_inclination.entry",
-        "head_inclination.clear",
-        "trunk_inclination.entry",
-        "trunk_inclination.clear",
-    ),
-    "Head & shoulders": (
-        "head_neutral_offset",
-        "head_down_duration",
-        "head_down_angle",
-        "shoulder_tension_duration",
-        "shoulder_raise_threshold",
-        "shoulder_neutral_clearance",
-    ),
-    "Embrace & knees": (
-        "role_assign_ms",
-        "role_hold_ms",
-        "embrace_closed_threshold",
-        "embrace_hysteresis_seconds",
-        "closed_embrace_min_knee_bend",
-        "knee_straight_duration",
-    ),
-    "Torso & hip offset": (
-        "axis_curve_entry",
-        "axis_curve_clear",
-        "axis_curve_duration",
-        "axis_curve_clear_duration",
-        "axis_neutral_offset",
-    ),
-    "Slow tango": (
-        "slow_tango_max_bpm",
-        "ankle_high_lift_ratio",
-        "max_consecutive_high_ankle_steps",
-    ),
-    "Music": (
-        "beat_tracking",
+        "overlay_smoothing",
         "tango_bpm",
-        "beat_analysis_seconds",
-        "auto_record_start_delay",
-        "auto_record_stop_delay",
-        "max_recordings",
+        "dancer_analysis.analyze_soundtrack",
     ),
-    "Replay movement": (
-        "replay_auto_analyse_movement",
-        "replay_step_history_seconds",
-    ),
-    "Review & Ollama": (
-        "replay_audio",
+    "Common · Review / Ollama": (
         "ollama_base_url",
         "ollama_model",
         "ollama_timeout",
@@ -200,13 +307,170 @@ SETTING_GROUPS = {
         "ollama_max_report_chars",
         "ollama_instruction",
     ),
+    "Single · Camera / View": (
+        "side",
+        "facing",
+        "capture_profile",
+        "allow_all_angles",
+    ),
+    "Single · Quality / Calibration": (
+        "min_torso",
+        "min_head",
+        "max_view_width",
+        "calibration_suggest_lower_pct",
+        "calibration_suggest_upper_pct",
+        "calibration_min_usable_samples",
+    ),
+    "Single · Temporal / Smoothing": (
+        "smoothing",
+        "min_filter_time_constant",
+        "entry_duration",
+        "clear_duration",
+    ),
+    "Single · Head / Shoulders": (
+        "head_neutral_offset",
+        "head_down_duration",
+        "head_down_angle",
+        "shoulder_tension_duration",
+        "shoulder_raise_threshold",
+        "shoulder_neutral_clearance",
+        "shoulder_visibility_floor",
+        "shoulder_ear_hip_scale_factor",
+        "shoulder_min_ear_hip_px",
+        "shoulder_nose_ear_scale_factor",
+        "shoulder_ear_ear_scale_factor",
+        "shoulder_width_scale_factor",
+        "shoulder_min_ref_scale_px",
+        "shoulder_baseline_clamp_floor",
+        "shoulder_adaptive_max_samples",
+        "shoulder_adaptive_min_samples",
+        "shoulder_adaptive_min_clearance",
+        "shoulder_adaptive_max_clearance",
+        "shoulder_adaptive_percentile",
+        "shoulder_recovery_min_pct",
+        "shoulder_recovery_ratio",
+    ),
+    "Single · Embrace / Knees": (
+        "role_assign_ms",
+        "role_hold_ms",
+        "embrace_closed_threshold",
+        "embrace_hysteresis_seconds",
+        "closed_embrace_min_knee_bend",
+        "knee_straight_duration",
+        "knee_recovery_margin",
+        "knee_visibility_floor",
+        "knee_min_segment_px",
+        "knee_tiebreak_other_max_vis",
+        "knee_tiebreak_min_advantage",
+    ),
+    "Single · Torso / Footwork": (
+        "axis_curve_entry",
+        "axis_curve_clear",
+        "axis_curve_duration",
+        "axis_curve_clear_duration",
+        "axis_neutral_offset",
+        "slow_tango_max_bpm",
+        "ankle_high_lift_ratio",
+        "max_consecutive_high_ankle_steps",
+    ),
+    "Single · Replay / Recovery": (
+        "replay_step_history_seconds",
+        "replay_joint_interpolation",
+        "replay_joint_max_gap",
+        "replay_recovery_auto",
+        "replay_recovery_max_gap_s",
+        "replay_recovery_context_s",
+        "replay_pivot_interpolation_max_gap_s",
+        "replay_show_recovered_joints",
+        "replay_recovery_budget_s",
+    ),
+    "Couple · Tracking / Interpolation": (
+        "dancer_analysis.identity_max_innovation_torso_lengths",
+        "dancer_analysis.identity_margin_torso_lengths",
+        "dancer_analysis.max_observation_gap_s",
+        "dancer_analysis.display_interpolation_max_gap_s",
+        "dancer_analysis.duplicate_pose_max_distance_torso_lengths",
+        "dancer_analysis.fixed_scale_min_ratio",
+        "dancer_analysis.fixed_scale_max_ratio",
+        "dancer_analysis.shot_cut_max_frame_gap_s",
+        "dancer_analysis.shot_cut_jump_torso_lengths",
+        "dancer_analysis.close_embrace_max_tilt_deg",
+    ),
+    "Couple · Temporal / Smoothing": (
+        "dancer_analysis.calibration_smoothing_s",
+        "dancer_analysis.calibration_entry_duration_s",
+        "dancer_analysis.calibration_clear_duration_s",
+    ),
+    "Couple · Axes / Coordination": (
+        "dancer_analysis.axis_smoothing_s",
+        "dancer_analysis.overlay_smoothing_s",
+        "dancer_analysis.axis_bridge_max_gap_s",
+        "dancer_analysis.overlay_min_landmark_visibility",
+        "dancer_analysis.velocity_filter_window_s",
+        "dancer_analysis.persistence_s",
+        "dancer_analysis.pairing_window_s",
+        "dancer_analysis.start_speed",
+        "dancer_analysis.stop_speed",
+        "dancer_analysis.slowing_fraction",
+        "dancer_analysis.transition_min_coverage",
+        "dancer_analysis.secondary_speed_rise",
+        "dancer_analysis.turn_exit_match_window_s",
+        "dancer_analysis.auto_turn_suggestions",
+    ),
+    "Calibration · Solo camera": (
+        "solo_camera.speak_instructions",
+        "solo_camera.stable_time_s",
+        "solo_camera.settle_drift_torso_lengths",
+        "solo_camera.hold_window_s",
+        "solo_camera.min_usable_hold_s",
+        "solo_camera.max_usable_gap_s",
+        "solo_camera.front_view_width_margin",
+        "solo_camera.retry_hint_delay_s",
+        "solo_camera.camera_stall_timeout_s",
+        "solo_camera.walking_take_limit_s",
+    ),
+}
+
+SETTING_ENGINE_SCOPES: dict[str, tuple[str, ...]] = {
+    "Common (Both Engines)": (
+        "Common · Files / Models",
+        "Common · Scene Routing",
+        "Common · Detection / Music",
+        "Common · Review / Ollama",
+    ),
+    "Single Dancer Engine": (
+        "Single · Camera / View",
+        "Single · Quality / Calibration",
+        "Calibration · Solo camera",
+        "Single · Temporal / Smoothing",
+        "Single · Head / Shoulders",
+        "Single · Embrace / Knees",
+        "Single · Torso / Footwork",
+        "Single · Replay / Recovery",
+        "Measurement normalization",
+        "Calibration defaults",
+    ),
+    "Couple Dancer Engine": (
+        "Couple · Tracking / Interpolation",
+        "Couple · Axes / Coordination",
+        "Couple · Temporal / Smoothing",
+    ),
 }
 
 SETTING_MAP: dict[str, tuple[str, Callable]] = {}
 
 
 def _setting_parser(field: str) -> Callable:
-    kind = float if "." in field else Config.model_fields[field].annotation
+    if "." in field:
+        root, sub = field.split(".", 1)
+        if root == "dancer_analysis":
+            kind = DancerAnalysisConfig.model_fields[sub].annotation
+        elif root == "solo_camera":
+            kind = SoloCameraCalibrationConfig.model_fields[sub].annotation
+        else:
+            kind = float
+    else:
+        kind = Config.model_fields[field].annotation
     if kind is bool:
         return parse_bool
     if kind is int:
@@ -219,6 +483,232 @@ def _setting_parser(field: str) -> Callable:
 for _fields in SETTING_GROUPS.values():
     for _field in _fields:
         SETTING_MAP[_field] = (_field, _setting_parser(_field))
+
+SETTING_DESCRIPTIONS: dict[str, str] = {
+    "dancer_analysis.calibration_smoothing_s": "Smoothing time constant in seconds for couple charts compared with approved calibration ranges.",
+    "dancer_analysis.calibration_entry_duration_s": "Seconds outside an approved couple range before a pending deviation becomes an alert.",
+    "dancer_analysis.calibration_clear_duration_s": "Seconds back inside an approved couple range before an alert clears.",
+
+    "side": "Anatomical side selected for side-view measurements.",
+    "facing": "Direction faced in the original, unmirrored image.",
+    "capture_profile": "Name identifying the camera and capture setup.",
+    "allow_all_angles": "Enables the experimental measurement path for additional view angles.",
+    "model_path": "Location of the pinned Lite model used when offline analysis selects Lite.",
+    "analysis_model": (
+        "Offline analysis model: lite (default), full, or heavy. "
+        "Missing models download when analysis starts; live coaching remains Lite."
+    ),
+    "data_dir": "Directory for the local database and practice artifacts.",
+    "confidence": "Minimum landmark confidence used by quality checks.",
+    "min_torso": "Minimum visible torso length as a fraction of image height.",
+    "min_head": "Minimum visible shoulder-to-ear segment as a fraction of image height.",
+    "max_view_width": "Maximum body-width-to-torso ratio accepted for a side view.",
+    "calibration_suggest_lower_pct": "Lower percentile used by the calibration editor's middle-range suggestion.",
+    "calibration_suggest_upper_pct": "Upper percentile used by the calibration editor's middle-range suggestion.",
+    "calibration_min_usable_samples": "Minimum usable frames required to summarize and approve a calibration passage.",
+    "smoothing": "Time constant for smoothing measurements over time.",
+    "overlay_smoothing": "Smoothing time constant for rendered landmark lines and segments.",
+    "min_filter_time_constant": "Minimum filter time constant floor (seconds) for descriptive knee/shoulder smoothing.",
+    "entry_duration": "Time a threshold must be crossed before confirming a deviation.",
+    "clear_duration": "Time a value must remain below its clear threshold before closing an event.",
+    "max_gap": "Maximum observation gap treated as continuous tracking.",
+    "head_neutral_offset": "Offset used by the separate ear-to-nose horizontal-angle cue.",
+    "head_down_duration": "Duration required before showing the head-angle warning.",
+    "head_down_angle": "Ear-to-nose image-angle boundary for that warning.",
+    "shoulder_tension_duration": "Duration required before showing the shoulder cue.",
+    "shoulder_raise_threshold": "Shoulder-elevation threshold above the relaxed baseline.",
+    "shoulder_neutral_clearance": "Fallback clearance used when no captured shoulder baseline is available.",
+    "shoulder_visibility_floor": "Helper landmark visibility floor checked in shoulder clearance geometry.",
+    "shoulder_ear_hip_scale_factor": "Primary anatomical scale multiplier applied to vertical ear-to-hip separation.",
+    "shoulder_min_ear_hip_px": "Minimum vertical ear-to-hip pixel separation required for the primary scale candidate.",
+    "shoulder_nose_ear_scale_factor": "Fallback scale multiplier applied to 2D nose-to-ear pixel distance.",
+    "shoulder_ear_ear_scale_factor": "Fallback scale multiplier applied to horizontal ear-to-ear pixel distance.",
+    "shoulder_width_scale_factor": "Fallback scale multiplier applied to horizontal shoulder-to-shoulder pixel distance.",
+    "shoulder_min_ref_scale_px": "Minimum shoulder reference scale S in pixels; smaller values mark clearance unavailable.",
+    "shoulder_baseline_clamp_floor": "Minimum floor for effective neutral shoulder clearance B in fallback elevation percentages.",
+    "shoulder_adaptive_max_samples": "Maximum qualifying relaxed-clearance samples collected for the adaptive shoulder baseline window.",
+    "shoulder_adaptive_min_samples": "Minimum qualifying samples required before the adaptive shoulder baseline takes effect.",
+    "shoulder_adaptive_min_clearance": "Lower raw clearance ratio bound for samples admitted into the adaptive baseline window.",
+    "shoulder_adaptive_max_clearance": "Upper raw clearance ratio bound for samples admitted into the adaptive baseline window.",
+    "shoulder_adaptive_percentile": "Percentile of adaptive baseline samples compared against the starting neutral clearance.",
+    "shoulder_recovery_min_pct": "Minimum percentage floor for the fallback shoulder tension recovery hysteresis boundary.",
+    "shoulder_recovery_ratio": "Fraction of shoulder_raise_threshold used for the fallback shoulder recovery boundary.",
+    "role_assign_ms": "Time an arm pattern must persist before assigning a role label.",
+    "role_hold_ms": "Time to retain a role label after the pattern disappears.",
+    "embrace_closed_threshold": "Boundary for the heuristic open/closed embrace label.",
+    "embrace_hysteresis_seconds": "Hysteresis duration used to stabilize embrace classification.",
+    "closed_embrace_min_knee_bend": "Minimum knee flexion used by the straight-knee cue in closed embrace.",
+    "knee_straight_duration": "Duration required before showing the knee cue.",
+    "knee_recovery_margin": "Degrees above closed_embrace_min_knee_bend required for fallback knee recovery hysteresis.",
+    "knee_visibility_floor": "Helper landmark visibility floor checked for hip, knee, and ankle in knee flexion geometry.",
+    "knee_min_segment_px": "Minimum pixel length required for both hip-to-knee and ankle-to-knee leg segments.",
+    "knee_tiebreak_other_max_vis": "Other-leg visibility ceiling below which the preferred-side knee tie-break can trigger.",
+    "knee_tiebreak_min_advantage": "Minimum visibility advantage required for the preferred leg to win the knee tie-break.",
+    "axis_curve_entry": "Posterior hip offset that starts a pending axis event.",
+    "axis_curve_clear": "Lower offset at which a confirmed axis event can clear.",
+    "axis_curve_duration": "Time above the entry threshold required to confirm an axis event.",
+    "axis_curve_clear_duration": "Time below the clear threshold required to close an axis event.",
+    "axis_neutral_offset": "Fallback neutral offset when no captured reference is available.",
+    "slow_tango_max_bpm": "Tempo ceiling for the slow-tango ankle-lift cue.",
+    "ankle_high_lift_ratio": "Ankle lift threshold relative to estimated leg length.",
+    "max_consecutive_high_ankle_steps": "Consecutive high-lift steps required to trigger the cue.",
+    "tango_bpm": (
+        "Fallback tempo when analysis has no soundtrack BPM. "
+        "Compared with the separate slow-tango ceiling for the ankle-lift cue."
+    ),
+    "replay_step_history_seconds": (
+        "Replay media-time window (0.5 to 30 seconds) over which observed step footprints fade out."
+    ),
+    "replay_joint_interpolation": (
+        "Display-only Review joint gap filling: linear by default, or quadratic with a linear fallback. "
+        "Raw calibration/scoring evidence is unchanged."
+    ),
+    "replay_joint_max_gap": (
+        "Maximum bracketed joint gap filled in Review, in seconds; default 3.0, and 0 disables filling. "
+        "Not the measurement tracking gap limit."
+    ),
+    "replay_recovery_auto": (
+        "Run display-only backward pose recovery automatically on short lower-limb dropouts during analysis."
+    ),
+    "replay_recovery_max_gap_s": (
+        "Maximum lower-limb dropout duration in seconds eligible for backward tracking recovery."
+    ),
+    "replay_recovery_context_s": (
+        "Seconds of context included before and after each gap window for backward pose recovery."
+    ),
+    "replay_pivot_interpolation_max_gap_s": (
+        "Maximum leg-joint interpolation gap in seconds allowed during a pivot when forward and backward passes miss."
+    ),
+    "replay_show_recovered_joints": (
+        "Display recovered backward-pass and interpolated joints on Review skeletons without changing measurements."
+    ),
+    "replay_recovery_budget_s": (
+        "Maximum cumulative window seconds recovered automatically per clip."
+    ),
+    "dancer_analysis.default_dancer_mode": (
+        "Default dancer mode for new runs: auto (detect from opening window), single, or couple."
+    ),
+    "dancer_analysis.auto_detection_window_s": (
+        "Duration in seconds from clip_in inspected when resolving Auto dancer mode."
+    ),
+    "dancer_analysis.primary_coverage_min": (
+        "Minimum fraction of the opening window with eligible observations for the primary subject."
+    ),
+    "dancer_analysis.primary_duration_min_s": (
+        "Minimum eligible primary-subject seconds required in the opening window."
+    ),
+    "dancer_analysis.second_joint_coverage_min": (
+        "Minimum fraction of the opening window where both tracked dancers are jointly eligible for Couple."
+    ),
+    "dancer_analysis.second_sustained_min_s": (
+        "Minimum continuous paired tracking span (seconds) required to qualify as a Couple in Auto mode."
+    ),
+    "dancer_analysis.brief_second_max_s": (
+        "Maximum total second-person coexistence (seconds) still accepted as Single in Auto mode."
+    ),
+    "dancer_analysis.together_min_s": (
+        "Minimum co-movement span (seconds) where both tracked dancers move coherently in the same region."
+    ),
+    "dancer_analysis.together_max_hip_separation_torso_lengths": (
+        "Maximum inter-dancer hip midpoint distance in pair torso lengths for co-movement qualification."
+    ),
+    "dancer_analysis.together_direction_cosine_min": (
+        "Minimum cosine similarity of hip velocities required for two dancers to qualify as moving together."
+    ),
+    "dancer_analysis.identity_max_innovation_torso_lengths": (
+        "Gating distance ceiling in torso lengths between predicted and observed hip midpoints per step."
+    ),
+    "dancer_analysis.identity_margin_torso_lengths": (
+        "Minimum cost margin in torso lengths required over the second-best A/B assignment; otherwise unknown."
+    ),
+    "dancer_analysis.max_observation_gap_s": (
+        "Maximum observation gap in seconds before continuous tracking spans and velocity windows break."
+    ),
+    "dancer_analysis.display_interpolation_max_gap_s": (
+        "Maximum per-track gap in seconds for linear display-only 2D drawing interpolation."
+    ),
+    "dancer_analysis.velocity_filter_window_s": (
+        "Half-window in seconds for centred linear-regression travel velocity estimation."
+    ),
+    "dancer_analysis.persistence_s": (
+        "Minimum duration in seconds a start, slowing, or settled speed condition must persist."
+    ),
+    "dancer_analysis.pairing_window_s": (
+        "Maximum interval in seconds for pairing Dancer A and Dancer B coordination events in the same phase."
+    ),
+    "dancer_analysis.start_speed": (
+        "Travel speed threshold in normalized torso lengths per second for start or restart onset."
+    ),
+    "dancer_analysis.stop_speed": (
+        "Travel speed ceiling in normalized torso lengths per second below which a dancer is settled."
+    ),
+    "dancer_analysis.slowing_fraction": (
+        "Fractional speed drop from steady-phase median required to trigger a slowing event."
+    ),
+    "dancer_analysis.transition_min_coverage": (
+        "Minimum measured pair coverage required in a transition window to summarize smoothness."
+    ),
+    "dancer_analysis.secondary_speed_rise": (
+        "Minimum rebound speed rise in pair torso lengths per second during slowing to count a secondary peak."
+    ),
+    "dancer_analysis.axis_smoothing_s": (
+        "Zero-phase EMA smoothing time constant (seconds) for Couple Torso Axis charts in Analytics."
+    ),
+    "dancer_analysis.overlay_smoothing_s": (
+        "Zero-phase EMA smoothing time constant (seconds) for Couple torso/midpoint axis video overlays."
+    ),
+    "dancer_analysis.axis_bridge_max_gap_s": (
+        "Maximum dropout gap (seconds) linearly bridged across Couple axis curves and overlays for display."
+    ),
+    "dancer_analysis.overlay_min_landmark_visibility": (
+        "Minimum landmark visibility threshold required to draw Couple torso/ankle overlay markers."
+    ),
+    "dancer_analysis.duplicate_pose_max_distance_torso_lengths": (
+        "Maximum median joint separation (in torso lengths) below which a redundant pose detection is suppressed."
+    ),
+    "dancer_analysis.fixed_scale_min_ratio": (
+        "Minimum observed-to-fixed torso length ratio allowed for Couple torso measurement eligibility."
+    ),
+    "dancer_analysis.fixed_scale_max_ratio": (
+        "Maximum observed-to-fixed torso length ratio allowed for Couple torso measurement eligibility."
+    ),
+    "dancer_analysis.shot_cut_max_frame_gap_s": (
+        "Frame-to-frame time gap ceiling (seconds) above which Couple tracking inserts a shot-cut break."
+    ),
+    "dancer_analysis.shot_cut_jump_torso_lengths": (
+        "Minimum hip jump displacement (in torso lengths) that triggers a Couple tracking shot-cut break."
+    ),
+    "dancer_analysis.turn_exit_match_window_s": (
+        "Maximum time window (seconds) around turn end for pairing a Couple turn exit marker."
+    ),
+    "dancer_analysis.close_embrace_max_tilt_deg": (
+        "Maximum individual torso tilt (degrees) accepted when splitting a merged close-embrace detection."
+    ),
+    "dancer_analysis.analyze_soundtrack": (
+        "Extract optional soundtrack beat candidates for step timing alignment by default."
+    ),
+    "dancer_analysis.auto_turn_suggestions": (
+        "Generate optional estimated turn marker suggestions when supported by torso rotation cues."
+    ),
+    "ollama_base_url": "Address of the local or reachable Ollama server.",
+    "ollama_model": "Model name installed on that Ollama server.",
+    "ollama_timeout": "Maximum wait for a local model request.",
+    "ollama_temperature": "Controls response variation.",
+    "ollama_num_ctx": "Requested model context capacity in tokens.",
+    "ollama_num_predict": "Maximum generated response length in tokens.",
+    "ollama_max_report_chars": "Maximum report text sent for local analysis.",
+    "ollama_instruction": "Additional instruction accompanying a report.",
+    "solo_camera.speak_instructions": "Speak guided solo camera calibration instructions when speech synthesis is available.",
+    "solo_camera.stable_time_s": "Seconds the requested view and stable pose must be visible after the prompt before capture starts.",
+    "solo_camera.settle_drift_torso_lengths": "Maximum torso midpoint drift in torso lengths allowed during the settle window.",
+    "solo_camera.hold_window_s": "Maximum capture window in seconds for a standing calibration hold attempt.",
+    "solo_camera.min_usable_hold_s": "Minimum usable seconds per metric required to accept a calibration hold or walking pass.",
+    "solo_camera.max_usable_gap_s": "Maximum gap in seconds between adjacent usable observations (capped by max_gap).",
+    "solo_camera.front_view_width_margin": "Width margin in torso lengths above max_view_width required for front-view holds.",
+    "solo_camera.retry_hint_delay_s": "Seconds spent waiting for the requested view or pose before showing an actionable hint.",
+    "solo_camera.camera_stall_timeout_s": "Seconds without a new delivered camera frame before reporting a stalled camera.",
+    "solo_camera.walking_take_limit_s": "Maximum capture duration in seconds for a single solo walking pass.",
+}
 
 
 def set_setting(data: dict, key: str, value: str) -> None:
@@ -242,14 +732,43 @@ def setting_value(cfg: Config, field: str):
 
 
 def export_toml(cfg: Config) -> str:
-    data = cfg.model_dump(exclude={"axis_curve"})
-    lines = [
-        f"{key} = {json.dumps(value)}" for key, value in data.items() if not isinstance(value, dict)
-    ]
-    for key, value in data.items():
+    fields = {field.split(".")[0] for field in SETTING_MAP} | {
+        "calibration_defaults",
+        "measurement_normalization",
+    }
+    data = cfg.model_dump(include=fields, exclude_none=True)
+    lines: list[str] = []
+
+    def _strip_none(value: Any) -> Any:
         if isinstance(value, dict):
-            lines.extend(("", f"[{key}]"))
-            lines.extend(f"{name} = {json.dumps(number)}" for name, number in value.items())
+            return {k: _strip_none(v) for k, v in value.items() if v is not None}
+        if isinstance(value, list):
+            return [_strip_none(v) for v in value if v is not None]
+        return value
+
+    def _is_table_list(value: Any) -> bool:
+        return isinstance(value, list) and bool(value) and all(isinstance(item, dict) for item in value)
+
+    def _emit_table(values: dict[str, Any], path: tuple[str, ...] = ()) -> None:
+        scalars = {
+            key: value for key, value in values.items()
+            if not isinstance(value, dict) and not _is_table_list(value)
+        }
+        dicts = {key: value for key, value in values.items() if isinstance(value, dict)}
+        table_lists = {key: value for key, value in values.items() if _is_table_list(value)}
+        for key, value in scalars.items():
+            lines.append(f"{key} = {json.dumps(value)}")
+        for key, value in dicts.items():
+            child = (*path, key)
+            lines.extend(("", f"[{'.'.join(child)}]"))
+            _emit_table(value, child)
+        for key, items in table_lists.items():
+            child = (*path, key)
+            for item in items:
+                lines.extend(("", f"[[{'.'.join(child)}]]"))
+                _emit_table(item, child)
+
+    _emit_table(_strip_none(data))
     return "\n".join(lines) + "\n"
 
 
@@ -287,6 +806,17 @@ ENV_MAP: dict[str, tuple[str, Callable[[str], float | int | bool]]] = {
     "ANKLE_HIGH_LIFT_RATIO": ("ankle_high_lift_ratio", float),
     "MAX_CONSECUTIVE_HIGH_ANKLE_STEPS": ("max_consecutive_high_ankle_steps", int),
 }
+
+
+def startup_config_path(explicit: Path | None) -> Path | None:
+    if explicit is not None:
+        return explicit
+    candidates = [path for path in (Path("config.toml"), Path("settings.toml")) if path.exists()]
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+    return max(candidates, key=lambda path: path.stat().st_mtime_ns)
 
 
 def load(

@@ -22,9 +22,10 @@ NAMES = {
     "right_foot_index": 32,
 }
 CONNECTIONS = [
-    (f"{side}_{a}", f"{side}_{b}")
+    (f"{side}_{a}", b if b == "nose" else f"{side}_{b}")
     for side in ("left", "right")
     for a, b in (
+        ("ear", "nose"),
         ("ear", "shoulder"),
         ("shoulder", "hip"),
         ("shoulder", "elbow"),

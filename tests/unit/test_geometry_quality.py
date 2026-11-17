@@ -24,7 +24,33 @@ from tango_posture.geometry import (
     wrapped,
 )
 from tango_posture.metrics import measure
-from tango_posture.overlay import screen_point
+from tango_posture.overlay import draw, screen_point
+
+
+@pytest.mark.parametrize("settings_coaching", [False, True])
+def test_overlay_does_not_apply_settings_judgements_with_calibration(monkeypatch, settings_coaching):
+    observation = frame()
+    observation.poses[0]["left_knee"] = Landmark(
+        x=0.5, y=0.8, visibility=0.99, presence=0.99,
+    )
+    labels = []
+    monkeypatch.setattr(
+        "tango_posture.overlay.cv2.putText",
+        lambda image, text, *args, **kwargs: labels.append(text) or image,
+    )
+    draw(
+        np.zeros((480, 640, 3), np.uint8), observation, False, [],
+        "Head pitch: outside approved range" if not settings_coaching else "",
+        0.7, head_down_elapsed=10, shoulder_tension_elapsed=10, knee_straight_elapsed=10,
+        axis_curve_elapsed=10, settings_coaching=settings_coaching, show_footer=False,
+    )
+    legacy = [
+        label for label in labels
+        if label.startswith(("Head horiz", "Shoulders:", "LOWER", "BEND", "BAD HEAD", "HIP OFFSET"))
+    ]
+    assert bool(legacy) is settings_coaching
+    if not settings_coaching:
+        assert "Head pitch: outside approved range" in labels
 
 
 @pytest.mark.parametrize("side", ["left", "right"])
@@ -661,3 +687,54 @@ def test_tango_30s_phrase_start_analysis_and_audio_recording(tmp_path):
     saved = tracker.save_audio(wav_out)
     assert wav_out.is_file()
     assert len(saved) >= 1
+
+
+def test_configurable_knee_and_shoulder_geometry_parameters():
+    # Shoulder scale and visibility floor parameters alter computed clearance.
+    pose = {
+        "left_ear": Landmark(0.50, 0.20, 0.45, 0.99),
+        "left_shoulder": Landmark(0.50, 0.36, 0.99, 0.99),
+        "left_hip": Landmark(0.50, 0.80, 0.99, 0.99),
+        "nose": Landmark(0.58, 0.22, 0.99, 0.99),
+    }
+    assert shoulder_tension_alignment(pose, 640, 480, visibility_floor=0.50) is None
+    lower_vis = shoulder_tension_alignment(
+        pose, 640, 480, visibility_floor=0.40, ear_hip_scale_factor=0.26, min_ear_hip_px=20.0
+    )
+    custom_scale = shoulder_tension_alignment(
+        pose, 640, 480, visibility_floor=0.40, ear_hip_scale_factor=0.52, min_ear_hip_px=20.0
+    )
+    assert lower_vis is not None and custom_scale is not None
+    assert custom_scale[1] == pytest.approx(lower_vis[1] * 0.5)
+
+    # Knee visibility floor and tie-break parameters alter chosen bend.
+    knee_pose = {
+        "left_hip": Landmark(0.50, 0.62, 0.90, 0.99),
+        "left_knee": Landmark(0.55, 0.80, 0.90, 0.99),  # visibly bent
+        "left_ankle": Landmark(0.50, 0.98, 0.90, 0.99),
+        "right_hip": Landmark(0.50, 0.62, 0.55, 0.99),
+        "right_knee": Landmark(0.50, 0.80, 0.55, 0.99),  # straighter, lower vis 0.55
+        "right_ankle": Landmark(0.50, 0.98, 0.55, 0.99),
+    }
+    tie_res = knee_bend_alignment(
+        knee_pose,
+        640,
+        480,
+        side="left",
+        visibility_floor=0.35,
+        tiebreak_other_max_vis=0.60,
+        tiebreak_min_advantage=0.15,
+    )
+    min_res = knee_bend_alignment(
+        knee_pose,
+        640,
+        480,
+        side="left",
+        visibility_floor=0.35,
+        tiebreak_other_max_vis=0.50,
+        tiebreak_min_advantage=0.15,
+    )
+    assert tie_res is not None and min_res is not None
+    assert tie_res[0] > 10.0
+    assert min_res[0] == pytest.approx(0.0, abs=0.5)
+    assert knee_bend_alignment(knee_pose, 640, 480, side="left", min_segment_px=500.0) is None

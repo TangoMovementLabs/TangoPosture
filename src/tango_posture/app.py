@@ -26,7 +26,9 @@ from .archive import (
     save_calibration_archive,
 )
 from .beat import BeatTracker
-from .calibration import calibrate, compatible, profile, save_calibration_file
+from .calibration.baseline import calibrate, compatible, profile, save_calibration_file
+from .calibration.measurements import measure_profile, measure_targets
+from .calibration.models import profile_from_calibration
 from .capture import Capture
 from .config import Config
 from .display import PracticeDisplay
@@ -42,7 +44,9 @@ from .geometry import (
     detect_role,
     head_horizontal_alignment,
     knee_bend_alignment,
+    knee_geometry_kwargs,
     pixel,
+    shoulder_geometry_kwargs,
     shoulder_tension_alignment,
 )
 from .metrics import measure
@@ -50,9 +54,11 @@ from .models import verify
 from .movement import render_floor_guide
 from .overlay import MESSAGES, draw
 from .pose.mediapipe_backend import MediaPipeEstimator
+from .references.coach import range_feedback, target_feedback
 from .reports import write_markdown_report
 from .session import Session
 from .storage import Storage
+from .temporal import Evaluator
 
 GUIDANCE = (
     "Fixed, level camera; whole body in frame; adequate light; uncluttered background.\n"
@@ -117,6 +123,11 @@ class Application:
     ):
         self.cfg, self.storage, self.video, self.headless = cfg, storage, video, headless
         self.reference, self.interval, self.name, self.review = reference, interval, name, review
+        self.range_profile = profile_from_calibration(reference) if reference else None
+        self.default_evaluators = {
+            key: Evaluator(key, 0, cfg, bounds=(target.lower, target.upper))
+            for key, target in cfg.calibration_defaults.items()
+        }
         self.estimator = estimator
         self.capture = capture
         self.display = display
@@ -218,6 +229,14 @@ class Application:
         if self.reference is None:
             self.notice = "Record and accept a reference first (C)"
             return
+        if self.range_profile is not None and not any(
+            target.camera_check_passed for target in self.range_profile.metrics.values()
+        ):
+            message = "Comparison only: complete the guided camera check before scoring"
+            if self.headless:
+                raise ValueError(message)
+            self.notice = message
+            return
         self.session = Session(
             self.reference,
             self.cfg,
@@ -270,7 +289,12 @@ class Application:
             print(f"Exports: {output}")
             self.notice = f"Saved {status}; active {summary['active_duration']:.1f}s. Exports printed in terminal."
             self.state = "FINISHED"
-        if self.frame_log and not self.report_written and not self.calibration_only:
+        if (
+            self.frame_log
+            and not self.report_written
+            and not self.calibration_only
+            and not self.recording
+        ):
             report_dir = (
                 self.workspace_path
                 if self.workspace_path is not None
@@ -324,6 +348,21 @@ class Application:
                     self.record_video,
                     self.record_overlay,
                     [float(row["timestamp"]) for row in self.frame_log],
+                    analytics={
+                        "model_hash": self.model_hash,
+                        "capture_profile": self.capture_profile,
+                        "max_gap": self.cfg.max_gap,
+                        "frame_timestamps": [float(row["timestamp"]) for row in self.frame_log],
+                        "frames": self.frame_log,
+                        "session": {
+                            "id": self.session.id,
+                            "status": status,
+                            "observations": self.session.rows,
+                            "summary": self.last_summary,
+                            "events": events,
+                            "max_gap": self.cfg.max_gap,
+                        } if self.session is not None else None,
+                    },
                 )
                 self.recording_saved = True
                 if self.display is not None:
@@ -387,6 +426,10 @@ class Application:
             self.storage.save_calibration(self.candidate)
             self.reference = self.candidate
             self.candidate = None
+            if self.calibration_only and self.display is not None:
+                saved = getattr(self.display, "calibration_saved", None)
+                if callable(saved) and self.saved_calibration_path is not None:
+                    saved(self.saved_calibration_path)
             print(
                 f"Calibration completed & saved: {self.saved_calibration_path} "
                 f"(id: {self.reference.id}, {self.reference.review['label']})"
@@ -446,6 +489,9 @@ class Application:
         if key == ord("s") and self.state in ("READY", "FINISHED") and not self.candidate:
             self.setup_confirmed = True
             self.start_session(timestamp)
+        if key == ord("t") and self.session and not self.session.finished:
+            self.finish(timestamp, "completed")
+            return True
         if key == ord("p") and self.session:
             if self.state == "RUNNING":
                 self.session.pause(timestamp)
@@ -458,6 +504,9 @@ class Application:
             if self.recording:
                 self.stop_recording_requested = True
             else:
+                if self.display is not None:
+                    self.display.recording.clear()
+                    self.display.recording_states.put("idle")
                 self.notice = "No recording is active; camera remains open"
             return True
         return True
@@ -468,6 +517,7 @@ class Application:
         if self.recordings_started >= self.cfg.max_recordings:
             self.notice = f"Recording limit reached ({self.cfg.max_recordings})"
             if self.display is not None:
+                self.display.recording.clear()
                 self.display.recording_states.put("limit")
             return
         assert self.workspace_path is not None
@@ -665,16 +715,44 @@ class Application:
                 if initialized and current_profile != self.capture_profile:
                     raise ValueError("Capture profile changed mid-run; recalibrate")
                 self.capture_profile = current_profile
+                observer = getattr(self.display, "observe", None)
+                if observer is not None:
+                    observer(frame)
+                prompts = getattr(self.display, "prompts", None)
+                if prompts is not None:
+                    while not prompts.empty():
+                        self._speak(prompts.get_nowait())
                 if not initialized:
                     if self.reference:
-                        compatible(self.reference, self.capture_profile, self.model_hash)
+                        comparison_only = self.range_profile is not None and not any(
+                            target.camera_check_passed for target in self.range_profile.metrics.values()
+                        )
+                        if comparison_only:
+                            if self.reference.model_hash != self.model_hash:
+                                raise ValueError("Reference measurement model changed; reanalyze the reference")
+                        else:
+                            compatible(self.reference, self.capture_profile, self.model_hash)
                     if self.headless and self.reference and not self.interval:
                         self.start_session(0.0 if self.video else timestamp)
                     initialized = True
-                view_range = tuple(self.reference.quality["view_range"]) if self.reference else None
-                observation = measure(
-                    frame, self.cfg, view_range if self.cal_start is None else None
+                view_range = (
+                    tuple(self.reference.quality["view_range"])
+                    if self.reference and "view_range" in self.reference.quality else None
                 )
+                observation = (
+                    measure_profile(frame, self.cfg, self.range_profile) if self.range_profile is not None else
+                    measure_targets(frame, self.cfg, self.cfg.calibration_defaults)
+                    if self.reference is None and self.cfg.calibration_defaults and self.cal_start is None else
+                    measure(frame, self.cfg, view_range if self.cal_start is None else None)
+                )
+                default_rows = [
+                    {"metric": key, "reason": observation.quality[key].reason, **evaluator.update(
+                        timestamp,
+                        observation.values[key] if observation.quality[key].valid else None,
+                    )}
+                    for key, evaluator in self.default_evaluators.items()
+                    if self.reference is None and self.cal_start is None
+                ]
                 if self.cal_start is not None:
                     end = self.cal_start + self.cfg.calibration_duration
                     if self.cal_start <= timestamp < end:
@@ -706,8 +784,21 @@ class Application:
                                 self.candidate.quality["axis_neutral_offset"] = float(
                                     np.median(self.cal_axis_offsets)
                                 )
-                            self.accept()
-                            self._speak("Calibration completed")
+                                candidate_ready = (
+                                    getattr(self.display, "candidate_ready", None)
+                                    if self.display is not None
+                                    else None
+                                )
+                                if callable(candidate_ready):
+                                    candidate_ready(self.candidate.name)
+                                if not (
+                                    self.calibration_only
+                                    and getattr(self.display, "requires_reference_acceptance", False)
+                                ):
+                                    self.accept()
+                                    self._speak("Calibration completed")
+                                else:
+                                    self._speak("Calibration ready. Press Accept to save.")
                             if self.headless:
                                 self.start_session(timestamp)
                         except ValueError as error:
@@ -756,8 +847,15 @@ class Application:
                     else self.cfg.shoulder_neutral_clearance
                 )
                 sh_neutral = (
-                    max(sh_neutral_base, float(np.percentile(self.relaxed_clearances, 75)))
-                    if len(self.relaxed_clearances) >= 15
+                    max(
+                        sh_neutral_base,
+                        float(
+                            np.percentile(
+                                self.relaxed_clearances, self.cfg.shoulder_adaptive_percentile
+                            )
+                        ),
+                    )
+                    if len(self.relaxed_clearances) >= self.cfg.shoulder_adaptive_min_samples
                     else sh_neutral_base
                 )
                 axis_neutral = (
@@ -768,9 +866,16 @@ class Application:
                 if len(frame.poses) == 1:
                     pose = frame.poses[0]
                     raw_role = detect_role(pose)
-                    metric_tau = max(1e-4, self.cfg.overlay_smoothing or self.cfg.smoothing)
+                    metric_tau = max(
+                        self.cfg.min_filter_time_constant,
+                        self.cfg.overlay_smoothing or self.cfg.smoothing,
+                    )
                     knee_info = knee_bend_alignment(
-                        pose, frame.width, frame.height, side=self.cfg.side
+                        pose,
+                        frame.width,
+                        frame.height,
+                        side=self.cfg.side,
+                        **knee_geometry_kwargs(self.cfg),
                     )
                     if knee_info is not None:
                         raw_knee_deg = knee_info[0]
@@ -836,7 +941,11 @@ class Application:
                         self.head_last_ts = timestamp
                         head_angle = self.head_smoothed
                     sh_info = shoulder_tension_alignment(
-                        pose, frame.width, frame.height, neutral_clearance=sh_neutral
+                        pose,
+                        frame.width,
+                        frame.height,
+                        neutral_clearance=sh_neutral,
+                        **shoulder_geometry_kwargs(self.cfg),
                     )
                     if sh_info is not None:
                         raw_elev_pct = sh_info[0]
@@ -847,7 +956,12 @@ class Application:
                             and timestamp >= self.cal_start
                         ):
                             self.cal_shoulder_clearances.append(raw_clear)
-                        elif len(self.relaxed_clearances) < 600 and 0.65 <= raw_clear <= 1.50:
+                        elif (
+                            len(self.relaxed_clearances) < self.cfg.shoulder_adaptive_max_samples
+                            and self.cfg.shoulder_adaptive_min_clearance
+                            <= raw_clear
+                            <= self.cfg.shoulder_adaptive_max_clearance
+                        ):
                             self.relaxed_clearances.append(raw_clear)
                         if (
                             self.shoulder_smoothed is None
@@ -936,6 +1050,11 @@ class Application:
                 self.frame_log.append(
                     {
                         "timestamp": timestamp,
+                        "poses": [
+                            {name: [point.x, point.y, point.z, point.visibility, point.presence]
+                             for name, point in pose.items()}
+                            for pose in frame.poses
+                        ],
                         "head_angle": head_angle,
                         "shoulder_elev_pct": shoulder_elev_pct,
                         "knee_bend_deg": knee_bend_deg,
@@ -963,7 +1082,10 @@ class Application:
                     head_down_elapsed = 0.0
                 bad_head = head_down_elapsed >= self.cfg.head_down_duration
 
-                sh_clear_threshold = max(4.0, self.cfg.shoulder_raise_threshold * 0.65)
+                sh_clear_threshold = max(
+                    self.cfg.shoulder_recovery_min_pct,
+                    self.cfg.shoulder_raise_threshold * self.cfg.shoulder_recovery_ratio,
+                )
                 if shoulder_elev_pct is not None:
                     if shoulder_elev_pct >= self.cfg.shoulder_raise_threshold:
                         if self.shoulder_tension_since is None:
@@ -990,7 +1112,9 @@ class Application:
                         shoulder_tension_elapsed = 0.0
                 bad_shoulders = shoulder_tension_elapsed >= self.cfg.shoulder_tension_duration
 
-                knee_clear_deg = self.cfg.closed_embrace_min_knee_bend + 2.5
+                knee_clear_deg = (
+                    self.cfg.closed_embrace_min_knee_bend + self.cfg.knee_recovery_margin
+                )
                 if knee_bend_deg is not None:
                     if knee_bend_deg < self.cfg.closed_embrace_min_knee_bend:
                         if self.knee_straight_since is None:
@@ -1043,6 +1167,18 @@ class Application:
                     else self.cfg.closed_embrace_min_knee_bend
                 )
                 message = self.notice
+                settings_coaching = self.reference is None and not self.cfg.calibration_defaults and not getattr(
+                    self.display, "disable_settings_coaching", False
+                )
+                if not settings_coaching:
+                    bad_head = bad_shoulders = bad_knees = bad_axis = bad_ankles = False
+                    head_down_elapsed = shoulder_tension_elapsed = knee_straight_elapsed = axis_curve_elapsed = 0.0
+                    axis_curve_state = "UNKNOWN"
+                    self.frame_log[-1]["alerts"] = {
+                        "head": False, "shoulders": False, "knees": False, "axis": False,
+                    }
+                    self.frame_log[-1]["axis_curve_alert"] = False
+                    self.frame_log[-1]["ankle_high_alert"] = False
                 if bad_ankles:
                     lift_pct = (ankle_lift_ratio or self.cfg.ankle_high_lift_ratio) * 100.0
                     message = (
@@ -1075,13 +1211,36 @@ class Application:
                         f"BAD HEAD ALIGNMENT: head pointing down ({head_disp_deg:+.1f} deg for "
                         f"{head_down_elapsed:.1f}s)"
                     )
+                elif self.state == "RUNNING" and self.range_profile is not None:
+                    message = range_feedback(self.rows, self.range_profile)[0] or next(
+                        (row.get("reason") or "Approved-range measurement unavailable (tracking/view)."
+                         for row in self.rows if row["state"] == "UNKNOWN"),
+                        "Within approved ranges / pending",
+                    )
+                elif self.reference is not None:
+                    message = self.notice or (
+                        "Selected calibration: coaching uses approved ranges only."
+                        if self.range_profile is not None else
+                        "Selected calibration has no approved ranges for posture coaching."
+                    )
+                elif default_rows and not getattr(self.display, "capture_evidence", False):
+                    message = target_feedback(default_rows, self.cfg.calibration_defaults)[0] or next(
+                        (row["reason"] or "Default-range measurement unavailable (tracking/view)."
+                         for row in default_rows if row["state"] == "UNKNOWN"),
+                        "Within Settings default ranges / pending",
+                    )
                 elif self.state == "RUNNING":
                     message = next(
-                        (q.reason for q in observation.quality.values() if not q.valid), ""
+                        (q.reason for metric, q in observation.quality.items()
+                         if not q.valid and (self.range_profile is None or
+                                             (self.session is not None and metric in self.session.evaluators))),
+                        "",
                     )
                     if not message:
                         message = next(
-                            (MESSAGES[r["metric"]] for r in self.rows if r["state"] == "DEVIATION"),
+                            (MESSAGES.get(r["metric"], f"{r['metric']}: outside approved range")
+                             for r in self.rows if r["state"] == "DEVIATION"),
+                            "Within approved ranges / pending" if self.range_profile else
                             "Within reference / pending: experimental thresholds",
                         )
                 if not self.headless or self.record_overlay:
@@ -1177,14 +1336,26 @@ class Application:
                             else "C calibrate | A accept | R retry | S start | P pause | E end | V verbose | Y torso/vertical | B beat-1 | Q quit"
                         ),
                     ]
+                    if not settings_coaching:
+                        lines[1] = f"Role: {self.role} | Beat: {beat_str}"
+                    if default_rows:
+                        lines.extend(target_feedback(default_rows, self.cfg.calibration_defaults)[1])
                     if not self.setup_confirmed:
                         lines.append(
                             "SETUP UNMIRRORED: check facing direction; V confirms / enables display mirror"
                         )
-                    for r in self.rows:
+                    for r in self.rows if settings_coaching or self.range_profile is not None else []:
                         val = "N/A" if r["smoothed"] is None else f"{r['smoothed']:.3f}"
                         delta = "N/A" if r["delta"] is None else f"{r['delta']:+.3f}"
                         lines.append(f"{r['metric']}: {val} | delta {delta} | {r['state']}")
+                    if self.range_profile is not None:
+                        for metric, target in self.range_profile.metrics.items():
+                            value = observation.values[metric]
+                            measured = f"{value:.4g}" if value is not None and observation.quality[metric].valid else "Unknown"
+                            lines.append(
+                                f"{metric}: {measured} | target {target.lower:.4g} .. {target.upper:.4g} "
+                                f"{target.unit} | {'camera checked' if target.camera_check_passed else 'comparison only'}"
+                            )
                     if self.state != "RUNNING" and not self.candidate:
                         reason = next(
                             (q.reason for q in observation.quality.values() if not q.valid),
@@ -1242,6 +1413,14 @@ class Application:
                         verbose_skeleton=self.verbose_skeleton,
                         show_vertical_axis=self.show_vertical_axis,
                         show_footer=self.display is None,
+                        settings_coaching=settings_coaching,
+                        shoulder_geometry=shoulder_geometry_kwargs(self.cfg),
+                        knee_geometry=knee_geometry_kwargs(self.cfg),
+                        show_head_alignment=getattr(self.display, "show_head_alignment", True),
+                        show_shoulders_height=getattr(self.display, "show_shoulders_height", True),
+                        show_role_detection=getattr(self.display, "show_role_detection", True),
+                        show_embrace_type=getattr(self.display, "show_embrace_type", True),
+                        show_alerts=not getattr(self.display, "suppress_alerts", False),
                     )
                     if self.record_overlay and (not self.calibration_only or calibration_frame):
                         if self.overlay_writer is None:
@@ -1263,6 +1442,9 @@ class Application:
                                 verbose_skeleton=True,
                                 show_vertical_axis=True,
                                 show_footer=False,
+                                settings_coaching=settings_coaching,
+                                shoulder_geometry=shoulder_geometry_kwargs(self.cfg),
+                                knee_geometry=knee_geometry_kwargs(self.cfg),
                             )
                             if self.overlay_lines_writer is None:
                                 lines_path = self.record_overlay.with_name(
@@ -1344,6 +1526,8 @@ class Application:
                             self.display.close()
                         elif not self.headless:
                             cv2.destroyAllWindows()
-                        if self.workspace_path is not None and (self.aborted or self.recording_saved):
+                        if self.workspace_path is not None and (
+                            self.aborted or self.recording_saved or self.calibration_only
+                        ):
                             shutil.rmtree(self.workspace_path, ignore_errors=True)
         return self.outputs

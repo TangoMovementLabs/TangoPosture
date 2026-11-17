@@ -3,8 +3,9 @@ import json
 import pytest
 
 from tango_posture.config import Config
+from tango_posture.models import MANIFEST
 from tango_posture.replay import VideoReader, cut_video_segment, parse_time, save_overlay_video
-from tango_posture.reports import write_markdown_report
+from tango_posture.reports import latest_analysis_model_section, write_markdown_report
 from tango_posture.review import read_report, save_analysis, saved_analyses, write_metadata
 
 
@@ -72,6 +73,34 @@ def test_report_writer_saves_metadata_and_preserves_multiple_reports(tmp_path):
     assert paths[0] != paths[1]
     assert all(path.with_suffix(".metadata.json").is_file() for path in paths)
     assert read_report(tmp_path / "latest_report.md").path == paths[1]
+
+
+def test_report_identifies_actual_model_hash_not_selected_offline_variant(tmp_path):
+    report = write_markdown_report(
+        tmp_path, Config(analysis_model="heavy"), "camera:0", "completed", [],
+        {"model_hash": MANIFEST["sha256"]},
+    ).read_text()
+    assert "| Pose Model | MediaPipe Pose Landmarker Lite |" in report
+    assert f"| Pose Model Version | `{MANIFEST['version']}` |" in report
+    assert f"| Pose Model SHA-256 | `{MANIFEST['sha256']}` |" in report
+
+
+@pytest.mark.parametrize("model_hash", ["unknown-model-hash", None])
+def test_report_does_not_guess_unknown_model_version(tmp_path, model_hash):
+    report = write_markdown_report(
+        tmp_path, Config(analysis_model="heavy"), "camera:0", "completed", [],
+        {"model_hash": model_hash},
+    ).read_text()
+    assert "| Pose Model | Unavailable |" in report
+    assert "| Pose Model Version | `Unavailable` |" in report
+    assert f"| Pose Model SHA-256 | `{model_hash or 'Unavailable'}` |" in report
+
+
+def test_latest_analysis_model_section_does_not_guess_unknown_identity():
+    section = latest_analysis_model_section("unknown-model-hash")
+    assert "| Pose Model | Unavailable |" in section
+    assert "| Pose Model Version | `Unavailable` |" in section
+    assert "| Pose Model SHA-256 | `unknown-model-hash` |" in section
 
 
 @pytest.mark.parametrize("value,expected", [("12.5", 12.5), ("01:02.5", 62.5), ("01:02:03", 3723)])

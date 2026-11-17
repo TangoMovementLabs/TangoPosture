@@ -511,6 +511,7 @@ def analyse_movement_observations(
     segment_index: int = 0,
     source_member: str = "video_00.mp4",
     timing_note: str = "",
+    use_observation_timestamps: bool = False,
     detector_config: dict[str, Any] | None = None,
     cancel: threading.Event | None = None,
     on_progress: Callable[[int], None] | None = None,
@@ -536,6 +537,7 @@ def analyse_movement_observations(
     last_hip_center: tuple[float, float] | None = None
     last_pose_time: float | None = None
     cut_frames: list[int] = []
+    frame_times: dict[int, float] = {}
 
     left_tracker = _SingleFootTracker("left", cfg)
     right_tracker = _SingleFootTracker("right", cfg)
@@ -552,7 +554,14 @@ def analyse_movement_observations(
         if not (0 <= frame_idx < frame_count):
             continue
         sampled_frames += 1
-        replay_time = frame_idx / fps
+        replay_time = (
+            float(obs.timestamp)
+            if use_observation_timestamps
+            and math.isfinite(obs.timestamp)
+            and obs.timestamp >= 0.0
+            else frame_idx / fps
+        )
+        frame_times[frame_idx] = replay_time
 
         if on_progress is not None:
             pct = min(99, int((frame_idx + 1) * 100 / max(1, frame_count)))
@@ -748,12 +757,22 @@ def analyse_movement_observations(
             pivot_samples.append({"frame": frame_idx, "time": replay_time, "valid": False})
 
     steps.sort(key=lambda item: (item["frame"], 0 if item["side"] == "left" else 1))
-    pivots = _detect_pivot_intervals(pivot_samples, fps=fps, cfg=cfg)
+    pivots = _detect_pivot_intervals(
+        pivot_samples,
+        fps=fps,
+        cfg=cfg,
+        frame_times=frame_times if use_observation_timestamps else None,
+    )
     hip_frames = _build_interpolated_hip_frames(hip_keypoints, pivots, fps=fps, cfg=cfg)
 
     if on_progress is not None:
         on_progress(100)
 
+    duration = (
+        max(frame_times.values()) + (1.0 / fps)
+        if use_observation_timestamps and frame_times
+        else float(frame_count / fps)
+    )
     return {
         "schema_version": MOVEMENT_SCHEMA_VERSION,
         "detector_version": DETECTOR_VERSION,
@@ -766,8 +785,10 @@ def analyse_movement_observations(
         "height": int(height),
         "fps": float(fps),
         "frame_count": int(frame_count),
-        "duration": round(float(frame_count / fps), 6),
-        "timing_basis": "frame_index_over_fps",
+        "duration": round(float(duration), 6),
+        "timing_basis": (
+            "observation_timestamp" if use_observation_timestamps else "frame_index_over_fps"
+        ),
         "timing_note": timing_note,
         "sample_stride": int(sample_stride),
         "coverage": {
@@ -819,6 +840,7 @@ def _detect_pivot_intervals(
     *,
     fps: float,
     cfg: dict[str, Any],
+    frame_times: dict[int, float] | None = None,
 ) -> list[dict[str, Any]]:
     # Split into contiguous valid runs separated by <= max_tracking_gap_s and no camera cuts
     runs: list[list[dict[str, Any]]] = []
@@ -968,12 +990,22 @@ def _detect_pivot_intervals(
             prev_end_frame = end_frame
             direction = "clockwise" if seg_dir > 0 else "anticlockwise"
             quality = float(np.median([s["quality"] for s in run[s_i : e_i + 1]]))
+            start_time = (
+                frame_times.get(start_frame, float(run[s_i]["time"]))
+                if frame_times is not None
+                else start_frame / fps
+            )
+            end_time = (
+                frame_times.get(end_frame, float(run[e_i]["time"]) + (1.0 / fps))
+                if frame_times is not None
+                else end_frame / fps
+            )
             pivots.append(
                 {
                     "start_frame": start_frame,
                     "end_frame": end_frame,
-                    "start_time": round(start_frame / fps, 6),
-                    "end_time": round(end_frame / fps, 6),
+                    "start_time": round(start_time, 6),
+                    "end_time": round(end_time, 6),
                     "direction": direction,
                     "net_rotation_deg": round(float(net_deg), 2),
                     "mean_rate_deg_s": round(float(net_deg / max(1e-4, dt_seg)), 2),
@@ -1019,7 +1051,12 @@ def _build_interpolated_hip_frames(
         fa, fb = int(a["frame"]), int(b["frame"])
         if fb - fa <= 1:
             continue
-        if (fb - fa) / fps > max_interp_gap_s:
+        dt_ab = (
+            float(b["time"]) - float(a["time"])
+            if "time" in a and "time" in b
+            else (fb - fa) / fps
+        )
+        if dt_ab > max_interp_gap_s:
             # Never interpolate across a tracking gap
             continue
         for f in range(fa + 1, fb):
@@ -1182,7 +1219,7 @@ def validate_movement_analysis(
         raise ValueError("Movement analysis detector version changed; re-run analysis")
     if data.get("detector_fingerprint") != detector_fingerprint():
         raise ValueError("Movement analysis detector configuration changed; re-run analysis")
-    if data.get("timing_basis") != "frame_index_over_fps":
+    if data.get("timing_basis") not in ("frame_index_over_fps", "observation_timestamp"):
         raise ValueError("Unsupported movement analysis timing basis")
 
     if expected_model_hash and data.get("model_hash") and data.get("model_hash") != expected_model_hash:
@@ -1524,6 +1561,7 @@ def render_movement_overlay(
     frame_index: int,
     fps: float | None = None,
     *,
+    frame_timestamp: float | None = None,
     show_pivots: bool = False,
     show_steps: bool = False,
     step_history_seconds: float = 5.0,
@@ -1541,7 +1579,11 @@ def render_movement_overlay(
     sx = canvas.shape[1] / src_w
     sy = canvas.shape[0] / src_h
     effective_fps = float(fps if fps and math.isfinite(fps) and fps > 0 else analysis.get("fps", 15.0))
-    media_time = frame_index / effective_fps
+    media_time = (
+        float(frame_timestamp)
+        if frame_timestamp is not None and math.isfinite(frame_timestamp) and frame_timestamp >= 0.0
+        else frame_index / effective_fps
+    )
 
     if show_steps:
         cut_frames = analysis.get("cut_frames", [])

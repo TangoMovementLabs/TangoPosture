@@ -80,11 +80,44 @@ def head_horizontal_alignment(
     return (angle, ear, nose)
 
 
+def shoulder_geometry_kwargs(cfg: Any) -> dict[str, float]:
+    """Extract configurable shoulder clearance geometry parameters from Config."""
+    return {
+        "visibility_floor": float(cfg.shoulder_visibility_floor),
+        "ear_hip_scale_factor": float(cfg.shoulder_ear_hip_scale_factor),
+        "min_ear_hip_px": float(cfg.shoulder_min_ear_hip_px),
+        "nose_ear_scale_factor": float(cfg.shoulder_nose_ear_scale_factor),
+        "ear_ear_scale_factor": float(cfg.shoulder_ear_ear_scale_factor),
+        "shoulder_width_scale_factor": float(cfg.shoulder_width_scale_factor),
+        "min_ref_scale_px": float(cfg.shoulder_min_ref_scale_px),
+        "baseline_clamp_floor": float(cfg.shoulder_baseline_clamp_floor),
+    }
+
+
+def knee_geometry_kwargs(cfg: Any) -> dict[str, float]:
+    """Extract configurable knee flexion geometry parameters from Config."""
+    return {
+        "visibility_floor": float(cfg.knee_visibility_floor),
+        "min_segment_px": float(cfg.knee_min_segment_px),
+        "tiebreak_other_max_vis": float(cfg.knee_tiebreak_other_max_vis),
+        "tiebreak_min_advantage": float(cfg.knee_tiebreak_min_advantage),
+    }
+
+
 def shoulder_tension_alignment(
     pose: dict[str, Landmark],
     width: int,
     height: int,
     neutral_clearance: float = 1.71,
+    *,
+    visibility_floor: float = 0.50,
+    ear_hip_scale_factor: float = 0.26,
+    min_ear_hip_px: float = 20.0,
+    nose_ear_scale_factor: float = 0.68,
+    ear_ear_scale_factor: float = 0.65,
+    shoulder_width_scale_factor: float = 0.28,
+    min_ref_scale_px: float = 8.0,
+    baseline_clamp_floor: float = 0.20,
 ) -> tuple[float, float, Landmark, Landmark] | None:
     """Return (elevation_pct, raw_clearance_ratio, ear_landmark, shoulder_landmark).
 
@@ -97,7 +130,12 @@ def shoulder_tension_alignment(
     for side in ("left", "right"):
         ear = pose.get(f"{side}_ear")
         sh = pose.get(f"{side}_shoulder")
-        if _usable_point(ear) and _usable_point(sh) and ear is not None and sh is not None:
+        if (
+            _usable_point(ear, visibility_floor)
+            and _usable_point(sh, visibility_floor)
+            and ear is not None
+            and sh is not None
+        ):
             dy = (sh.y - ear.y) * height
             pairs.append((dy, ear, sh))
     if not pairs:
@@ -109,37 +147,52 @@ def shoulder_tension_alignment(
     for side in ("left", "right"):
         ear = pose.get(f"{side}_ear")
         hip = pose.get(f"{side}_hip")
-        if _usable_point(ear) and _usable_point(hip) and ear is not None and hip is not None:
+        if (
+            _usable_point(ear, visibility_floor)
+            and _usable_point(hip, visibility_floor)
+            and ear is not None
+            and hip is not None
+        ):
             eh_dy = (hip.y - ear.y) * height
-            if eh_dy > 20.0:
-                torso_scales.append(0.26 * eh_dy)
+            if eh_dy > min_ear_hip_px:
+                torso_scales.append(ear_hip_scale_factor * eh_dy)
 
     head_scales: list[float] = []
     nose = pose.get("nose")
-    if _usable_point(nose) and nose is not None:
+    if _usable_point(nose, visibility_floor) and nose is not None:
         for _, ear, _ in pairs:
             # Use full 2D Euclidean distance (invariant to head pitch) scaled to match
-            # vertical ear-to-hip normalization (~0.68x nose-to-ear distance).
+            # vertical ear-to-hip normalization.
             head_scales.append(
-                0.68 * math.hypot((nose.x - ear.x) * width, (nose.y - ear.y) * height)
+                nose_ear_scale_factor * math.hypot((nose.x - ear.x) * width, (nose.y - ear.y) * height)
             )
     l_ear, r_ear = pose.get("left_ear"), pose.get("right_ear")
-    if _usable_point(l_ear) and _usable_point(r_ear) and l_ear is not None and r_ear is not None:
-        head_scales.append(0.65 * abs(l_ear.x - r_ear.x) * width)
+    if (
+        _usable_point(l_ear, visibility_floor)
+        and _usable_point(r_ear, visibility_floor)
+        and l_ear is not None
+        and r_ear is not None
+    ):
+        head_scales.append(ear_ear_scale_factor * abs(l_ear.x - r_ear.x) * width)
     l_sh, r_sh = pose.get("left_shoulder"), pose.get("right_shoulder")
-    if _usable_point(l_sh) and _usable_point(r_sh) and l_sh is not None and r_sh is not None:
-        head_scales.append(0.28 * abs(l_sh.x - r_sh.x) * width)
+    if (
+        _usable_point(l_sh, visibility_floor)
+        and _usable_point(r_sh, visibility_floor)
+        and l_sh is not None
+        and r_sh is not None
+    ):
+        head_scales.append(shoulder_width_scale_factor * abs(l_sh.x - r_sh.x) * width)
 
     # Prefer vertical ear-to-hip height when visible (invariant to yaw rotation and shrugging);
     # otherwise fall back to head/shoulder scales aligned to the same ratio.
     ref_scale = max(torso_scales) if torso_scales else max(head_scales, default=0.0)
-    if ref_scale < 8.0:
+    if ref_scale < min_ref_scale_px:
         return None
 
     # Select the most elevated (smallest neck clearance) visible shoulder
     min_dy, best_ear, best_sh = min(pairs, key=lambda item: item[0])
     raw_clearance = min_dy / ref_scale
-    base = max(0.20, float(neutral_clearance))
+    base = max(baseline_clamp_floor, float(neutral_clearance))
     elevation_pct = ((base - raw_clearance) / base) * 100.0
     return (elevation_pct, raw_clearance, best_ear, best_sh)
 
@@ -419,6 +472,11 @@ def knee_bend_alignment(
     width: int,
     height: int,
     side: str = "left",
+    *,
+    visibility_floor: float = 0.35,
+    min_segment_px: float = 10.0,
+    tiebreak_other_max_vis: float = 0.60,
+    tiebreak_min_advantage: float = 0.15,
 ) -> tuple[float, list[tuple[Landmark, Landmark, Landmark]]] | None:
     """Return (knee_bend_degrees, visible_leg_triplets).
 
@@ -438,9 +496,9 @@ def knee_bend_alignment(
         knee = pose.get(f"{s}_knee")
         ankle = pose.get(f"{s}_ankle")
         if (
-            _usable_point(hip, 0.35)
-            and _usable_point(knee, 0.35)
-            and _usable_point(ankle, 0.35)
+            _usable_point(hip, visibility_floor)
+            and _usable_point(knee, visibility_floor)
+            and _usable_point(ankle, visibility_floor)
             and hip is not None
             and knee is not None
             and ankle is not None
@@ -451,7 +509,7 @@ def knee_bend_alignment(
             vy = (ankle.y - knee.y) * height
             u_norm = math.hypot(ux, uy)
             v_norm = math.hypot(vx, vy)
-            if u_norm >= 10.0 and v_norm >= 10.0:
+            if u_norm >= min_segment_px and v_norm >= min_segment_px:
                 cos_ang = max(-1.0, min(1.0, (ux * vx + uy * vy) / (u_norm * v_norm)))
                 interior_deg = math.degrees(math.acos(cos_ang))
                 bend_deg = max(0.0, 180.0 - interior_deg)
@@ -470,7 +528,7 @@ def knee_bend_alignment(
         far_bend, far_conf, _ = side_bends[ordered_sides[1]]
         # If the occluded far leg has much lower landmark visibility, use the camera-facing leg;
         # otherwise use min(near_bend, far_bend) so a straight standing leg is always caught.
-        if far_conf < 0.60 and near_conf >= far_conf + 0.15:
+        if far_conf < tiebreak_other_max_vis and near_conf >= far_conf + tiebreak_min_advantage:
             chosen_bend = near_bend
         else:
             chosen_bend = min(near_bend, far_bend)

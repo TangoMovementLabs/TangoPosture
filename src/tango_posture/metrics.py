@@ -22,6 +22,7 @@ def measure(
         return unknown("One-person mode only" if len(frame.poses) > 1 else "No person detected")
     if frame.width <= 0 or frame.height <= 0 or not math.isfinite(frame.timestamp):
         return unknown("Invalid frame geometry or timestamp")
+    scale_dim = min(frame.width, frame.height)
     p = frame.poses[0]
     good = lambda name: reliable(p.get(name), cfg.confidence)
     if not cfg.allow_all_angles:
@@ -33,7 +34,7 @@ def measure(
         points = {k: pixel(v, frame.width, frame.height) for k, v in p.items()}
         s, h = points[cfg.side + "_shoulder"], points[cfg.side + "_hip"]
         length = float(np.linalg.norm(s - h))
-        if length < cfg.min_torso * frame.height:
+        if length < cfg.min_torso * scale_dim:
             return unknown("Torso too small or degenerate")
         width = (
             max(
@@ -57,7 +58,7 @@ def measure(
         reason = ""
         if not good(cfg.side + "_ear"):
             reason = "Cannot assess: ear not visible"
-        elif np.linalg.norm(points[cfg.side + "_ear"] - s) < cfg.min_head * frame.height:
+        elif np.linalg.norm(points[cfg.side + "_ear"] - s) < cfg.min_head * scale_dim:
             reason = "Cannot assess: shoulder-to-ear segment too short"
         if reason:
             for m in METRICS[:2]:
@@ -82,7 +83,7 @@ def measure(
         h_side = cfg.side if cfg.side in vis_hips else vis_hips[0]
         s, h = points[f"{s_side}_shoulder"], points[f"{h_side}_hip"]
     length = float(np.linalg.norm(s - h))
-    if length < cfg.min_torso * frame.height:
+    if length < cfg.min_torso * scale_dim:
         return unknown("Torso too small or degenerate")
     sh_span = (
         float(np.linalg.norm(points["left_shoulder"] - points["right_shoulder"]))
@@ -105,7 +106,7 @@ def measure(
     else:
         e_side = cfg.side if cfg.side in vis_ears else vis_ears[0]
         ear_pt = points[f"{e_side}_ear"]
-    if np.linalg.norm(ear_pt - s) < cfg.min_head * frame.height:
+    if np.linalg.norm(ear_pt - s) < cfg.min_head * scale_dim:
         for m in METRICS[:2]:
             quality[m] = QualityResult(
                 False, "Cannot assess: shoulder-to-ear segment too short", width

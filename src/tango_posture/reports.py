@@ -9,6 +9,7 @@ from typing import Any
 
 from .config import Config
 from .domain import METRICS, UNITS, Calibration, SessionSummary
+from .models import model_manifest
 from .review import write_metadata
 
 
@@ -43,10 +44,11 @@ def summarize(
     spans: list[tuple[float, float]],
     pause_duration: float,
     cfg: Config,
+    ranges: dict[str, tuple[float, float]] | None = None,
 ) -> SessionSummary:
     active = sum(end - start for start, end in spans)
     result = {}
-    for m in METRICS:
+    for m in (ranges if ranges is not None else METRICS):
         observations = [r for r in rows if r["metric"] == m]
         valid = above = confirmed = 0.0
         intervals = []
@@ -57,8 +59,8 @@ def summarize(
                 if 0 < dt <= cfg.max_gap and a["delta"] is not None and b["delta"] is not None:
                     valid += dt
                     intervals.append((a["timestamp"], b["timestamp"]))
-                    magnitude = a["delta"] if m == "head_forward" else abs(a["delta"])
-                    if magnitude > getattr(cfg, m).entry:
+                    magnitude = a["delta"] if ranges is None and m == "head_forward" else abs(a["delta"])
+                    if magnitude > (getattr(cfg, m).entry if ranges is None else 0):
                         above += dt
         own_events = [e for e in events if e["metric"] == m]
         lengths = []
@@ -99,8 +101,30 @@ def _format_video_ref(path: Path | None, *, omit_absolute_path: bool = False) ->
     return f"[`{path}`](file://{resolved})"
 
 
-def write_markdown_report(
-    report_dir: Path,
+def pose_model_details(model_hash: object) -> tuple[str, str, str]:
+    """Identify a model only from its verified weight fingerprint."""
+    digest = model_hash if isinstance(model_hash, str) and model_hash else "Unavailable"
+    for variant in ("lite", "full", "heavy"):
+        manifest = model_manifest(variant)
+        if manifest["sha256"] == digest:
+            return f"MediaPipe Pose Landmarker {variant.capitalize()}", manifest["version"], digest
+    return "Unavailable", "Unavailable", digest
+
+
+def latest_analysis_model_section(model_hash: object, *, has_original_report: bool = True) -> str:
+    name, version, digest = pose_model_details(model_hash)
+    return (
+        "## Latest Review posture & movement analysis\n\n"
+        "| Field | Value |\n| --- | --- |\n"
+        f"| Pose Model | {name} |\n"
+        f"| Pose Model Version | `{version}` |\n"
+        f"| Pose Model SHA-256 | `{digest}` |\n\n"
+        + ("The original report below describes its original run; its findings were not regenerated."
+           if has_original_report else "")
+    )
+
+
+def render_markdown_report(
     cfg: Config,
     source: str,
     status: str,
@@ -114,18 +138,10 @@ def write_markdown_report(
     recorded_overlay: Path | None = None,
     import_context: dict[str, Any] | None = None,
     movement_data: dict[str, Any] | None = None,
-) -> Path:
-    report_dir.mkdir(parents=True, exist_ok=True)
+) -> str:
     now_utc = datetime.now(UTC)
-    stamp = now_utc.strftime("%Y%m%d_%H%M%S")
-    suffix = f"_{session_id[:8]}" if session_id else ""
-    report_path = report_dir / f"report_{stamp}{suffix}.md"
-    counter = 1
-    while report_path.exists():
-        report_path = report_dir / f"report_{stamp}{suffix}_{counter:02d}.md"
-        counter += 1
-    latest_path = report_dir / "latest_report.md"
     is_imported = bool(import_context and import_context.get("is_imported_reference"))
+    movement_only = bool(is_imported and import_context and import_context.get("analysis_mode") == "movement")
 
     total_frames = len(frame_log)
     start_t = frame_log[0]["timestamp"] if frame_log else 0.0
@@ -133,10 +149,10 @@ def write_markdown_report(
     total_duration = max(0.0, end_t - start_t)
 
     # Role analysis (Leader vs Follower)
-    leader_spans = _contiguous_spans(frame_log, lambda f: f["role"] == "LEADER", cfg.max_gap)
-    follower_spans = _contiguous_spans(frame_log, lambda f: f["role"] == "FOLLOWER", cfg.max_gap)
-    leader_frames = sum(1 for f in frame_log if f["role"] == "LEADER")
-    follower_frames = sum(1 for f in frame_log if f["role"] == "FOLLOWER")
+    leader_spans = _contiguous_spans(frame_log, lambda f: f.get("role") == "LEADER", cfg.max_gap)
+    follower_spans = _contiguous_spans(frame_log, lambda f: f.get("role") == "FOLLOWER", cfg.max_gap)
+    leader_frames = sum(1 for f in frame_log if f.get("role") == "LEADER")
+    follower_frames = sum(1 for f in frame_log if f.get("role") == "FOLLOWER")
     if leader_frames > follower_frames and leader_frames > 0:
         dominant_role = "LEADER (left arm raised, right arm horizontal)"
     elif follower_frames > leader_frames and follower_frames > 0:
@@ -147,10 +163,10 @@ def write_markdown_report(
         dominant_role = "NONE DETECTED (arms neither in Leader nor Follower embrace)"
 
     # Head horizontal alignment analysis
-    head_angles = [f["head_angle"] for f in frame_log if f["head_angle"] is not None]
+    head_angles = [float(f["head_angle"]) for f in frame_log if f.get("head_angle") is not None]
     down_spans = _contiguous_spans(
         frame_log,
-        lambda f: f["head_angle"] is not None and f["head_angle"] < cfg.head_down_angle,
+        lambda f: f.get("head_angle") is not None and float(f["head_angle"]) < cfg.head_down_angle,
         cfg.max_gap,
     )
     confirmed_head_down = [
@@ -264,6 +280,7 @@ def write_markdown_report(
         if phrases_seen and bpms_seen
         else f"`{cfg.tango_bpm:.1f} BPM` (8 beats/phrase)"
     )
+    model_name, model_version, model_hash = pose_model_details(performance.get("model_hash"))
 
     lines = [
         "# Tango Posture & Body Alignment Report",
@@ -275,6 +292,8 @@ def write_markdown_report(
         "  1. **Body Alignment Analysis**: Quantify head horizontal pitch (ear-to-nose angle relative to horizontal), head-forward offset (ear relative to shoulder/torso), head segment inclination, and trunk vertical inclination.",
         "  2. **Leader / Follower Embrace Identification**: Detect whether the dancer adopts the **Leader** embrace (left arm raised, right arm horizontal around the follower) or **Follower** embrace (right arm raised, left arm horizontal around the leader's shoulder) and when each role occurs.",
         "  3. **Tango 8-Beat Phrase Tracking**: Track the 8-beat Argentine tango musical phrase (`Beat 1..8 -> 1..8`) and map alignment events to both time and musical phrase/beat.",
+        "  4. **Tracking and comparison**: Select a calibration in Review for posture alerts."
+        if movement_only else
         "  4. **Body Performance & Issue Pinpointing (Where in Time)**: Identify every time interval where alignment deviated beyond configured thresholds (such as the head pointing down for longer than the `.env` threshold) or where camera framing obstructed full-body tracking, with exact timestamps so the dancer and teacher can inspect those moments.",
         "  5. **Scope & Disclaimer**: This is a geometric movement observation aid, not a medical assessment or an authority on artistic tango quality.",
         "",
@@ -292,12 +311,17 @@ def write_markdown_report(
         f"| Session ID | `{session_id or 'uncalibrated-observation-run'}` |",
         f"| Observed Timeline | `{_fmt_time(start_t)}` to `{_fmt_time(end_t)}` (`{total_duration:.2f}s`, `{total_frames}` frames) |",
         f"| Selected Side / Facing | `side={cfg.side}`, `facing={cfg.facing}` |",
-        f"| Head-Down Alert Config (`.env`) | Angle `< {cfg.head_down_angle:+.1f} deg` for `>= {cfg.head_down_duration:.1f}s` (neutral offset `{cfg.head_neutral_offset:+.1f} deg`) |",
-        f"| Shoulder Tension Config (`.env`) | Elevation `>= +{cfg.shoulder_raise_threshold:.1f}%` for `>= {cfg.shoulder_tension_duration:.1f}s` |",
-        f"| Axis Curvature Config (`axis_curve`) | Entry `>{cfg.axis_curve_entry * 100.0:+.1f}%` for `>= {cfg.axis_curve_duration:.1f}s`, Clear `<{cfg.axis_curve_clear * 100.0:+.1f}%` for `>= {cfg.axis_curve_clear_duration:.2f}s` |",
-        f"| Closed-Embrace Knee Bend Config (`.env`) | Min knee bend `>= {cfg.closed_embrace_min_knee_bend:.1f} deg` (alert after `{cfg.knee_straight_duration:.1f}s`) |",
+        f"| Pose Model | {model_name} |",
+        f"| Pose Model Version | `{model_version}` |",
+        f"| Pose Model SHA-256 | `{model_hash}` |",
+        *([] if movement_only else [
+            f"| Head-Down Alert Config (`.env`) | Angle `< {cfg.head_down_angle:+.1f} deg` for `>= {cfg.head_down_duration:.1f}s` (neutral offset `{cfg.head_neutral_offset:+.1f} deg`) |",
+            f"| Shoulder Tension Config (`.env`) | Elevation `>= +{cfg.shoulder_raise_threshold:.1f}%` for `>= {cfg.shoulder_tension_duration:.1f}s` |",
+            f"| Axis Curvature Config (`axis_curve`) | Entry `>{cfg.axis_curve_entry * 100.0:+.1f}%` for `>= {cfg.axis_curve_duration:.1f}s`, Clear `<{cfg.axis_curve_clear * 100.0:+.1f}%` for `>= {cfg.axis_curve_clear_duration:.2f}s` |",
+            f"| Closed-Embrace Knee Bend Config (`.env`) | Min knee bend `>= {cfg.closed_embrace_min_knee_bend:.1f} deg` (alert after `{cfg.knee_straight_duration:.1f}s`) |",
+        ]),
         f"| Embrace Type Distribution | `CLOSED`: `{closed_frames}` frames, `OPEN`: `{open_frames}` frames (hysteresis `{cfg.embrace_hysteresis_seconds:.2f}s`) |",
-        f"| Slow-Tango Low-Feet Config (`.env`) | Tempo `<={cfg.slow_tango_max_bpm:.0f} BPM`, max ankle lift `<={cfg.ankle_high_lift_ratio * 100.0:.1f}%`, alert after `{cfg.max_consecutive_high_ankle_steps}` consecutive high steps (peak streak `{max_consec_ankle_steps}`) |",
+        *([] if movement_only else [f"| Slow-Tango Low-Feet Config (`.env`) | Tempo `<={cfg.slow_tango_max_bpm:.0f} BPM`, max ankle lift `<={cfg.ankle_high_lift_ratio * 100.0:.1f}%`, alert after `{cfg.max_consecutive_high_ankle_steps}` consecutive high steps (peak streak `{max_consec_ankle_steps}`) |"]),
         f"| Role Hysteresis Config (`.env`) | Assign after `{cfg.role_assign_ms:.0f} ms`, hold for `{cfg.role_hold_ms:.0f} ms` before returning to `NONE` |",
         f"| Musical 8-Beat Phrase Tracking | {phrase_summary} |",
         f"| Runtime Throughput & Latency | `{fps_str}` (median frame latency `{lat_str}`, dropped frames `{performance.get('dropped_frames', 0)}`) |",
@@ -399,6 +423,48 @@ def write_markdown_report(
                 ]
             )
 
+        couple_ctx = import_context.get("couple_result")
+        if isinstance(couple_ctx, dict) or import_context.get("resolved_dancer_mode") == "couple":
+            couple_dict = couple_ctx if isinstance(couple_ctx, dict) else {}
+            ann = couple_dict.get("annotations") or {}
+            a_name = str(ann.get("dancer_a_name") or "Dancer A")
+            b_name = str(ann.get("dancer_b_name") or "Dancer B")
+            c_sums = couple_dict.get("summaries") or {}
+            posture_sums = c_sums.get("posture") or {}
+            coord_sums = c_sums.get("coordination") or {}
+
+            def _fmt_couple_posture(pkey: str, label: str) -> str:
+                item = posture_sums.get(pkey)
+                if not isinstance(item, dict) or item.get("median_deg") is None:
+                    return f"- **{label}**: unavailable"
+                cov = float(item.get("coverage") or 0.0) * 100.0
+                return (
+                    f"- **{label}**: median `{float(item['median_deg']):+.1f} deg` "
+                    f"(IQR `{float(item.get('iqr_deg') or 0.0):.1f} deg`, {cov:.0f}% coverage)"
+                )
+
+            def _fmt_couple_lag(ckey: str, label: str) -> str:
+                item = coord_sums.get(ckey)
+                if not isinstance(item, dict) or item.get("value") is None:
+                    reason = str(item.get("reason") or "unavailable") if isinstance(item, dict) else "unavailable"
+                    return f"- **{label}**: unavailable ({reason})"
+                return f"- **{label}**: `{float(item['value']):+.0f} ms` ({int(item.get('count') or 0)} paired events)"
+
+            lines.extend(
+                [
+                    "### Couple Axis & Coordination Summary",
+                    "",
+                    _fmt_couple_posture("torso_tilt_a", f"{a_name} torso axis tilt"),
+                    _fmt_couple_posture("torso_tilt_b", f"{b_name} torso axis tilt"),
+                    _fmt_couple_posture("couple_midpoint_tilt", "Couple midpoint axis tilt"),
+                    _fmt_couple_posture("torso_separation", "Torso axis separation"),
+                    _fmt_couple_lag("start_lag_ms", "Start lag (B - A)"),
+                    _fmt_couple_lag("slow_lag_ms", "Slowing lag (B - A)"),
+                    _fmt_couple_lag("settle_lag_ms", "Settle lag (B - A)"),
+                    "",
+                ]
+            )
+
     lines.extend(
         [
             "### Detected Leader / Follower Embrace Intervals",
@@ -440,8 +506,10 @@ def write_markdown_report(
                 f"| Median Head Horizontal Angle | `{median(head_angles):+.1f} deg` | `0 deg` = nose level with ear; negative = pointing down |",
                 f"| Minimum (Most Downward) Angle | `{min(head_angles):+.1f} deg` | Lowest downward pitch observed |",
                 f"| Maximum (Most Upward) Angle | `{max(head_angles):+.1f} deg` | Highest pitch observed |",
-                f"| Total Time Pointing Down (`< {cfg.head_down_angle:+.1f} deg`) | `{total_head_down_sec:.2f}s` | Cumulative time below downward angle threshold |",
-                f"| **Confirmed Bad Head Alignment Alerts (`>= {cfg.head_down_duration:.1f}s`)** | **`{len(confirmed_head_down)}`** | Triggered red on-screen `BAD HEAD ALIGNMENT` alert |",
+                *([] if movement_only else [
+                    f"| Total Time Pointing Down (`< {cfg.head_down_angle:+.1f} deg`) | `{total_head_down_sec:.2f}s` | Cumulative time below downward angle threshold |",
+                    f"| **Confirmed Bad Head Alignment Alerts (`>= {cfg.head_down_duration:.1f}s`)** | **`{len(confirmed_head_down)}`** | Triggered red on-screen `BAD HEAD ALIGNMENT` alert |",
+                ]),
             ]
         )
     else:
@@ -462,8 +530,10 @@ def write_markdown_report(
                 f"| Frames with Visible Ear & Shoulder | `{len(shoulder_elevs)} / {total_frames}` | Shoulder elevation coverage |",
                 f"| Median Shoulder Elevation | `{median(shoulder_elevs):+.1f}%` | `0%` = relaxed neutral; positive = shoulders raised toward ears |",
                 f"| Peak Shoulder Elevation | `{max(shoulder_elevs):+.1f}%` | Highest shoulder shrug / tension observed |",
-                f"| Total Time Raised (`>= +{cfg.shoulder_raise_threshold:.1f}%`) | `{total_shoulder_tension_sec:.2f}s` | Cumulative time with elevated shoulders |",
-                f"| **Confirmed Shoulder Tension Alerts (`>= {cfg.shoulder_tension_duration:.1f}s`)** | **`{len(confirmed_shoulder_tension)}`** | Triggered red on-screen `LOWER YOUR SHOULDERS` alert |",
+                *([] if movement_only else [
+                    f"| Total Time Raised (`>= +{cfg.shoulder_raise_threshold:.1f}%`) | `{total_shoulder_tension_sec:.2f}s` | Cumulative time with elevated shoulders |",
+                    f"| **Confirmed Shoulder Tension Alerts (`>= {cfg.shoulder_tension_duration:.1f}s`)** | **`{len(confirmed_shoulder_tension)}`** | Triggered red on-screen `LOWER YOUR SHOULDERS` alert |",
+                ]),
             ]
         )
     else:
@@ -484,8 +554,10 @@ def write_markdown_report(
                 f"| Frames with Visible Ankle, Hip & Head | `{len(axis_ratios)} / {total_frames}` | Full-body axis curvature coverage |",
                 f"| Median Hip / Pelvis Offset | `{median(axis_ratios) * 100.0:+.1f}%` | `0.0%` = hip on reference ankle–back-of-head line; `+` = hip/bump protruding behind line |",
                 f"| Peak Posterior Curvature | `{max(axis_ratios) * 100.0:+.1f}%` | Maximum hip protrusion behind ankle–back-of-head line |",
-                f"| Total Time Above Entry (`>{cfg.axis_curve_entry * 100.0:+.1f}%`) | `{total_axis_above_entry_sec:.2f}s` | Cumulative time exceeding entry threshold |",
-                f"| **Confirmed Axis Curvature Alerts (`>= {cfg.axis_curve_duration:.1f}s` w/ hysteresis `<{cfg.axis_curve_clear * 100.0:+.1f}%`)** | **`{len(confirmed_axis_curve)}`** | Triggered red on-screen `HIP OFFSET` alert; separate from the torso axis |",
+                *([] if movement_only else [
+                    f"| Total Time Above Entry (`>{cfg.axis_curve_entry * 100.0:+.1f}%`) | `{total_axis_above_entry_sec:.2f}s` | Cumulative time exceeding entry threshold |",
+                    f"| **Confirmed Axis Curvature Alerts (`>= {cfg.axis_curve_duration:.1f}s` w/ hysteresis `<{cfg.axis_curve_clear * 100.0:+.1f}%`)** | **`{len(confirmed_axis_curve)}`** | Triggered red on-screen `HIP OFFSET` alert; separate from the torso axis |",
+                ]),
             ]
         )
     else:
@@ -609,7 +681,7 @@ def write_markdown_report(
     )
 
     has_issues = False
-    if confirmed_head_down:
+    if confirmed_head_down and not movement_only:
         has_issues = True
         lines.append(
             f"### 4.1 Confirmed Bad Head Alignment (`< {cfg.head_down_angle:+.1f} deg` for `>= {cfg.head_down_duration:.1f}s` — RED ALERT)"
@@ -620,7 +692,7 @@ def write_markdown_report(
         )
         lines.append("| --- | --- | --- | --- | --- | --- | --- |")
         for s, e, items in confirmed_head_down:
-            angles = [float(x["head_angle"]) for x in items if x["head_angle"] is not None]
+            angles = [float(x["head_angle"]) for x in items if x.get("head_angle") is not None]
             trigger_t = s + cfg.head_down_duration
             p_num, b_num = items[0].get("phrase"), items[0].get("beat")
             beat_tag = f" (P{p_num} B{b_num}/8)" if p_num and b_num else ""
@@ -631,7 +703,7 @@ def write_markdown_report(
             )
         lines.append("")
 
-    if confirmed_shoulder_tension:
+    if confirmed_shoulder_tension and not movement_only:
         has_issues = True
         lines.append(
             f"### 4.2 Confirmed Shoulder Tension (`>= +{cfg.shoulder_raise_threshold:.1f}%` for `>= {cfg.shoulder_tension_duration:.1f}s` — LOWER YOUR SHOULDERS)"
@@ -657,7 +729,7 @@ def write_markdown_report(
             )
         lines.append("")
 
-    if confirmed_knee_straight:
+    if confirmed_knee_straight and not movement_only:
         has_issues = True
         lines.append(
             f"### 4.2b Confirmed Unbent Knees in Closed Embrace (`< {cfg.closed_embrace_min_knee_bend:.1f} deg` for `>= {cfg.knee_straight_duration:.1f}s` — BEND YOUR KNEES)"
@@ -683,7 +755,7 @@ def write_markdown_report(
             )
         lines.append("")
 
-    if confirmed_axis_curve:
+    if confirmed_axis_curve and not movement_only:
         has_issues = True
         lines.append(
             f"### 4.2c Confirmed Axis Curvature (`>{cfg.axis_curve_entry * 100.0:+.1f}%` for `>= {cfg.axis_curve_duration:.1f}s`, clear `<{cfg.axis_curve_clear * 100.0:+.1f}%` — HIP OFFSET)"
@@ -710,7 +782,7 @@ def write_markdown_report(
             )
         lines.append("")
 
-    if confirmed_ankle_high:
+    if confirmed_ankle_high and not movement_only:
         has_issues = True
         lines.append(
             f"### 4.2d Confirmed High Ankle Lift in Slow Tango (`>={cfg.ankle_high_lift_ratio * 100.0:.1f}%` for `>={cfg.max_consecutive_high_ankle_steps}` consecutive steps at `<={cfg.slow_tango_max_bpm:.0f} BPM`)"
@@ -740,7 +812,7 @@ def write_markdown_report(
             )
         lines.append("")
 
-    if transient_head_down:
+    if transient_head_down and not movement_only:
         has_issues = True
         lines.append(
             f"### 4.2 Brief Head-Down Dips (`< {cfg.head_down_angle:+.1f} deg` for `< {cfg.head_down_duration:.1f}s`)"
@@ -749,7 +821,7 @@ def write_markdown_report(
         lines.append("| Start Time | End Time | Duration | Worst Angle | Note |")
         lines.append("| --- | --- | --- | --- | --- |")
         for s, e, items in transient_head_down:
-            angles = [float(x["head_angle"]) for x in items if x["head_angle"] is not None]
+            angles = [float(x["head_angle"]) for x in items if x.get("head_angle") is not None]
             lines.append(
                 f"| `{_fmt_time(s)}` | `{_fmt_time(e)}` | `{e - s:.2f}s` | `{min(angles):+.1f} deg` | "
                 f"Transient downward head tilt (recovered before `{cfg.head_down_duration:.1f}s` threshold) |"
@@ -763,10 +835,11 @@ def write_markdown_report(
         lines.append("| Metric | Onset Time | Confirmed At | End Time | Peak Deviation | End Reason |")
         lines.append("| --- | --- | --- | --- | --- | --- |")
         for ev in sorted(session_events, key=lambda x: x["onset"]):
+            units = session_summary.get("units", UNITS) if session_summary else UNITS
             end_val = ev["end"] if ev["end"] is not None else ev["detection"]
             lines.append(
                 f"| `{ev['metric']}` | `{_fmt_time(ev['onset'])}` | `{_fmt_time(ev['detection'])}` | "
-                f"`{_fmt_time(end_val)}` | `{ev['peak_deviation']:.3f} {UNITS[ev['metric']]}` | `{ev['end_reason']}` |"
+                f"`{_fmt_time(end_val)}` | `{ev['peak_deviation']:.3f} {units[ev['metric']]}` | `{ev['end_reason']}` |"
             )
         lines.append("")
 
@@ -789,10 +862,44 @@ def write_markdown_report(
 
     if not has_issues:
         lines.append(
+            "- Posture alerts require a calibration profile in Review."
+            if movement_only else
             "- No alignment deviations, head-down alerts, or camera framing issues were detected during this run."
         )
 
-    content = "\n".join(lines).rstrip() + "\n"
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def write_markdown_report(
+    report_dir: Path,
+    cfg: Config,
+    source: str,
+    status: str,
+    frame_log: list[dict[str, Any]],
+    performance: dict[str, Any],
+    reference: Calibration | None = None,
+    session_id: str | None = None,
+    session_summary: dict[str, Any] | None = None,
+    session_events: list[dict[str, Any]] | None = None,
+    recorded_video: Path | None = None,
+    recorded_overlay: Path | None = None,
+    import_context: dict[str, Any] | None = None,
+    movement_data: dict[str, Any] | None = None,
+) -> Path:
+    report_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+    suffix = f"_{session_id[:8]}" if session_id else ""
+    report_path = report_dir / f"report_{stamp}{suffix}.md"
+    counter = 1
+    while report_path.exists():
+        report_path = report_dir / f"report_{stamp}{suffix}_{counter:02d}.md"
+        counter += 1
+    latest_path = report_dir / "latest_report.md"
+    content = render_markdown_report(
+        cfg, source, status, frame_log, performance, reference, session_id,
+        session_summary, session_events, recorded_video, recorded_overlay,
+        import_context, movement_data,
+    )
     report_path.write_text(content, encoding="utf-8")
     latest_path.write_text(content, encoding="utf-8")
     timestamps = [

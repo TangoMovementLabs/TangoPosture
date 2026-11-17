@@ -9,9 +9,11 @@ and pose-model setup. Optional report interpretation connects to your configured
 
 Visit the [TangoPosture community website](https://tangoposture-community.correia-ramos.chatgpt.site/).
 
-![Tango Posture Coach desktop application screenshot](logos/Screenshot.png)
+The desktop application uses **Qt / PySide6** exclusively.
 
-**Experimental movement observation, not medical assessment or a judgement of artistic tango quality.** See the [Tango Posture Coach Manual](docs/TANGO_POSTURE_GUIDE.md) for one guide to practice, references, reports, configuration, examples, and limitations. Open **Help → Search & browse Tango Posture Manual** in the desktop app for the same guide with search and section navigation.
+For the complete manual — covering desktop workspaces, posture metrics & formulas, calibration workflow, tracking engine, every Settings parameter with worked examples, architecture, and troubleshooting — read the [Tango Posture Coach Manual](docs/TANGO_POSTURE_GUIDE.md) or open **Help & Guide** in the desktop navigation rail.
+
+**Experimental movement observation, not medical assessment or a judgement of artistic tango quality.**
 
 ---
 
@@ -20,9 +22,9 @@ Visit the [TangoPosture community website](https://tangoposture-community.correi
 1. **All-Angle Calibration & 360° Pivot / Side-Step Support (`allow_all_angles=true`)**
    - Calibrate and practice **facing the camera**, in **side-on profile**, or while executing **side steps (*pasos al costado*), ochos, and 360° pivots** without losing tracking.
    - Uses your central spine axis (midpoint of shoulders to midpoint of hips) when both sides are visible, and seamlessly falls back to the visible side during pivots.
-2. **Dedicated Calibration Camera & Reference Archives (`calibrations/`)**
-   - Pressing `C` speaks **"Calibration starting"**, gives you a **3-second countdown** to get into position, plays a **1-second beep** throughout the 12-second capture window, and announces **"Calibration completed"** (or speaks the specific reason if calibration failed).
-   - **References > Open calibration camera** opens a dedicated camera window. A valid capture saves `calibrations/<reference name>.tpc`, containing raw video, overlay video, and `reference.json`. Capturing again with the same name replaces that archive rather than adding recordings; failed captures preserve the previous valid file.
+2. **Reference Recordings & Calibration Profiles**
+   - `.tpr` files contain replayable reference video and cached measurements; `.tpc` profiles contain approved metric ranges independently of the source video.
+   - **Library > Guided camera calibration** and **References > New Calibration** guide neutral/change/return/repeat holds and open the same approval editor used by a reference video's **Create calibration** action. New profiles require a distinct name; originals are not replaced.
 3. **Head Horizontal Alignment & Neutral Camera Offset**
    - Draws a cyan horizontal reference line from the ear and a live ear-to-nose pitch vector (`Head horiz: +0.0 deg`).
    - Compensates for natural ear-to-nose landmark geometry and camera tilt via `head_neutral_offset=-12.0` (or auto-zeroes to your calibrated straight posture) and triggers a red **`BAD HEAD ALIGNMENT`** alert when the head drops below `head_down_angle` (`-15.0 deg`) for longer than `head_down_duration` (`3.0s`).
@@ -91,9 +93,34 @@ uv python install 3.11
 uv sync --frozen
 uv run tango-posture --help
 uv run tango-posture models fetch
+uv run tango-posture qt
 ```
 
-`models fetch` is an explicit setup operation. It downloads only the versioned model in `models/manifest.json`, verifies SHA-256, and atomically installs it. Runs never download models. For offline installation, transfer that exact verified file yourself and pass `--model-path /path/to/pose_landmarker_lite.task`. Every run verifies its checksum.
+`models fetch` is an explicit setup operation for the pinned Lite model in
+[models/manifest.json](models/manifest.json). Live Practice always uses Lite and
+never downloads models. For offline live installation, transfer that exact
+verified file yourself and pass `--model-path /path/to/pose_landmarker_lite.task`.
+Every run verifies its checksum.
+
+For offline video analysis, choose **Settings → Files → Offline analysis model**:
+**Lite**, **Full**, or **Heavy** (`analysis_model` in TOML; default `lite`).
+Review's **Analyze posture & movement** and Library video analysis use this choice.
+Missing analysis models download automatically with progress when analysis starts;
+Full/Heavy are cached under `<data_dir>/models/`, while Lite uses `model_path`.
+Before downloading, analysis also checks the data-folder model cache, the folder
+containing the configured Lite model, and the local `models/` folder for the
+selected variant's filename. A found copy is SHA-256 verified and used in place;
+the app does not scan the entire disk or duplicate installed weights.
+After download, analysis runs locally and can reuse the verified cache offline.
+Downloads are cancellable and atomically installed only after SHA-256 verification;
+failure never substitutes another model. Changing models requires reanalysis to
+replace existing cached results, and calibration comparison still requires a
+matching model hash.
+
+`uv run tango-posture`, `uv run tango-posture gui`, and
+`uv run tango-posture qt` all open the same PySide6 desktop interface.
+The packaged application also uses Qt. The former Tk interface has been removed;
+existing `.tp`/`.tpc` archives, data directories, and TOML settings are retained.
 
 The pinned MediaPipe 0.10.31 release fixes Windows Tasks initialization (`function 'free' not found` in 0.10.30) without pulling in a second OpenCV package. See [wheel evidence](docs/wheel_compatibility.json), [third-party notices](THIRD_PARTY_NOTICES.md), and the [model manifest](models/manifest.json). Original application code is Apache-2.0; dependency and model terms remain separate.
 
@@ -137,52 +164,36 @@ failed verification prevents installer publication.
 
 ## Webcam Practice Workflow
 
-### Option 1: Graphical Practice Studio (Recommended)
+### Option 1: Graphical Practice Studio
 
-Open the native desktop interface with any of these commands:
+Open the native Qt desktop interface with:
 
 ```bash
-./run_practice.sh
-uv run tango-posture
-uv run tango-posture gui
+uv run tango-posture qt
 ```
 
-Startup shows a branded splash screen for three seconds with a busy cursor and
-animated waiting indicator. **About** (or **Help > About TangoPosture**) shows the
-application version, license, and a clickable GitHub repository link.
+Qt startup shows a branded splash screen for three seconds. The left navigation
+rail opens **Home**, **Practice**, **Library**, **Review**, **Analytics**,
+**AI Coach**, **Settings**, and **Help & Guide**. **About** shows the version,
+license, and repository link.
 
-The **Practice** tab selects a camera or video and shows the run log; it also offers
-video analysis without a live preview. **References**
-lets you name a calibration and open its dedicated camera window, choose saved
-`.tpc` references (with legacy JSON/SQLite support), or define a reference interval
-in a video. Press **C** in the calibration window to capture or retry, then close
-it. The saved `.tpc` becomes the selected reference; the coach reads its embedded
-`reference.json`. Use **Match reference
-camera settings** to restore the recorded side, facing, resolution, and capture
-profile. Confirm physical camera placement each time you reuse a reference.
+In **Practice**, name the practice, select a camera or video source, then click
+**Start Preview**. Use **New Calibration** for guided camera capture and explicit
+range approval. **Home > Manage References > New Calibration** also starts this workflow;
+saved `.tpc` profiles can be inspected and matched with **Match Camera Settings**.
+Confirm unchanged physical camera placement when reusing a reference.
 
-**Files & recording** controls model/data paths and the **Practice name**.
-Practices are saved as `practice/<name>.tp`; an existing name appends recordings
-without replacing earlier segments. **New practice name** starts a separate archive.
-**Settings** groups configuration values into camera/view, quality/calibration,
-tracking, head/shoulders, embrace/knees, hip offset, music, and review/Ollama tabs. The Settings menu
-imports/exports TOML; the File menu also imports/exports TOML and saves
-complete practice presets, including filenames and reference choices.
+**Record (R)** starts video recording. **Start Scoring (S)** starts
+reference-relative evaluation independently of recording. **Pause Scoring (P)**
+pauses scoring, and **Stop & Save (E)** saves the current recording.
+**Abort Recording (X)** discards the current unsaved recording after confirmation.
+**Close Preview** releases the capture. Previously saved recordings remain intact.
+Practices are saved as `practice/<name>.tp`; reusing the name appends indexed
+recordings rather than replacing earlier segments.
 
-Click **Open practice coach** for a live preview with Calibrate, Accept, Record,
-Start scoring, Pause/resume, Stop recording/save, Beat 1, Skeleton, Torso axis, Quit/save,
-and Abort/exit buttons.
-**C** captures or retries calibration; **R / Record** starts video recording in
-the coach window. **S** starts reference-based scoring and session
-statistics, not video recording, and requires an accepted reference. **E** stops
-and saves recording and scoring while keeping the preview open; **Q** saves and
-quits. Press **R** again after **E** to add another recording to the same practice.
-The existing keyboard shortcuts work in this window too. Settings changes apply to
-the next run; closing the coach releases capture and saves reports and recordings.
-
-**Abort / exit (X)** closes the coach and discards the current unsaved video, overlay,
-report, and scoring session. Previously saved segments remain intact; Abort requires
-confirmation and does not show the saved-file popup.
+**Settings** groups camera/view, quality/calibration, tracking, head/shoulders,
+embrace/knees, hip offset, music, and replay/Ollama values. Apply changes for the
+current session; use TOML import/export to retain settings across launches.
 
 Tick **Automatically record songs** in the coach to record when the live microphone
 detects music and save when it detects a sustained stop. It repeats for subsequent
@@ -191,8 +202,7 @@ it saves an active automatic recording and stops automation. This option require
 camera mode, enabled beat tracking, and a usable microphone; it does not use clock
 or tap-tempo fallback as evidence of a song.
 
-Set the following under **Settings > Music** (also accessible from the coach's
-**Parameters > Music recording parameters** menu). Changes apply to the next run:
+Set the following under **Settings > Music**. Changes apply to the next run:
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
@@ -203,36 +213,48 @@ Set the following under **Settings > Music** (also accessible from the coach's
 Short silent gaps below the stop delay do not split a recording. Song detection is
 heuristic; the configured delays apply after the detector reports music or silence.
 
-The GUI needs a desktop display and Python's Tk support (check with
-`uv run python -m tkinter`). Headless processing continues to use the CLI below.
+The GUI needs a desktop display and PySide6, installed by `uv sync --frozen`.
+Tk/Tcl is not required. Headless processing continues to use the CLI below.
 
 ### Read reports, replay recordings, and review with Ollama
 
-The **Review** tab opens saved practices and calibrations automatically. Select a `.tp` or `.tpc` archive
-from the list or **Open practice**, then choose **Recording 00**, **Recording 01**,
-and so on to load its matching report and videos. A `.tpc` has one **Calibration**
-entry showing its reference values/JSON and raw/overlay videos. **Refresh** finds saved practices and calibrations
-in the selected data directory. Legacy Markdown reports remain readable. Reports have formatted
-headings, search, line wrapping, and clickable timestamps.
+**Library** lists `.tp` practices, `.tpr` reference recordings and `.tpc`
+calibration profiles. Local, YouTube and Facebook imports default to **Import as
+reference (.tpr)**; uncheck it to create a practice archive. Imports retain raw,
+overlay, floor-lines and indexed analytics without changing the original media.
+**Promote to Reference** copies a selected practice recording or excerpt into a
+separate `.tpr`. Rename persists the display name;
+confirmed Delete moves an archive to Trash.
 
-New recordings include a third **Full lines + messages** video: the complete skeleton and alignment cues on a plain background. Frame notes appear in the live coach and replay sidebar, leaving the video area free of the footer. Older recordings retain their baked-in footer.
+On a `.tpr`, choose **Create calibration**. Select the numbered dancer in the
+video; explicitly restart a track after ambiguity or occlusion and confirm linked
+passages show the same dancer. Save that selection in the reference if desired.
+Work through **Head → Shoulders → Hips → Torso → Knees**, review the histogram,
+timeline, median, middle 80%, reliable duration and extreme examples, and edit
+example passages separately from acceptable limits. Approve only supported
+metrics and save distinct profiles for different contexts.
 
-Under **Video replay**, use **Compare alongside** to show one or more views with shared playback, speed, frame stepping, and seeking. Switch between **Raw video**, **Overlay**, and **Full lines + messages** for the selected
-recording. Archive contents are extracted temporarily and removed when closed.
-Play/pause, step through frames, scrub the timeline, change
-speed, or enter a time such as `01:12.5`. Clicking a report timestamp seeks to that
-moment. Metadata inside the `.tp` archive associates each report with its recordings and
-frame timeline, accounting for dropped capture frames when seeking recorded videos.
-Older Markdown reports still open through their existing video links; timestamp
-seeking for these reports is approximate. Use **Open video** to locate moved files.
+Video-derived profiles support comparison immediately, but do not enable scoring.
+Use **Check camera** on a profile for guided repeatability checks, retry or skip
+failed steps, and explicitly approve live use metric by metric. Walking contexts
+include a walking drill. Repeatability is an engineering check, not technique or
+cross-camera accuracy validation; confirm the view is comparable. Approved live
+profiles require matching model and capture settings and unchanged physical placement.
 
-Video replay is silent by default. Enable **Sound (ffplay)** for optional audio
-when FFmpeg's `ffplay` and an audio output device are available. Audio and Tk video
-use separate playback clocks; the **system player** button is available for normal
-audio/video playback and synchronization. Pause and seeking stop/restart optional audio.
+In **Review**, use **Open Library Archive…**, select the recording and stream,
+then play, scrub, step frames, or change speed. Report timestamps seek to archived
+frames, including timing gaps. **Analyze posture & movement** saves results in
+the selected `.tp` or `.tpr`; layer controls display skeletons, metrics, alerts, pivots,
+steps, and lines on a neutral floor. **Open Comparison…** selects another Library
+archive for synchronized side-by-side video. Archive contents are extracted
+temporarily and cleaned up when closed. Qt replay is currently video-only;
+export a stream for playback with audio in an external player.
 
-In **Ollama analysis**, set the server URL and a chat model, optionally use **List
-installed models**, enter an analysis focus, then click **Analyze report**. The
+**Analytics** loads indexed recording analytics from `.tp` archives, independently
+of the original database. Unknown observations remain gaps, not good scores.
+
+In **AI Coach**, configure the server in Settings, select a report, choose a model
+with **Check Ollama**, enter an analysis focus, then click **Analyze Selected Report**. The
 report text is sent on this action; video files are not uploaded. Responses stream
 into the app without blocking practice controls. Example setup on the machine
 running Ollama:
@@ -245,7 +267,7 @@ ollama pull llama3.2
 
 The default URL is `http://127.0.0.1:11434`, which means the machine running this
 application. Configure another reachable server when Ollama runs elsewhere.
-Settings and presets retain the server, model, instruction, timeout, temperature,
+TOML settings retain the server, model, instruction, timeout, temperature,
 context size, report character limit, and output-token limit. TOML examples:
 
 ```toml
@@ -350,7 +372,8 @@ Common settings:
 ## Saved Artifacts & Output Directories
 
 - **`practice/<name>.tp`**: Portable ZIP archive containing `video_00.mp4`, `overlay_00.mp4`, `report_00.md`, `report_00.metadata.json`, and a manifest. Further recordings increment to `01`, `02`, and beyond, preserving earlier recordings. Observation-only runs have a report but no recorded videos.
-- **`calibrations/<name>.tpc`**: Calibration ZIP archive containing `reference.json`, `video_00.mp4`, `overlay_00.mp4`, a calibration summary, metadata, and manifest. A new accepted capture replaces the named archive. Reuse via `--calibration latest`, a `.tpc` path, or UUID; legacy JSON references remain readable.
+- **`references/<name>.tpr`**: Reference recording ZIP with raw/overlay/lines video where available, indexed measurements, report and source/selection metadata.
+- **`calibrations/<name>.tpc`**: Version-2 calibration ZIP with `profile.json` and a manifest: explicitly approved ranges, units, views, context, evidence coverage, provenance, model and measurement versions. It needs no source video to score. Version-1 `.tpc` files remain readable as neutral baselines, without invented distributions. Legacy JSON baselines also remain readable.
 - **Legacy `reports/` and `videos/`**: Existing loose files remain untouched and readable; new practice reports and recordings are archived instead.
 - **`data/tango.sqlite3` & `data/exports/SESSION_ID/`**: SQLite session storage (`summary.json`, `observations.csv`, `events.csv`).
 

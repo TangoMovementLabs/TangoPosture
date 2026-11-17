@@ -4,6 +4,8 @@ soundtrack analysis, relinking, and teacher-vs-practice comparison.
 
 from __future__ import annotations
 
+import hashlib
+import io
 import math
 import shutil
 import wave
@@ -16,33 +18,55 @@ import pytest
 
 from tango_posture.config import Config
 from tango_posture.domain import FrameObservation, Landmark
-from tango_posture.reference_import import (
+from tango_posture.models import analysis_model_path, model_manifest
+from tango_posture.references.coach import coach_notes_for_frame, render_coach_frame_overlay
+from tango_posture.references.companions import load_report_coach_data, load_report_movement_data
+from tango_posture.references.comparison import compare_clips, relink_report_video
+from tango_posture.references.constants import (
     MAX_IMPORT_RANGE_SECONDS,
     SOUNDTRACK_SAMPLE_RATE,
     SOUNDTRACK_SOURCE_LABEL,
-    ImportCancelledError,
-    YouTubeClockAlignment,
-    YouTubeSourceLink,
+)
+from tango_posture.references.downloads import (
     _download_with_subprocess,
-    analyse_imported_clip,
-    analyse_video_soundtrack,
-    build_youtube_open_url,
-    coach_notes_for_frame,
-    compare_clips,
     download_facebook_reel,
     download_youtube_video,
     imports_directory,
-    iter_virtual_clip_frames,
-    load_report_coach_data,
-    load_report_movement_data,
+)
+from tango_posture.references.errors import ImportCancelledError
+from tango_posture.references.links import (
+    YouTubeClockAlignment,
+    YouTubeSourceLink,
+    build_youtube_open_url,
     parse_facebook_reel_url,
     parse_youtube_url,
+)
+from tango_posture.references.pipeline import analyse_imported_clip
+from tango_posture.references.soundtrack import analyse_video_soundtrack
+from tango_posture.references.video import (
+    iter_virtual_clip_frames,
     probe_import_video,
-    relink_report_video,
-    render_coach_frame_overlay,
     validate_clip_range,
 )
 from tango_posture.review import read_report
+
+
+def test_review_skeleton_uses_same_frame_measurements_instead_of_lagging_display_pose(monkeypatch):
+    seen = {}
+    data = {"width": 160, "height": 120, "frames": {
+        "5": {"timestamp": 0.5, "poses": [{"nose": [0.2, 0.3, 0, 1, 1]}],
+              "measurement_poses": [{"nose": [0.8, 0.3, 0, 1, 1]}]},
+    }}
+
+    def render(image, observation, *args, **kwargs):
+        seen["observation"] = observation
+        return image
+
+    monkeypatch.setattr("tango_posture.references.coach.draw", render)
+    render_coach_frame_overlay(np.zeros((120, 160, 3), np.uint8), data, 5, Config())
+    assert seen["observation"].timestamp == 0.5
+    assert seen["observation"].poses[0]["nose"].x == 0.8
+    assert data["frames"]["5"]["poses"][0]["nose"][0] == 0.2
 
 
 def _write_test_video(
@@ -64,6 +88,69 @@ def _write_test_video(
         writer.write(frame)
     writer.release()
     return path
+
+
+@pytest.mark.parametrize("variant", ["lite", "full", "heavy"])
+def test_offline_analysis_dispatches_selected_model_and_records_its_identity(
+    tmp_path, monkeypatch, variant,
+):
+    monkeypatch.chdir(tmp_path)
+    video = _write_test_video(tmp_path / "clip.avi", duration_seconds=0.3)
+    payload = f"{variant} analysis weights".encode()
+    digest = hashlib.sha256(payload).hexdigest()
+    manifest = model_manifest(variant)
+    monkeypatch.setitem(manifest, "sha256", digest)
+    downloads, loaded, progress = [], [], []
+
+    def download(url, **kwargs):
+        downloads.append(url)
+        return io.BytesIO(payload)
+
+    class Estimator:
+        def __init__(self, path, *, variant):
+            loaded.append((path, variant))
+
+        def estimate(self, image, timestamp):
+            return FrameObservation(timestamp, image.shape[1], image.shape[0], [])
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("urllib.request.urlopen", download)
+    monkeypatch.setattr("tango_posture.references.pipeline.MediaPipeEstimator", Estimator)
+    cfg = Config(
+        model_path=str(tmp_path / "live_lite.task"), data_dir=str(tmp_path / "data"),
+        analysis_model=variant, beat_tracking=False,
+    )
+    result = analyse_imported_clip(
+        video_path=video, cfg=cfg, selected_out=0.3,
+        progress_callback=lambda current, total, message: progress.append(message),
+    )
+    assert loaded == [(analysis_model_path(cfg), variant)]
+    assert downloads == [manifest["source_url"]]
+    assert result.coach_data["model_hash"] == digest
+    assert result.coach_data["model_variant"] == variant
+    report = result.report_path.read_text(encoding="utf-8")
+    assert f"| Pose Model | MediaPipe Pose Landmarker {variant.capitalize()} |" in report
+    assert f"| Pose Model Version | `{manifest['version']}` |" in report
+    assert f"| Pose Model SHA-256 | `{digest}` |" in report
+    assert any(f"frames with {variant.capitalize()}" in message for message in progress)
+    if variant != "lite":
+        assert not (tmp_path / "live_lite.task").exists()
+
+
+def test_incompatible_analysis_model_rejects_calibration_before_download(tmp_path, monkeypatch, reference):
+    video = _write_test_video(tmp_path / "clip.avi", duration_seconds=0.3)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("An incompatible calibration must be rejected before downloading")
+
+    monkeypatch.setattr("urllib.request.urlopen", forbidden)
+    with pytest.raises(ValueError, match="model"):
+        analyse_imported_clip(
+            video_path=video, cfg=Config(data_dir=str(tmp_path), analysis_model="heavy"),
+            selected_out=0.3, analysis_mode="posture", reference=reference,
+        )
 
 
 def _make_pose_for_time(
@@ -286,7 +373,7 @@ def test_youtube_independent_clock_alignment():
 @pytest.mark.parametrize("duration,fps_label", [(0.0, "N/A"), (0.002, "500.0 FPS")])
 def test_import_processing_fps_handles_timer_resolution(tmp_path, monkeypatch, duration, fps_label):
     ticks = count(0.0, duration)
-    monkeypatch.setattr("tango_posture.reference_import.time.perf_counter", lambda: next(ticks))
+    monkeypatch.setattr('tango_posture.references.pipeline.time.perf_counter', lambda: next(ticks))
     video_path = _write_test_video(tmp_path / "short.avi", duration_seconds=1.0)
     result = analyse_imported_clip(
         video_path=video_path,
@@ -336,6 +423,24 @@ def test_virtual_clip_range_decoding_and_limits(tmp_path):
     assert video_path.read_bytes() == orig_bytes
 
 
+def test_movement_import_never_builds_fallback_coaching(tmp_path, monkeypatch):
+    video_path = _write_test_video(tmp_path / "clip.avi", duration_seconds=0.5)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Movement import must not build threshold-based coaching")
+
+    monkeypatch.setattr("tango_posture.references.pipeline._build_coach_frame_entry", forbidden)
+    result = analyse_imported_clip(
+        video_path=video_path,
+        cfg=Config(data_dir=str(tmp_path / "data")),
+        selected_out=0.5,
+        estimator_factory=_SyntheticEstimator,
+    )
+    assert result.coach_data["frames"]
+    assert all(entry["measurement_poses"] for entry in result.coach_data["frames"].values())
+    assert not result.coach_data["settings_coaching"]
+
+
 def test_offline_import_movement_and_posture_modes_and_calibration_exclusion(tmp_path):
     video_path = _write_test_video(tmp_path / "clip.avi", fps=15.0, duration_seconds=6.0)
     cfg = Config(
@@ -363,10 +468,20 @@ def test_offline_import_movement_and_posture_modes_and_calibration_exclusion(tmp
     assert res_mov.movement_path.is_file()
     assert res_mov.coverage["pivots"].status == "detected"
     assert res_mov.coverage["steps"].status == "detected"
+    assert res_mov.coverage["posture"].status == "disabled"
+    assert res_mov.coverage["posture"].event_count == 0
+    assert all(
+        "message" not in entry and "alerts" not in entry and "measurement_poses" in entry
+        for entry in res_mov.coach_data["frames"].values()
+    )
     # Exported markdown omits full absolute local path
     md_text = res_mov.report_path.read_text(encoding="utf-8")
     assert str(tmp_path) not in md_text
     assert "https://www.youtube.com/watch?v=dQw4w9WgXcQ" in md_text
+    assert all(text not in md_text for text in (
+        "BAD HEAD ALIGNMENT", "LOWER YOUR SHOULDERS", "BEND YOUR KNEES",
+        "Confirmed Axis Curvature Alerts",
+    ))
 
     # 2. Reference-relative posture review with calibration interval [0.5, 2.5) inside [0.5, 5.5)
     res_posture = analyse_imported_clip(
@@ -417,7 +532,7 @@ def test_poor_footage_reports_not_enough_evidence_without_fabricating_events(tmp
     assert res_cropped.coverage["steps"].event_count == 0
     assert res_cropped.coverage["pivots"].status == "no_events_detected"
 
-    # Multi-person footage -> posture, pivots, and steps all report not_enough_evidence
+    # Multi-person footage -> posture is disabled, pivots and steps lack evidence.
     res_multi = analyse_imported_clip(
         video_path=video_path,
         cfg=cfg,
@@ -427,7 +542,7 @@ def test_poor_footage_reports_not_enough_evidence_without_fabricating_events(tmp
         analysis_mode="movement",
         estimator_factory=lambda: _SyntheticEstimator(multi_person=True),
     )
-    assert res_multi.coverage["posture"].status == "not_enough_evidence"
+    assert res_multi.coverage["posture"].status == "disabled"
     assert res_multi.coverage["pivots"].status == "not_enough_evidence"
     assert res_multi.coverage["steps"].status == "not_enough_evidence"
 
@@ -613,7 +728,7 @@ def test_direct_youtube_download_caching_and_full_open_coach_analysis(tmp_path, 
         )
 
     # Missing yt-dlp surfaces clear actionable error when no downloader is available
-    monkeypatch.setattr("tango_posture.reference_import._find_ytdlp_command", lambda: None)
+    monkeypatch.setattr('tango_posture.references.downloads._find_ytdlp_command', lambda: None)
     monkeypatch.setitem(__import__("sys").modules, "yt_dlp", None)
     with pytest.raises(ValueError, match="Cannot download from YouTube: 'yt-dlp' is not installed"):
         download_youtube_video("https://youtu.be/oHg5SJYRHA0", imp_dir)
@@ -656,9 +771,10 @@ def test_direct_youtube_download_caching_and_full_open_coach_analysis(tmp_path, 
     assert not np.array_equal(cv2.resize(raw_img, (rendered.shape[1], rendered.shape[0])), rendered)
 
     notes = coach_notes_for_frame(coach_data, first_frame_idx)
-    assert notes is not None and len(notes) >= 4
+    assert notes is not None
     joined = "\n".join(notes)
-    assert "Role:" in joined and "Torso axis:" in joined and "Clip Movement Totals:" in joined
+    assert "Clip Movement Totals:" in joined
+    assert "Role:" not in joined and "Torso axis:" not in joined
 
 
 def test_facebook_reel_download_uses_validated_cache_and_injected_downloader(tmp_path):
@@ -682,7 +798,7 @@ def test_facebook_reel_download_uses_validated_cache_and_injected_downloader(tmp
 
 
 def test_ytdlp_subprocess_uses_ssl_cert_file_not_unsupported_ca_option(tmp_path, monkeypatch):
-    from tango_posture import reference_import
+    import tango_posture.references.downloads as reference_import
 
     ca_bundle = tmp_path / "ca-bundle.pem"
     ca_bundle.write_text("trusted test certificate bundle")

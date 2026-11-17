@@ -1,15 +1,18 @@
 import math
-from typing import Any
+from collections.abc import Mapping
+from typing import Any, Literal
 
 import cv2
 
 from .domain import FrameObservation, Landmark
 from .geometry import (
     ankle_lift_alignment,
+    calculate,
     detect_embrace_type,
     detect_role,
     head_horizontal_alignment,
     knee_bend_alignment,
+    pixel,
     shoulder_tension_alignment,
     torso_axis_alignment,
 )
@@ -21,6 +24,7 @@ MESSAGES = {
     "head_inclination": "Head angle differs from reference",
     "trunk_inclination": "Trunk angle differs from reference",
 }
+TORSO_AXIS_EXTENSION = 0.25
 
 
 def screen_point(x: float, y: float, width: int, height: int, mirror: bool) -> tuple[int, int]:
@@ -30,8 +34,9 @@ def screen_point(x: float, y: float, width: int, height: int, mirror: bool) -> t
     )
 
 
-def _draw_torso_axis(
-    image: Any, pose: dict[str, Landmark], mirror: bool, confidence: float
+def draw_torso_axis(
+    image: Any, pose: dict[str, Landmark], mirror: bool, confidence: float, *,
+    show_labels: bool = True,
 ) -> None:
     height, width = image.shape[:2]
     axis = torso_axis_alignment(pose, width, height, confidence)
@@ -49,11 +54,10 @@ def _draw_torso_axis(
     bottom = min(height - 1, round(hy + 0.35 * length))
     for y in range(top, bottom + 1, 20):
         cv2.line(image, (hx, y), (hx, min(y + 11, bottom)), vertical_color, 2, cv2.LINE_AA)
-    # Extend the torso direction by 15% beyond each midpoint.
     cv2.line(
         image,
-        (round(hx - 0.15 * dx), round(hy - 0.15 * dy)),
-        (round(sx + 0.15 * dx), round(sy + 0.15 * dy)),
+        (round(hx - TORSO_AXIS_EXTENSION * dx), round(hy - TORSO_AXIS_EXTENSION * dy)),
+        (round(sx + TORSO_AXIS_EXTENSION * dx), round(sy + TORSO_AXIS_EXTENSION * dy)),
         torso_color,
         3,
         cv2.LINE_AA,
@@ -62,6 +66,8 @@ def _draw_torso_axis(
         cv2.circle(image, point, 5, torso_color, -1, cv2.LINE_AA)
     # Magnitude stays the same when the display is mirrored; it is not a judgement
     # that leaning is wrong, nor an estimate of forward/backward lean in 3D.
+    if not show_labels:
+        return
     labels = (
         (f"Torso axis: {abs(angle):.1f} deg", torso_color),
         ("Vertical (level camera)", vertical_color),
@@ -80,6 +86,267 @@ def _draw_torso_axis(
             2,
             cv2.LINE_AA,
         )
+
+
+def _draw_dashed_line(
+    image: Any,
+    start: tuple[int, int],
+    end: tuple[int, int],
+    color: tuple[int, int, int],
+    thickness: int = 2,
+    dash: int = 10,
+    gap: int = 8,
+) -> None:
+    dx = end[0] - start[0]
+    dy = end[1] - start[1]
+    length = math.hypot(dx, dy)
+    if length < 1.0:
+        return
+    ux, uy = dx / length, dy / length
+    step = dash + gap
+    pos = 0.0
+    while pos < length:
+        seg_end = min(pos + dash, length)
+        p0 = (round(start[0] + ux * pos), round(start[1] + uy * pos))
+        p1 = (round(start[0] + ux * seg_end), round(start[1] + uy * seg_end))
+        cv2.line(image, p0, p1, color, thickness, cv2.LINE_AA)
+        pos += step
+
+
+def _draw_dotted_line(
+    image: Any,
+    start: tuple[int, int],
+    end: tuple[int, int],
+    color: tuple[int, int, int],
+    thickness: int = 2,
+    spacing: int = 8,
+) -> None:
+    dx = end[0] - start[0]
+    dy = end[1] - start[1]
+    length = math.hypot(dx, dy)
+    if length < 1.0:
+        return
+    ux, uy = dx / length, dy / length
+    radius = max(1, thickness)
+    pos = 0.0
+    while pos <= length:
+        pt = (round(start[0] + ux * pos), round(start[1] + uy * pos))
+        cv2.circle(image, pt, radius, color, -1, cv2.LINE_AA)
+        pos += spacing
+
+
+def edge_provenance_style(
+    a: str,
+    b: str,
+    joint_origins: Mapping[str, str] | None,
+) -> Literal["solid", "dashed", "dotted"]:
+    """Return bone line style for endpoints (`dotted` if either is interpolated, else `dashed` if backward)."""
+    if not joint_origins:
+        return "solid"
+    oa = joint_origins.get(a, "forward")
+    ob = joint_origins.get(b, "forward")
+    if oa == "interpolated" or ob == "interpolated":
+        return "dotted"
+    if oa == "backward" or ob == "backward":
+        return "dashed"
+    return "solid"
+
+
+def draw_styled_bone(
+    image: Any,
+    start: tuple[int, int],
+    end: tuple[int, int],
+    color: tuple[int, int, int],
+    thickness: int = 2,
+    style: Literal["solid", "dashed", "dotted"] = "solid",
+) -> None:
+    """Draw a skeleton bone segment in solid, dashed, or dotted provenance style."""
+    if style == "dashed":
+        _draw_dashed_line(image, start, end, color, thickness=thickness, dash=10, gap=6)
+    elif style == "dotted":
+        _draw_dotted_line(image, start, end, color, thickness=thickness, spacing=8)
+    else:
+        cv2.line(image, start, end, color, thickness, cv2.LINE_AA)
+
+
+def draw_head_alignment(
+    image: Any,
+    pose: dict[str, Landmark],
+    mirror: bool,
+    confidence: float,
+    *,
+    neutral_offset: float = 0.0,
+    show_labels: bool = True,
+) -> None:
+    """Draw ear-to-nose head alignment lines relative to horizontal."""
+    height, width = image.shape[:2]
+    reliable_pose = {k: v for k, v in pose.items() if reliable(v, confidence)}
+    head_info = head_horizontal_alignment(
+        reliable_pose, width, height, neutral_offset=neutral_offset
+    )
+    if head_info is None:
+        return
+    angle, ear, nose = head_info
+    ex, ey = screen_point(ear.x, ear.y, width, height, mirror)
+    nx, ny = screen_point(nose.x, nose.y, width, height, mirror)
+    dir_x = 1 if nx >= ex else -1
+    seg_len = max(min(65.0, width * 0.45), math.hypot(nx - ex, ny - ey))
+    hx = round(ex + dir_x * seg_len)
+    rad = math.radians(angle)
+    vx = round(ex + dir_x * seg_len * math.cos(rad))
+    vy = round(ey - seg_len * math.sin(rad))
+    ref_color, vec_color = (255, 220, 0), (0, 220, 255)
+
+    cv2.line(image, (ex, ey), (hx, ey), ref_color, 2, cv2.LINE_AA)
+    cv2.line(image, (ex, ey), (vx, vy), vec_color, 3, cv2.LINE_AA)
+    for point in ((ex, ey), (nx, ny)):
+        cv2.circle(image, point, 4, vec_color, -1, cv2.LINE_AA)
+    arc_r = min(34, max(10, round(seg_len * 0.55)))
+    base_deg = 0.0 if dir_x > 0 else 180.0
+    end_deg = base_deg - angle if dir_x > 0 else base_deg + angle
+    cv2.ellipse(
+        image,
+        (ex, ey),
+        (arc_r, arc_r),
+        0.0,
+        min(base_deg, end_deg),
+        max(base_deg, end_deg),
+        vec_color,
+        2,
+        cv2.LINE_AA,
+    )
+    if not show_labels:
+        return
+    text = f"Head alignment: {angle:+.1f} deg"
+    (text_width, text_height), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 2)
+    tx = max(8, min(min(ex, nx) - 10, width - text_width - 8))
+    ty = max(text_height + 8, min(min(ey, ny) - 14, height - 12))
+    cv2.putText(
+        image,
+        text,
+        (tx, ty),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.52,
+        vec_color,
+        2,
+        cv2.LINE_AA,
+    )
+
+
+def draw_head_posture(
+    image: Any,
+    pose: dict[str, Landmark],
+    mirror: bool,
+    confidence: float,
+    *,
+    side: str = "left",
+    facing: str = "right",
+    show_labels: bool = True,
+) -> None:
+    """Draw shoulder-to-ear head posture lines and trunk/vertical reference."""
+    height, width = image.shape[:2]
+    reliable_pose = {k: v for k, v in pose.items() if reliable(v, confidence)}
+    other_side = "right" if side == "left" else "left"
+
+    def midpoint(a: Landmark, b: Landmark) -> Landmark:
+        return Landmark((a.x + b.x) / 2, (a.y + b.y) / 2)
+
+    def pair_center(joint: str) -> Landmark | None:
+        left, right = reliable_pose.get(f"left_{joint}"), reliable_pose.get(f"right_{joint}")
+        if left is not None and right is not None:
+            return midpoint(left, right)
+        return reliable_pose.get(f"{side}_{joint}") or reliable_pose.get(f"{other_side}_{joint}")
+
+    ls, rs = reliable_pose.get("left_shoulder"), reliable_pose.get("right_shoulder")
+    le, re = reliable_pose.get("left_ear"), reliable_pose.get("right_ear")
+    shoulder = pair_center("shoulder")
+    hip = pair_center("hip")
+
+    wide_shoulders = False
+    if ls is not None and rs is not None and shoulder is not None:
+        span_px = math.hypot((ls.x - rs.x) * width, (ls.y - rs.y) * height)
+        if hip is not None:
+            torso_px = math.hypot((shoulder.x - hip.x) * width, (shoulder.y - hip.y) * height)
+            wide_shoulders = torso_px > 0 and (span_px / torso_px) > 0.25
+        else:
+            wide_shoulders = abs(ls.x - rs.x) > 0.08
+
+    ear: Landmark | None = (
+        midpoint(le, re)
+        if le is not None and re is not None and wide_shoulders
+        else reliable_pose.get(f"{side}_ear") or reliable_pose.get(f"{other_side}_ear")
+    )
+
+    if ear is None or shoulder is None:
+        return
+
+    sx, sy = screen_point(shoulder.x, shoulder.y, width, height, mirror)
+    ex, ey = screen_point(ear.x, ear.y, width, height, mirror)
+    neck_len = math.hypot(ex - sx, ey - sy)
+    if neck_len < 1.0:
+        return
+
+    ref_color, head_color = (255, 220, 0), (255, 180, 0)
+    ref_len = max(neck_len * 1.25, min(40.0, height * 0.45))
+
+    label: str | None = None
+    if hip is not None:
+        ear_px = pixel(ear, width, height)
+        sh_px = pixel(shoulder, width, height)
+        hp_px = pixel(hip, width, height)
+        if (
+            float(math.hypot(*(sh_px - hp_px))) >= 1.0
+            and float(math.hypot(*(ear_px - sh_px))) >= 1.0
+        ):
+            metrics = calculate(ear_px, sh_px, hp_px, facing)
+            hx, hy = screen_point(hip.x, hip.y, width, height, mirror)
+            tdx, tdy = sx - hx, sy - hy
+            tlen = math.hypot(tdx, tdy)
+            if tlen >= 1.0:
+                ref_end = (
+                    max(0, min(width - 1, round(sx + ref_len * tdx / tlen))),
+                    max(0, min(height - 1, round(sy + ref_len * tdy / tlen))),
+                )
+                _draw_dashed_line(image, (sx, sy), ref_end, ref_color, 2)
+            label = (
+                f"Head posture: {metrics['head_inclination']:+.1f} deg "
+                f"({metrics['head_forward'] * 100:+.1f}%)"
+            )
+
+    if label is None:
+        ref_end = (sx, max(0, round(sy - ref_len)))
+        _draw_dashed_line(image, (sx, sy), ref_end, ref_color, 2)
+        f_sign = 1.0 if facing == "right" else -1.0
+        ear_px = pixel(ear, width, height)
+        sh_px = pixel(shoulder, width, height)
+        neck_angle = math.degrees(
+            math.atan2(f_sign * (ear_px[0] - sh_px[0]), ear_px[1] - sh_px[1])
+        )
+        label = f"Head posture: {neck_angle:+.1f} deg"
+
+    cv2.line(image, (sx, sy), (ex, ey), head_color, 3, cv2.LINE_AA)
+    nose = reliable_pose.get("nose")
+    if nose is not None:
+        nx, ny = screen_point(nose.x, nose.y, width, height, mirror)
+        cv2.line(image, (ex, ey), (nx, ny), head_color, 2, cv2.LINE_AA)
+    for point in ((sx, sy), (ex, ey)):
+        cv2.circle(image, point, 5, head_color, -1, cv2.LINE_AA)
+
+    if not show_labels:
+        return
+    (text_width, text_height), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 2)
+    tx = max(8, min(ex + 12, width - text_width - 8))
+    ty = max(text_height + 8, min(ey, height - 12))
+    cv2.putText(
+        image,
+        label,
+        (tx, ty),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.52,
+        head_color,
+        2,
+        cv2.LINE_AA,
+    )
 
 
 def draw(
@@ -125,62 +392,73 @@ def draw(
     verbose_skeleton: bool = True,
     show_vertical_axis: bool = True,
     show_footer: bool = True,
+    settings_coaching: bool = True,
+    skeleton_poses: list[dict[str, Landmark]] | None = None,
+    skeleton_joint_origins: Mapping[str, str] | None = None,
+    shoulder_geometry: dict[str, float] | None = None,
+    knee_geometry: dict[str, float] | None = None,
+    show_head_alignment: bool = True,
+    show_shoulders_height: bool = True,
+    show_role_detection: bool = True,
+    show_embrace_type: bool = True,
+    show_alerts: bool = True,
 ) -> Any:
     image = cv2.flip(image, 1) if mirror else image.copy()
     disp_w = max(960, observation.width)
     disp_h = round(observation.height * disp_w / observation.width)
     if (disp_w, disp_h) != (image.shape[1], image.shape[0]):
         image = cv2.resize(image, (disp_w, disp_h), interpolation=cv2.INTER_LINEAR)
-    bad_head = head_down_elapsed >= head_down_duration
-    bad_shoulders = shoulder_tension_elapsed >= shoulder_tension_duration
-    bad_knees = knee_straight_elapsed >= knee_straight_duration
-    bad_axis = axis_curve_state == "DEVIATION" or (
+    bad_head = show_alerts and settings_coaching and head_down_elapsed >= head_down_duration
+    bad_shoulders = show_alerts and settings_coaching and shoulder_tension_elapsed >= shoulder_tension_duration
+    bad_knees = show_alerts and settings_coaching and knee_straight_elapsed >= knee_straight_duration
+    bad_axis = show_alerts and settings_coaching and (axis_curve_state == "DEVIATION" or (
         axis_curve_elapsed >= axis_curve_duration
         and (axis_curve_smoothed is None or axis_curve_smoothed >= axis_curve_clear)
-    )
-    bad_ankles = bool(ankle_high_alert)
+    ))
+    bad_ankles = show_alerts and settings_coaching and bool(ankle_high_alert)
     detected_role = role
     detected_embrace = embrace_type
-    for pose in observation.poses:
-        if detected_role is None:
-            detected_role = detect_role(pose)
-        if detected_embrace is None and detected_role in ("LEADER", "FOLLOWER"):
-            detected_embrace = detect_embrace_type(
-                pose, detected_role, closed_threshold=embrace_closed_threshold
-            )
+    for pose in observation.poses if skeleton_poses is None else skeleton_poses:
         if verbose_skeleton:
             for a, b in CONNECTIONS:
                 if reliable(pose.get(a), confidence) and reliable(pose.get(b), confidence):
                     pa, pb = pose[a], pose[b]
-                    cv2.line(
+                    draw_styled_bone(
                         image,
                         screen_point(pa.x, pa.y, disp_w, disp_h, mirror),
                         screen_point(pb.x, pb.y, disp_w, disp_h, mirror),
                         (80, 220, 80),
                         2,
+                        style=edge_provenance_style(a, b, skeleton_joint_origins),
                     )
-        for p in pose.values():
+        for name, p in pose.items():
             if math.isfinite(p.x) and math.isfinite(p.y) and 0 <= p.x <= 1 and 0 <= p.y <= 1:
+                origin = (
+                    skeleton_joint_origins.get(name, "forward")
+                    if skeleton_joint_origins
+                    else "forward"
+                )
+                dot_center = screen_point(p.x, p.y, disp_w, disp_h, mirror)
                 if verbose_skeleton:
-                    cv2.circle(
-                        image,
-                        screen_point(p.x, p.y, disp_w, disp_h, mirror),
-                        3,
-                        (80, 220, 80) if reliable(p, confidence) else (0, 180, 255),
-                        -1,
-                    )
+                    if not reliable(p, confidence):
+                        cv2.circle(image, dot_center, 3, (0, 180, 255), -1)
+                    elif origin in ("backward", "interpolated"):
+                        cv2.circle(image, dot_center, 4, (80, 220, 80), 1, cv2.LINE_AA)
+                    else:
+                        cv2.circle(image, dot_center, 3, (80, 220, 80), -1)
                 elif reliable(p, confidence):
-                    cv2.circle(
-                        image,
-                        screen_point(p.x, p.y, disp_w, disp_h, mirror),
-                        4,
-                        (80, 220, 80),
-                        -1,
-                    )
+                    cv2.circle(image, dot_center, 4, (80, 220, 80), -1)
+    for pose in observation.poses:
+        if detected_role is None:
+            detected_role = detect_role(pose)
+        if settings_coaching and detected_embrace is None and detected_role in ("LEADER", "FOLLOWER"):
+            detected_embrace = detect_embrace_type(
+                pose, detected_role, closed_threshold=embrace_closed_threshold
+            )
         head_info = head_horizontal_alignment(
             pose, observation.width, observation.height, neutral_offset=head_neutral_offset
         )
-        if head_info is not None:
+        if settings_coaching and show_head_alignment and head_info is not None:
             raw_angle, ear, nose = head_info
             angle = head_angle_smoothed if head_angle_smoothed is not None else raw_angle
             ex, ey = screen_point(ear.x, ear.y, disp_w, disp_h, mirror)
@@ -233,8 +511,9 @@ def draw(
             observation.width,
             observation.height,
             neutral_clearance=shoulder_neutral_clearance,
+            **(shoulder_geometry or {}),
         )
-        if sh_info is not None:
+        if settings_coaching and show_shoulders_height and sh_info is not None:
             raw_elev_pct, raw_clear, sh_ear, sh_lm = sh_info
             elev_pct = shoulder_elev_smoothed if shoulder_elev_smoothed is not None else raw_elev_pct
             _sex, sey = screen_point(sh_ear.x, sh_ear.y, disp_w, disp_h, mirror)
@@ -278,9 +557,9 @@ def draw(
                 cv2.LINE_AA,
             )
         knee_info = knee_bend_alignment(
-            pose, observation.width, observation.height, side=side
+            pose, observation.width, observation.height, side=side, **(knee_geometry or {})
         )
-        if knee_info is not None:
+        if settings_coaching and knee_info is not None:
             raw_knee_bend_deg, vis_legs = knee_info
             knee_bend_deg = (
                 knee_bend_smoothed if knee_bend_smoothed is not None else raw_knee_bend_deg
@@ -324,9 +603,9 @@ def draw(
                     cv2.LINE_AA,
                 )
         if show_vertical_axis:
-            _draw_torso_axis(image, pose, mirror, confidence)
+            draw_torso_axis(image, pose, mirror, confidence)
         ankle_info = ankle_lift_alignment(pose, observation.width, observation.height)
-        if ankle_info is not None:
+        if settings_coaching and ankle_info is not None:
             raw_ankle_lift, lifted_lm, grounded_lm = ankle_info
             shown_lift = (
                 ankle_lift_smoothed if ankle_lift_smoothed is not None else raw_ankle_lift
@@ -376,39 +655,49 @@ def draw(
                 2,
                 cv2.LINE_AA,
             )
-    role_text = f"Role: {detected_role or 'NONE'}"
-    role_color = (
-        (255, 220, 0)
-        if detected_role == "LEADER"
-        else (255, 140, 255)
-        if detected_role == "FOLLOWER"
-        else (200, 200, 200)
-    )
-    cv2.putText(
-        image,
-        role_text,
-        (12, 28),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.7,
-        role_color,
-        2,
-        cv2.LINE_AA,
-    )
-    alert_y = 62
-    if detected_role in ("LEADER", "FOLLOWER") and detected_embrace in ("CLOSED", "OPEN"):
+    alert_y = 28
+    if show_role_detection:
+        role_text = f"Role: {detected_role or 'NONE'}"
+        role_color = (
+            (255, 220, 0)
+            if detected_role == "LEADER"
+            else (255, 140, 255)
+            if detected_role == "FOLLOWER"
+            else (200, 200, 200)
+        )
+        cv2.putText(
+            image,
+            role_text,
+            (12, disp_h - 18),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            role_color,
+            2,
+            cv2.LINE_AA,
+        )
+    if (
+        settings_coaching
+        and show_embrace_type
+        and detected_role in ("LEADER", "FOLLOWER")
+        and detected_embrace in ("CLOSED", "OPEN")
+    ):
         embrace_label = f"Embrace: {detected_embrace} EMBRACE"
         embrace_color = (0, 230, 255) if detected_embrace == "CLOSED" else (120, 240, 120)
         cv2.putText(
             image,
             embrace_label,
-            (12, 56),
+            (12, disp_h - 46 if show_role_detection else disp_h - 18),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.65,
             embrace_color,
             2,
             cv2.LINE_AA,
         )
-        alert_y = 88
+    if not settings_coaching and message:
+        cv2.putText(
+            image, message, (12, alert_y), cv2.FONT_HERSHEY_SIMPLEX,
+            0.55, (0, 165, 255), 2, cv2.LINE_AA,
+        )
     if bad_head:
         cv2.putText(
             image,

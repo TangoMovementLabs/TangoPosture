@@ -9,8 +9,10 @@ from conftest import frame
 
 from tango_posture.app import Application
 from tango_posture.archive import PracticeArchive, read_manifest
-from tango_posture.calibration import load_calibration_file, profile
+from tango_posture.calibration.baseline import load_calibration_file, profile
+from tango_posture.calibration.measurements import measure_ranges
 from tango_posture.capture import Captured
+from tango_posture.config import Config
 from tango_posture.models import MANIFEST, fetch, verify
 from tango_posture.movement import render_floor_guide
 from tango_posture.practice import GuiDisplay
@@ -51,6 +53,162 @@ class FakeEstimator:
 
     def close(self):
         self.closed = True
+
+
+@pytest.mark.parametrize("analysis_model", ["full", "heavy"])
+def test_live_practice_keeps_lite_when_analysis_model_changes(tmp_path, monkeypatch, analysis_model):
+    verified, loaded = [], []
+    cfg = Config(data_dir=str(tmp_path), analysis_model=analysis_model, beat_tracking=False)
+    monkeypatch.setattr(
+        "tango_posture.app.verify", lambda path: verified.append(path) or MANIFEST["sha256"],
+    )
+    monkeypatch.setattr(
+        "tango_posture.app.MediaPipeEstimator", lambda path: loaded.append(path) or FakeEstimator(),
+    )
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("Live Practice must not download an analysis model")
+
+    monkeypatch.setattr("urllib.request.urlopen", forbidden)
+
+    class Buttons(GuiDisplay):
+        def __init__(self):
+            super().__init__()
+            self.frames = 0
+
+        def show(self, image):
+            self.frames += 1
+            if self.frames == 2:
+                self.request("q")
+
+    storage = Storage(tmp_path)
+    try:
+        app = Application(cfg, storage, capture=FakeCapture(count=2), display=Buttons())
+        app.run()
+        assert verified == [Path(cfg.model_path)]
+        assert loaded == [Path(cfg.model_path)]
+        assert app.model_hash == MANIFEST["sha256"]
+        assert not (tmp_path / "models").exists()
+    finally:
+        storage.close()
+
+
+def test_settings_range_defaults_coach_without_granting_session_scoring(tmp_path, monkeypatch):
+    monkeypatch.setattr("tango_posture.app.verify", lambda _: MANIFEST["sha256"])
+    value = measure_ranges(frame(0, forward=0.2), Config()).values["head_pitch"]
+    cfg = Config(data_dir=str(tmp_path), beat_tracking=False, entry_duration=0.1, smoothing=0.0001,
+                 calibration_defaults={
+                     "head_pitch": {"lower": value + 10, "upper": value + 20,
+                                    "unit": "degrees", "view": "all"},
+                 })
+    labels = []
+    monkeypatch.setattr(
+        "tango_posture.overlay.cv2.putText",
+        lambda image, text, *args, **kwargs: labels.append(text) or image,
+    )
+
+    class Buttons(GuiDisplay):
+        def show(self, image):
+            pass
+
+    storage = Storage(tmp_path)
+    app = Application(
+        cfg, storage, video="fixture", capture=FakeCapture(count=5),
+        estimator=FakeEstimator(), display=Buttons(),
+    )
+    try:
+        app.run()
+        assert "Head pitch (ear-to-nose)" in app.display.notes
+        assert "outside approved range" in app.display.notes
+        assert app.session is None and app.reference is None
+        assert not any(
+            label.startswith(("Head horiz:", "Shoulders:", "LOWER SHOULDERS", "BEND KNEES"))
+            for label in labels
+        )
+    finally:
+        storage.close()
+
+
+@pytest.mark.parametrize("camera_checked", [False, True])
+@pytest.mark.parametrize("metric", ["head_pitch", "torso_axis_tilt"])
+def test_range_scoring_records_reusable_landmarks_and_portable_analytics(
+    tmp_path, cfg, monkeypatch, camera_checked, metric,
+):
+    from tango_posture.archive import read_analytics
+    from tango_posture.calibration.evidence import cached_evidence
+    from tango_posture.calibration.models import ApprovedRange, Passage, RangeProfile
+    from tango_posture.desktop_qt.analytics.data import load_archive_dataset
+    from tango_posture.desktop_qt.practice.worker import QtPracticeDisplay
+    from tango_posture.references.archives import promote_reference
+
+    monkeypatch.setattr("tango_posture.app.verify", lambda _: MANIFEST["sha256"])
+    labels = []
+    monkeypatch.setattr(
+        "tango_posture.overlay.cv2.putText",
+        lambda image, text, *args, **kwargs: labels.append(text) or image,
+    )
+    cfg.data_dir = str(tmp_path)
+    cfg.beat_tracking = False
+    cfg.head_down_duration = 0.1
+    cfg.head_neutral_offset = 180
+    target = RangeProfile(
+        name="Checked camera", context="Neutral posture", model_hash=MANIFEST["sha256"],
+        capture_profile=profile(cfg, 640, 480, "camera:0" if camera_checked else "video"),
+        source={"archive": "missing.tpr"},
+        metrics={metric: ApprovedRange(
+            lower=9 if metric == "torso_axis_tilt" else -5,
+            upper=11 if metric == "torso_axis_tilt" else 5, unit="degrees", view="side",
+            passages=[Passage(start=0, end=2)], median=0, p10=-3, p90=3,
+            valid_duration=1.8, selected_duration=2, samples=20, inside_fraction=1,
+            camera_check_passed=camera_checked,
+        )},
+    )
+
+    class Buttons(QtPracticeDisplay):
+        def __init__(self):
+            super().__init__(capture_evidence=True)
+            self.count = 0
+            self.recording.set()
+            self.request("s")
+
+        def show(self, image):
+            super().show(image)
+            self.count += 1
+            if self.count == 30:
+                self.request("q")
+
+    storage = Storage(tmp_path)
+    capture, estimator = FakeCapture(), FakeEstimator()
+    app = Application(
+        cfg, storage, reference=target.calibration(), capture=capture,
+        estimator=estimator, display=Buttons(), practice_name="Range scoring",
+    )
+    try:
+        app.run()
+        assert capture.closed and estimator.closed
+        if camera_checked:
+            assert app.last_summary["metrics"][metric]["event_count"] == 1
+            assert set(app.last_summary["metrics"]) == {metric}
+        else:
+            assert app.last_summary is None and app.session is None
+            assert "comparison only" in app.display.notes.lower()
+        assert "BAD HEAD ALIGNMENT" not in app.display.notes
+        assert not any(
+            label.startswith(("Head horiz:", "Shoulders:", "LOWER SHOULDERS", "BEND KNEES"))
+            for label in labels
+        )
+        assert all(not any(entry["alerts"].values()) for entry in app.frame_log)
+        analytics = read_analytics(app.practice_file, 0)
+        assert len(analytics["frames"]) == 30
+        assert analytics["frames"][0]["poses"]
+        dataset = load_archive_dataset(app.practice_file, 0)
+        if camera_checked:
+            assert dataset.metrics[metric].event_count == 1
+        reference = tmp_path / "references" / "Promoted.tpr"
+        promote_reference(app.practice_file, reference, "Reusable camera evidence")
+        assert len(cached_evidence(reference).frames) == 30
+    finally:
+        storage.close()
 
 
 def test_zero_duration_processing_has_unavailable_fps(tmp_path, cfg, monkeypatch):
@@ -166,6 +324,40 @@ def test_native_display_buttons_use_the_existing_session_pipeline(tmp_path, refe
         assert capture.closed and estimator.closed and display.stopped.is_set()
         assert app.practice_file.is_file()
         assert not (tmp_path / "reports").exists()
+    finally:
+        storage.close()
+
+
+def test_stop_scoring_does_not_stop_recording_pipeline(tmp_path, reference, cfg, monkeypatch):
+    monkeypatch.setattr("tango_posture.app.verify", lambda _: MANIFEST["sha256"])
+    keys = iter("stq")
+
+    class Buttons(GuiDisplay):
+        def show(self, image):
+            super().show(image)
+            self.request(next(keys))
+
+    cfg.data_dir = str(tmp_path)
+    cfg.beat_tracking = False
+    storage = Storage(tmp_path)
+    storage.save_calibration(reference)
+    capture = FakeCapture(count=3)
+    app = Application(
+        cfg,
+        storage,
+        video="fixture",
+        reference=reference,
+        capture=capture,
+        estimator=FakeEstimator(),
+        display=Buttons(),
+        practice_name="stop-scoring",
+    )
+    try:
+        app.run()
+        assert app.state == "FINISHED"
+        assert app.recording_saved
+        assert storage.list("sessions")[0]["status"] == "completed"
+        assert app.practice_file is not None and app.practice_file.is_file()
     finally:
         storage.close()
 
@@ -387,7 +579,7 @@ def test_archive_save_failure_preserves_recordings_and_closes_capture(
     workspace.mkdir()
     monkeypatch.setattr("tango_posture.app.mkdtemp", lambda **_: str(workspace))
 
-    def fail_save(*args):
+    def fail_save(*args, **kwargs):
         raise OSError("archive disk full")
 
     monkeypatch.setattr("tango_posture.app.append_segment", fail_save)

@@ -12,6 +12,21 @@ def test_gui_no_longer_has_ignore_env_flag():
         parser().parse_args(["gui", "--ignore-env"])
 
 
+@pytest.mark.parametrize("arguments", [[], ["gui"], ["qt"], ["gui", "--qt"]])
+def test_all_desktop_entrypoints_launch_qt(arguments, monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    received = []
+
+    def launch(cfg):
+        received.append(cfg)
+        return 7
+
+    monkeypatch.setattr("tango_posture.desktop_qt.launch_qt", launch)
+    assert main(arguments) == 7
+    assert len(received) == 1
+    assert received[0].data_dir == "data"
+
+
 def test_manifest_copy():
     import json
     from pathlib import Path

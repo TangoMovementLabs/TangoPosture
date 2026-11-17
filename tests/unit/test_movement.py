@@ -688,3 +688,29 @@ def test_scan_video_movement_streams_and_supports_cancellation(tmp_path: Path):
     cancel.set()
     with pytest.raises((RuntimeError, ValueError), match="cancelled"):
         scan_video_movement(video_path, FakeEstimator(), cancel=cancel)
+
+
+def test_movement_observation_timestamp_mode_handles_vfr_timestamps():
+    # Nominal fps is 30, but actual frame timestamps advance at 10 Hz (0.1s per frame)
+    nominal_fps = 30.0
+    frames = []
+    for i in range(18):
+        t = i * 0.1
+        yaw = 0.0 if i < 4 else (55.0 * min(1.0, (i - 4) / 6.0))
+        frames.append((i, _make_pose_observation(t, hip_yaw_deg=yaw)))
+
+    result = analyse_movement_observations(
+        frames,
+        width=640,
+        height=480,
+        fps=nominal_fps,
+        frame_count=18,
+        sample_stride=1,
+        use_observation_timestamps=True,
+    )
+    assert result["timing_basis"] == "observation_timestamp"
+    validate_movement_analysis(result)
+    assert len(result["pivots"]) == 1
+    pivot = result["pivots"][0]
+    assert pivot["start_time"] == pytest.approx(pivot["start_frame"] * 0.1, abs=1e-4)
+
