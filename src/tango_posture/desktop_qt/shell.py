@@ -290,4 +290,10 @@ class MainWindow(QMainWindow):
                 screen.open_measurement_normalization(payload)
 
     def closeEvent(self, event: QCloseEvent) -> None:
+        practice = self.screens.get(Route.PRACTICE)
+        if isinstance(practice, PracticeScreen) and practice.worker_running:
+            practice.stop_for_navigation()
+        refs = self.screens.get(Route.REFERENCES)
+        if isinstance(refs, ReferencesScreen):
+            refs.stop_for_navigation()
         super().closeEvent(event)

@@ -1642,6 +1642,200 @@ rotation cues appear; otherwise turns are annotated explicitly in Review.
 **Example:** keep `false` for pure linear walking drills or enable `true` to
 pre-populate editable turn markers on giro/ocho exercises.
 
+### Couple calibration smoothing (seconds) - `dancer_analysis.calibration_smoothing_s`
+
+**Default:** `0.25 seconds`; non-negative.
+
+Smoothing time constant for couple charts compared against approved calibration ranges.
+
+**Example:** set `0.25 s` for steady torso-axis trend evaluation without hiding sustained tilts.
+
+### Couple calibration entry duration (seconds) - `dancer_analysis.calibration_entry_duration_s`
+
+**Default:** `1.5 seconds`; non-negative.
+
+Duration a couple metric must stay outside an approved range before raising a deviation alert.
+
+**Example:** `1.5 s` avoids flagging momentary weight transfers as posture deviations.
+
+### Couple calibration clear duration (seconds) - `dancer_analysis.calibration_clear_duration_s`
+
+**Default:** `0.75 seconds`; non-negative.
+
+Duration a couple metric must remain back inside an approved range before clearing an alert.
+
+**Example:** `0.75 s` ensures the couple has truly re-stabilized before clearing the cue.
+
+### Couple axis smoothing (seconds) - `dancer_analysis.axis_smoothing_s`
+
+**Default:** `0.25 seconds`; non-negative.
+
+Zero-phase EMA smoothing time constant for couple torso-axis tilt and separation curves in Analytics.
+
+**Example:** increase to `0.35 s` to reduce high-frequency frame jitter on noisy footage.
+
+### Couple overlay smoothing (seconds) - `dancer_analysis.overlay_smoothing_s`
+
+**Default:** `0.20 seconds`; non-negative.
+
+Smoothing time constant for rendered couple torso-axis lines during Review playback.
+
+**Example:** `0.20 s` keeps torso axis lines steady while remaining responsive during pivots.
+
+### Couple axis bridge max gap (seconds) - `dancer_analysis.axis_bridge_max_gap_s`
+
+**Default:** `0.25 seconds`; positive.
+
+Maximum dropout gap linearly bridged across couple axis curves and overlays for display.
+
+**Example:** `0.25 s` bridges a 5–7 frame occlusion without inventing long missing segments.
+
+### Couple overlay min landmark visibility - `dancer_analysis.overlay_min_landmark_visibility`
+
+**Default:** `0.50`; `0.0` to `1.0`.
+
+Minimum landmark visibility threshold required to draw couple overlay markers.
+
+**Example:** `0.50` hides occluded shoulder/hip markers rather than drawing unreliable lines.
+
+### Duplicate pose max distance (torso lengths) - `dancer_analysis.duplicate_pose_max_distance_torso_lengths`
+
+**Default:** `0.18 torso lengths`; positive.
+
+Maximum median joint separation below which a redundant duplicate detection on the same person is suppressed.
+
+**Example:** `0.18` suppresses overlapping ghost detections without merging two distinct partners.
+
+### Fixed scale minimum ratio - `dancer_analysis.fixed_scale_min_ratio`
+
+**Default:** `0.45`; `0.0` to `1.0`.
+
+Minimum observed-to-fixed torso length ratio allowed for couple torso measurement eligibility.
+
+**Example:** `0.45` rejects severely foreshortened detections that distort normalized metrics.
+
+### Fixed scale maximum ratio - `dancer_analysis.fixed_scale_max_ratio`
+
+**Default:** `2.20`; above `1.0`.
+
+Maximum observed-to-fixed torso length ratio allowed for couple torso measurement eligibility.
+
+**Example:** `2.20` rejects sudden scale spikes caused by background detections.
+
+### Shot-cut max frame gap (seconds) - `dancer_analysis.shot_cut_max_frame_gap_s`
+
+**Default:** `1.50 seconds`; positive.
+
+Frame-to-frame time gap ceiling above which couple tracking inserts a shot-cut break.
+
+**Example:** `1.50 s` prevents linking dancers across edited video cuts.
+
+### Shot-cut jump (torso lengths) - `dancer_analysis.shot_cut_jump_torso_lengths`
+
+**Default:** `1.50 torso lengths`; positive.
+
+Minimum hip displacement jump that triggers a couple tracking shot-cut break.
+
+**Example:** `1.50` resets tracking if the camera cuts to a different angle.
+
+### Turn exit match window (seconds) - `dancer_analysis.turn_exit_match_window_s`
+
+**Default:** `3.00 seconds`; positive.
+
+Maximum time window around turn end for pairing a couple turn exit marker.
+
+**Example:** `3.00 s` pairs delayed exit transitions with the preceding giro or ocho.
+
+### Close-embrace max tilt (degrees) - `dancer_analysis.close_embrace_max_tilt_deg`
+
+**Default:** `25.0 degrees`; `0.0` to `90.0`.
+
+Maximum individual torso tilt accepted when splitting a merged close-embrace detection.
+
+**Example:** `25.0°` keeps split close-embrace torsos physically plausible.
+
+### Solo camera calibration settings
+
+### Speak calibration instructions - `solo_camera.speak_instructions`
+
+**Default:** `true`.
+
+Speaks guided solo camera calibration prompts aloud when speech synthesis is available.
+
+**Example:** disable for silent practice; on-screen instructions still guide every phase.
+
+### Stable time before hold (seconds) - `solo_camera.stable_time_s`
+
+**Default:** `0.75 seconds`; positive.
+
+Seconds the requested view and steady pose must hold after the prompt before capture starts.
+
+**Example:** `0.75 s` ensures you have finished turning before recording begins.
+
+### Settle drift limit (torso lengths) - `solo_camera.settle_drift_torso_lengths`
+
+**Default:** `0.05 torso lengths`; positive.
+
+Maximum torso midpoint drift allowed during the settle window before re-arming.
+
+**Example:** `0.05` allows natural breathing while catching large weight shifts.
+
+### Hold capture window (seconds) - `solo_camera.hold_window_s`
+
+**Default:** `2.5 seconds`; positive.
+
+Maximum elapsed capture duration of a standing calibration hold attempt.
+
+**Example:** `2.5 s` gives enough samples for a reliable median and P10–P90 spread.
+
+### Minimum usable hold time (seconds) - `solo_camera.min_usable_hold_s`
+
+**Default:** `2.0 seconds`; positive, at most `hold_window_s`.
+
+Minimum cumulative usable seconds required per metric to accept a hold or walking pass.
+
+**Example:** `2.0 s` out of `2.5 s` requires at least 80% valid tracking coverage.
+
+### Maximum usable gap (seconds) - `solo_camera.max_usable_gap_s`
+
+**Default:** `0.20 seconds`; positive, smaller than `hold_window_s`.
+
+Maximum gap between adjacent usable observations (capped by `max_gap`) that still earns duration.
+
+**Example:** `0.20 s` prevents long tracking dropouts from counting toward hold time.
+
+### Front-view width margin (torso lengths) - `solo_camera.front_view_width_margin`
+
+**Default:** `0.10 torso lengths`; non-negative.
+
+Buffer above `max_view_width` required before accepting a front-view hold.
+
+**Example:** `0.10` creates a buffer zone so oblique three-quarter poses prompt you to turn squarely.
+
+### Retry hint delay (seconds) - `solo_camera.retry_hint_delay_s`
+
+**Default:** `8.0 seconds`; positive.
+
+Seconds spent waiting for the requested view or pose before surfacing an actionable hint.
+
+**Example:** after `8.0 s` without a clear view, the guide suggests adjusting framing or lighting.
+
+### Camera stall timeout (seconds) - `solo_camera.camera_stall_timeout_s`
+
+**Default:** `3.0 seconds`; positive.
+
+Seconds without a new delivered camera frame before reporting a stalled camera.
+
+**Example:** `3.0 s` triggers **Camera stopped responding** with a **Retry camera** option.
+
+### Walking take limit (seconds) - `solo_camera.walking_take_limit_s`
+
+**Default:** `8.0 seconds`; positive.
+
+Maximum capture duration in seconds for a single solo walking pass.
+
+**Example:** `8.0 s` caps a 4-step studio walk across the frame while allowing earlier **End take**.
+
 ### Review & Ollama settings
 
 Ollama is optional report commentary, not the pose tracker or calibration

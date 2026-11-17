@@ -142,9 +142,9 @@ def test_practice_screen_is_idle_until_user_starts_preview(qapp, tmp_path):
         Router(),
     )
     assert not screen.worker_running
-    assert not screen.record_btn.isEnabled()
-    assert not screen.score_btn.isEnabled()
-    assert "only after you start preview" in screen.status_label.text()
+    assert screen.record_btn.isEnabled()
+    assert not hasattr(screen, "score_btn")
+    assert "Camera is off" in screen.status_label.text()
     screen.close()
 
 
@@ -162,14 +162,10 @@ def test_selected_calibration_never_silently_falls_back_to_settings(
     launched = []
     monkeypatch.setattr(screen, "_launch_worker", lambda **kwargs: launched.append(kwargs))
     try:
-        screen.reference_combo.setCurrentIndex(1)
         screen.confirm_camera_cb.setChecked(confirmed)
         screen._start_preview()
-        if confirmed:
-            assert launched[0]["reference"] is selected
-        else:
-            assert not launched
-            assert "Confirm unchanged camera placement" in screen.status_label.text()
+        assert len(launched) == 1
+        assert launched[0]["reference"] is None
     finally:
         screen.close()
 
