@@ -218,3 +218,132 @@ def test_walking_plan_uses_take_states_without_stillness():
     rec = session.end_walking_take()
     assert rec is not None and rec.usable and rec.role == "walking"
     assert len(build_check_phases(["head_pitch", "shoulder_clearance"])) == 8
+
+
+def test_quick_setup_phases_explicit_turn_directions():
+    from tango_posture.calibration.camera_session import CHECK_SPECS
+
+    phases = {p.phase_id: p for p in build_quick_setup_phases()}
+    assert "turn to the camera" in phases["front_a"].instruction.lower()
+    assert "turn to the camera" in phases["front_b"].instruction.lower()
+    assert "turn left" in phases["side_a"].instruction.lower()
+    assert "turn right" in phases["side_b"].instruction.lower()
+    assert phases["front_a"].turn_direction == "camera"
+    assert phases["side_a"].turn_direction == "left"
+    assert phases["side_b"].turn_direction == "right"
+
+    walking = build_walking_phases()
+    assert "turn left" in walking[0].instruction.lower()
+    assert "turn right" in walking[1].instruction.lower()
+
+    all_instructions = [p.instruction for p in phases.values()] + [p.instruction for p in walking]
+    for spec in CHECK_SPECS.values():
+        all_instructions.append(spec.neutral_instruction)
+    assert all("direction shown" not in txt.lower() and "as shown" not in txt.lower() for txt in all_instructions)
+
+
+def test_quick_setup_completes_both_side_turns_with_occluded_far_joints():
+    def _profile_with_occluded_far_side(
+        *, near_side: str, facing: str, ankle_vis: float = 0.95
+    ) -> dict[str, Landmark]:
+        nose_x = 0.53 if facing == "right" else 0.47
+        far_side = "right" if near_side == "left" else "left"
+        pose = {
+            "nose": _lm(nose_x, 0.20, 0.95),
+            f"{near_side}_ear": _lm(0.50, 0.20, 0.95),
+            f"{far_side}_ear": _lm(0.50, 0.20, 0.35),
+            f"{near_side}_shoulder": _lm(0.50, 0.32, 0.95),
+            f"{far_side}_shoulder": _lm(0.50, 0.32, 0.40),
+            f"{near_side}_hip": _lm(0.50, 0.58, 0.95),
+            f"{far_side}_hip": _lm(0.50, 0.58, 0.40),
+            f"{near_side}_knee": _lm(0.51, 0.74, ankle_vis),
+            f"{far_side}_knee": _lm(0.49, 0.74, 0.35),
+            f"{near_side}_ankle": _lm(0.50, 0.90, ankle_vis),
+            f"{far_side}_ankle": _lm(0.50, 0.90, 0.35),
+        }
+        return pose
+
+    cfg = Config()
+    session = SoloCameraSession(cfg, now_monotonic=0.0, auto_detect_side_facing=True)
+    session.start_plan(build_quick_setup_phases(), now_monotonic=0.0, speak_enabled=False)
+
+    t = 0.0
+    # Complete front_a and front_b
+    for phase_id in ("front_a", "front_b"):
+        assert session.current_phase is not None and session.current_phase.phase_id == phase_id
+        session.process_frame(FrameObservation(t, 640, 480, [_front_pose()]), now_monotonic=t)
+        t += 0.8
+        session.process_frame(FrameObservation(t, 640, 480, [_front_pose()]), now_monotonic=t)
+        assert session.state == "Capture"
+        for i in range(1, 27):
+            ts = t + i * 0.1
+            session.process_frame(
+                FrameObservation(ts, 640, 480, [_front_pose()]),
+                now_monotonic=ts,
+                speak_enabled=False,
+            )
+        t += 2.7
+
+    # While still facing camera on side_a, hint must explicitly say Turn left
+    assert session.current_phase is not None and session.current_phase.phase_id == "side_a"
+    session.process_frame(FrameObservation(t, 640, 480, [_front_pose()]), now_monotonic=t)
+    assert "turn left" in session.hint_message.lower()
+
+    # Turn left (left side near camera, facing right) with occluded right shoulder/hip (vis 0.40)
+    # and complete within the faster 1.5s side hold window (1.6s total)
+    t += 0.1
+    pose_left = _profile_with_occluded_far_side(near_side="left", facing="right")
+    session.process_frame(FrameObservation(t, 640, 480, [pose_left]), now_monotonic=t)
+    assert session.state == "Settle"
+    t += 0.8
+    session.process_frame(FrameObservation(t, 640, 480, [pose_left]), now_monotonic=t)
+    assert session.state == "Capture"
+    for i in range(1, 17):
+        ts = t + i * 0.1
+        # Inject a single-frame view flicker (<= 0.35s) mid-capture and confirm capture continues
+        if i == 8:
+            session.process_frame(
+                FrameObservation(ts, 640, 480, [_front_pose()]),
+                now_monotonic=ts,
+                speak_enabled=False,
+            )
+            assert session.state == "Capture"
+            continue
+        session.process_frame(
+            FrameObservation(ts, 640, 480, [pose_left]),
+            now_monotonic=ts,
+            speak_enabled=False,
+        )
+    t += 1.7
+
+    # Turn right must advance after the 1.5s side_a capture and complete in 1.5s too
+    assert session.current_phase is not None and session.current_phase.phase_id == "side_b"
+    session.process_frame(FrameObservation(t, 640, 480, [_front_pose()]), now_monotonic=t)
+    assert "turn right" in session.hint_message.lower()
+
+    t += 0.1
+    pose_right = _profile_with_occluded_far_side(near_side="right", facing="left")
+    session.process_frame(FrameObservation(t, 640, 480, [pose_right]), now_monotonic=t)
+    assert session.state == "Settle"
+    t += 0.8
+    session.process_frame(FrameObservation(t, 640, 480, [pose_right]), now_monotonic=t)
+    assert session.state == "Capture"
+    for i in range(1, 17):
+        ts = t + i * 0.1
+        session.process_frame(
+            FrameObservation(ts, 640, 480, [pose_right]),
+            now_monotonic=ts,
+            speak_enabled=False,
+        )
+
+    assert session.state == "Review"
+    passages = session.accepted_passages
+    assert set(passages) == {"front_a", "front_b", "side_a", "side_b"}
+    assert passages["side_a"].detected_side == "left"
+    assert passages["side_a"].detected_facing == "right"
+    assert passages["side_b"].detected_side == "right"
+    assert passages["side_b"].detected_facing == "left"
+    for pid in ("side_a", "side_b"):
+        assert (passages[pid].passage.end - passages[pid].passage.start) <= 1.7
+        assert "trunk_inclination" in passages[pid].eligible_metrics
+        assert "head_forward" in passages[pid].eligible_metrics

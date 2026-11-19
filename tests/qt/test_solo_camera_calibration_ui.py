@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from PySide6.QtWidgets import QApplication
 
@@ -135,3 +137,135 @@ def test_references_lists_range_profile_and_check_with_camera_prepares_wizard(qa
 
     wizard.close()
     screen.close()
+
+
+def test_guided_enter_review_announces_saves_and_stays_open_for_review(qapp, tmp_path, monkeypatch):
+    from tempfile import TemporaryDirectory
+
+    import cv2
+    import numpy as np
+
+    from tango_posture.archive import append_segment, practice_directory, practice_path
+    from tango_posture.calibration.archives import read_range_profile
+    from tango_posture.calibration.camera_session import AcceptedPassageRecord
+
+    cfg = Config(data_dir=str(tmp_path))
+    bridge = ServiceBridge(cfg)
+    wizard = GuidedCalibration(bridge, embedded=True, profile_name="My studio")
+    wizard.speak_cb.setChecked(True)
+    wizard.show()
+    qapp.processEvents()
+
+    temp_dir = TemporaryDirectory(dir=tmp_path)
+    temp_root = Path(temp_dir.name)
+    staging_dir = temp_root / "staging"
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    prac_dir = practice_directory(str(temp_root))
+    prac_dir.mkdir(parents=True, exist_ok=True)
+
+    video = temp_root / "video.mp4"
+    report = temp_root / "report.md"
+    report.write_text("# Guided evidence\n", encoding="utf-8")
+    writer = cv2.VideoWriter(str(video), cv2.VideoWriter.fourcc(*"mp4v"), 10, (640, 480))
+    assert writer.isOpened()
+
+    front_pose = {
+        "nose": [0.50, 0.20, 0.0, 0.99, 0.99],
+        "left_ear": [0.54, 0.20, 0.0, 0.99, 0.99],
+        "right_ear": [0.46, 0.20, 0.0, 0.99, 0.99],
+        "left_shoulder": [0.62, 0.32, 0.0, 0.99, 0.99],
+        "right_shoulder": [0.38, 0.32, 0.0, 0.99, 0.99],
+        "left_hip": [0.58, 0.58, 0.0, 0.99, 0.99],
+        "right_hip": [0.42, 0.58, 0.0, 0.99, 0.99],
+        "left_ankle": [0.58, 0.90, 0.0, 0.99, 0.99],
+        "right_ankle": [0.42, 0.90, 0.0, 0.99, 0.99],
+    }
+    side_pose = {
+        "nose": [0.53, 0.20, 0.0, 0.99, 0.99],
+        "left_ear": [0.50, 0.20, 0.0, 0.99, 0.99],
+        "right_ear": [0.495, 0.20, 0.0, 0.45, 0.45],
+        "left_shoulder": [0.50, 0.32, 0.0, 0.99, 0.99],
+        "right_shoulder": [0.50, 0.32, 0.0, 0.40, 0.40],
+        "left_hip": [0.50, 0.58, 0.0, 0.99, 0.99],
+        "right_hip": [0.50, 0.58, 0.0, 0.40, 0.40],
+        "left_ankle": [0.50, 0.90, 0.0, 0.99, 0.99],
+        "right_ankle": [0.50, 0.90, 0.0, 0.40, 0.40],
+    }
+    entries = []
+    timestamps = [i / 10.0 for i in range(30)]
+    for idx in range(30):
+        writer.write(np.zeros((480, 640, 3), dtype=np.uint8))
+        pose = front_pose if idx < 15 else side_pose
+        entries.append({"poses": [pose]})
+    writer.release()
+
+    tp_file = practice_path(prac_dir, "solo_calibration_evidence")
+    append_segment(
+        tp_file,
+        report,
+        video,
+        None,
+        timestamps,
+        analytics={
+            "model_hash": MANIFEST["sha256"],
+            "capture_profile": build_capture_profile(cfg, 640, 480, "camera:0"),
+            "frames": entries,
+            "max_gap": cfg.max_gap,
+        },
+    )
+
+    wizard._temp_dir = temp_dir
+    wizard._staging_dir = staging_dir
+    wizard._frozen_cfg = cfg
+    wizard._session._accepted_passages = {
+        "front_a": AcceptedPassageRecord(
+            phase_id="front_a",
+            plan_kind="quick",
+            view="front",
+            repetition=1,
+            role="neutral",
+            passage=Passage(start=0.0, end=1.4),
+            eligible_metrics={"shoulder_clearance": 1.4},
+            usable=True,
+        ),
+        "side_a": AcceptedPassageRecord(
+            phase_id="side_a",
+            plan_kind="quick",
+            view="side",
+            repetition=1,
+            role="neutral",
+            passage=Passage(start=1.5, end=2.9),
+            eligible_metrics={"trunk_inclination": 1.4},
+            usable=True,
+            detected_side="left",
+            detected_facing="right",
+        ),
+    }
+    wizard._session.state = "Review"
+
+    spoken: list[tuple[int, str]] = []
+    monkeypatch.setattr(wizard._speech, "speak", lambda pid, text: spoken.append((pid, text)))
+
+    wizard._enter_review()
+    qapp.processEvents()
+
+    assert wizard.stack.currentIndex() == 2
+    assert wizard.isVisible()
+    assert spoken == [(0, "Self calibration completed. Save it and review it.")]
+    assert "Self calibration completed. Save it and review it." in wizard.review_summary.text()
+    assert "Self calibration completed. Saved:" in wizard.status_banner.text()
+    assert len(wizard.saved_paths) == 2
+    for saved in wizard.saved_paths:
+        assert saved.is_file()
+        assert saved.suffix == ".tpc"
+        prof = read_range_profile(saved)
+        assert prof.metrics
+
+    # Clicking Save ready profiles again succeeds cleanly with overwrite=True and keeps embedded view visible
+    wizard.save_views_btn.click()
+    qapp.processEvents()
+    assert wizard.isVisible()
+    assert len(wizard.saved_paths) == 2
+
+    wizard.close()
+    temp_dir.cleanup()

@@ -93,6 +93,8 @@ class DancerAnalysisConfig(BaseModel):
     shot_cut_jump_torso_lengths: float = Field(default=1.50, gt=0.0)
     turn_exit_match_window_s: float = Field(default=3.00, gt=0.0)
     close_embrace_max_tilt_deg: float = Field(default=25.0, gt=0.0, le=90.0)
+    couple_axis_max_separation_m: float = Field(default=1.0, gt=0.0)
+    couple_axis_rejoin_separation_m: float = Field(default=0.80, gt=0.0)
     analyze_soundtrack: bool = False
     auto_turn_suggestions: bool = False
 
@@ -104,6 +106,10 @@ class DancerAnalysisConfig(BaseModel):
             raise ValueError("stop_speed must be below start_speed")
         if self.fixed_scale_min_ratio >= self.fixed_scale_max_ratio:
             raise ValueError("fixed_scale_min_ratio must be below fixed_scale_max_ratio")
+        if self.couple_axis_rejoin_separation_m > self.couple_axis_max_separation_m:
+            raise ValueError(
+                "couple_axis_rejoin_separation_m must not exceed couple_axis_max_separation_m"
+            )
         return self
 
 
@@ -406,6 +412,8 @@ SETTING_GROUPS = {
         "dancer_analysis.overlay_smoothing_s",
         "dancer_analysis.axis_bridge_max_gap_s",
         "dancer_analysis.overlay_min_landmark_visibility",
+        "dancer_analysis.couple_axis_max_separation_m",
+        "dancer_analysis.couple_axis_rejoin_separation_m",
         "dancer_analysis.velocity_filter_window_s",
         "dancer_analysis.persistence_s",
         "dancer_analysis.pairing_window_s",
@@ -683,6 +691,12 @@ SETTING_DESCRIPTIONS: dict[str, str] = {
     ),
     "dancer_analysis.close_embrace_max_tilt_deg": (
         "Maximum individual torso tilt (degrees) accepted when splitting a merged close-embrace detection."
+    ),
+    "dancer_analysis.couple_axis_max_separation_m": (
+        "Estimated dancer separation (metres) above which the shared Couple midpoint axis line is hidden."
+    ),
+    "dancer_analysis.couple_axis_rejoin_separation_m": (
+        "Estimated dancer separation (metres) below which a hidden Couple midpoint axis line reappears (hysteresis)."
     ),
     "dancer_analysis.analyze_soundtrack": (
         "Extract optional soundtrack beat candidates for step timing alignment by default."

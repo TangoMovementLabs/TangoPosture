@@ -115,6 +115,8 @@ shot_cut_max_frame_gap_s = 1.50
 shot_cut_jump_torso_lengths = 1.50
 turn_exit_match_window_s = 3.00
 close_embrace_max_tilt_deg = 25.0
+couple_axis_max_separation_m = 1.0
+couple_axis_rejoin_separation_m = 0.80
 analyze_soundtrack = false
 auto_turn_suggestions = false
 

@@ -1302,6 +1302,7 @@ def run_couple_analysis(
     head_a_series: list[dict[str, Any]] = []
     head_b_series: list[dict[str, Any]] = []
     frame_overlays: list[dict[str, Any]] = []
+    couple_axis_active: bool | None = None
 
     def _norm_from_canonical(pt: tuple[float, float], w: int, h: int) -> list[float]:
         return [round(pt[0] / max(1, w - 1), 6), round(-pt[1] / max(1, h - 1), 6)]
@@ -1332,6 +1333,24 @@ def run_couple_analysis(
         mid_tilt: float | None = None
         sep: float | None = None
 
+        # Hysteresis check on estimated separation (metres; 1 torso length ≈ 0.50 m)
+        hip_sep_m: float | None = None
+        if pf.dancer_a and pf.dancer_b and pf.dancer_a.hip_px and pf.dancer_b.hip_px:
+            torso_ref = max(float(scale_pair or 0.0), 1.0)
+            hip_dist_px = math.hypot(
+                pf.dancer_a.hip_px[0] - pf.dancer_b.hip_px[0],
+                pf.dancer_a.hip_px[1] - pf.dancer_b.hip_px[1],
+            )
+            hip_sep_m = (hip_dist_px / torso_ref) * 0.50
+            if couple_axis_active is None:
+                couple_axis_active = hip_sep_m <= float(da_cfg.couple_axis_max_separation_m)
+            elif couple_axis_active:
+                if hip_sep_m > float(da_cfg.couple_axis_max_separation_m):
+                    couple_axis_active = False
+            elif hip_sep_m <= float(da_cfg.couple_axis_rejoin_separation_m):
+                couple_axis_active = True
+
+        draw_pair_axis = couple_axis_active is not False
         if pf.pair_torso_eligible and pf.dancer_a and pf.dancer_b:
             assert pf.dancer_a.hip_px and pf.dancer_b.hip_px and pf.dancer_a.shoulder_px and pf.dancer_b.shoulder_px
             hp = (
@@ -1347,15 +1366,17 @@ def run_couple_analysis(
             sep = abs(wrapped_angle_diff(ta, tb))
             midpoint_series.append({"timestamp": t, "value": round(mid_tilt, 3), "status": "measured", "reason": ""})
             separation_series.append({"timestamp": t, "value": round(sep, 3), "status": "measured", "reason": ""})
-            pair_hip_norm = _norm_from_canonical(hp, pf.width, pf.height)
-            pair_sh_norm = _norm_from_canonical(sp, pf.width, pf.height)
+            if draw_pair_axis:
+                pair_hip_norm = _norm_from_canonical(hp, pf.width, pf.height)
+                pair_sh_norm = _norm_from_canonical(sp, pf.width, pf.height)
         elif pf.pair_hip_eligible and pf.dancer_a and pf.dancer_b:
             assert pf.dancer_a.hip_px and pf.dancer_b.hip_px
             hp = (
                 0.5 * (pf.dancer_a.hip_px[0] + pf.dancer_b.hip_px[0]),
                 0.5 * (pf.dancer_a.hip_px[1] + pf.dancer_b.hip_px[1]),
             )
-            hip_only_norm = _norm_from_canonical(hp, pf.width, pf.height)
+            if draw_pair_axis:
+                hip_only_norm = _norm_from_canonical(hp, pf.width, pf.height)
             midpoint_series.append(
                 {
                     "timestamp": t,

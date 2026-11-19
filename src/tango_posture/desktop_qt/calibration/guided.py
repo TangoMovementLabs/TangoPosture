@@ -33,7 +33,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ...archive import calibration_directory, calibration_path
+from ...archive import calibration_directory, calibration_path, practice_directory
 from ...calibration.archives import save_range_profile
 from ...calibration.camera_session import (
     CHECK_SPECS,
@@ -43,6 +43,7 @@ from ...calibration.camera_session import (
     build_walking_phases,
     check_full_body_framing,
     evaluate_metric_repeat_check,
+    prepare_side_measurement_frame,
 )
 from ...calibration.evidence import cached_evidence
 from ...calibration.measurements import measure_ranges
@@ -628,14 +629,11 @@ class GuidedCalibration(QDialog):
         self._sync_capture_ui()
 
     def _announce_captured_and_prompt(self) -> None:
-        if self.speak_cb.isChecked():
-            if self._session.state == "Prompt":
-                self._speech.speak(
-                    self._session.active_prompt_id,
-                    f"Captured. {self._session.current_instruction}",
-                )
-            elif self._session.state == "Review":
-                self._speech.speak(0, "Captured. Your standing examples are ready.")
+        if self.speak_cb.isChecked() and self._session.state == "Prompt":
+            self._speech.speak(
+                self._session.active_prompt_id,
+                f"Captured. {self._session.current_instruction}",
+            )
 
     def _maybe_speak(self, prompt_id: int) -> None:
         if self.speak_cb.isChecked() and self._session.state == "Prompt":
@@ -655,6 +653,13 @@ class GuidedCalibration(QDialog):
         self.hint_label.setText(self._session.hint_message)
         self._detected_side = self._session.cfg.side
         self._detected_facing = self._session.cfg.facing
+        if self._frozen_cfg is not None and (
+            self._frozen_cfg.side != self._session.cfg.side
+            or self._frozen_cfg.facing != self._session.cfg.facing
+        ):
+            self._frozen_cfg = self._frozen_cfg.model_copy(
+                update={"side": self._session.cfg.side, "facing": self._session.cfg.facing}
+            )
         if (
             self.speak_cb.isChecked()
             and self._session.hint_message
@@ -714,11 +719,19 @@ class GuidedCalibration(QDialog):
         self._speech.cancel_all()
         self._release_camera()
         self.stack.setCurrentIndex(2)
+        self.status_banner.setText("Self calibration completed. Save it and review it.")
         records = self._session.accepted_passages
         if not records:
             self.review_summary.setText("No usable holds were captured yet.")
             return
-        lines = [f"Captured {len(records)} accepted passage(s):"]
+        try:
+            self._save_ready_profiles(auto_triggered=True)
+        except (OSError, ValueError, RuntimeError):
+            pass
+        lines = ["Self calibration completed. Save it and review it."]
+        if self.saved_paths:
+            lines.append("Saved profiles: " + ", ".join(p.name for p in self.saved_paths))
+        lines.append(f"Captured {len(records)} accepted passage(s):")
         for rec in records.values():
             metrics_txt = ", ".join(f"{k} ({v:.2f}s)" for k, v in rec.eligible_metrics.items())
             lines.append(
@@ -727,6 +740,8 @@ class GuidedCalibration(QDialog):
             for mk, reason in rec.unavailable_reasons.items():
                 lines.append(f"  - {mk} unavailable: {reason}")
         self.review_summary.setText("\n".join(lines))
+        if self.speak_cb.isChecked():
+            self._speech.speak(0, "Self calibration completed. Save it and review it.")
 
     def _run_selected_checks(self) -> None:
         selected = [cid for cid, cb in self.check_boxes.items() if cb.isChecked()]
@@ -765,7 +780,12 @@ class GuidedCalibration(QDialog):
         if self._temp_dir is None:
             raise ValueError("No captured camera session is available to stage.")
         temp_root = Path(self._temp_dir.name)
-        practice_files = sorted((temp_root / "practices").glob("*.tp"))
+        prac_dir = practice_directory(str(temp_root))
+        practice_files = sorted(prac_dir.glob("*.tp")) if prac_dir.is_dir() else []
+        if not practice_files and (temp_root / "practices").is_dir():
+            practice_files = sorted((temp_root / "practices").glob("*.tp"))
+        if not practice_files:
+            practice_files = sorted(temp_root.rglob("*.tp"))
         if not practice_files:
             raise ValueError("No recorded practice archive was found in temporary storage.")
         src_tp = practice_files[-1]
@@ -778,7 +798,7 @@ class GuidedCalibration(QDialog):
         ev = cached_evidence(staged)
         last_ts = ev.frames[-1].timestamp
         for rec in self._session.accepted_passages.values():
-            if rec.passage.start >= last_ts:
+            if rec.passage.start > last_ts + 1.0:
                 raise ValueError(f"Passage {rec.phase_id} is outside promoted evidence timestamps.")
         self._staged_tpr = staged
         ref_dir = reference_directory(self._cfg.data_dir)
@@ -801,6 +821,8 @@ class GuidedCalibration(QDialog):
                 "check_id": rec.check_id,
                 "eligible_metrics": rec.eligible_metrics,
                 "unavailable_reasons": rec.unavailable_reasons,
+                "detected_side": rec.detected_side,
+                "detected_facing": rec.detected_facing,
             }
             for rec in self._session.accepted_passages.values()
         ]
@@ -852,23 +874,42 @@ class GuidedCalibration(QDialog):
             self.bridge.calibrations_changed.emit()
             self.accept()
 
-    def _save_ready_profiles(self) -> None:
+    def _save_ready_profiles(self, _checked: bool = False, *, auto_triggered: bool = False) -> None:
         try:
             tpr = self._stage_and_publish_evidence()
-        except (OSError, ValueError, RuntimeError) as error:
-            QMessageBox.warning(self, "Evidence staging failed", str(error))
+            ev = cached_evidence(tpr)
+        except (OSError, ValueError, RuntimeError, TypeError) as error:
+            if not auto_triggered:
+                QMessageBox.warning(self, "Evidence staging failed", str(error))
             return
         cfg = self._frozen_cfg or self._selected_setup_config()
-        ev = cached_evidence(tpr)
         cal_dir = calibration_directory(self._cfg.data_dir)
         cal_dir.mkdir(parents=True, exist_ok=True)
         base_name = self.name_input.text().strip() or "Studio webcam"
         max_gap = self._session.effective_max_gap()
 
         # Build samples per view
+        passages_list = list(self._session.accepted_passages.values())
         raw_samples: dict[str, list[tuple[float, float | None]]] = {k: [] for k in METRIC_DETAILS}
         for fr in ev.frames:
-            obs = measure_ranges(fr, cfg)
+            matching_rec = next(
+                (rec for rec in passages_list if rec.passage.start <= fr.timestamp <= rec.passage.end),
+                None,
+            )
+            if (
+                matching_rec is not None
+                and matching_rec.view == "side"
+                and matching_rec.detected_side is not None
+                and matching_rec.detected_facing is not None
+            ):
+                frame_cfg = cfg.model_copy(
+                    update={"side": matching_rec.detected_side, "facing": matching_rec.detected_facing}
+                )
+                eval_frame = prepare_side_measurement_frame(fr, frame_cfg)
+            else:
+                frame_cfg = cfg
+                eval_frame = fr
+            obs = measure_ranges(eval_frame, frame_cfg)
             for mk in METRIC_DETAILS:
                 q = obs.quality.get(mk)
                 val = obs.values.get(mk)
@@ -883,7 +924,8 @@ class GuidedCalibration(QDialog):
             targets.append(("Solo walking", "side"))
 
         if not targets:
-            QMessageBox.information(self, "Nothing to save", "No usable holds or walking passes were captured.")
+            if not auto_triggered:
+                QMessageBox.information(self, "Nothing to save", "No usable holds or walking passes were captured.")
             return
 
         written: list[Path] = []
@@ -946,23 +988,29 @@ class GuidedCalibration(QDialog):
                 camera_checks={"solo_camera_ledger": self._ledger_payload()},
             )
             try:
-                save_range_profile(prof_path, profile_obj, overwrite=False)
+                save_range_profile(prof_path, profile_obj, overwrite=True)
                 written.append(prof_path)
             except (OSError, ValueError, FileExistsError) as err:
                 failed_names.append(f"{prof_name}: {err}")
 
         if written:
-            self.saved_paths.extend(written)
+            self.saved_paths = list(written)
             self.saved_path = written[-1]
             self.bridge.calibrations_changed.emit()
-        if failed_names:
-            QMessageBox.warning(
-                self,
-                "Partial save",
-                "Some profiles could not be saved:\n" + "\n".join(failed_names),
+            self.status_banner.setText(
+                "Self calibration completed. Saved: "
+                + ", ".join(p.name for p in written)
+                + ". You can review ranges in editor."
             )
+        if failed_names:
+            if not auto_triggered:
+                QMessageBox.warning(
+                    self,
+                    "Partial save",
+                    "Some profiles could not be saved:\n" + "\n".join(failed_names),
+                )
             return
-        if written:
+        if written and not auto_triggered and not self._embedded:
             self.accept()
 
     def _keep_evidence_only(self) -> None:
@@ -985,7 +1033,7 @@ class GuidedCalibration(QDialog):
             self._display.stop = True
         if self._thread is not None and self._thread.isRunning():
             self._thread.quit()
-            self._thread.wait(3000)
+            self._thread.wait(10000)
         self._thread = None
         self._worker = None
 
