@@ -509,6 +509,8 @@ class GuidedCalibration(QDialog):
         self._release_camera()
         self._auto_begin_pending = auto_begin
         self._preview_stable_since: float | None = None
+        self._staged_tpr = None
+        self._published_tpr = None
         self._temp_dir = TemporaryDirectory(prefix="tango-solo-cal-", ignore_cleanup_errors=True)
         temp_root = Path(self._temp_dir.name)
         self._staging_dir = temp_root / "staging"
@@ -730,7 +732,10 @@ class GuidedCalibration(QDialog):
             pass
         lines = ["Self calibration completed. Save it and review it."]
         if self.saved_paths:
-            lines.append("Saved profiles: " + ", ".join(p.name for p in self.saved_paths))
+            lines.append(
+                "Saved .tpc calibration file(s): "
+                + ", ".join(str(p) for p in self.saved_paths)
+            )
         lines.append(f"Captured {len(records)} accepted passage(s):")
         for rec in records.values():
             metrics_txt = ", ".join(f"{k} ({v:.2f}s)" for k, v in rec.eligible_metrics.items())

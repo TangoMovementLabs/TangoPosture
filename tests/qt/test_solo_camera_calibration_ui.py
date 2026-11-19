@@ -258,8 +258,12 @@ def test_guided_enter_review_announces_saves_and_stays_open_for_review(qapp, tmp
     for saved in wizard.saved_paths:
         assert saved.is_file()
         assert saved.suffix == ".tpc"
+        assert saved.parent == tmp_path / "calibrations"
         prof = read_range_profile(saved)
         assert prof.metrics
+
+    listed_paths = {ref.path.resolve() for ref in bridge.list_references() if ref.is_archive}
+    assert {p.resolve() for p in wizard.saved_paths} <= listed_paths
 
     # Clicking Save ready profiles again succeeds cleanly with overwrite=True and keeps embedded view visible
     wizard.save_views_btn.click()

@@ -11,6 +11,10 @@ def data_directory() -> Path:
         return Path.home() / "Library" / "Application Support" / "TangoPosture"
     if sys.platform == "win32":
         return Path(os.environ["LOCALAPPDATA"]) / "TangoPosture"
+    if sys.platform.startswith("linux"):
+        xdg_data = os.environ.get("XDG_DATA_HOME", "").strip()
+        base = Path(xdg_data) if xdg_data else (Path.home() / ".local" / "share")
+        return base / "TangoPosture"
     raise RuntimeError(f"Unsupported desktop platform: {sys.platform}")
 
 

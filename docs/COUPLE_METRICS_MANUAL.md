@@ -332,3 +332,293 @@ When a Box Plot or Scatter Plot highlights an extreme outlier ($> Q_3 + 1.5 \cdo
 2. Check if either skeleton is drawn with **dotted lines** (`interpolated_display = True`) or missing shoulders/hips.
 3. Check if a tracking break or bystander appeared in frame within `±0.3 s`.
 4. **Only coach the dancer on outliers that have solid measured skeletons and clear framing**—ignore hardware/occlusion outliers or clean them with **Analysis Region** and **Save Annotations**.
+
+---
+
+## 7. Consistent 4-Stage Framework to Test & Validate Every Couple Metric
+
+Use this repeatable protocol whenever you change camera placement, video framerate, MediaPipe model (`lite` / `full` / `heavy`), or `dancer_analysis` thresholds:
+
+```mermaid
+flowchart LR
+    S1["Stage 1: Controlled Studio Benchmark Drills"] --> S2["Stage 2: Pre-Flight Tracking and Coverage Gate"]
+    S2 --> S3["Stage 3: Review Cross-Check via Couple Evidence"]
+    S3 --> S4["Stage 4: Single-Parameter Tweak and Re-Measure"]
+    S4 --> S2
+```
+
+### Stage 1 — Record 5 Controlled Ground-Truth Benchmark Clips (10–20 Seconds Each)
+Instead of guessing on complex milonga footage first, verify accuracy on **five simple 10–20 s drills** filmed cleanly across the camera view (`>= 30 FPS`):
+1. **Drill 1 — Sync Start, Cruise & Stop (Group 1)**: Stand still for 2 s → Dancer A initiates walking right across the frame while Dancer B starts clearly `~0.2 s` later → cruise 4 steps → decelerate together → stop still for 2 s. *(Ground truth: `velocity > 0.20`, positive `start_lag_ms ~ +200 ms`, `paired_count = 1` per phase.)*
+2. **Drill 2 — Metronome Stepping Drill (Group 2)**: Step clearly on every click of a steady `120 BPM` (`500 ms` period) metronome or tango *marcato* track for 12 steps, then pause 2 s and intentionally step `1` beat half-step late (*traspié*). *(Ground truth: `contact_count >= 12` per dancer, `beat_offset_ms` tightly clustered near `0 ms`, low `iqr_beat_offset_ms < 40 ms`.)*
+3. **Drill 3 — Smooth Stop vs Double-Clutch Rebound (Group 3)**: Walk 4 steps and brake monotonically to zero (`Run A`), then walk 4 steps, brake almost to a stop, lurch forward/rock backward unintentionally (`Run B`), and finally repeat `Run B` while annotating **Planned Pause** / **Planned Reversal** (`Run C`). *(Ground truth: `Run A` -> `0` cues; `Run B` -> `>= 1` unintended peak/reversal; `Run C` -> unintended drops to `0` while planned tallies increment.)*
+4. **Drill 4 — Upright Parallel vs Apilado A-Frame vs Apart `> 1 m` (Group 4)**: Stand still upright facing side-on (`3 s`) → lean symmetrically right (`~+8°` both) (`3 s`) → form an inward A-frame (`A = +6°`, `B = -6°`) (`3 s`) → separate `> 1.2 m` apart and rejoin `< 0.7 m` (`3 s`). *(Ground truth: upright tilts `~0°`; symmetric lean shows `torso_separation ~0°` and high `torso_tilt_pearson_r`; A-frame shows `torso_separation ~12°`; separation disables shared axis line above `1.0 m` and restores below `0.80 m`.)*
+5. **Drill 5 — Gyro / Ocho Pivot & Clean vs Overlapped Exit (Group 5)**: Stand → rotate `180°` (*media vuelta* / *giro*), finish rotating for `0.5 s`, then step out (`Turn 1: clean exit`) → rotate `180°` again and step out *while* hips are still finishing rotation (`Turn 2: overlapped exit`). *(Ground truth: `exit_minus_turn_end_ms > 0` on Turn 1, `< 0 ms` with `overlap_count = 1` on Turn 2.)*
+
+### Stage 2 — Pre-Flight Tracking & Coverage Gatekeeping (Must Pass Before Scoring Any Metric)
+Inspect `result.coverage`, `tracking.fixed_scale_*`, and `series["pair_breaks"]` before trusting numbers:
+- `a_hip_coverage >= 0.75` and `b_hip_coverage >= 0.75` (`pair_hip_coverage >= 0.70`) for Travel, Coordination, and Transitions.
+- `pair_torso_coverage >= 0.70` and `a_head_coverage / b_head_coverage >= 0.60` for Posture and Head metrics.
+- Fixed scales `fixed_scale_a_px` and `fixed_scale_b_px` within `15%` of manual shoulder-to-hip pixel check (`scale_a / scale_b` realistic for partner heights).
+- Verify `travel_axis_unit` arrow in **Review** points along the true line of dance (if perpendicular or inverted due to walking back and forth equally, draw explicit 2-point **Travel Direction**).
+
+### Stage 3 — Ground-Truth Verification in **Review → Couple Evidence**
+- Scrub the timeline frame-by-frame to compare every automated candidate event (`start`, `slow`, `settle`, `contact`, `musical_target`, `speed_cue`, `turn`) against the actual video frame.
+- Use manual edits/confirmations/deletions in `CoupleAnnotations`, which invoke `rebuild_couple_result_with_annotations()` (`couple/measurements.py`) without wiping out the raw `automated_candidates` so you can measure raw detector precision vs annotated truth.
+
+### Stage 4 — Single-Parameter Sensitivity Check
+When tuning a setting (`start_speed`, `velocity_filter_window_s`, `confidence`, etc.), change **one parameter at a time**, re-run **Analyze** (or `rebuild_couple_result_with_annotations`), and compare summary **medians** and **IQRs**. A healthy configuration is stable: changing a threshold by `±15%` should not double event counts or flip lag signs!
+
+---
+
+## 8. Detailed Playbook by Analytical Group & Metric
+
+---
+
+### 8.1 Group 1: Travel and Coordination
+
+#### Metrics Covered
+- `velocity_a` & `velocity_b` (signed `torso_lengths / s`, computed via `compute_centred_regression_velocity`)
+- `velocity_pair` (signed `pair_torso_lengths / s` of the dual-hip midpoint)
+- `start_lag_ms`, `slow_lag_ms`, `settle_lag_ms` (median and IQR of $t_B - t_A$ in ms)
+- `paired_count` & `unpaired_count` (`start_paired_count`/`unpaired_count`, `slow_paired_count`/`unpaired_count`, `settle_paired_count`/`unpaired_count`)
+
+#### Validation Test (How to Verify Each Metric)
+1. **`velocity_a`, `velocity_b`, `velocity_pair`**: Measure physical floor distance traveled in a steady straight walk (e.g., `2.0 m` over `4.0 s` = `0.50 m/s ≈ 1.0 tl/s` assuming `1 tl ≈ 0.50 m`). Check that `velocity_pair` plateaus near `+1.0 tl/s` (rightward/with-axis) and `-1.0 tl/s` when walking back along the opposite direction. Confirm `velocity` returns to `None` cleanly across breaks/gaps (`> max_observation_gap_s`), never inventing infinite spikes.
+2. **`start_lag_ms`, `slow_lag_ms`, `settle_lag_ms`**: Inspect the first 3 `start` / `slow` / `settle` events in Drill 1 in **Review**. Compare exact visual video frame where Dancer A's vs Dancer B's pelvis center translates horizontally against `event["timestamp"]`. Confirm `lag_ms = (t_B - t_A) * 1000` matches your stopwatch/frame diff within `±1 frame` (`±33 ms` at 30 fps) thanks to sub-frame linear crossing interpolation (`_interpolate_crossing`).
+3. **`paired_count` & `unpaired_count`**: Count distinct walk phrases manually (`N`). Verify `start_paired_count == N`, `settle_paired_count == N`, and inspect every `unpaired_count > 0` item (`reason == "no_partner_event_within_pairing_window"`) to distinguish real missed partner moves vs tracking dropouts.
+
+#### Recommendations & Interpretation Targets
+| Metric | Healthy Tango Recommendation | Warning Signs to Investigate |
+| --- | --- | --- |
+| **`velocity_a` / `velocity_b` / `velocity_pair`** | Steady *caminata*: peak speeds `0.6 – 1.8 tl/s` (`0.3 – 0.9 m/s`); fast *corrida*: up to `2.5 tl/s`. Zero resting speed `< 0.08 tl/s`. | Resting noise floor `> 0.15 tl/s` (jitter/wrong axis) or peak speed `> 5.0 tl/s` (identity swap). |
+| **`start_lag_ms`** | Leader = `A`, Follower = `B`: **`+40 ms to +180 ms`** (`IQR < 100 ms`). Shows connection wait without dragging. | **Consistent negative (`< -30 ms`)**: Follower anticipates/rushes before Leader's center moves, or A/B roles are inverted!<br>**Large positive (`> +300 ms`)**: Delayed transfer/heavy pull. |
+| **`slow_lag_ms`** | **`0 ms to +180 ms`**, staying tight (`IQR < 120 ms`) alongside `start_lag_ms`. | Widening `slow_lag_ms` while `start_lag_ms` is tight indicates losing chest-to-chest braking connection at phrase ends. |
+| **`settle_lag_ms`** | **`-30 ms to +150 ms`**. Near `0 ms` means both partners settle on the floor cleanly together. | **`> +350 ms`** or unpaired `settle`: one partner glides past or keeps shifting hips after the other has parked. |
+| **`paired_count` / `unpaired_count`** | `paired_count / (paired_count + unpaired_count / 2) >= 0.85` across clean walking phrases. | High `unpaired_count` (`> 25%` of phrases): threshold mismatch, asymmetry across dancers, or a tracking `pair_break` occurring mid-phrase. |
+
+#### Controlling Parameters (`DancerAnalysisConfig`)
+- `velocity_filter_window_s` (`0.15 s`): Half-window for centred OLS regression (`±0.15 s` = `0.30 s` total).
+- `max_observation_gap_s` (`0.20 s`): Maximum gap between raw hip detections inside a regression segment.
+- `start_speed` (`0.20 tl/s`): Upward speed crossing threshold to transition `IDLE -> TRAVELLING`.
+- `stop_speed` (`0.10 tl/s`): Downward speed threshold to emit `settle` and return `TRAVELLING -> IDLE`.
+- `slowing_fraction` (`0.25`): Triggers `slow` when active speed falls below `(1 - 0.25) * v_med` of current travelling bout.
+- `persistence_s` (`0.15 s`): Hold duration required after crossing `start_speed` / `slow_thresh` / `stop_speed`.
+- `pairing_window_s` (`0.50 s`): Maximum allowed $|t_B - t_A|$ for 1-to-1 greedy pairing.
+- User annotations: **Travel Direction 2-point vector** (`travel_direction_points`), manual `start` / `slow` / `settle` confirmations or adjustments, **Baseline passages** (for `fixed_scale_*`).
+
+#### Troubleshooting & Parameter Tweaks
+- **Problem: `velocity_*` stays near `0.0` even though dancers are walking fast, OR signs look wrong.**
+  - *Cause*: Auto-PCA `_infer_travel_axis()` locked onto perpendicular depth/sway axis, or couple walked equal distance out and back so camera-plane PCA picked side-to-side motion.
+  - *Fix*: Explicitly draw the 2-point **Travel Direction** arrow along the line of dance in **Review**, or crop to one linear pass.
+- **Problem: `velocity_*` is mostly `None` (`unavailable`).**
+  - *Cause*: Video framerate is `< 20 FPS` (e.g., 12–15 FPS gives `< 3` frames inside `±0.15 s`!) or `hip_eligible` drops frequently (`confidence = 0.70`).
+  - *Fix*: Increase `velocity_filter_window_s` to `0.25 s`, raise `max_observation_gap_s` to `0.30 s`, or lower `confidence` to `0.55`.
+- **Problem: False `start` events triggered during stationary sway/breathing, or slow lyrical walking never triggers `start`.**
+  - *Fix*: Raise `start_speed` (`0.25–0.30 tl/s`) and `persistence_s` (`0.20 s`) to suppress breathing jitter; lower `start_speed` to `0.12–0.15 tl/s` and `stop_speed` to `0.06 tl/s` for ultra-slow *Pugliese* steps.
+- **Problem: `slow` never fires before `settle`, or fires on gentle speed variations mid-walk.**
+  - *Fix*: Check `slowing_fraction` (`0.25`). Lower to `0.15` if brakes are gradual; raise to `0.35` to ignore natural step-by-step hip velocity ripple during cruising.
+- **Problem: `unpaired_count` is high even when both partners visibly start/stop together.**
+  - *Fix*: Check `pair_breaks` (never pairs across breaks!)—re-anchor identities if an ambiguity break occurred between $t_A$ and $t_B$. If real response lags exceed `0.5 s` (e.g., slow musical pause response), widen `pairing_window_s` to `0.75–1.00 s`.
+
+#### Visualizations to Build for Group 1
+1. **Dual Velocity Trace + Threshold Band Chart**: Plot `velocity_a(t)` and `velocity_b(t)` overlaid against horizontal dotted lines at `±start_speed` and `±stop_speed`, with shaded vertical phase ribbons from `start` → `slow` → `settle` and connecting arrow brackets annotated with `lag_ms`.
+2. **Phase Lag Distribution Strip/Box Plot**: Side-by-side box plots (with individual scatter points + horizontal `0 ms` zero-lag line) of paired `start_lag_ms`, `slow_lag_ms`, and `settle_lag_ms` to spot anticipation (`< 0 ms`), sluggish stops, and Tukey outliers (`> Q3 + 1.5*IQR`).
+3. **Pairing Integrity Bar Chart**: Stacked bar showing `paired_count` vs `unpaired_count` for `start`, `slow`, and `settle` alongside `pair_hip_coverage`.
+
+---
+
+### 8.2 Group 2: Steps and Musical Timing
+
+#### Metrics Covered
+- `contact_count` (total detected `contact` events per dancer `A` and `B`)
+- `matched_count` (contacts paired with a nearest `musical_target`)
+- `beat_offset_ms` & `median_beat_offset_ms` ($t_{\text{contact}} - t_{\text{beat}}$ in ms)
+- `iqr_beat_offset_ms` ($P_{75} - P_{25}$ spread of `beat_offset_ms`)
+- `beat_fraction` & `median_beat_fraction` ($(t_{\text{contact}} - t_{\text{beat}}) / P_{\text{target}}$)
+
+#### Validation Test (How to Verify Each Metric)
+1. **`contact_count`**: On Drill 2 (12 clean steps), watch the raw ankle trajectory in **Review**. Verify that detected `contact` timestamps match the exact frame where the stepping foot plants/settles onto the floor (not mid-swing *boleo* or stationary ankle twist). Confirm `contact_count` matches visible floor transfers within `±1` step.
+2. **`matched_count` & `beat_offset_ms`**: Compare `beat_targets` timestamps against known metronome click timestamps or audible downbeats in the video (`nearest_beat_time`). Check `matched_count == contact_count` whenever musical targets exist across the clip span. Verify negative offsets match visibly early steps and positive offsets match visibly delayed steps.
+3. **`iqr_beat_offset_ms` & `median_beat_fraction`**: On a constant `120 BPM` (`500 ms` beat period) vs `100 BPM` (`600 ms` beat period) test, confirm a constant `50 ms` delay gives `beat_fraction = +0.10` at 120 BPM and `+0.083` at 100 BPM. Confirm half-beat *traspié* checks (`beat_subdivision = 2`) keep `beat_fraction` inside `[-0.5, +0.5]` instead of inflating offsets near `±250 ms`.
+
+#### Recommendations & Interpretation Targets
+| Metric | Healthy Tango Recommendation | Warning Signs to Investigate |
+| --- | --- | --- |
+| **`contact_count` vs `matched_count`** | `matched_count == contact_count` whenever music is active (`status = user_confirmed` when beats verified). | `matched_count == 0` -> soundtrack beats missing (`analyze_soundtrack = false` or quiet audio) and no manual beats entered. `contact_count` near zero despite walking -> skirt/dark floor occluded ankles! |
+| **`median_beat_offset_ms`** | **On-beat (*marcato*, Di Sarli/D'Arienzo)**: `-35 ms to +45 ms`.<br>**Behind the beat (*cadencia* / Pugliese)**: `+30 ms to +110 ms`. | Large consistent mismatch (`|offset| > 180 ms` at `~120 BPM`): off-beat stepping (*contratiempo* when `beat_subdivision = 1`), wrong audio-video sync offset, or `beat_offset_s` phase shift. |
+| **`iqr_beat_offset_ms`** | Tight consistent pocket: **`<= 60–90 ms`**. Intermediate dancers typically `90–140 ms`. | **`> 160 ms`**: Erratic rushing/dragging, double-time vs half-time switching, or mixing single-beat steps and half-beat *traspiés* under `subdivision = 1`. |
+| **`median_beat_fraction` (A vs B)** | Leader & Follower share similar `median_beat_fraction` (e.g., `|frac_B - frac_A| <= 0.08`). Typically `-0.08 to +0.15` for grounded walking. | Near `±0.40 – 0.50`: Consistently stepping on the **and** half-beat while grid is `subdivision = 1` (set `beat_subdivision = 2` to evaluate *traspiés* properly!). |
+
+#### Controlling Parameters
+- **Music & Beat Grid**: `tango_bpm` (`120.0 BPM` harmonic prior), `beat_analysis_seconds` (`30.0 s` phrase lock), `dancer_analysis.analyze_soundtrack` (`false` default — turn `true` for audio clips).
+- **Review Beat Annotations (`CoupleAnnotations`)**: `manual_beats`, `beat_subdivision` (`1`, `2`, `3`, ...), `beat_offset_s` (fine phase shift in seconds).
+- **Step Contact Engine (`DETECTOR_CONFIG` in `movement.py`)**: `step_min_landmark_confidence` (`0.45`), `step_smooth_tau_s` (`0.10 s`), `step_move_speed_scale_s` (`0.30`), `step_settle_speed_scale_s` (`0.35`), `step_settle_radius_scale` (`0.045`), `step_settle_min_duration_s` (`0.10 s`), `step_min_center_travel_scale` (`0.075`), `step_min_both_ends_travel_scale` (`0.065`), `step_min_leg_extension_ratio` (`0.78`), `step_max_airborne_lift_scale` (`0.14`), `step_debounce_s` (`0.25 s`).
+
+#### Troubleshooting & Parameter Tweaks
+- **Problem: Every footstep is missed (`contact_count` is much smaller than actual steps).**
+  - *Causes*: (1) Partner's skirt, wide trousers, or dark shoes against a dark floor pushed ankles/heels/toes below `step_min_landmark_confidence` (`0.45`). (2) Tiny micro-steps `< 0.075` body scale (`step_min_center_travel_scale`) or ultra-fast steps faster than `step_debounce_s` (`0.25 s`). (3) Frame rate `< 15 FPS`.
+  - *Fixes*: Improve floor-to-shoe visual contrast and film at `>= 30 FPS`; use offline **Full** or **Heavy** model (`analysis_model = "heavy"`); add/confirm missed `contact` annotations manually in **Review → Couple Evidence**.
+- **Problem: Phantom extra `contact` events appear during pivots or leg *boleos* / *ganchos*.**
+  - *Cause*: Ankle swings low or twists in place while weight never transferred.
+  - *Fix*: Inspect the event in Review; delete false `contact` candidates directly in **Couple Evidence** (`deleted = True`).
+- **Problem: `beat_offset_ms` alternates `-250 ms` and `+250 ms` symmetrically (high `iqr_beat_offset_ms`), even though steps look musical.**
+  - *Causes*: (1) Video audio track dropped beat/halved tempo (`60 vs 120 BPM`), OR (2) Dancer is stepping syncopated half-beats (*traspiés*) with `beat_subdivision = 1`, OR (3) Audio recording latency shifts beats by a fixed `80–150 ms`.
+  - *Fixes*: Set `tango_bpm` closer to track BPM before running soundtrack analysis; tap/confirm `manual_beats` in Review; set `beat_subdivision = 2` for *traspié* phrases; apply `beat_offset_s` if audio/video mux has constant lag.
+
+#### Visualizations to Build for Group 2
+1. **Beat-Phase Circular Rose Plot (`[-0.5, +0.5]` → `[-180°, +180°]`)**: Maps `beat_fraction` onto a polar compass where `0°` (12 o'clock) is the musical beat, positive angles (`+90° = +0.25 beat`) sit behind the beat, and separate radial rings/colors compare **Dancer A** vs **Dancer B**.
+2. **Paired Partner Offset Timeline / Waterfall**: Plot `timestamp` (X) vs `beat_offset_ms` (Y) with separate traces for A and B (`y = 0 ms` dashed beat reference), showing whether A and B drift in parallel or diverge mid-song.
+3. **Histogram + IQR Strip Plot of `beat_offset_ms`**: Compare A and B timing distributions side-by-side (`[Q1 - 1.5*IQR, Q3 + 1.5*IQR]` outlier markers) to separate consistent rhythmic placement (*cadencia*) from erratic inconsistency.
+
+---
+
+### 8.3 Group 3: Transitions
+
+#### Metrics Covered
+- `secondary_speed_peaks` (unintended speed surges while slowing down)
+- `unintended_reversals` (unintended velocity sign flips opposite dominant motion)
+- `planned_pauses`, `planned_reversals`, & `settling_steps` (user mark tallies)
+- Transition `coverage` & `status` (`"measured"` vs `"unavailable"`)
+
+#### Validation Test (How to Verify Each Metric)
+1. **Smooth Brake Negative Control (`Run A`)**: Record 3 clean decelerations to complete stillness with no bounce. Verify `[t_slow, t_settle]` brackets align cleanly with actual deceleration, `coverage >= 0.75`, `status == "measured"`, `secondary_speed_peaks == 0`, and `unintended_reversals == 0`.
+2. **Deliberate Double-Clutch / Rocking Positive Control (`Run B`)**: Walk, slow almost to `stop_speed`, deliberately lunge `+0.20 tl/s` (`>= 0.12` rise for `>= 0.15 s`) or rebound backward `> stop_speed`, then settle. Verify `secondary_speed_peaks >= 1` and/or `unintended_reversals >= 1` emit matching `speed_cue` timestamps exact to the video stumble.
+3. **Choreography Override Check (`Run C`)**: On `Run B`, place `PlannedTransitionMark` (`planned_pause`, `settling_step`, or `planned_reversal`) overlapping `±0.20 s`. Confirm `rebuild_couple_result_with_annotations()` flips `speed_cue` status to `"user_confirmed"` and drops `secondary_speed_peaks` / `unintended_reversals` to `0` while incrementing `settling_steps` / `planned_reversals`.
+
+#### Recommendations & Interpretation Targets
+| Metric | Healthy Tango Recommendation | Warning Signs to Investigate |
+| --- | --- | --- |
+| **`secondary_speed_peaks`** | **`0` per clean phrase ending** (`<= 1` minor collecting adjustment per clip when intentional marks are entered). | **`>= 2` unintended peaks**: Couple breaks down deceleration—either one partner collects late, pushes off at end of step, or pulls when weight transfer finishes. |
+| **`unintended_reversals`** | **`0` unintended reversals** in unidirectional *caminata*. | **`>= 1` unintended reversals**: Over-striding followed by subtle backward recoil/bounce at stop (rock step out of control), unless a real *rebote*/*vaivén* happened! |
+| **`planned_pauses` / `planned_reversals` / `settling_steps`** | Matches number of choreographed pauses, direction changes, and deliberate *cruce*/closing adjustments in the clip. | `0` across a clip filled with deliberate *rebotes* or stops -> reviewer has not marked choreography yet, biasing `unintended_*` high! |
+| **Transition `coverage` & `status`** | `status == "measured"` and **`coverage >= 0.75`** (`>= 0.85` ideal). | `status == "unavailable"` (`insufficient_transition_coverage`): Partner hips occluded during turn-in stops—never coach transition quality when `status == "unavailable"`. |
+
+#### Controlling Parameters
+- `dancer_analysis.transition_min_coverage` (`0.75`): Minimum fraction of valid dual-hip frames required in `[t_slow, t_settle]` (or `[mark - 0.5s, mark_end + 0.5s]`).
+- `dancer_analysis.secondary_speed_rise` (`0.12 tl/s`): Surge above running minimum required to trigger a `secondary_speed_peak` (60% of this = `0.072 tl/s` must hold over `persistence_s`).
+- `dancer_analysis.persistence_s` (`0.15 s`): Minimum duration a speed surge or opposite velocity must stay sustained.
+- `dancer_analysis.stop_speed` (`0.10 tl/s`): Opposite velocity floor for detecting reversal (`v * dom_sign < -stop_speed`).
+- `dancer_analysis.slowing_fraction` (`0.25`): Controls where `slow` begins transition brackets (note: if no `slow` event fires and there are no planned marks, `_evaluate_transitions()` checks clip-wide reversal only, not `secondary_speed_peaks`).
+- Review `annotations.planned_transitions`: `PlannedTransitionMark(kind=...)` with `±0.20 s` overlap tolerance (`_overlaps_planned`).
+
+#### Troubleshooting & Parameter Tweaks
+- **Problem: Transition `status == "unavailable"` even though steps occurred clearly.**
+  - *Cause*: One partner's hip dipped below `confidence = 0.70` mid-brake (dropping bracket `pair_hip_coverage < 0.75`), or `slow` never triggered so only whole-clip `pair_hip_coverage` was checked under occlusion.
+  - *Fix*: Inspect gray `unavailable` regions in **Analytics**; add Dancer Anchors around gaps, check lighting, or adjust `confidence` (`0.55–0.65`) / `transition_min_coverage` (`0.60`) only if hip occlusion is minor.
+- **Problem: `secondary_speed_peaks` triggers on every tiny ankle settle ripple.**
+  - *Cause*: `velocity_filter_window_s` (`0.15 s`) + `secondary_speed_rise` (`0.12 tl/s`) is sensitive to natural pelvic settling bounce on fast steps.
+  - *Fix*: Raise `secondary_speed_rise` to `0.18–0.22 tl/s` or widen `velocity_filter_window_s` to `0.20 s` / `persistence_s` to `0.20 s`. Mark genuine double-steps as `settling_step`.
+- **Problem: Planned *rebote* (*amague* / change of direction) counts as `unintended_reversals`.**
+  - *Cause*: Reviewer left `planned_transitions` empty; note also that whole-clip `dom_sign` is determined by net sign majority, so a clip walking 50% right and 50% left will see one half as opposite!
+  - *Fix*: Mark **Planned Reversal** at the turnaround timestamp in Review (`±0.20 s` covers turning apex), or clip unidirectional *caminata* passages separately.
+
+#### Visualizations to Build for Group 3
+1. **Deceleration Speed-vs-Time Phase Strip**: Plot `|velocity_pair(t)|` inside each shaded `[t_slow, t_settle]` bracket, showing the decaying curve, running minimum dashed envelope (`running_min + secondary_speed_rise`), red markers for `measured` `speed_cue`s, and green markers for `user_confirmed` planned choreography marks.
+2. **Signed Velocity Reversal Strip**: Plot signed `velocity_pair(t)` around `0.0 tl/s` with shaded zones at `±stop_speed`, making unintended backward recoils immediately visible below zero.
+
+---
+
+### 8.4 Group 4: Posture and Alignment
+
+#### Metrics Covered
+- `torso_tilt_a` & `torso_tilt_b` (signed degrees from image vertical, $+ =$ shoulders camera-right of hips)
+- `couple_midpoint_tilt` (signed degrees of pair midpoint hip→shoulder axis)
+- `torso_separation` ($|\operatorname{wrapped\_diff}(\theta_A, \theta_B)| \ge 0^\circ$)
+- `head_pitch_a` & `head_pitch_b` (degrees with `head_neutral_offset` subtracted)
+- `torso_tilt_pearson_r` (Pearson $r \in [-1, +1]$ on aligned `measured` frame pairs)
+
+#### Validation Test (How to Verify Each Metric)
+1. **Static Plumb & Lean Verification (Drill 4)**: Stand straight next to a visible vertical doorway/pillar (`0°`), then lean noticeably right toward camera-right (`+x`) and confirm both `torso_tilt_a` and `torso_tilt_b` read `~0° ± 2°` upright and turn positive (`+6°..+12°`) leaning right and negative (`-6°..-12°`) leaning left.
+2. **A-Frame Separation Check**: While Leader leans `+6°` right toward Follower and Follower leans `-6°` left into embrace, verify `couple_midpoint_tilt` reads `~0°` (centered!), while `torso_separation` reads `~12°` (`|6 - (-6)|`). Confirm that when partners walk $> 1.0\text{ m}$ apart (`couple_axis_max_separation_m`), Review hides the shared couple line and keeps individual A/B lines, restoring below `0.80 m`.
+3. **Pearson Synchronization Check (`torso_tilt_pearson_r`)**: Record 10 s swaying/leaning smoothly together left-and-right as a coupled unit (`r` should exceed `+0.70`), vs Follower stiffening upright while Leader sways alone (`r` drops near `0.0`).
+4. **Head Pitch Sanity Check (`head_pitch_a/b`)**: Look level ahead (`~0°`), then drop chin to look at partner's feet (`<= -15°`). Verify values stay `None` (`head_landmarks_unavailable`) when facing directly away from camera so unseen noses are never guessed.
+
+#### Recommendations & Interpretation Targets
+| Metric | Healthy Tango Recommendation | Warning Signs to Investigate |
+| --- | --- | --- |
+| **`torso_tilt_a` & `torso_tilt_b`** | **Steady upright (*salón*)**: Median within `±4°` of vertical (assuming level camera), `IQR <= 3°–5°`.<br>**Milonguero *apilado***: Controlled forward lean `4°–10°` toward partner (`IQR <= 4°`), opposite signs between facing partners! | **Large `IQR > 10°`**: Forward-back bobbing every step ("pitching"), OR camera roll tilt / severe foreshortening (`fixed_scale` issues). |
+| **`couple_midpoint_tilt`** | **`0° ± 3°`** (`IQR <= 3°`) in balanced embrace—even in *apilado*, mutual leans cancel around vertical center! | Steady drift away from `0°` (`> 6°` sustained) signals the pair's shared center-of-gravity axis is tilting off-balance over one side (or tripod horizon is tilted). |
+| **`torso_separation`** | **Parallel upright**: `0°–4°` (`IQR <= 3°`).<br>**Balanced A-frame *apilado***: `6°–14°` (`IQR <= 4°`). | **Large separation `> 18°`** with **high `IQR > 8°`**: Dropping into heavy V/A tension collapse during turns or pushing away with arms. |
+| **`head_pitch_a` / `head_pitch_b`** | Gaze slightly level (`-8° to +6°`, `IQR <= 6°`), keeping cervical line aligned without looking down at feet. | Sustained negative median (`< -15°`) -> chronic looking at the floor (note: verify `head_neutral_offset` matches natural anatomy/camera height first!). |
+| **`torso_tilt_pearson_r`** | **Synchronous sway / side-by-side parallel**: `r >= +0.50`.<br>**Rigid static upright stance**: `r` can be near `0` or `unavailable (zero_variance)` if tilts barely move! | **`r < 0.0` during active movement** (or unexpected sign): In pure in-line linear sway, one dancer tilts away while partner tilts toward (*broken frame* or counter-leaning). Note sign convention when partners rotate 180° relative to camera! |
+
+#### Controlling Parameters
+- **Core Quality & Normalization**: `confidence` (`0.70`), `min_torso` (`0.12`), `head_neutral_offset` (`-12.0°`), `dancer_analysis.fixed_scale_min_ratio` (`0.45`), `dancer_analysis.fixed_scale_max_ratio` (`2.20`), `dancer_analysis.close_embrace_max_tilt_deg` (`25.0°`).
+- **Smoothing & Display**: `dancer_analysis.axis_smoothing_s` (`0.25 s`, Analytics charts), `dancer_analysis.overlay_smoothing_s` (`0.20 s`, Review playback lines), `dancer_analysis.axis_bridge_max_gap_s` (`0.25 s`), `dancer_analysis.overlay_min_landmark_visibility` (`0.50`).
+- **Midpoint Axis Distance Gate**: `dancer_analysis.couple_axis_max_separation_m` (`1.0 m`), `dancer_analysis.couple_axis_rejoin_separation_m` (`0.80 m`).
+- **Calibration Ranges**: Optional `baseline_passages` and `.tpc` approved limits (`COUPLE_METRIC_DETAILS`), evaluated via `calibration_smoothing_s` (`0.25 s`), `calibration_entry_duration_s` (`1.5 s`), `calibration_clear_duration_s` (`0.75 s`).
+
+#### Troubleshooting & Parameter Tweaks
+- **Problem: `torso_tilt_a` & `torso_tilt_b` both show a steady `+5°` bias even when dancers stand visibly vertical.**
+  - *Cause*: Tripod/phone camera horizon is rolled `5°` (since `atan2` uses raw image vertical).
+  - *Fix*: Level camera mechanically. In existing clips, rely on `torso_separation`, `torso_tilt_pearson_r`, and `baseline_change_deg` (using `baseline_passages` neutral stance subtraction!).
+- **Problem: `torso_tilt_pearson_r` reads `unavailable` (`zero_variance` or `insufficient_paired_samples`) or unexpectedly near `0`.**
+  - *Causes*: (1) If both dancers hold rock-steady posture (`std ~ 0°`), tiny signal-to-noise ratio prevents correlation (`zero_variance`). (2) `pair_torso_coverage` had `< 3` simultaneously measured frames. (3) During 180° turns facing camera vs side-on, screen-right (`+`) switches anatomical direction!
+  - *Fix*: Compute `torso_tilt_pearson_r` across dynamic walking/swaying clips in **one dominant facing direction** (`pair_torso_coverage >= 0.70`, `>= 10` moving samples), not static standing holds.
+- **Problem: Shared green/cyan midpoint axis line flickers ON/OFF or disappears during wide open embrace.**
+  - *Fix*: Adjust `couple_axis_max_separation_m` (e.g., `1.2 m` for wide open embrace) and `couple_axis_rejoin_separation_m` (`0.95 m`) keeping a `>= 0.15 m` hysteresis gap.
+- **Problem: Torso lines jump wildly to `±35°` when partners overlap tightly in close embrace.**
+  - *Fix*: Check `fixed_scale_min_ratio` / `max_ratio` (`0.55–1.80` tightens rejection of foreshortened bodies) and keep `close_embrace_max_tilt_deg` (`20–25°`) so implausible split candidates are discarded; verify **Analysis Model** (`Full` or `Heavy` cuts close-embrace overlap errors noticeably vs `Lite`).
+
+#### Visualizations to Build for Group 4
+1. **Synchronized Multi-Axis Ribbon Plot**: Plot `torso_tilt_a(t)`, `torso_tilt_b(t)`, and `couple_midpoint_tilt(t)` on top (`±°`), and `torso_separation(t)` below (`0°+`), with gray shading wherever `unavailable` occurs and optional green/red approved-range corridors.
+2. **Partner Tilt Joint Scatter Plot (`torso_tilt_a` vs `torso_tilt_b`) + OLS Trend Line**: Visualize `torso_tilt_pearson_r` directly! Highlight `y = x` (parallel sway) vs `y = -x` (symmetric A-frame inclination) and flag points outside `±2 SD` residuals as moment-by-moment disconnection or occlusion outliers.
+3. **Violin / Box Plots of `torso_separation` & `head_pitch_a/b` by Passage/Baseline**: Compare upright standing (`baseline`) vs walking vs turning intervals to see whether embrace geometry collapses specifically during turns.
+
+---
+
+### 8.5 Group 5: Turns
+
+#### Metrics Covered
+- `turn_count` (confirmed user turns + optional auto-suggested pivot intervals)
+- `median_turn_duration_s` & `iqr_turn_duration_s` (`turn_end - turn_start` in seconds)
+- `median_exit_minus_turn_end_ms` & `iqr_exit_minus_turn_end_ms` ($(t_{\text{exit}} - t_{\text{turn\_end}}) \times 1000$)
+- `overlap_count` (turns where $t_{\text{exit}} < t_{\text{turn\_end}}$, flagging `exit_occurred_during_turn`)
+- `pivot_behavior_a`, `pivot_behavior_b`, & `embrace_opening` (qualitative turn metadata labels)
+
+#### Validation Test (How to Verify Each Metric)
+1. **`turn_count` & `median_turn_duration_s`**: Mark `turn_start` when the pivoting dancer begins rotating hips and `turn_end` at completion on 4 controlled *ochos* / *giros*. Compare `turn_duration_s` against frame timestamps. Toggle `auto_turn_suggestions = True` and verify auto pivot brackets (`event_type == "turn"`, `status == "estimated"`) align with real `>= 20°` hip yaw rotations (`DETECTOR_CONFIG`) without double-counting user-marked turns (`±0.30 s` deduplication window).
+2. **`exit_minus_turn_end_ms` & `overlap_count`**: On Drill 5, verify that clean exits (stepping out after turn completion) show positive values (`+150 to +450 ms`, `overlap = False`) and premature exits (initiating travel step before hips finish rotating) show negative values (`< 0 ms`, `overlap = True`, incrementing `overlap_count`).
+3. **Qualitative Tags (`pivot_behavior_a/b`, `embrace_opening`)**: Confirm round-trip persistence inside exported JSON/archive metadata after saving in Review (`pivot_behavior` values: `appears_planted`, `rotates_in_place`, `repositions`, `unknown`).
+
+#### Recommendations & Interpretation Targets
+| Metric | Healthy Tango Recommendation | Warning Signs to Investigate |
+| --- | --- | --- |
+| **`median_turn_duration_s` & `iqr_turn_duration_s`** | Consistent tempo-matched turn phrasing: typically `0.6 – 1.8 s` for *ochos*, `1.5 – 3.5 s` for *giro* sequences, with compact IQR (`< 0.4 s` across repeated identical *ochos*). | Large `iqr_turn_duration_s`: Rushing certain turn sides (e.g., left-pivot faster than right-pivot) or inconsistent `turn_start/turn_end` annotation criteria. |
+| **`median_exit_minus_turn_end_ms`** | Clean grounded pivot completion before exit transfer: **`+50 ms to +300 ms`** (`iqr < 180 ms`). | **`< 0 ms` (negative)** -> **Rushed exit** before pivot resolves.<br>**`> +800 ms`** -> Long dead pause/hesitation losing musical continuity, OR missed linking to the right `exit` marker (`turn_exit_match_window_s`). |
+| **`overlap_count`** | **`0`** (clean separation between rotational pivot completion and linear exit departure). | **`>= 1` overlap**: Follower/Leader pulls off the standing axis mid-pivot (`exit_occurred_during_turn`). Prioritize reviewing video at that turn's `timestamp`! |
+| **`pivot_behavior_a` / `b` & `embrace_opening`** | Stable `appears_planted` or deliberate `rotates_in_place` without unwanted `embrace_opening`. | Repeated `repositions` (hopping/re-anchoring standing foot mid-pivot) paired with negative `exit_minus_turn_end_ms` and widening `torso_separation`. |
+
+#### Controlling Parameters
+- `dancer_analysis.turn_exit_match_window_s` (`3.00 s` default): Maximum time window `|t_exit - t_turn_end|` (with `t_exit >= t_turn_start - 0.10 s`) used to pair an `exit` annotation to a turn.
+- `dancer_analysis.auto_turn_suggestions` (`false` default): Merges automated hip-yaw `pivot_candidates` not overlapping confirmed turns within `±0.30 s`.
+- **3D/2D Pivot Detector (`DETECTOR_CONFIG` in `movement.py`)**: `min_landmark_confidence` (`0.55`), `heading_smooth_tau_s` (`0.10 s`), `min_3d_hip_span` (`0.035`), `min_2d_hip_span_ratio` (`0.08`), `pivot_window_min_s` (`0.35 s`), `pivot_window_max_s` (`0.80 s`), `pivot_min_net_deg` (`20.0°`), `pivot_entry_rate_deg_s` (`30.0°/s`), `pivot_exit_rate_deg_s` (`14.0°/s`), `pivot_max_opposite_fraction` (`0.22`), `pivot_foot_anchor_radius_scale` (`0.18`).
+
+#### Troubleshooting & Parameter Tweaks
+- **Problem: `median_exit_minus_turn_end_ms` is `None` (`unavailable`) even though turns and exits were marked.**
+  - *Cause*: Marked `exit` fell outside `turn_exit_match_window_s` (`3.0 s` from `turn_end`), was placed $> 0.10\text{ s}$ BEFORE `turn_start`, or was consumed by an adjacent turn!
+  - *Fix*: Inspect timestamp ordering (`turn_start <= turn_end`, `exit >= turn_start - 0.10`) in Review, or widen `turn_exit_match_window_s` up to `4.5 s` for slow extended *giros*.
+- **Problem: `auto_turn_suggestions = true` creates too few or missing turn suggestions.**
+  - *Cause*: Slow *molinetes* or partial `< 20°` pivots don't hit `30.0°/s` entry angular velocity or drop hip visibility below `0.55` during cross-body occlusion.
+  - *Fix*: Switch **Offline Analysis Model** to **Full** or **Heavy** for cleaner 3D hip yaw (`world_pose` `dx, dz`), or mark `turn_start` / `turn_end` explicitly in **Review → Couple Evidence** (manual confirmations always take priority over auto suggestions).
+- **Problem: `overlap_count` increments when the exit looks clean visually.**
+  - *Cause*: Reviewer placed `turn_end` slightly too late (after upper body relaxed) or `exit` at toe detachment instead of weight departure.
+  - *Fix*: Standardize your annotation rule: mark `turn_end` on the **last frame of hip yaw rotation** and mark `exit` on the **first frame of linear hip translation / exit step initiation**.
+
+#### Visualizations to Build for Group 5
+1. **Turn Duration & Exit-Timing Gantt / Dumbbell Chart**: One horizontal bar per turn (`Y = turn #1, #2, ...`), showing `[turn_start, turn_end]` duration (`seconds`) with a diamond marker at `exit_timestamp` (colored green if right of `turn_end` = clean exit, red if inside/left of `turn_end` = `overlap`!).
+2. **Exit Offset Strip + Threshold Plot (`exit_minus_turn_end_ms`)**: Horizontal zero-line separating premature overlapped exits (`< 0 ms` shaded red) from clean settled exits (`>= 0 ms` shaded green), grouped by `pivot_behavior` (`rotates_in_place` vs `repositions`) or `embrace_opening`.
+3. **Turn-Scoped Cross-Domain Alignment Overlay**: Plot `torso_separation(t)` and `|velocity_pair(t)|` locked around `[turn_start - 0.5s, turn_end + 1.0s]` so you can visually verify whether overlaps correlate with embrace collapse!
+
+---
+
+## 9. Quick Reference Matrix: Metrics → Parameters → Ideal Visual Check
+
+| Analytical Group | Key Summary Metrics | Top Tunable Parameters | Best Assessment Chart |
+| --- | --- | --- | --- |
+| **1. Travel & Coordination** | `velocity_a/b/pair`, `start/slow/settle_lag_ms`, `paired_count`, `unpaired_count` | `velocity_filter_window_s`, `start_speed`, `stop_speed`, `slowing_fraction`, `persistence_s`, `pairing_window_s` | Dual speed curves + lag-bracket boxplots |
+| **2. Steps & Beat Timing** | `contact_count`, `matched_count`, `beat_offset_ms`, `iqr_beat_offset_ms`, `beat_fraction` | `tango_bpm`, `analyze_soundtrack`, `manual_beats`, `beat_subdivision`, `beat_offset_s` | Polar Beat-Phase Rose (`[-0.5, +0.5]`) + A/B offset ladder |
+| **3. Transitions** | `secondary_speed_peaks`, `unintended_reversals`, `planned_*`, `coverage/status` | `transition_min_coverage`, `secondary_speed_rise`, `persistence_s`, `planned_transitions` | Braking speed curve inside `[t_slow, t_settle]` |
+| **4. Posture & Alignment** | `torso_tilt_a/b`, `couple_midpoint_tilt`, `torso_separation`, `head_pitch_a/b`, `torso_tilt_pearson_r` | `axis_smoothing_s`, `couple_axis_max_separation_m`, `couple_axis_rejoin_separation_m`, `fixed_scale_*`, `confidence` | Synchronized tilt series + A-vs-B joint scatter |
+| **5. Turns** | `turn_count`, `median/iqr_turn_duration_s`, `median/iqr_exit_minus_turn_end_ms`, `overlap_count`, `pivot_behavior`, `embrace_opening` | `auto_turn_suggestions`, `turn_exit_match_window_s`, `turn_start/turn_end/exit` markers | Turn Gantt + exit-offset dumbbell (`0 ms` overlap line) |
