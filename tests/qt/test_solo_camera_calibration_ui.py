@@ -699,7 +699,7 @@ def test_speech_manager_queues_and_pads_tail_silence_without_cutting_off(qapp, t
     monkeypatch.setattr(
         Path,
         "is_file",
-        lambda self: True if str(self) == "/usr/bin/afplay" else orig_is_file(self),
+        lambda self: True if self.as_posix() == "/usr/bin/afplay" else orig_is_file(self),
     )
 
     first_play_started = threading.Event()
