@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
 import cv2
@@ -37,7 +38,14 @@ from ...archive import (
     read_analytics,
     read_movement_analysis,
 )
-from ...calibration.archives import read_range_profile, save_range_profile
+from ...calibration.archives import (
+    EMBEDDED_EVIDENCE_MEMBER,
+    extract_embedded_evidence,
+    has_embedded_evidence,
+    read_range_profile,
+    save_range_profile,
+)
+from ...calibration.camera_session import ledger_metric_samples, resolve_side_frame_config
 from ...calibration.evidence import (
     Evidence,
     cached_couple_result,
@@ -200,6 +208,8 @@ class CalibrationEditor(QDialog):
         self._omit_source_archive = omit_source_archive
         self._prefer_cfg_orientation = prefer_cfg_orientation
         self._auto_approve_drafts = auto_approve_drafts
+        self._embedded_temp_dir: TemporaryDirectory[str] | None = None
+        self._embedded_tpr_source: Path | None = None
         tpr_path: Path | None = None
         if suffix == ".tpc":
             self._editing_profile_path: Path | None = path
@@ -207,7 +217,15 @@ class CalibrationEditor(QDialog):
             self.setWindowTitle("Edit approved range calibration")
             if source_reference is not None:
                 tpr_path = source_reference
-            else:
+            elif has_embedded_evidence(path):
+                self._embedded_temp_dir = TemporaryDirectory(prefix="tango_tpc_ev_")
+                extracted = extract_embedded_evidence(path, Path(self._embedded_temp_dir.name))
+                if extracted is not None:
+                    tpr_path = extracted
+                    self._embedded_tpr_source = extracted
+                    self._omit_source_archive = True
+                    self._prefer_cfg_orientation = True
+            if tpr_path is None and suffix == ".tpc":
                 has_ref_hint = bool(
                     base_profile.source.get("archive")
                     or base_profile.source.get("archive_sha256")
@@ -230,6 +248,8 @@ class CalibrationEditor(QDialog):
         elif suffix == ".tpr":
             self._editing_profile_path = None
             tpr_path = path
+            if omit_source_archive:
+                self._embedded_tpr_source = tpr_path
             self.setWindowTitle("Review evidence & approve calibration ranges")
         else:
             raise ValueError("Create a .tpr reference before approving calibration ranges")
@@ -558,6 +578,8 @@ class CalibrationEditor(QDialog):
             self.auto_link_button.setEnabled(False)
             self.confirm_identity.setText("I confirm dancer A and B identities throughout these passages")
             self.confirm_identity.setChecked(False)
+        if self._omit_source_archive:
+            save_selection.setEnabled(False)
         self._recompute()
         if not self._profile_only and self._auto_approve_drafts and self._metric_passages:
             self._preapprove_draft_metrics()
@@ -578,7 +600,16 @@ class CalibrationEditor(QDialog):
         self.step_combo.setCurrentText(initial_step)
         self.step_combo.blockSignals(False)
         self._change_step(initial_step)
-        self._seek_frame(0)
+        initial_seek_ts: float | None = None
+        if self._ledger and not self._profile_only and self.evidence is not None:
+            initial_key = self.metric_combo.currentData()
+            initial_target = self.approved.get(initial_key) if initial_key is not None else None
+            if initial_target is not None and initial_target.passages:
+                initial_seek_ts = initial_target.passages[0].start
+        if initial_seek_ts is not None:
+            self._seek_timestamp(initial_seek_ts)
+        else:
+            self._seek_frame(0)
         self.finished.connect(self._release)
 
     def _load_reference_evidence(
@@ -687,15 +718,41 @@ class CalibrationEditor(QDialog):
                         for index, frame in enumerate(self.evidence.frames)
                     },
                 }
+            ledger_auto_link = (
+                not self.couple
+                and bool(self._ledger)
+                and anchors is None
+            )
             self._auto_linked_single = (
                 anchors is None
                 and self._editing_profile_path is None
                 and has_coach_frames
                 and max((len(frame.poses) for frame in self.evidence.frames), default=0) == 1
             )
-            if self._auto_linked_single:
+            if ledger_auto_link:
+                ledger_anchors = single_dancer_anchors(
+                    self.evidence,
+                    self.cfg.confidence,
+                    skip_static=False,
+                    allow_multi_pose_gaps=True,
+                )
+                if self._editing_profile_path is None or len(self._anchors) <= 1:
+                    self._anchors = ledger_anchors
+                    self._track_start = min(self._anchors)
+                    self._auto_linked_single = True
+            elif self._auto_linked_single:
                 self._anchors = single_dancer_anchors(self.evidence, self.cfg.confidence)
                 self._track_start = min(self._anchors)
+            if (
+                not self._auto_linked_single
+                and not self.couple
+                and bool(self._ledger)
+                and self._editing_profile_path is not None
+                and self._anchors
+                and set(self._anchors.values()) == {0}
+                and max((len(frame.poses) for frame in self.evidence.frames), default=0) <= 1
+            ):
+                self._auto_linked_single = True
             self._movement_data = analytics.get("movement_data")
             if self._movement_data is None:
                 movement = read_movement_analysis(self._archive.folder, 0)
@@ -740,6 +797,9 @@ class CalibrationEditor(QDialog):
             self._reader.close()
         if self._archive is not None:
             self._archive.close()
+        if self._embedded_temp_dir is not None:
+            self._embedded_temp_dir.cleanup()
+            self._embedded_temp_dir = None
 
     def _mark_current_metric_draft(self, *_args: object) -> None:
         key = self.metric_combo.currentData()
@@ -843,41 +903,6 @@ class CalibrationEditor(QDialog):
             update={"max_view_width": base_cfg.max_view_width + base_cfg.solo_camera.front_view_width_margin}
         )
 
-    def _prepare_side_frames_for_ledger(
-        self, frames: list[FrameObservation], base_cfg: Config
-    ) -> list[FrameObservation]:
-        if not self._ledger:
-            return frames
-        side_records = [
-            rec for rec in self._ledger
-            if isinstance(rec, dict) and rec.get("view") == "side"
-        ]
-        if not side_records:
-            return frames
-        from ...calibration.camera_session import prepare_side_measurement_frame
-
-        prepared: list[FrameObservation] = []
-        for fr in frames:
-            matched = next(
-                (
-                    rec for rec in side_records
-                    if float(rec.get("start", 0.0)) <= fr.timestamp <= float(rec.get("end", 0.0))
-                ),
-                None,
-            )
-            if matched is not None:
-                det_side = matched.get("detected_side")
-                det_facing = matched.get("detected_facing")
-                frame_cfg = (
-                    base_cfg.model_copy(update={"side": det_side, "facing": det_facing})
-                    if det_side in ("left", "right") and det_facing in ("left", "right")
-                    else base_cfg
-                )
-                prepared.append(prepare_side_measurement_frame(fr, frame_cfg))
-            else:
-                prepared.append(fr)
-        return prepared
-
     def _samples_for_view(self, view_mode: str) -> dict[str, list[tuple[float, float | None]]]:
         if self.couple:
             assert self._couple_result is not None
@@ -891,11 +916,10 @@ class CalibrationEditor(QDialog):
         if cached is not None:
             return cached
         cfg = self.cfg.model_copy(update={"allow_all_angles": view_mode != "side"})
-        frames_for_view = self._selected_frames
         if view_mode == "side" and self._ledger:
-            cfg = self._ledger_side_cfg(cfg)
-            frames_for_view = self._prepare_side_frames_for_ledger(frames_for_view, cfg)
-        computed = metric_samples(frames_for_view, cfg, view=view_mode)  # type: ignore[arg-type]
+            computed = ledger_metric_samples(self._selected_frames, cfg, self._ledger, view="side")
+        else:
+            computed = metric_samples(self._selected_frames, cfg, view=view_mode)  # type: ignore[arg-type]
         self._samples_by_view[view_mode] = computed
         return computed
 
@@ -1279,8 +1303,8 @@ class CalibrationEditor(QDialog):
             if (
                 target is not None and self._approved_coach_data is not None
                 and target.view == self.view_combo.currentText()
-                and target.lower == self.lower_spin.value()
-                and target.upper == self.upper_spin.value()
+                and math.isclose(target.lower, self.lower_spin.value(), abs_tol=1e-5)
+                and math.isclose(target.upper, self.upper_spin.value(), abs_tol=1e-5)
             ):
                 for index, frame in enumerate(self._selected_frames):
                     entry = self._approved_coach_data["frames"][str(index)]
@@ -1655,21 +1679,28 @@ class CalibrationEditor(QDialog):
                 for index, frame in enumerate(self._selected_frames)
             }}
         eval_cfg = self._ledger_side_cfg(self.cfg)
-        eval_frames = self._prepare_side_frames_for_ledger(self._selected_frames, eval_cfg)
+        frames_payload: dict[str, Any] = {}
+        for index, frame in enumerate(self._selected_frames):
+            if self._ledger:
+                eval_frame, eval_cfg_i = resolve_side_frame_config(frame, self.cfg, self._ledger)
+            else:
+                eval_frame, eval_cfg_i = frame, self.cfg
+            frame_entry: dict[str, Any] = {
+                "timestamp": eval_frame.timestamp,
+                "measurement_poses": [
+                    {name: [lm.x, lm.y, lm.z, lm.visibility, lm.presence]
+                     for name, lm in pose.items()}
+                    for pose in eval_frame.poses
+                ],
+            }
+            if self._ledger:
+                frame_entry["side"] = eval_cfg_i.side
+                frame_entry["facing"] = eval_cfg_i.facing
+            frames_payload[str(index)] = frame_entry
         data = {
             "width": self.evidence.frames[0].width,
             "height": self.evidence.frames[0].height,
-            "frames": {
-                str(index): {
-                    "timestamp": frame.timestamp,
-                    "measurement_poses": [
-                        {name: [lm.x, lm.y, lm.z, lm.visibility, lm.presence]
-                         for name, lm in pose.items()}
-                        for pose in frame.poses
-                    ],
-                }
-                for index, frame in enumerate(eval_frames)
-            },
+            "frames": frames_payload,
         }
         return compare_approved_coach_data(data, eval_cfg, approved)
 
@@ -1702,6 +1733,8 @@ class CalibrationEditor(QDialog):
         if self._omit_source_archive:
             base_source.pop("archive", None)
             base_source.pop("archive_sha256", None)
+            if self._embedded_tpr_source is not None:
+                base_source["embedded_evidence"] = EMBEDDED_EVIDENCE_MEMBER
             if not base_source.get("provenance"):
                 base_source.pop("provenance", None)
         source: dict[str, Any] = {
@@ -1765,7 +1798,12 @@ class CalibrationEditor(QDialog):
                     self._editing_profile_path is not None
                     and path.resolve() == self._editing_profile_path.resolve()
                 )
-            save_range_profile(path, result, overwrite=overwrite)
+            save_range_profile(
+                path,
+                result,
+                overwrite=overwrite,
+                embedded_evidence=self._embedded_tpr_source,
+            )
             self.saved_path = path
             self.accept()
         except (OSError, ValueError, TypeError) as error:
@@ -1829,10 +1867,12 @@ class CalibrationEditor(QDialog):
             )
             if self._approved_coach_data is not None and not self.couple:
                 entry = self._approved_coach_data["frames"][str(index)]
-                draw_cfg = self._ledger_side_cfg(self.cfg)
-                draw_frame = self._prepare_side_frames_for_ledger(
-                    [self._selected_frames[index]], draw_cfg
-                )[0]
+                if self._ledger:
+                    draw_frame, draw_cfg = resolve_side_frame_config(
+                        self._selected_frames[index], self.cfg, self._ledger
+                    )
+                else:
+                    draw_frame, draw_cfg = self._selected_frames[index], self.cfg
                 image = render_approved_feedback(
                     image, draw_frame, draw_cfg, self.approved,
                     entry["calibration_rows"],

@@ -35,7 +35,7 @@ from PySide6.QtWidgets import (
 )
 
 from ...archive import calibration_directory, calibration_path, practice_directory
-from ...calibration.archives import save_range_profile
+from ...calibration.archives import EMBEDDED_EVIDENCE_MEMBER, save_range_profile
 from ...calibration.camera_session import (
     CHECK_SPECS,
     SoloCameraSession,
@@ -44,10 +44,10 @@ from ...calibration.camera_session import (
     build_walking_phases,
     check_full_body_framing,
     evaluate_metric_repeat_check,
-    prepare_side_measurement_frame,
+    ledger_metric_samples,
 )
 from ...calibration.evidence import cached_evidence
-from ...calibration.measurements import measure_ranges
+from ...calibration.measurements import metric_samples
 from ...calibration.models import METRIC_DETAILS, ApprovedRange, Passage, RangeProfile
 from ...calibration.statistics import summarize_examples
 from ...config import Config
@@ -510,7 +510,8 @@ class GuidedCalibration(QDialog):
             self._release_camera()
             self._start_preview()
 
-    def _start_preview(self, *, auto_begin: bool = False) -> None:
+    def _start_preview(self, *, auto_begin: bool = False, announce: bool = True) -> None:
+        self._speech.cancel_all()
         self._release_camera()
         self._auto_begin_pending = auto_begin
         self._preview_stable_since: float | None = None
@@ -540,7 +541,7 @@ class GuidedCalibration(QDialog):
         self.status_banner.setText("Starting camera preview…")
         self._thread.start()
         self._poll_timer.start()
-        if self.speak_cb.isChecked():
+        if announce and self.speak_cb.isChecked():
             preview_prompt = (
                 "Camera preview started. Step back until your head and shoes fit in the frame."
                 if auto_begin or self.auto_start_cb.isChecked()
@@ -648,6 +649,7 @@ class GuidedCalibration(QDialog):
         self._sync_capture_ui()
 
     def _announce_captured_and_prompt(self) -> None:
+        self._last_spoken_hint = ""
         if self.speak_cb.isChecked() and self._session.state == "Prompt":
             self._speech.speak(
                 self._session.active_prompt_id,
@@ -704,8 +706,14 @@ class GuidedCalibration(QDialog):
         self.phase_label.setText(phase_text)
         self.instruction_label.setText(self._session.current_instruction)
         self.hint_label.setText(self._session.hint_message)
+        orient_changed = (
+            self._detected_side != self._session.cfg.side
+            or self._detected_facing != self._session.cfg.facing
+        )
         self._detected_side = self._session.cfg.side
         self._detected_facing = self._session.cfg.facing
+        if orient_changed:
+            self._update_orientation_indicator()
         if self._frozen_cfg is not None and (
             self._frozen_cfg.side != self._session.cfg.side
             or self._frozen_cfg.facing != self._session.cfg.facing
@@ -741,6 +749,7 @@ class GuidedCalibration(QDialog):
 
     def _repeat_instruction(self) -> None:
         self._speech.cancel_all()
+        self._last_spoken_hint = ""
         prompt_id = self._session.retry_phase(
             now_monotonic=time.monotonic(),
             speak_enabled=self.speak_cb.isChecked(),
@@ -753,6 +762,7 @@ class GuidedCalibration(QDialog):
 
     def _skip_view(self) -> None:
         self._speech.cancel_all()
+        self._last_spoken_hint = ""
         prompt_id = self._session.skip_view(
             now_monotonic=time.monotonic(),
             speak_enabled=self.speak_cb.isChecked(),
@@ -775,7 +785,6 @@ class GuidedCalibration(QDialog):
         if self._review_entered:
             return
         self._review_entered = True
-        self._speech.cancel_all()
         self._release_camera()
         self.stack.setCurrentIndex(2)
         self.status_banner.setText("Self calibration completed. Review and save your calibration.")
@@ -808,7 +817,8 @@ class GuidedCalibration(QDialog):
         self._editor_open = False
         self._repeat_wait_since = None
         self._repeat_interval_s = 5.0
-        self._start_preview()
+        self._last_spoken_hint = ""
+        self._start_preview(announce=False)
         if self._display is not None:
             self._display.recording.set()
         self.stack.setCurrentIndex(1)
@@ -825,7 +835,8 @@ class GuidedCalibration(QDialog):
         self._editor_open = False
         self._repeat_wait_since = None
         self._repeat_interval_s = 5.0
-        self._start_preview()
+        self._last_spoken_hint = ""
+        self._start_preview(announce=False)
         if self._display is not None:
             self._display.recording.set()
         self.stack.setCurrentIndex(1)
@@ -952,9 +963,16 @@ class GuidedCalibration(QDialog):
                 auto_approve_drafts=True,
             )
             if editor.exec() == QDialog.DialogCode.Accepted and editor.saved_path is not None:
+                saved_name = editor.name_input.text().strip()
+                if saved_name:
+                    self.name_input.setText(saved_name)
                 self.saved_path = editor.saved_path
                 self.saved_paths = [editor.saved_path]
                 self.status_banner.setText(f"Saved calibration: {editor.saved_path.name}")
+                self.review_summary.setText(
+                    f"Saved calibration: {editor.saved_path.name}\n\n"
+                    "You can reopen it anytime from Library -> Edit calibration."
+                )
                 self.bridge.calibrations_changed.emit()
                 if self._embedded:
                     self.accepted.emit()
@@ -979,30 +997,9 @@ class GuidedCalibration(QDialog):
 
         # Build samples per view
         passages_list = list(self._session.accepted_passages.values())
-        raw_samples: dict[str, list[tuple[float, float | None]]] = {k: [] for k in METRIC_DETAILS}
-        for fr in ev.frames:
-            matching_rec = next(
-                (rec for rec in passages_list if rec.passage.start <= fr.timestamp <= rec.passage.end),
-                None,
-            )
-            if (
-                matching_rec is not None
-                and matching_rec.view == "side"
-                and matching_rec.detected_side is not None
-                and matching_rec.detected_facing is not None
-            ):
-                frame_cfg = cfg.model_copy(
-                    update={"side": matching_rec.detected_side, "facing": matching_rec.detected_facing}
-                )
-                eval_frame = prepare_side_measurement_frame(fr, frame_cfg)
-            else:
-                frame_cfg = cfg
-                eval_frame = fr
-            obs = measure_ranges(eval_frame, frame_cfg)
-            for mk in METRIC_DETAILS:
-                q = obs.quality.get(mk)
-                val = obs.values.get(mk)
-                raw_samples[mk].append((fr.timestamp, val if (q and q.valid) else None))
+        ledger = self._ledger_payload()
+        front_samples = metric_samples(ev.frames, cfg, view="front")
+        side_samples = ledger_metric_samples(ev.frames, cfg, ledger, view="side")
 
         has_neutral = any(r.role == "neutral" for r in passages_list)
         has_walking = any(r.role == "walking" for r in passages_list)
@@ -1015,9 +1012,10 @@ class GuidedCalibration(QDialog):
         approved: dict[str, ApprovedRange] = {}
         for mk, passages in passages_by_metric.items():
             view = views_by_metric.get(mk, "side")
+            samples_for_mk = side_samples[mk] if view == "side" else front_samples[mk]
             try:
                 stats = summarize_examples(
-                    raw_samples[mk],
+                    samples_for_mk,
                     passages,
                     max_gap,
                     suggest_lower_pct=cfg.calibration_suggest_lower_pct,
@@ -1037,7 +1035,7 @@ class GuidedCalibration(QDialog):
                         ]
                         if len(holds_4) == 4:
                             ok, _ = evaluate_metric_repeat_check(
-                                raw_samples[mk], holds_4, max_gap, expected_sign=spec.expected_sign
+                                samples_for_mk, holds_4, max_gap, expected_sign=spec.expected_sign
                             )
                             check_ok = ok
             approved[mk] = ApprovedRange(
@@ -1070,12 +1068,17 @@ class GuidedCalibration(QDialog):
             context=context,
             model_hash=ev.model_hash,
             capture_profile=capture_profile,
-            source={"dancer_mode": "single"},
+            source={"dancer_mode": "single", "embedded_evidence": EMBEDDED_EVIDENCE_MEMBER},
             metrics=approved,
-            camera_checks={"solo_camera_ledger": self._ledger_payload()},
+            camera_checks={"solo_camera_ledger": ledger},
         )
         try:
-            save_range_profile(prof_path, profile_obj, overwrite=True)
+            save_range_profile(
+                prof_path,
+                profile_obj,
+                overwrite=True,
+                embedded_evidence=tpr,
+            )
         except (OSError, ValueError, FileExistsError) as err:
             if not auto_triggered:
                 QMessageBox.warning(self, "Could not save calibration", f"{base_name}: {err}")

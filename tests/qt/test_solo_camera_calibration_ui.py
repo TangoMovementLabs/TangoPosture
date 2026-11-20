@@ -324,14 +324,17 @@ def test_guided_enter_review_announces_once_opens_editor_and_saves_single_tpc(
     prof = read_range_profile(tpc_files[0])
     assert set(prof.metrics) == {"shoulder_clearance", "trunk_inclination"}
     assert "archive" not in prof.source
+    assert prof.source.get("embedded_evidence") == "evidence.tpr"
 
-    # Reopening via Edit calibration works cleanly in profile-only mode without a .tpr file
+    # Reopening via Edit calibration after staging temp_dir is deleted preserves full video & charts
+    temp_dir.cleanup()
     edited_dialogs: list[CalibrationEditor] = []
 
-    class ProfileOnlyEditDialog(CalibrationEditor):
+    class EmbeddedEvidenceEditDialog(CalibrationEditor):
         def exec(self) -> int:
             edited_dialogs.append(self)
-            assert self._profile_only
+            assert not self._profile_only
+            assert self._reader is not None
             assert self.chart.data is not None and len(self.chart.data.segments) >= 1
             assert self.distribution.pixmap() is not None and not self.distribution.pixmap().isNull()
             self.lower_spin.setValue(self.lower_spin.value() - 1.0)
@@ -341,7 +344,7 @@ def test_guided_enter_review_announces_once_opens_editor_and_saves_single_tpc(
 
     monkeypatch.setattr(
         "tango_posture.desktop_qt.calibration.editor.CalibrationEditor",
-        ProfileOnlyEditDialog,
+        EmbeddedEvidenceEditDialog,
     )
     saved_after_edit = open_profile_calibration_editor(tpc_files[0], cfg, wizard, bridge=bridge)
     assert saved_after_edit is not None
@@ -364,8 +367,21 @@ def test_guided_enter_review_announces_once_opens_editor_and_saves_single_tpc(
     finally:
         library.close()
 
+    # Legacy .tpc without embedded evidence still opens cleanly in _profile_only mode with visuals
+    legacy_path = tmp_path / "calibrations" / "Legacy.tpc"
+    save_range_profile(legacy_path, prof, overwrite=True)
+    legacy_editor = CalibrationEditor(legacy_path, cfg)
+    try:
+        assert legacy_editor._profile_only
+        assert legacy_editor.chart.data is not None and len(legacy_editor.chart.data.segments) >= 1
+        assert (
+            legacy_editor.distribution.pixmap() is not None
+            and not legacy_editor.distribution.pixmap().isNull()
+        )
+    finally:
+        legacy_editor.reject()
+
     wizard.close()
-    temp_dir.cleanup()
 
 
 def test_guided_waits_for_speech_and_repeats_instruction_after_five_seconds(
@@ -428,5 +444,418 @@ def test_guided_waits_for_speech_and_repeats_instruction_after_five_seconds(
     wizard._update_repeat_timer(now[0])
     assert len(spoken) == 1
     assert spoken[0][1] == wizard._session.current_instruction
+
+    wizard.close()
+
+
+def test_guided_four_phase_with_dropouts_and_opposite_sides_preserves_all_metrics_and_embedded_video(
+    qapp, tmp_path, monkeypatch
+):
+    """End-to-end 4-phase Self Calibration with pose dropouts and opposite side holds:
+    auto-approves all 8 metrics, plots all timeseries/distributions, embeds video in 1 .tpc,
+    and preserves full video + charts after temp_dir cleanup."""
+    from tempfile import TemporaryDirectory
+
+    import cv2
+    import numpy as np
+
+    import tango_posture.desktop_qt.calibration.guided as guided_mod
+    from tango_posture.archive import append_segment, practice_directory, practice_path
+    from tango_posture.calibration.archives import has_embedded_evidence, read_range_profile
+    from tango_posture.calibration.camera_session import AcceptedPassageRecord
+    from tango_posture.calibration.models import METRIC_DETAILS
+    from tango_posture.desktop_qt.calibration import editor as editor_mod
+    from tango_posture.desktop_qt.calibration.editor import CalibrationEditor
+
+    cfg = Config(data_dir=str(tmp_path))
+    bridge = ServiceBridge(cfg)
+    wizard = GuidedCalibration(bridge, embedded=True, profile_name="JR Self Cam")
+    wizard.speak_cb.setChecked(False)
+    wizard.show()
+    qapp.processEvents()
+
+    temp_dir = TemporaryDirectory(dir=tmp_path)
+    temp_root = Path(temp_dir.name)
+    staging_dir = temp_root / "staging"
+    staging_dir.mkdir(parents=True, exist_ok=True)
+    prac_dir = practice_directory(str(temp_root))
+    prac_dir.mkdir(parents=True, exist_ok=True)
+
+    video = temp_root / "jr.mp4"
+    report = temp_root / "jr.md"
+    report.write_text("# JR Self Cam evidence\n", encoding="utf-8")
+
+    front_pose = {
+        "nose": [0.50, 0.20, 0.0, 0.99, 0.99],
+        "left_ear": [0.54, 0.20, 0.0, 0.99, 0.99],
+        "right_ear": [0.46, 0.20, 0.0, 0.99, 0.99],
+        "left_shoulder": [0.62, 0.32, 0.0, 0.99, 0.99],
+        "right_shoulder": [0.38, 0.32, 0.0, 0.99, 0.99],
+        "left_hip": [0.58, 0.58, 0.0, 0.99, 0.99],
+        "right_hip": [0.42, 0.58, 0.0, 0.99, 0.99],
+        "left_knee": [0.58, 0.74, 0.0, 0.99, 0.99],
+        "right_knee": [0.42, 0.74, 0.0, 0.99, 0.99],
+        "left_ankle": [0.58, 0.90, 0.0, 0.99, 0.99],
+        "right_ankle": [0.42, 0.90, 0.0, 0.99, 0.99],
+    }
+
+    def _side_pose(near_side: str, facing: str) -> dict[str, list[float]]:
+        far_side = "right" if near_side == "left" else "left"
+        nose_x = 0.56 if facing == "right" else 0.44
+        return {
+            "nose": [nose_x, 0.20, 0.0, 0.99, 0.99],
+            f"{near_side}_ear": [0.50, 0.20, 0.0, 0.99, 0.99],
+            f"{far_side}_ear": [0.50, 0.20, 0.0, 0.10, 0.10],
+            f"{near_side}_shoulder": [0.50, 0.32, 0.0, 0.99, 0.99],
+            f"{far_side}_shoulder": [0.495, 0.32, 0.0, 0.40, 0.40],
+            f"{near_side}_hip": [0.50, 0.58, 0.0, 0.99, 0.99],
+            f"{far_side}_hip": [0.495, 0.58, 0.0, 0.40, 0.40],
+            f"{near_side}_knee": [0.52, 0.74, 0.0, 0.99, 0.99],
+            f"{far_side}_knee": [0.49, 0.74, 0.0, 0.40, 0.40],
+            f"{near_side}_ankle": [0.50, 0.90, 0.0, 0.99, 0.99],
+            f"{far_side}_ankle": [0.50, 0.90, 0.0, 0.40, 0.40],
+        }
+
+    # 70 frames @ 10fps (0.0..6.9s) with explicit dropout gaps between holds:
+    # 0..14 (0.0..1.4s): front_a
+    # 15..16 (1.5..1.6s): DROPOUT (poses=[])
+    # 17..31 (1.7..3.1s): front_b
+    # 32..33 (3.2..3.3s): DROPOUT (poses=[])
+    # 34..48 (3.4..4.8s): side_a (right/right, occluded left ear/shoulder/hip)
+    # 49..50 (4.9..5.0s): DROPOUT (poses=[])
+    # 51..65 (5.1..6.5s): side_b (left/left, occluded right ear/shoulder/hip)
+    # 66..69: side_b tail
+    writer = cv2.VideoWriter(str(video), cv2.VideoWriter.fourcc(*"mp4v"), 10, (640, 480))
+    assert writer.isOpened()
+    entries = []
+    timestamps = [i / 10.0 for i in range(70)]
+    for idx in range(70):
+        writer.write(np.zeros((480, 640, 3), dtype=np.uint8))
+        if idx in (15, 16, 32, 33, 49, 50):
+            entries.append({"poses": []})
+        elif idx <= 31:
+            entries.append({"poses": [front_pose]})
+        elif idx <= 48:
+            entries.append({"poses": [_side_pose("right", "right")]})
+        else:
+            entries.append({"poses": [_side_pose("left", "left")]})
+    writer.release()
+
+    tp_file = practice_path(prac_dir, "solo_calibration_evidence")
+    append_segment(
+        tp_file,
+        report,
+        video,
+        None,
+        timestamps,
+        analytics={
+            "model_hash": MANIFEST["sha256"],
+            "capture_profile": build_capture_profile(cfg, 640, 480, "camera:0"),
+            "frames": entries,
+            "max_gap": cfg.max_gap,
+        },
+    )
+
+    wizard._temp_dir = temp_dir
+    wizard._staging_dir = staging_dir
+    wizard._frozen_cfg = cfg
+    front_m = {"shoulder_clearance": 1.4, "torso_axis_tilt": 1.4}
+    side_m = {
+        "head_pitch": 1.4,
+        "head_forward": 1.4,
+        "head_inclination": 1.4,
+        "trunk_inclination": 1.4,
+        "hip_offset": 1.4,
+        "knee_flexion": 1.4,
+    }
+    wizard._session._accepted_passages = {
+        "front_a": AcceptedPassageRecord(
+            phase_id="front_a", plan_kind="quick", view="front", repetition=1, role="neutral",
+            passage=Passage(start=0.0, end=1.4), eligible_metrics=front_m, usable=True,
+            detected_side="left", detected_facing="right",
+        ),
+        "front_b": AcceptedPassageRecord(
+            phase_id="front_b", plan_kind="quick", view="front", repetition=2, role="neutral",
+            passage=Passage(start=1.7, end=3.1), eligible_metrics=front_m, usable=True,
+            detected_side="left", detected_facing="right",
+        ),
+        "side_a": AcceptedPassageRecord(
+            phase_id="side_a", plan_kind="quick", view="side", repetition=1, role="neutral",
+            passage=Passage(start=3.4, end=4.8), eligible_metrics=side_m, usable=True,
+            detected_side="right", detected_facing="right",
+        ),
+        "side_b": AcceptedPassageRecord(
+            phase_id="side_b", plan_kind="quick", view="side", repetition=2, role="neutral",
+            passage=Passage(start=5.1, end=6.5), eligible_metrics=side_m, usable=True,
+            detected_side="left", detected_facing="left",
+        ),
+    }
+    wizard._session.state = "Review"
+
+    rendered_overlays: list[tuple[dict[str, str], bool]] = []
+    real_render_approved = editor_mod.render_approved_feedback
+
+    def _spy_render(image, observation, cfg_arg, targets, rows):
+        out = real_render_approved(image, observation, cfg_arg, targets, rows)
+        rendered_overlays.append(({str(r["metric"]): str(r["state"]) for r in rows}, bool(np.any(out > 0))))
+        return out
+
+    monkeypatch.setattr(editor_mod, "render_approved_feedback", _spy_render)
+
+    class InspectAndSaveEditor(CalibrationEditor):
+        def exec(self) -> int:
+            assert set(self.approved) == set(METRIC_DETAILS)
+            for step_idx in range(self.step_combo.count()):
+                self.step_combo.setCurrentIndex(step_idx)
+                for m_idx in range(self.metric_combo.count()):
+                    self.metric_combo.setCurrentIndex(m_idx)
+                    assert self.chart.data is not None
+                    valid_pts = [v for _, v in self.chart.data.points if v is not None]
+                    assert len(valid_pts) >= 10
+                    assert self.chart.states
+                    assert self.distribution.pixmap() is not None and not self.distribution.pixmap().isNull()
+
+            # Verify both side_a (idx 38) and side_b (idx 58) evaluate all side metrics & draw lines
+            for frame_idx in (38, 58):
+                rendered_overlays.clear()
+                self.scrubber.setValue(frame_idx)
+                qapp.processEvents()
+                assert rendered_overlays
+                states_map, has_lines = rendered_overlays[-1]
+                for side_key in side_m:
+                    assert states_map.get(side_key) in ("WITHIN_REFERENCE", "DEVIATION", "PENDING")
+                assert has_lines
+
+            self._save()
+            return self.result()
+
+    monkeypatch.setattr(guided_mod, "CalibrationEditor", InspectAndSaveEditor)
+    wizard._enter_review()
+    qapp.processEvents()
+
+    tpc_files = list((tmp_path / "calibrations").glob("*.tpc"))
+    assert len(tpc_files) == 1
+    assert tpc_files[0].name == "JR Self Cam.tpc"
+    assert not (tmp_path / "references").exists() or not list((tmp_path / "references").iterdir())
+    assert has_embedded_evidence(tpc_files[0])
+    assert "JR Self Cam.tpc" in wizard.review_summary.text()
+
+    prof = read_range_profile(tpc_files[0])
+    assert set(prof.metrics) == set(METRIC_DETAILS)
+
+    # Delete staging temp_dir, reopen JR Self Cam.tpc, and verify full video + charts remain intact
+    temp_dir.cleanup()
+    reopened = CalibrationEditor(tpc_files[0], cfg)
+    try:
+        assert not reopened._profile_only
+        assert reopened._reader is not None
+        assert set(reopened.approved) == set(METRIC_DETAILS)
+        for step_idx in range(reopened.step_combo.count()):
+            reopened.step_combo.setCurrentIndex(step_idx)
+            for m_idx in range(reopened.metric_combo.count()):
+                reopened.metric_combo.setCurrentIndex(m_idx)
+                assert reopened.chart.data is not None
+                assert len([v for _, v in reopened.chart.data.points if v is not None]) >= 10
+                assert reopened.distribution.pixmap() is not None and not reopened.distribution.pixmap().isNull()
+        reopened.lower_spin.setValue(reopened.lower_spin.value() - 0.5)
+        reopened._approve()
+        reopened._save()
+        assert reopened.saved_path is not None
+        assert has_embedded_evidence(reopened.saved_path)
+    finally:
+        if reopened.isVisible():
+            reopened.reject()
+
+    wizard.close()
+
+
+def test_speech_manager_queues_and_pads_tail_silence_without_cutting_off(qapp, tmp_path, monkeypatch):
+    import threading
+    import time
+    import wave
+
+    import tango_posture.desktop_qt.practice.worker as worker_mod
+    from tango_posture.desktop_qt.practice.worker import SpeechManager, _pad_wav_silence
+
+    # 1. Verify _pad_wav_silence appends exact trailing silence frames
+    raw_wav = tmp_path / "raw.wav"
+    padded_wav = tmp_path / "padded.wav"
+    with wave.open(str(raw_wav), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(22050)
+        w.writeframes(b"\x01\x02" * 100)
+    assert _pad_wav_silence(raw_wav, padded_wav, 0.40)
+    with wave.open(str(padded_wav), "rb") as r:
+        expected_pad = round(22050 * 0.40)
+        assert r.getnframes() == 100 + expected_pad
+        all_bytes = r.readframes(r.getnframes())
+        assert all_bytes[:200] == b"\x01\x02" * 100
+        assert all_bytes[200:] == b"\x00" * (expected_pad * 2)
+
+    # 2. Verify SpeechManager serializes queued utterances via say->WAV->afplay without killing active speech
+    monkeypatch.setattr(SpeechManager, "is_available", staticmethod(lambda: True))
+    orig_is_file = Path.is_file
+    monkeypatch.setattr(
+        Path,
+        "is_file",
+        lambda self: True if str(self) == "/usr/bin/afplay" else orig_is_file(self),
+    )
+
+    first_play_started = threading.Event()
+    release_first_play = threading.Event()
+    commands_run: list[list[str]] = []
+    terminated_cmds: list[list[str]] = []
+    padded_frame_counts: list[int] = []
+
+    class FakeProc:
+        def __init__(self, cmd: list[str]) -> None:
+            self.cmd = list(cmd)
+            self._cancelled = threading.Event()
+            commands_run.append(self.cmd)
+            if self.cmd[0] == "/usr/bin/say" and "-o" in self.cmd:
+                out_path = Path(self.cmd[self.cmd.index("-o") + 1])
+                with wave.open(str(out_path), "wb") as w:
+                    w.setnchannels(1)
+                    w.setsampwidth(2)
+                    w.setframerate(22050)
+                    w.writeframes(b"\x10\x00" * 50)
+
+        def wait(self, timeout: float | None = None) -> int:
+            if self.cmd[0] == "/usr/bin/afplay":
+                with wave.open(self.cmd[1], "rb") as r:
+                    padded_frame_counts.append(r.getnframes())
+                if len(padded_frame_counts) == 1:
+                    first_play_started.set()
+                    while not release_first_play.is_set() and not self._cancelled.is_set():
+                        time.sleep(0.01)
+            return -15 if self._cancelled.is_set() else 0
+
+        def terminate(self) -> None:
+            terminated_cmds.append(self.cmd)
+            self._cancelled.set()
+
+        def kill(self) -> None:
+            self._cancelled.set()
+
+    monkeypatch.setattr(worker_mod.subprocess, "Popen", lambda cmd, **kw: FakeProc(cmd))
+
+    mgr = SpeechManager(timeout_s=5.0, tail_silence_s=0.40, post_speech_delay_s=0.0)
+    finished: list[tuple[int, bool]] = []
+    mgr.speech_finished.connect(lambda pid, failed: finished.append((pid, failed)))
+
+    mgr.speak(1, "First instruction")
+    assert first_play_started.wait(timeout=2.0)
+    assert mgr.is_speaking()
+
+    # Queue second phrase while first is still playing -> first must NOT be terminated
+    mgr.speak(2, "Second instruction")
+    assert terminated_cmds == []
+    assert mgr.is_speaking()
+
+    release_first_play.set()
+    deadline = time.monotonic() + 2.0
+    while (mgr.is_speaking() or len(finished) < 2) and time.monotonic() < deadline:
+        qapp.processEvents()
+        time.sleep(0.01)
+
+    assert not mgr.is_speaking()
+    assert terminated_cmds == []
+    assert finished == [(1, False), (2, False)]
+    assert len(padded_frame_counts) == 2
+    assert all(cnt == 50 + round(22050 * 0.40) for cnt in padded_frame_counts)
+
+    # 3. Verify cancel_all stops active utterance, clears pending queue, suppresses signals, and resets state
+    block_play = threading.Event()
+    play3_started = threading.Event()
+    finished.clear()
+    terminated_cmds.clear()
+
+    class BlockingFakeProc(FakeProc):
+        def wait(self, timeout: float | None = None) -> int:
+            if self.cmd[0] == "/usr/bin/afplay":
+                play3_started.set()
+                while not block_play.is_set() and not self._cancelled.is_set():
+                    time.sleep(0.01)
+            return -15 if self._cancelled.is_set() else 0
+
+    monkeypatch.setattr(worker_mod.subprocess, "Popen", lambda cmd, **kw: BlockingFakeProc(cmd))
+    mgr.speak(3, "Third instruction")
+    assert play3_started.wait(timeout=2.0)
+    mgr.speak(4, "Queued fourth instruction")
+    mgr.cancel_all()
+    assert not mgr.is_speaking()
+    assert any(cmd[0] == "/usr/bin/afplay" for cmd in terminated_cmds)
+    time.sleep(0.05)
+    qapp.processEvents()
+    assert finished == []
+
+    # Subsequent speak() after cancel_all() works normally
+    block_play.set()
+    mgr.speak(5, "Recovered instruction")
+    deadline = time.monotonic() + 2.0
+    while (mgr.is_speaking() or len(finished) < 1) and time.monotonic() < deadline:
+        qapp.processEvents()
+        time.sleep(0.01)
+    assert finished == [(5, False)]
+    assert not mgr.is_speaking()
+
+
+def test_guided_speech_transitions_do_not_cancel_completion_or_checks(qapp, tmp_path, monkeypatch):
+    import tango_posture.desktop_qt.calibration.guided as guided_mod
+    from tango_posture.calibration.camera_session import AcceptedPassageRecord
+
+    cfg = Config(data_dir=str(tmp_path))
+    bridge = ServiceBridge(cfg)
+    wizard = GuidedCalibration(bridge, embedded=True, profile_name="Speech flow")
+    wizard.speak_cb.setChecked(True)
+
+    spoken: list[tuple[int, str]] = []
+    cancel_calls: list[bool] = []
+    monkeypatch.setattr(wizard._speech, "speak", lambda pid, text: spoken.append((pid, text)))
+    orig_cancel = wizard._speech.cancel_all
+    monkeypatch.setattr(
+        wizard._speech,
+        "cancel_all",
+        lambda: (cancel_calls.append(True), orig_cancel())[-1],
+    )
+    monkeypatch.setattr(wizard, "_review_in_editor", lambda: None)
+
+    # _enter_review must NOT cancel_all() before speaking "Self calibration completed."
+    wizard._session._accepted_passages = {
+        "front_a": AcceptedPassageRecord(
+            phase_id="front_a",
+            plan_kind="quick",
+            view="front",
+            repetition=1,
+            role="neutral",
+            passage=Passage(start=0.0, end=2.0),
+            eligible_metrics={"shoulder_clearance": 2.0},
+            usable=True,
+        )
+    }
+    wizard._enter_review()
+    qapp.processEvents()
+    assert cancel_calls == []
+    assert spoken == [(0, "Self calibration completed.")]
+
+    # _run_selected_checks and _run_walking_plan must pass announce=False to _start_preview
+    preview_announce_args: list[bool] = []
+
+    def _fake_start_preview(*, auto_begin: bool = False, announce: bool = True) -> None:
+        preview_announce_args.append(announce)
+        if announce and wizard.speak_cb.isChecked():
+            wizard._speech.speak(0, "Camera preview started.")
+
+    monkeypatch.setattr(wizard, "_start_preview", _fake_start_preview)
+    monkeypatch.setattr(guided_mod, "build_check_phases", lambda ids: [])
+    monkeypatch.setattr(guided_mod, "build_walking_phases", list)
+
+    wizard.check_boxes["head_pitch"].setChecked(True)
+    spoken.clear()
+    wizard._run_selected_checks()
+    wizard._run_walking_plan()
+    assert preview_announce_args == [False, False]
+    assert not any("Camera preview started" in txt for _, txt in spoken)
 
     wizard.close()

@@ -123,11 +123,11 @@ auto_turn_suggestions = false
 [solo_camera]
 speak_instructions = true
 stable_time_s = 0.75
-settle_drift_torso_lengths = 0.05
+settle_drift_torso_lengths = 0.08
 hold_window_s = 2.5
 min_usable_hold_s = 2.0
 max_usable_gap_s = 0.20
-front_view_width_margin = 0.10
+front_view_width_margin = 0.15
 retry_hint_delay_s = 8.0
 camera_stall_timeout_s = 3.0
 walking_take_limit_s = 8.0

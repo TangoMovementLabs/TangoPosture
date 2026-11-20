@@ -424,3 +424,201 @@ def test_turn_direction_enforcement_and_buffered_side_recording():
     assert session.accepted_passages["side_a"].usable
     assert session.accepted_passages["side_a"].eligible_metrics["trunk_inclination"] >= 1.0
     assert session.accepted_passages["side_a"].detected_facing == "right"
+
+
+def test_resolve_side_frame_config_and_ledger_metric_samples():
+    """resolve_side_frame_config leaves front holds intact and repairs opposite-side holds per ledger."""
+    from tango_posture.calibration.camera_session import (
+        ledger_metric_samples,
+        resolve_side_frame_config,
+    )
+
+    cfg = Config(side="left", facing="right", max_view_width=0.45)
+
+    def _side_hold_pose(near_side: str, facing: str) -> dict[str, Landmark]:
+        far_side = "right" if near_side == "left" else "left"
+        nose_x = 0.56 if facing == "right" else 0.44
+        return {
+            "nose": _lm(nose_x, 0.20, 0.95),
+            f"{near_side}_ear": _lm(0.50, 0.20, 0.95),
+            f"{far_side}_ear": _lm(0.50, 0.20, 0.10),
+            f"{near_side}_shoulder": _lm(0.50, 0.32, 0.95),
+            f"{far_side}_shoulder": _lm(0.49, 0.32, 0.35),
+            f"{near_side}_hip": _lm(0.50, 0.58, 0.95),
+            f"{far_side}_hip": _lm(0.49, 0.58, 0.35),
+            f"{near_side}_knee": _lm(0.51, 0.74, 0.95),
+            f"{far_side}_knee": _lm(0.49, 0.74, 0.35),
+            f"{near_side}_ankle": _lm(0.50, 0.90, 0.95),
+            f"{far_side}_ankle": _lm(0.50, 0.90, 0.35),
+        }
+
+    ledger = [
+        {"phase_id": "front_a", "view": "front", "start": 0.0, "end": 0.5, "detected_side": "left", "detected_facing": "right"},
+        {"phase_id": "side_a", "view": "side", "start": 1.0, "end": 1.5, "detected_side": "right", "detected_facing": "right"},
+        {"phase_id": "side_b", "view": "side", "start": 2.0, "end": 2.5, "detected_side": "left", "detected_facing": "left"},
+    ]
+
+    front_fr = FrameObservation(0.2, 640, 480, [_front_pose()])
+    out_front, out_front_cfg = resolve_side_frame_config(front_fr, cfg, ledger)
+    assert out_front is front_fr
+    assert out_front_cfg.side == cfg.side and out_front_cfg.facing == cfg.facing
+
+    side_a_fr = FrameObservation(1.2, 640, 480, [_side_hold_pose("right", "right")])
+    out_a, cfg_a = resolve_side_frame_config(side_a_fr, cfg, ledger)
+    assert (cfg_a.side, cfg_a.facing) == ("right", "right")
+    assert (out_a.poses[0]["left_shoulder"].visibility or 0.0) >= cfg.confidence
+
+    side_b_fr = FrameObservation(2.2, 640, 480, [_side_hold_pose("left", "left")])
+    out_b, cfg_b = resolve_side_frame_config(side_b_fr, cfg, ledger)
+    assert (cfg_b.side, cfg_b.facing) == ("left", "left")
+    assert (out_b.poses[0]["right_shoulder"].visibility or 0.0) >= cfg.confidence
+
+    samples = ledger_metric_samples([front_fr, side_a_fr, side_b_fr], cfg, ledger, view="side")
+    for mk in ("head_pitch", "head_forward", "head_inclination", "trunk_inclination", "hip_offset", "knee_flexion"):
+        vals = [val for _, val in samples[mk]]
+        assert vals[0] is None
+        assert vals[1] is not None and vals[2] is not None
+
+
+def test_dual_ear_equal_visibility_uses_z_depth_ignoring_stale_cfg_side():
+    """Real MediaPipe frames report ~1.0 visibility on both ears; z-depth must determine side and facing."""
+    from tango_posture.calibration.camera_session import _detect_side_orientation
+
+    def _mediapipe_side_pose(*, near_side: str, facing: str) -> dict[str, Landmark]:
+        # In 60-85 degree profiles, the far ear can sit slightly ahead of the nose in x,
+        # while both ears have visibility=0.99 and z differs meaningfully.
+        far_side = "right" if near_side == "left" else "left"
+        nose_x = 0.520 if facing == "right" else 0.480
+        near_ear_x = 0.485 if facing == "right" else 0.515
+        far_ear_x = 0.525 if facing == "right" else 0.475  # slightly ahead of nose!
+        near_z, far_z = -0.15, 0.08
+        return {
+            "nose": Landmark(nose_x, 0.20, 0.99, 0.99, -0.08),
+            f"{near_side}_ear": Landmark(near_ear_x, 0.20, 0.99, 0.99, near_z),
+            f"{far_side}_ear": Landmark(far_ear_x, 0.20, 0.99, 0.99, far_z),
+            f"{near_side}_shoulder": Landmark(0.50, 0.32, 0.99, 0.99, near_z),
+            f"{far_side}_shoulder": Landmark(0.51, 0.32, 0.99, 0.99, far_z),
+            f"{near_side}_hip": Landmark(0.50, 0.58, 0.99, 0.99, near_z),
+            f"{far_side}_hip": Landmark(0.51, 0.58, 0.99, 0.99, far_z),
+            f"{near_side}_knee": Landmark(0.50, 0.74, 0.99, 0.99, near_z),
+            f"{far_side}_knee": Landmark(0.51, 0.74, 0.99, 0.99, far_z),
+            f"{near_side}_ankle": Landmark(0.50, 0.90, 0.99, 0.99, near_z),
+            f"{far_side}_ankle": Landmark(0.51, 0.90, 0.99, 0.99, far_z),
+        }
+
+    # Turn left (left side near camera, facing right) even when cfg.side is stale "right"
+    cfg_stale_right = Config(side="right", facing="left")
+    pose_left = _mediapipe_side_pose(near_side="left", facing="right")
+    orient_l = _detect_side_orientation(pose_left, cfg_stale_right)
+    assert orient_l is not None
+    assert orient_l[0] == "left" and orient_l[1] == "right"
+    view_l, hint_l = classify_guide_view(
+        FrameObservation(0.0, 640, 480, [pose_left]),
+        cfg_stale_right,
+        requested_view="side",
+        turn_direction="left",
+    )
+    assert view_l == "side", hint_l
+
+    # Turn right (right side near camera, facing left) even when cfg.side is stale "left"
+    cfg_stale_left = Config(side="left", facing="right")
+    pose_right = _mediapipe_side_pose(near_side="right", facing="left")
+    orient_r = _detect_side_orientation(pose_right, cfg_stale_left)
+    assert orient_r is not None
+    assert orient_r[0] == "right" and orient_r[1] == "left"
+    view_r, hint_r = classify_guide_view(
+        FrameObservation(0.0, 640, 480, [pose_right]),
+        cfg_stale_left,
+        requested_view="side",
+        turn_direction="right",
+    )
+    assert view_r == "side", hint_r
+
+    # Opposite turn direction reports clear diagnostic hint
+    view_opp, hint_opp = classify_guide_view(
+        FrameObservation(0.0, 640, 480, [pose_right]),
+        cfg_stale_left,
+        requested_view="side",
+        turn_direction="left",
+    )
+    assert view_opp == "uncertain"
+    assert "opposite side" in hint_opp.lower()
+    assert "turn left" in hint_opp.lower()
+
+
+def test_torso_scaled_profile_threshold_accepts_widescreen_and_rejects_front_pose():
+    """1280x720 wide-shot side profile with dx=0.007 (<0.010) passes via torso scaling,
+    while a narrow-shouldered front-facing pose is still rejected."""
+    cfg = Config(side="left", facing="right", max_view_width=0.45)
+
+    # Full-body widescreen profile: torso_px = 0.18 * 720 = 129.6px; dx = 0.007 * 1280 = 8.96px (0.069 * torso_px)
+    wide_side = {
+        "nose": Landmark(0.507, 0.20, 0.99, 0.99, -0.05),
+        "left_ear": Landmark(0.500, 0.20, 0.99, 0.99, -0.10),
+        "right_ear": Landmark(0.501, 0.20, 0.99, 0.99, 0.05),
+        "left_shoulder": Landmark(0.500, 0.30, 0.99, 0.99, -0.10),
+        "right_shoulder": Landmark(0.495, 0.30, 0.99, 0.99, 0.05),
+        "left_hip": Landmark(0.500, 0.48, 0.99, 0.99, -0.10),
+        "right_hip": Landmark(0.495, 0.48, 0.99, 0.99, 0.05),
+        "left_ankle": Landmark(0.500, 0.80, 0.99, 0.99, -0.10),
+        "right_ankle": Landmark(0.495, 0.80, 0.99, 0.99, 0.05),
+    }
+    view_wide, hint_wide = classify_guide_view(
+        FrameObservation(0.0, 1280, 720, [wide_side]),
+        cfg,
+        requested_view="side",
+        turn_direction="left",
+    )
+    assert view_wide == "side", hint_wide
+
+    # Narrow-shouldered front-facing pose: nose centered between left_ear and right_ear
+    narrow_front = {
+        "nose": Landmark(0.500, 0.20, 0.99, 0.99, -0.05),
+        "left_ear": Landmark(0.520, 0.20, 0.99, 0.99, 0.0),
+        "right_ear": Landmark(0.480, 0.20, 0.99, 0.99, 0.0),
+        "left_shoulder": Landmark(0.525, 0.30, 0.99, 0.99, 0.0),
+        "right_shoulder": Landmark(0.475, 0.30, 0.99, 0.99, 0.0),
+        "left_hip": Landmark(0.520, 0.56, 0.99, 0.99, 0.0),
+        "right_hip": Landmark(0.480, 0.56, 0.99, 0.99, 0.0),
+        "left_ankle": Landmark(0.520, 0.90, 0.99, 0.99, 0.0),
+        "right_ankle": Landmark(0.480, 0.90, 0.99, 0.99, 0.0),
+    }
+    view_nf, hint_nf = classify_guide_view(
+        FrameObservation(0.0, 1280, 720, [narrow_front]),
+        cfg,
+        requested_view="side",
+        turn_direction="left",
+    )
+    assert view_nf == "uncertain"
+    assert "turn left" in hint_nf.lower()
+
+
+def test_settle_brief_view_flicker_grace_and_prolonged_loss():
+    """Brief <=0.25s view flicker in Settle keeps settling; >0.25s loss returns to Wait for view and pose."""
+    cfg = Config()
+    session = SoloCameraSession(cfg, now_monotonic=0.0)
+    phases = build_quick_setup_phases()[:1]  # front_a
+    session.start_plan(phases, now_monotonic=0.0, speak_enabled=False)
+
+    # Enter Settle at t=1.0
+    session.process_frame(FrameObservation(1.0, 640, 480, [_front_pose()]), now_monotonic=1.0)
+    assert session.state == "Settle"
+
+    # Brief 0.15s view loss (<= 0.25s) preserves Settle
+    session.process_frame(FrameObservation(1.15, 640, 480, [_side_pose("right")]), now_monotonic=1.15)
+    assert session.state == "Settle"
+
+    # Recover view at t=1.25 -> still in Settle, then completes settle at t=1.80 -> Capture
+    session.process_frame(FrameObservation(1.25, 640, 480, [_front_pose()]), now_monotonic=1.25)
+    assert session.state == "Settle"
+    session.process_frame(FrameObservation(1.80, 640, 480, [_front_pose()]), now_monotonic=1.80)
+    assert session.state == "Capture"
+
+    # Retry phase and test prolonged >0.25s view loss in Settle resets to Wait for view and pose
+    session.retry_phase(now_monotonic=2.0, speak_enabled=False)
+    session.process_frame(FrameObservation(2.1, 640, 480, [_front_pose()]), now_monotonic=2.1)
+    assert session.state == "Settle"
+    session.process_frame(FrameObservation(2.2, 640, 480, [_side_pose("right")]), now_monotonic=2.2)
+    assert session.state == "Settle"
+    session.process_frame(FrameObservation(2.5, 640, 480, [_side_pose("right")]), now_monotonic=2.5)
+    assert session.state == "Wait for view and pose"

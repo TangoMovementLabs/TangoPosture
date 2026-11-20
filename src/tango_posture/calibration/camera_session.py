@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from itertools import pairwise
-from typing import Literal
+from typing import Any, Literal
 
 from ..config import Config
 from ..domain import FrameObservation, Landmark, MetricObservation
+from ..geometry import wrapped
 from ..quality import reliable
-from .measurements import measure_ranges, view_eligible
-from .models import METRIC_DETAILS, Passage
+from .measurements import measure_ranges, metric_samples, view_eligible
+from .models import CYCLIC_METRICS, METRIC_DETAILS, Passage
 from .statistics import repeat_check, summarize_examples
 
 SessionState = Literal[
@@ -344,25 +346,13 @@ def _detect_side_orientation(
     nose = pose.get("nose")
     if nose is None or not reliable(nose, head_conf) or not _in_frame(nose):
         return None
-    candidates: list[tuple[Literal["left", "right"], Landmark]] = []
+    candidates: dict[Literal["left", "right"], Landmark] = {}
     for side in ("left", "right"):
         pt = pose.get(f"{side}_ear")
         if pt is not None and reliable(pt, head_conf) and _in_frame(pt):
-            candidates.append((side, pt))  # type: ignore[arg-type]
+            candidates[side] = pt  # type: ignore[index]
     if not candidates:
         return None
-    candidates.sort(
-        key=lambda item: (
-            abs(nose.x - item[1].x) >= 0.010,
-            item[1].visibility if item[1].visibility is not None else 0.0,
-            item[0] == cfg.side,
-        ),
-        reverse=True,
-    )
-    ear_side, ear = candidates[0]
-    dx = nose.x - ear.x
-    detected_facing: Literal["left", "right"] = "right" if dx > 0 else "left"
-    other_side: Literal["left", "right"] = "right" if ear_side == "left" else "left"
 
     def _side_torso_ok(s: Literal["left", "right"]) -> bool:
         sh = pose.get(f"{s}_shoulder")
@@ -372,13 +362,81 @@ def _detect_side_orientation(
             and hip is not None and reliable(hip, cfg.confidence) and _in_frame(hip)
         )
 
+    if len(candidates) == 1:
+        ear_side, ear = next(iter(candidates.items()))
+        dx = nose.x - ear.x
+        detected_facing: Literal["left", "right"] = "right" if dx > 0 else "left"
+        other_side: Literal["left", "right"] = "right" if ear_side == "left" else "left"
+        if _side_torso_ok(ear_side):
+            detected_side: Literal["left", "right"] = ear_side
+        elif _side_torso_ok(other_side):
+            detected_side = other_side
+        else:
+            detected_side = ear_side
+        return detected_side, detected_facing, ear
+
+    le = candidates["left"]
+    re = candidates["right"]
+    ear_mid_x = 0.5 * (le.x + re.x)
+    dx_mid = nose.x - ear_mid_x
+    if abs(dx_mid) >= 1e-6:
+        detected_facing = "right" if dx_mid > 0 else "left"
+    else:
+        best_side: Literal["left", "right"] = (
+            "left" if abs(nose.x - le.x) >= abs(nose.x - re.x) else "right"
+        )
+        detected_facing = "right" if (nose.x - candidates[best_side].x) > 0 else "left"
+
+    le_vis = le.visibility if le.visibility is not None else 0.0
+    re_vis = re.visibility if re.visibility is not None else 0.0
+    ls = pose.get("left_shoulder")
+    rs = pose.get("right_shoulder")
+
+    # Select the near-camera ear by visibility advantage, then 3D z-depth (smaller z is closer),
+    # then profile-trailing offset, avoiding tie-breaking on stale cfg.side.
+    if abs(le_vis - re_vis) >= 0.15:
+        ear_side = "left" if le_vis > re_vis else "right"
+    else:
+        z_votes: list[Literal["left", "right"]] = []
+        if (
+            le.z is not None and re.z is not None
+            and math.isfinite(le.z) and math.isfinite(re.z)
+            and abs(le.z - re.z) >= 0.02
+        ):
+            z_votes.append("left" if le.z < re.z else "right")
+        if (
+            ls is not None and rs is not None
+            and ls.z is not None and rs.z is not None
+            and math.isfinite(ls.z) and math.isfinite(rs.z)
+            and abs(ls.z - rs.z) >= 0.03
+        ):
+            z_votes.append("left" if ls.z < rs.z else "right")
+        if z_votes and len(set(z_votes)) == 1:
+            ear_side = z_votes[0]
+        else:
+            sign = 1.0 if detected_facing == "right" else -1.0
+            l_proj = (nose.x - le.x) * sign
+            r_proj = (nose.x - re.x) * sign
+            if abs(l_proj - r_proj) >= 0.005:
+                ear_side = "left" if l_proj > r_proj else "right"
+            else:
+                ear_side = "right" if detected_facing == "right" else "left"
+
+    other_side = "right" if ear_side == "left" else "left"
     if _side_torso_ok(ear_side):
-        detected_side: Literal["left", "right"] = ear_side
+        detected_side = ear_side
     elif _side_torso_ok(other_side):
         detected_side = other_side
     else:
         detected_side = ear_side
-    return detected_side, detected_facing, ear
+
+    chosen_ear = candidates[ear_side]
+    sign = 1.0 if detected_facing == "right" else -1.0
+    if (nose.x - chosen_ear.x) * sign <= 0:
+        alt_ear = candidates[other_side]
+        if (nose.x - alt_ear.x) * sign > 0:
+            chosen_ear = alt_ear
+    return detected_side, detected_facing, chosen_ear
 
 
 def prepare_side_measurement_frame(frame: FrameObservation, cfg: Config) -> FrameObservation:
@@ -479,6 +537,121 @@ def prepare_side_measurement_frame(frame: FrameObservation, cfg: Config) -> Fram
     )
 
 
+def _raw_view_width(frame: FrameObservation, confidence: float) -> float | None:
+    if len(frame.poses) != 1:
+        return None
+    pose = frame.poses[0]
+    geom = _pose_torso_geometry(pose, frame.width, frame.height, confidence)
+    if geom is None:
+        return None
+    _, torso_px = geom
+    ls, rs = pose.get("left_shoulder"), pose.get("right_shoulder")
+    lh, rh = pose.get("left_hip"), pose.get("right_hip")
+    sh_ok = (
+        ls is not None and rs is not None
+        and reliable(ls, confidence) and reliable(rs, confidence)
+        and _in_frame(ls) and _in_frame(rs)
+    )
+    hip_ok = (
+        lh is not None and rh is not None
+        and reliable(lh, confidence) and reliable(rh, confidence)
+        and _in_frame(lh) and _in_frame(rh)
+    )
+    if not sh_ok and not hip_ok:
+        return None
+    sh_span = (
+        math.hypot((ls.x - rs.x) * frame.width, (ls.y - rs.y) * frame.height)
+        if sh_ok and ls is not None and rs is not None
+        else 0.0
+    )
+    hip_span = (
+        math.hypot((lh.x - rh.x) * frame.width, (lh.y - rh.y) * frame.height)
+        if hip_ok and lh is not None and rh is not None
+        else 0.0
+    )
+    return max(sh_span, hip_span) / torso_px
+
+
+def resolve_side_frame_config(
+    frame: FrameObservation,
+    base_cfg: Config,
+    ledger: Sequence[Mapping[str, Any]] | None = None,
+) -> tuple[FrameObservation, Config]:
+    """Resolve per-frame orientation and repair occluded far-side joints for side frames only."""
+    side_cutoff = base_cfg.max_view_width + base_cfg.solo_camera.front_view_width_margin
+    matched_side_rec: Mapping[str, Any] | None = None
+    if ledger:
+        for rec in ledger:
+            if not isinstance(rec, Mapping):
+                continue
+            start_t = float(rec.get("start", 0.0)) - 1e-5
+            end_t = float(rec.get("end", 0.0)) + 1e-5
+            if not (start_t <= frame.timestamp <= end_t):
+                continue
+            if rec.get("view") == "front":
+                return frame, base_cfg
+            if rec.get("view") == "side":
+                matched_side_rec = rec
+                break
+    vw = _raw_view_width(frame, base_cfg.confidence) if matched_side_rec is None else None
+    is_side_frame = matched_side_rec is not None or (
+        len(frame.poses) == 1 and vw is not None and vw <= side_cutoff
+    )
+    if not is_side_frame:
+        return frame, base_cfg
+
+    side_cfg = (
+        base_cfg.model_copy(update={"max_view_width": side_cutoff})
+        if ledger
+        else base_cfg
+    )
+    det_side: str | None = None
+    det_facing: str | None = None
+    if matched_side_rec is not None:
+        raw_side = matched_side_rec.get("detected_side")
+        raw_facing = matched_side_rec.get("detected_facing")
+        if raw_side in ("left", "right") and raw_facing in ("left", "right"):
+            det_side, det_facing = raw_side, raw_facing
+    if det_side is None and len(frame.poses) == 1:
+        orient = _detect_side_orientation(frame.poses[0], side_cfg)
+        if orient is not None:
+            det_side, det_facing = orient[0], orient[1]
+    if det_side in ("left", "right") and det_facing in ("left", "right"):
+        side_cfg = side_cfg.model_copy(update={"side": det_side, "facing": det_facing})
+    return prepare_side_measurement_frame(frame, side_cfg), side_cfg
+
+
+def ledger_metric_samples(
+    frames: Sequence[FrameObservation],
+    base_cfg: Config,
+    ledger: Sequence[Mapping[str, Any]],
+    *,
+    view: Literal["side", "front", "all"],
+) -> dict[str, list[tuple[float, float | None]]]:
+    """Compute metric time series honoring per-phase side/facing ledger entries."""
+    if view != "side":
+        return metric_samples(frames, base_cfg, view=view)
+    result: dict[str, list[tuple[float, float | None]]] = {key: [] for key in METRIC_DETAILS}
+    previous: dict[str, float] = {}
+    for frame in frames:
+        eval_frame, eval_cfg = resolve_side_frame_config(frame, base_cfg, ledger)
+        eval_cfg = eval_cfg.model_copy(update={"allow_all_angles": False})
+        obs = measure_ranges(eval_frame, eval_cfg)
+        eligible = view_eligible("side", obs.view_width, eval_cfg.max_view_width)
+        for key, series in result.items():
+            value = (
+                obs.values[key]
+                if eligible and obs.quality[key].valid
+                else None
+            )
+            if value is not None and key in CYCLIC_METRICS:
+                if key in previous:
+                    value = previous[key] + wrapped(value - previous[key])
+                previous[key] = value
+            series.append((frame.timestamp, value))
+    return result
+
+
 def _turn_hint(
     requested_view: Literal["front", "side"] | None,
     turn_direction: Literal["camera", "left", "right"] | None,
@@ -518,20 +691,9 @@ def classify_guide_view(
     le = pose.get("left_ear")
     re = pose.get("right_ear")
 
-    obs = measure_ranges(frame, cfg)
-    vw = obs.view_width
+    vw = _raw_view_width(frame, conf)
     if vw is None or not math.isfinite(vw):
-        sh_span = (
-            math.hypot((ls.x - rs.x) * frame.width, (ls.y - rs.y) * frame.height)
-            if ls is not None and rs is not None and reliable(ls, conf) and reliable(rs, conf) and _in_frame(ls) and _in_frame(rs)
-            else 0.0
-        )
-        hip_span = (
-            math.hypot((lh.x - rh.x) * frame.width, (lh.y - rh.y) * frame.height)
-            if lh is not None and rh is not None and reliable(lh, conf) and reliable(rh, conf) and _in_frame(lh) and _in_frame(rh)
-            else 0.0
-        )
-        vw = max(sh_span, hip_span) / torso_px
+        vw = 0.0
 
     front_cutoff = cfg.max_view_width + cfg.solo_camera.front_view_width_margin
 
@@ -571,19 +733,37 @@ def classify_guide_view(
     if vw <= cfg.max_view_width or allow_buffer_side:
         if orient is None:
             return "uncertain", "Keep your profile head (nose and ear) visible in the frame."
-        _, _, ear = orient
+        _, detected_facing, ear = orient
         assert nose is not None
-        dx = nose.x - ear.x
-        if abs(dx) < 0.010:
-            return "uncertain", _turn_hint(requested_view or "side", turn_direction)
+        head_conf = min(conf, 0.45)
+        dx_px = (nose.x - ear.x) * frame.width
+        min_dx_px = max(2.0, 0.03 * torso_px)
+        both_ears_ok = (
+            le is not None and reliable(le, head_conf) and _in_frame(le)
+            and re is not None and reliable(re, head_conf) and _in_frame(re)
+        )
+        mid_ok = True
+        if both_ears_ok:
+            assert le is not None and re is not None
+            dx_mid_px = (nose.x - 0.5 * (le.x + re.x)) * frame.width
+            mid_ok = abs(dx_mid_px) >= max(1.5, 0.02 * torso_px)
+        if abs(dx_px) < min_dx_px or not mid_ok:
+            if requested_view == "side" and turn_direction in ("left", "right"):
+                return (
+                    "uncertain",
+                    f"Body is side-on — turn {turn_direction} and look straight ahead in profile, not toward the camera.",
+                )
+            return "uncertain", "Keep your head in side profile, looking straight ahead rather than at the camera."
         if requested_view == "side" and turn_direction in ("left", "right"):
             # Turning to your own left faces the right side of the unmirrored image, and vice versa.
-            expected_sign = 1.0 if turn_direction == "left" else -1.0
-            if dx * expected_sign <= 0:
-                return "uncertain", _turn_hint(requested_view, turn_direction)
+            expected_facing: Literal["left", "right"] = "right" if turn_direction == "left" else "left"
+            if detected_facing != expected_facing:
+                return (
+                    "uncertain",
+                    f"Opposite side detected — turn {turn_direction} (to your own {turn_direction}) so you are side-on to the camera.",
+                )
         elif strict_facing:
-            expected_sign = 1.0 if cfg.facing == "right" else -1.0
-            if dx * expected_sign <= 0:
+            if detected_facing != cfg.facing:
                 turn_word = "left" if cfg.facing == "right" else "right"
                 return "uncertain", f"Turn {turn_word} so you are side-on to the camera (Face {cfg.facing})."
         hint = "" if requested_view in (None, "side") else _turn_hint(requested_view, turn_direction)
@@ -723,6 +903,7 @@ class SoloCameraSession:
         self._phase_samples: dict[str, list[tuple[float, float | None]]] = {}
         self._phase_last_bad_reason: dict[str, str] = {}
         self._take_active: bool = False
+        self._settle_view_lost_since: float | None = None
         self._capture_view_lost_since: float | None = None
 
     @property
@@ -776,6 +957,7 @@ class SoloCameraSession:
         self._wait_started_mono = now_monotonic
         self._settle_started_mono = None
         self._settle_anchor_mid = None
+        self._settle_view_lost_since = None
         self._take_active = False
         if phase is not None and not phase.requires_stillness:
             self.state = "Wait for take"
@@ -789,6 +971,7 @@ class SoloCameraSession:
         self._phase_last_bad_reason = {}
         self._settle_started_mono = None
         self._settle_anchor_mid = None
+        self._settle_view_lost_since = None
         self._capture_view_lost_since = None
 
     def on_speech_finished(self, prompt_id: int, *, now_monotonic: float = 0.0, failed: bool = False) -> None:
@@ -947,12 +1130,15 @@ class SoloCameraSession:
                         update={"facing": detected_facing, "side": detected_side}
                     )
         view_matches = req_view is not None and detected_view == req_view
-        eval_frame = (
-            prepare_side_measurement_frame(frame, self.cfg)
-            if detected_view == "side"
-            else frame
-        )
-        obs = measure_ranges(eval_frame, self.cfg)
+        if detected_view == "side":
+            eval_cfg = self.cfg.model_copy(
+                update={"max_view_width": self.cfg.max_view_width + self.cfg.solo_camera.front_view_width_margin}
+            )
+            eval_frame = prepare_side_measurement_frame(frame, eval_cfg)
+        else:
+            eval_cfg = self.cfg
+            eval_frame = frame
+        obs = measure_ranges(eval_frame, eval_cfg)
         framing_ok = view_matches or (req_view is None and check_full_body_framing(frame, self.cfg)[0])
         return GateEvaluation("ok", detected_view, view_matches, framing_ok, view_hint, mid, torso_px, obs)
 
@@ -1002,15 +1188,21 @@ class SoloCameraSession:
                 self.state = "Settle"
                 self._settle_started_mono = now_monotonic
                 self._settle_anchor_mid = gate.torso_midpoint
+                self._settle_view_lost_since = None
                 self.hint_message = "Hold steady…"
             return gate
 
         if self.state == "Settle":
             if not gate.view_matches or gate.torso_midpoint is None or gate.torso_length_px is None:
-                self._settle_started_mono = None
-                self._settle_anchor_mid = None
-                self.state = "Wait for view and pose"
+                if self._settle_view_lost_since is None:
+                    self._settle_view_lost_since = now_monotonic
+                if now_monotonic - self._settle_view_lost_since > 0.25:
+                    self._settle_started_mono = None
+                    self._settle_anchor_mid = None
+                    self._settle_view_lost_since = None
+                    self.state = "Wait for view and pose"
                 return gate
+            self._settle_view_lost_since = None
             assert self._settle_anchor_mid is not None and self._settle_started_mono is not None
             drift = math.hypot(
                 gate.torso_midpoint[0] - self._settle_anchor_mid[0],
