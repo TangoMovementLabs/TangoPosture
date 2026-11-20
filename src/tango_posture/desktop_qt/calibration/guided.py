@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import queue
 import shutil
 import time
@@ -59,6 +60,7 @@ from ..practice.worker import (
     QtPracticeWorker,
     SpeechManager,
     discover_cameras,
+    populate_camera_combo,
 )
 from ..service_bridge import ServiceBridge, numpy_to_qimage
 from ..theme import COLOR_BASE, COLOR_BORDER, COLOR_TEXT_MUTED, COLOR_TEXT_PRIMARY
@@ -110,6 +112,10 @@ class GuidedCalibration(QDialog):
         self._thread: PracticeThread | None = None
         self._camera_active = False
         self._paused = False
+        self._review_entered = False
+        self._editor_open = False
+        self._repeat_wait_since: float | None = None
+        self._repeat_interval_s = 5.0
         self._frozen_cfg: Config | None = None
         self._collected_frames: list[FrameObservation] = []
         self._camera_meta: dict[str, Any] = {}
@@ -418,7 +424,7 @@ class GuidedCalibration(QDialog):
 
     def _update_filename_preview(self) -> None:
         base = self.name_input.text().strip() or "Studio webcam"
-        preview_txt = f"• {base} · Neutral · Front.tpc\n• {base} · Neutral · Side.tpc"
+        preview_txt = f"• {base}.tpc"
         self.filename_preview.setText(preview_txt)
         if hasattr(self, "review_filename_preview"):
             self.review_filename_preview.setText(preview_txt)
@@ -428,6 +434,10 @@ class GuidedCalibration(QDialog):
         self._speech.cancel_all()
         self._release_camera()
         self._paused = False
+        self._review_entered = False
+        self._editor_open = False
+        self._repeat_wait_since = None
+        self._repeat_interval_s = 5.0
         self._collected_frames.clear()
         self._staged_tpr = None
         self._published_tpr = None
@@ -489,16 +499,11 @@ class GuidedCalibration(QDialog):
         })
 
     def _scan_cameras(self) -> None:
-        current = int(self.camera_combo.currentData() or self._cfg.camera)
-        discovered = self._camera_discoverer(configured_index=current)
-        self.camera_combo.blockSignals(True)
-        self.camera_combo.clear()
-        for idx, label in discovered:
-            self.camera_combo.addItem(label, idx)
-        pos = self.camera_combo.findData(current)
-        if pos >= 0:
-            self.camera_combo.setCurrentIndex(pos)
-        self.camera_combo.blockSignals(False)
+        populate_camera_combo(
+            self.camera_combo,
+            self._camera_discoverer,
+            fallback_index=self._cfg.camera,
+        )
 
     def _on_camera_changed(self) -> None:
         if self._camera_active:
@@ -536,10 +541,12 @@ class GuidedCalibration(QDialog):
         self._thread.start()
         self._poll_timer.start()
         if self.speak_cb.isChecked():
-            self._speech.speak(
-                0,
-                "Camera preview started. Step back until your head and shoes fit in the frame, then press Begin.",
+            preview_prompt = (
+                "Camera preview started. Step back until your head and shoes fit in the frame."
+                if auto_begin or self.auto_start_cb.isChecked()
+                else "Camera preview started. Step back until your head and shoes fit in the frame, then press Begin."
             )
+            self._speech.speak(0, preview_prompt)
 
     def _on_worker_failed(self, message: str) -> None:
         self._release_camera()
@@ -584,13 +591,16 @@ class GuidedCalibration(QDialog):
                 self.status_banner.setText(reason)
                 if ok and (getattr(self, "_auto_begin_pending", False) or self.auto_start_cb.isChecked()):
                     now_m = time.monotonic()
-                    prev_stable = getattr(self, "_preview_stable_since", None)
-                    if prev_stable is None:
-                        self._preview_stable_since = now_m
-                    elif now_m - prev_stable >= self._cfg.solo_camera.stable_time_s:
-                        self._auto_begin_pending = False
-                        self._begin_capture()
-                        return
+                    if self._speech.is_speaking():
+                        self._preview_stable_since = None
+                    else:
+                        prev_stable = getattr(self, "_preview_stable_since", None)
+                        if prev_stable is None:
+                            self._preview_stable_since = now_m
+                        elif now_m - prev_stable >= self._cfg.solo_camera.stable_time_s:
+                            self._auto_begin_pending = False
+                            self._begin_capture()
+                            return
                 else:
                     self._preview_stable_since = None
             elif self.stack.currentIndex() == 1 and not self._paused:
@@ -601,10 +611,13 @@ class GuidedCalibration(QDialog):
                     speak_enabled=self.speak_cb.isChecked(),
                 )
                 if len(self._session.accepted_passages) > prev_accepted:
+                    self._repeat_wait_since = None
                     self._announce_captured_and_prompt()
                 self._sync_capture_ui()
-        if self.stack.currentIndex() == 1 and not self._paused and self._session.check_watchdog(time.monotonic()):
-            self._on_worker_failed(self._session.error_message)
+        if self.stack.currentIndex() == 1 and not self._paused:
+            self._update_repeat_timer(time.monotonic())
+            if self._session.check_watchdog(time.monotonic()):
+                self._on_worker_failed(self._session.error_message)
 
     def _begin_capture(self) -> None:
         if not self._camera_active:
@@ -612,6 +625,10 @@ class GuidedCalibration(QDialog):
             return
         if self._display is not None:
             self._display.recording.set()
+        self._review_entered = False
+        self._editor_open = False
+        self._repeat_wait_since = None
+        self._repeat_interval_s = 5.0
         self._frozen_cfg = self._selected_setup_config()
         self.camera_combo.setEnabled(False)
         self._last_spoken_hint = ""
@@ -642,15 +659,49 @@ class GuidedCalibration(QDialog):
             self._speech.speak(prompt_id, self._session.current_instruction)
 
     def _on_speech_finished(self, prompt_id: int, failed: bool) -> None:
+        if self._review_entered or self.stack.currentIndex() != 1:
+            return
         self._session.on_speech_finished(prompt_id, now_monotonic=time.monotonic(), failed=failed)
+        if self._session.state in ("Wait for view and pose", "Wait for take"):
+            self._repeat_wait_since = time.monotonic()
+        self._sync_capture_ui()
+
+    def _update_repeat_timer(self, now_m: float) -> None:
+        if self._session.state not in ("Wait for view and pose", "Wait for take"):
+            self._repeat_wait_since = None
+            return
+        if self._speech.is_speaking():
+            self._repeat_wait_since = now_m
+            return
+        if self._repeat_wait_since is None:
+            self._repeat_wait_since = now_m
+            return
+        elapsed = now_m - self._repeat_wait_since
+        if elapsed >= self._repeat_interval_s:
+            self._repeat_wait_since = now_m
+            if self.speak_cb.isChecked() and self._session.current_instruction:
+                self._speech.speak(0, self._session.current_instruction)
         self._sync_capture_ui()
 
     def _sync_capture_ui(self) -> None:
         phase = self._session.current_phase
-        self.phase_label.setText(
+        phase_text = (
             f"State: {self._session.state}"
             + (f" · {phase.view.capitalize()} rep {phase.repetition}" if phase else "")
         )
+        if (
+            self._session.state in ("Wait for view and pose", "Wait for take")
+            and self.speak_cb.isChecked()
+            and not self._speech.is_speaking()
+        ):
+            if self._repeat_wait_since is None:
+                self._repeat_wait_since = time.monotonic()
+            remaining = max(0, math.ceil(self._repeat_interval_s - (time.monotonic() - self._repeat_wait_since)))
+            if remaining > 0:
+                phase_text += f" · Repeat in {remaining}s"
+        elif self._session.state not in ("Wait for view and pose", "Wait for take"):
+            self._repeat_wait_since = None
+        self.phase_label.setText(phase_text)
         self.instruction_label.setText(self._session.current_instruction)
         self.hint_label.setText(self._session.hint_message)
         self._detected_side = self._session.cfg.side
@@ -664,6 +715,7 @@ class GuidedCalibration(QDialog):
             )
         if (
             self.speak_cb.isChecked()
+            and not self._speech.is_speaking()
             and self._session.hint_message
             and self._session.hint_message != self._last_spoken_hint
             and self._session.state == "Wait for view and pose"
@@ -684,6 +736,8 @@ class GuidedCalibration(QDialog):
         self.pause_btn.setText("Resume" if self._paused else "Pause")
         if self._paused:
             self._speech.cancel_all()
+        else:
+            self._repeat_wait_since = time.monotonic()
 
     def _repeat_instruction(self) -> None:
         self._speech.cancel_all()
@@ -718,24 +772,20 @@ class GuidedCalibration(QDialog):
         self.walk_returned_btn.setVisible(False)
 
     def _enter_review(self) -> None:
+        if self._review_entered:
+            return
+        self._review_entered = True
         self._speech.cancel_all()
         self._release_camera()
         self.stack.setCurrentIndex(2)
-        self.status_banner.setText("Self calibration completed. Save it and review it.")
+        self.status_banner.setText("Self calibration completed. Review and save your calibration.")
         records = self._session.accepted_passages
         if not records:
             self.review_summary.setText("No usable holds were captured yet.")
             return
-        try:
-            self._save_ready_profiles(auto_triggered=True)
-        except (OSError, ValueError, RuntimeError):
-            pass
-        lines = ["Self calibration completed. Save it and review it."]
-        if self.saved_paths:
-            lines.append(
-                "Saved .tpc calibration file(s): "
-                + ", ".join(str(p) for p in self.saved_paths)
-            )
+        lines = [
+            "Self calibration completed. Review ranges, edit the name if needed, and save your .tpc file."
+        ]
         lines.append(f"Captured {len(records)} accepted passage(s):")
         for rec in records.values():
             metrics_txt = ", ".join(f"{k} ({v:.2f}s)" for k, v in rec.eligible_metrics.items())
@@ -746,13 +796,18 @@ class GuidedCalibration(QDialog):
                 lines.append(f"  - {mk} unavailable: {reason}")
         self.review_summary.setText("\n".join(lines))
         if self.speak_cb.isChecked():
-            self._speech.speak(0, "Self calibration completed. Save it and review it.")
+            self._speech.speak(0, "Self calibration completed.")
+        QTimer.singleShot(0, self._review_in_editor)
 
     def _run_selected_checks(self) -> None:
         selected = [cid for cid, cb in self.check_boxes.items() if cb.isChecked()]
         if not selected:
             QMessageBox.information(self, "Select checks", "Select at least one measurement check.")
             return
+        self._review_entered = False
+        self._editor_open = False
+        self._repeat_wait_since = None
+        self._repeat_interval_s = 5.0
         self._start_preview()
         if self._display is not None:
             self._display.recording.set()
@@ -766,6 +821,10 @@ class GuidedCalibration(QDialog):
         self._sync_capture_ui()
 
     def _run_walking_plan(self) -> None:
+        self._review_entered = False
+        self._editor_open = False
+        self._repeat_wait_since = None
+        self._repeat_interval_s = 5.0
         self._start_preview()
         if self._display is not None:
             self._display.recording.set()
@@ -778,10 +837,10 @@ class GuidedCalibration(QDialog):
         self._maybe_speak(prompt_id)
         self._sync_capture_ui()
 
-    def _stage_and_publish_evidence(self) -> Path:
-        """Promote temporary practice capture into staging, verify it, and publish to references/."""
-        if self._published_tpr is not None and self._published_tpr.is_file():
-            return self._published_tpr
+    def _stage_evidence(self) -> Path:
+        """Promote temporary practice capture into temporary staging only (never writes to references/)."""
+        if self._staged_tpr is not None and self._staged_tpr.is_file():
+            return self._staged_tpr
         if self._temp_dir is None:
             raise ValueError("No captured camera session is available to stage.")
         temp_root = Path(self._temp_dir.name)
@@ -806,6 +865,14 @@ class GuidedCalibration(QDialog):
             if rec.passage.start > last_ts + 1.0:
                 raise ValueError(f"Passage {rec.phase_id} is outside promoted evidence timestamps.")
         self._staged_tpr = staged
+        return staged
+
+    def _stage_and_publish_evidence(self) -> Path:
+        """Promote temporary practice capture into staging and publish to references/."""
+        if self._published_tpr is not None and self._published_tpr.is_file():
+            return self._published_tpr
+        staged = self._stage_evidence()
+        base_name = self.name_input.text().strip() or "Solo camera evidence"
         ref_dir = reference_directory(self._cfg.data_dir)
         ref_dir.mkdir(parents=True, exist_ok=True)
         dest = reference_path(ref_dir, f"{base_name} {int(time.time())}")
@@ -832,56 +899,73 @@ class GuidedCalibration(QDialog):
             for rec in self._session.accepted_passages.values()
         ]
 
-    def _build_metric_drafts(self, view: str, *, context: str) -> tuple[dict[str, list[Passage]], dict[str, str], dict[str, str]]:
+    def _build_metric_drafts(
+        self, view: str | None, *, context: str
+    ) -> tuple[dict[str, list[Passage]], dict[str, str], dict[str, str]]:
         passages_by_metric: dict[str, list[Passage]] = {}
         views_by_metric: dict[str, str] = {}
         reasons: dict[str, str] = {}
         role_target = "walking" if context == "Solo walking" else "neutral"
         for rec in self._session.accepted_passages.values():
-            if rec.view != view or rec.role != role_target:
+            if rec.role != role_target:
+                continue
+            if view is not None and rec.view != view:
                 continue
             for mk in rec.eligible_metrics:
                 passages_by_metric.setdefault(mk, []).append(rec.passage)
-                views_by_metric[mk] = view
+                views_by_metric[mk] = rec.view
             for mk, reason in rec.unavailable_reasons.items():
                 reasons.setdefault(mk, reason)
         return passages_by_metric, views_by_metric, reasons
 
     def _review_in_editor(self) -> None:
-        try:
-            tpr = self._stage_and_publish_evidence()
-        except (OSError, ValueError, RuntimeError) as error:
-            QMessageBox.warning(self, "Evidence staging failed", str(error))
+        if self._editor_open or not self._session.accepted_passages:
             return
-        cfg = self._frozen_cfg or self._selected_setup_config()
-        views_present = {rec.view for rec in self._session.accepted_passages.values()}
-        default_view = "side" if "side" in views_present else next(iter(views_present), "side")
-        metric_passages, metric_views, reasons = self._build_metric_drafts(
-            default_view, context="Neutral posture"
-        )
-        base_name = self.name_input.text().strip() or "Studio webcam"
-        editor = CalibrationEditor(
-            tpr,
-            cfg,
-            self,
-            bridge=self.bridge,
-            base_profile=self._target_profile,
-            metric_passages=metric_passages,
-            metric_views=metric_views,
-            unavailable_reasons=reasons,
-            ledger=self._ledger_payload(),
-            default_context="Neutral posture",
-            default_name=f"{base_name} · Neutral · {default_view.capitalize()}",
-        )
-        if editor.exec() == QDialog.DialogCode.Accepted and editor.saved_path is not None:
-            self.saved_path = editor.saved_path
-            self.saved_paths.append(editor.saved_path)
-            self.bridge.calibrations_changed.emit()
-            self.accept()
+        self._editor_open = True
+        try:
+            try:
+                tpr = self._stage_evidence()
+            except (OSError, ValueError, RuntimeError) as error:
+                QMessageBox.warning(self, "Evidence staging failed", str(error))
+                return
+            cfg = self._frozen_cfg or self._selected_setup_config()
+            has_neutral = any(r.role == "neutral" for r in self._session.accepted_passages.values())
+            context = "Neutral posture" if has_neutral else "Solo walking"
+            metric_passages, metric_views, reasons = self._build_metric_drafts(
+                None, context=context
+            )
+            base_name = self.name_input.text().strip() or "Studio webcam"
+            editor = CalibrationEditor(
+                tpr,
+                cfg,
+                self,
+                bridge=self.bridge,
+                base_profile=self._target_profile,
+                metric_passages=metric_passages,
+                metric_views=metric_views,
+                unavailable_reasons=reasons,
+                ledger=self._ledger_payload(),
+                default_context=context,
+                default_name=base_name,
+                omit_source_archive=True,
+                prefer_cfg_orientation=True,
+                auto_approve_drafts=True,
+            )
+            if editor.exec() == QDialog.DialogCode.Accepted and editor.saved_path is not None:
+                self.saved_path = editor.saved_path
+                self.saved_paths = [editor.saved_path]
+                self.status_banner.setText(f"Saved calibration: {editor.saved_path.name}")
+                self.bridge.calibrations_changed.emit()
+                if self._embedded:
+                    self.accepted.emit()
+                else:
+                    self.accept()
+        finally:
+            self._editor_open = False
 
     def _save_ready_profiles(self, _checked: bool = False, *, auto_triggered: bool = False) -> None:
         try:
-            tpr = self._stage_and_publish_evidence()
+            tpr = self._stage_evidence()
             ev = cached_evidence(tpr)
         except (OSError, ValueError, RuntimeError, TypeError) as error:
             if not auto_triggered:
@@ -920,102 +1004,88 @@ class GuidedCalibration(QDialog):
                 val = obs.values.get(mk)
                 raw_samples[mk].append((fr.timestamp, val if (q and q.valid) else None))
 
-        targets: list[tuple[str, str]] = []
-        if any(r.view == "front" and r.role == "neutral" for r in self._session.accepted_passages.values()):
-            targets.append(("Neutral posture", "front"))
-        if any(r.view == "side" and r.role == "neutral" for r in self._session.accepted_passages.values()):
-            targets.append(("Neutral posture", "side"))
-        if any(r.role == "walking" for r in self._session.accepted_passages.values()):
-            targets.append(("Solo walking", "side"))
+        has_neutral = any(r.role == "neutral" for r in passages_list)
+        has_walking = any(r.role == "walking" for r in passages_list)
+        if not (has_neutral or has_walking):
+            if not auto_triggered:
+                QMessageBox.information(self, "Nothing to save", "No usable holds or walking passes were captured.")
+            return
+        context = "Neutral posture" if has_neutral else "Solo walking"
+        passages_by_metric, views_by_metric, _ = self._build_metric_drafts(None, context=context)
+        approved: dict[str, ApprovedRange] = {}
+        for mk, passages in passages_by_metric.items():
+            view = views_by_metric.get(mk, "side")
+            try:
+                stats = summarize_examples(
+                    raw_samples[mk],
+                    passages,
+                    max_gap,
+                    suggest_lower_pct=cfg.calibration_suggest_lower_pct,
+                    suggest_upper_pct=cfg.calibration_suggest_upper_pct,
+                    min_usable_samples=cfg.calibration_min_usable_samples,
+                )
+            except ValueError:
+                continue
+            check_ok = False
+            if context != "Solo walking":
+                for cid, spec in CHECK_SPECS.items():
+                    if mk in spec.metrics:
+                        holds_4 = [
+                            rec.passage
+                            for pid in (f"{cid}_neutral_a", f"{cid}_changed_a", f"{cid}_neutral_b", f"{cid}_changed_b")
+                            if (rec := self._session.accepted_passages.get(pid)) is not None
+                        ]
+                        if len(holds_4) == 4:
+                            ok, _ = evaluate_metric_repeat_check(
+                                raw_samples[mk], holds_4, max_gap, expected_sign=spec.expected_sign
+                            )
+                            check_ok = ok
+            approved[mk] = ApprovedRange(
+                lower=float(stats["lower"]),
+                upper=float(stats["upper"]),
+                unit=METRIC_DETAILS[mk][2],
+                view=view,  # type: ignore[arg-type]
+                passages=passages,
+                median=float(stats["median"]),
+                p10=float(stats["p10"]),
+                p90=float(stats["p90"]),
+                valid_duration=float(stats["valid_duration"]),
+                selected_duration=float(stats["selected_duration"]),
+                samples=int(stats["samples"]),
+                inside_fraction=float(stats["inside_fraction"]),
+                camera_check_passed=check_ok,
+            )
 
-        if not targets:
+        if not approved:
             if not auto_triggered:
                 QMessageBox.information(self, "Nothing to save", "No usable holds or walking passes were captured.")
             return
 
-        written: list[Path] = []
-        failed_names: list[str] = []
-        for context, view in targets:
-            passages_by_metric, _, _ = self._build_metric_drafts(view, context=context)
-            approved: dict[str, ApprovedRange] = {}
-            for mk, passages in passages_by_metric.items():
-                try:
-                    stats = summarize_examples(
-                        raw_samples[mk],
-                        passages,
-                        max_gap,
-                        suggest_lower_pct=cfg.calibration_suggest_lower_pct,
-                        suggest_upper_pct=cfg.calibration_suggest_upper_pct,
-                        min_usable_samples=cfg.calibration_min_usable_samples,
-                    )
-                except ValueError:
-                    continue
-                check_ok = False
-                if context != "Solo walking":
-                    for cid, spec in CHECK_SPECS.items():
-                        if mk in spec.metrics:
-                            holds_4 = [
-                                rec.passage
-                                for pid in (f"{cid}_neutral_a", f"{cid}_changed_a", f"{cid}_neutral_b", f"{cid}_changed_b")
-                                if (rec := self._session.accepted_passages.get(pid)) is not None
-                            ]
-                            if len(holds_4) == 4:
-                                ok, _ = evaluate_metric_repeat_check(
-                                    raw_samples[mk], holds_4, max_gap, expected_sign=spec.expected_sign
-                                )
-                                check_ok = ok
-                approved[mk] = ApprovedRange(
-                    lower=float(stats["lower"]),
-                    upper=float(stats["upper"]),
-                    unit=METRIC_DETAILS[mk][2],
-                    view=view,  # type: ignore[arg-type]
-                    passages=passages,
-                    median=float(stats["median"]),
-                    p10=float(stats["p10"]),
-                    p90=float(stats["p90"]),
-                    valid_duration=float(stats["valid_duration"]),
-                    selected_duration=float(stats["selected_duration"]),
-                    samples=int(stats["samples"]),
-                    inside_fraction=float(stats["inside_fraction"]),
-                    camera_check_passed=check_ok,
-                )
-            if not approved:
-                continue
-            prof_name = f"{base_name} · {'Solo walking' if context == 'Solo walking' else 'Neutral'} · {view.capitalize()}"
-            prof_path = calibration_path(cal_dir, prof_name)
-            profile_obj = RangeProfile(
-                name=prof_name,
-                context=context,
-                model_hash=ev.model_hash,
-                capture_profile=ev.capture_profile,
-                source=ev.source,
-                metrics=approved,
-                camera_checks={"solo_camera_ledger": self._ledger_payload()},
-            )
-            try:
-                save_range_profile(prof_path, profile_obj, overwrite=True)
-                written.append(prof_path)
-            except (OSError, ValueError, FileExistsError) as err:
-                failed_names.append(f"{prof_name}: {err}")
-
-        if written:
-            self.saved_paths = list(written)
-            self.saved_path = written[-1]
-            self.bridge.calibrations_changed.emit()
-            self.status_banner.setText(
-                "Self calibration completed. Saved: "
-                + ", ".join(p.name for p in written)
-                + ". You can review ranges in editor."
-            )
-        if failed_names:
+        prof_path = calibration_path(cal_dir, base_name)
+        capture_profile = dict(ev.capture_profile)
+        capture_profile["side"] = cfg.side
+        capture_profile["facing"] = cfg.facing
+        profile_obj = RangeProfile(
+            name=base_name,
+            context=context,
+            model_hash=ev.model_hash,
+            capture_profile=capture_profile,
+            source={"dancer_mode": "single"},
+            metrics=approved,
+            camera_checks={"solo_camera_ledger": self._ledger_payload()},
+        )
+        try:
+            save_range_profile(prof_path, profile_obj, overwrite=True)
+        except (OSError, ValueError, FileExistsError) as err:
             if not auto_triggered:
-                QMessageBox.warning(
-                    self,
-                    "Partial save",
-                    "Some profiles could not be saved:\n" + "\n".join(failed_names),
-                )
+                QMessageBox.warning(self, "Could not save calibration", f"{base_name}: {err}")
             return
-        if written and not auto_triggered and not self._embedded:
+
+        self.saved_paths = [prof_path]
+        self.saved_path = prof_path
+        self.bridge.calibrations_changed.emit()
+        self.status_banner.setText(f"Saved calibration: {prof_path.name}")
+        if not auto_triggered and not self._embedded:
             self.accept()
 
     def _keep_evidence_only(self) -> None:

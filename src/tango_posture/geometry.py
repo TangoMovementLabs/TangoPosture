@@ -1012,14 +1012,20 @@ class PoseSmoother:
             else:
                 dt = max(0.0, timestamp - prev_ts)
                 alpha = 1.0 - math.exp(-dt / max(1e-4, self.smoothing_sec))
-                sx = prev.x + alpha * (lm.x - prev.x)
-                sy = prev.y + alpha * (lm.y - prev.y)
-                # Smooth confidence with slightly slower decay than rise to prevent edge blinking
+                vis_factor = (
+                    max(0.2, min(1.0, lm.visibility / 0.7))
+                    if lm.visibility is not None and math.isfinite(lm.visibility)
+                    else 1.0
+                )
+                pos_alpha = alpha * vis_factor
+                sx = prev.x + pos_alpha * (lm.x - prev.x)
+                sy = prev.y + pos_alpha * (lm.y - prev.y)
+                # Smooth confidence with slower decay than rise to prevent edge blinking
                 if lm.visibility is not None and prev.visibility is not None:
                     alpha_v = (
                         alpha
                         if lm.visibility >= prev.visibility
-                        else 1.0 - math.exp(-dt / max(1e-4, self.smoothing_sec * 1.25))
+                        else 1.0 - math.exp(-dt / max(1e-4, self.smoothing_sec * 2.0))
                     )
                     sv: float | None = prev.visibility + alpha_v * (
                         lm.visibility - prev.visibility
@@ -1030,7 +1036,7 @@ class PoseSmoother:
                     alpha_p = (
                         alpha
                         if lm.presence >= prev.presence
-                        else 1.0 - math.exp(-dt / max(1e-4, self.smoothing_sec * 1.25))
+                        else 1.0 - math.exp(-dt / max(1e-4, self.smoothing_sec * 2.0))
                     )
                     sp: float | None = prev.presence + alpha_p * (lm.presence - prev.presence)
                 else:

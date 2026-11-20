@@ -31,7 +31,8 @@ from PySide6.QtWidgets import (
 
 from ...archive import read_analytics
 from ...calibration.archives import read_range_profile
-from ...calibration.models import METRIC_DETAILS, ApprovedRange, RangeProfile
+from ...calibration.models import ALL_METRIC_DETAILS as METRIC_DETAILS
+from ...calibration.models import ApprovedRange, RangeProfile
 from ...calibration.normalization import (
     HoldSourceIdentity,
     HoldWindow,
@@ -176,7 +177,7 @@ class MetricNormalizationRowWidget(QFrame):
         self._check_prac_stats: HoldWindowStats | None = None
         self._dirty = False
 
-        _, label, unit = METRIC_DETAILS[metric]
+        _, label, unit = METRIC_DETAILS.get(metric, ("Posture", metric, target.unit))
         self._unit = unit
         self.setProperty("class", "card")
 
@@ -622,7 +623,7 @@ class MetricNormalizationRowWidget(QFrame):
         if not in_physical_domain(self.metric_key, adjusted):
             self.preview_output_lbl.setText(
                 f"Adjustment unavailable: {_format_metric_value(raw, self._unit)} {_format_signed_offset(offset, self._unit)} "
-                f"falls outside valid physical domain for {METRIC_DETAILS[self.metric_key][1]}"
+                f"falls outside valid physical domain for {METRIC_DETAILS.get(self.metric_key, ('', self.metric_key, self._unit))[1]}"
             )
             self.preview_output_lbl.setStyleSheet(f"color: {COLOR_DANGER}; font-weight: 600;")
             return

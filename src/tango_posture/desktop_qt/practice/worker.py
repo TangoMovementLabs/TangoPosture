@@ -6,11 +6,16 @@ import sqlite3
 import subprocess
 import sys
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from queue import SimpleQueue
+from typing import TYPE_CHECKING
 
 import cv2
 from PySide6.QtCore import QObject, QThread, Signal
+
+if TYPE_CHECKING:
+    from PySide6.QtWidgets import QComboBox
 
 from ...app import Application
 from ...calibration.baseline import load_calibration_file
@@ -33,10 +38,15 @@ class SpeechManager(QObject):
         self._lock = threading.Lock()
         self._active_proc: subprocess.Popen[bytes] | None = None
         self._generation = 0
+        self._speaking = False
 
     @staticmethod
     def is_available() -> bool:
         return sys.platform == "darwin" and Path("/usr/bin/say").is_file()
+
+    def is_speaking(self) -> bool:
+        with self._lock:
+            return self._speaking
 
     def speak(self, prompt_id: int, text: str) -> None:
         self.cancel_all()
@@ -46,6 +56,7 @@ class SpeechManager(QObject):
         with self._lock:
             self._generation += 1
             gen = self._generation
+            self._speaking = True
 
         def _worker() -> None:
             failed = False
@@ -73,6 +84,8 @@ class SpeechManager(QObject):
                     if self._active_proc is proc:
                         self._active_proc = None
                     still_current = gen == self._generation
+                    if still_current:
+                        self._speaking = False
                 if still_current:
                     self.speech_finished.emit(prompt_id, failed)
 
@@ -81,6 +94,7 @@ class SpeechManager(QObject):
     def cancel_all(self) -> None:
         with self._lock:
             self._generation += 1
+            self._speaking = False
             proc = self._active_proc
             self._active_proc = None
         if proc is not None:
@@ -118,6 +132,29 @@ def discover_cameras(max_indices: int = 5, *, configured_index: int = 0) -> list
     if configured_index not in seen:
         found.insert(0, (configured_index, f"Camera {configured_index}"))
     return sorted(found, key=lambda item: item[0])
+
+
+def populate_camera_combo(
+    combo: QComboBox,
+    discoverer: Callable[..., list[tuple[int, str]]] = discover_cameras,
+    *,
+    fallback_index: int = 0,
+) -> list[tuple[int, str]]:
+    """Discover cameras and refresh a QComboBox while preserving the selected index."""
+    current_data = combo.currentData()
+    current = fallback_index if current_data is None else int(current_data)
+    discovered = discoverer(configured_index=current)
+    combo.blockSignals(True)
+    try:
+        combo.clear()
+        for idx, label in discovered:
+            combo.addItem(label, idx)
+        pos = combo.findData(current)
+        if pos >= 0:
+            combo.setCurrentIndex(pos)
+    finally:
+        combo.blockSignals(False)
+    return discovered
 
 
 class QtPracticeDisplay(GuiDisplay):

@@ -568,3 +568,47 @@ def test_review_and_coach_normalization_notices_and_stale_recheck_fallback(
         assert review.report_normalization_notice.isHidden()
     finally:
         window.close()
+
+
+def test_mainwindow_loads_couple_calibration_profile_in_normalization_panel(
+    qapp, tmp_path: Path,
+) -> None:
+    """MainWindow/Settings must load couple .tpc metrics like torso_tilt_a without KeyError."""
+    cfg = Config(data_dir=str(tmp_path))
+    couple_profile = RangeProfile(
+        id="cal-couple-torso",
+        name="Couple Torso",
+        created_at_utc="2026-11-15T12:00:00Z",
+        context="Close embrace",
+        model_hash=MANIFEST["sha256"],
+        capture_profile=build_capture_profile(cfg, 1000, 1000, "video"),
+        source={"archive": "couple_ref.tpr"},
+        metrics={
+            "torso_tilt_a": ApprovedRange(
+                lower=-3.0,
+                upper=4.0,
+                unit="degrees",
+                view="all",
+                passages=[Passage(start=0.0, end=2.0)],
+                median=0.5,
+                p10=-2.0,
+                p90=3.0,
+                valid_duration=2.0,
+                selected_duration=2.0,
+                samples=20,
+                inside_fraction=1.0,
+                approved=True,
+            ),
+        },
+    )
+    cal_dir = Path(cfg.data_dir) / "calibrations"
+    cal_dir.mkdir(parents=True, exist_ok=True)
+    save_range_profile(cal_dir / "couple.tpc", couple_profile)
+    _make_practice_archive(cfg, tmp_path, "couple_prac.tp", [_pose_frame(0.1 * i) for i in range(6)])
+
+    window = MainWindow(cfg)
+    try:
+        panel = window.screens[Route.SETTINGS].normalization_panel
+        assert "torso_tilt_a" in panel.metric_rows
+    finally:
+        window.close()

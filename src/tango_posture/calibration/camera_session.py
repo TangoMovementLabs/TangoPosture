@@ -563,25 +563,10 @@ def classify_guide_view(
 
     # Side check: width <= max_view_width (or buffer zone with clear profile head) + ear-to-nose horizontal sign
     orient = _detect_side_orientation(pose, cfg)
-    head_conf = min(conf, 0.45)
-    both_ears_reliable = (
-        le is not None and reliable(le, conf) and _in_frame(le)
-        and re is not None and reliable(re, conf) and _in_frame(re)
-    )
-    nose_outside_ears = (
-        nose is not None
-        and reliable(nose, head_conf)
-        and _in_frame(nose)
-        and (
-            not both_ears_reliable
-            or (le is not None and re is not None and not (min(le.x, re.x) <= nose.x <= max(le.x, re.x)))
-        )
-    )
     allow_buffer_side = (
         requested_view == "side"
         and vw <= front_cutoff
         and orient is not None
-        and nose_outside_ears
     )
     if vw <= cfg.max_view_width or allow_buffer_side:
         if orient is None:
@@ -591,7 +576,12 @@ def classify_guide_view(
         dx = nose.x - ear.x
         if abs(dx) < 0.010:
             return "uncertain", _turn_hint(requested_view or "side", turn_direction)
-        if strict_facing:
+        if requested_view == "side" and turn_direction in ("left", "right"):
+            # Turning to your own left faces the right side of the unmirrored image, and vice versa.
+            expected_sign = 1.0 if turn_direction == "left" else -1.0
+            if dx * expected_sign <= 0:
+                return "uncertain", _turn_hint(requested_view, turn_direction)
+        elif strict_facing:
             expected_sign = 1.0 if cfg.facing == "right" else -1.0
             if dx * expected_sign <= 0:
                 turn_word = "left" if cfg.facing == "right" else "right"
@@ -1073,8 +1063,13 @@ class SoloCameraSession:
         if self._phase_start_ts is None:
             self._phase_start_ts = timestamp
         self._phase_end_ts = timestamp
+        side_cutoff = self.cfg.max_view_width + self.cfg.solo_camera.front_view_width_margin
         scoring_view_ok = (
-            view_eligible(phase.view, obs.view_width, self.cfg.max_view_width)
+            view_eligible(
+                phase.view,
+                obs.view_width,
+                side_cutoff if phase.view == "side" else self.cfg.max_view_width,
+            )
             if obs.view_width is not None
             else True
         )

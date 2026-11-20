@@ -209,3 +209,92 @@ def test_practice_screen_starts_and_releases_worker_without_blocking(
     assert screen.status_label.text() == "Practice preview closed."
     screen.close()
 
+
+def test_practice_screen_scan_cameras_selects_and_passes_camera_to_worker(
+    qapp, tmp_path, monkeypatch
+):
+    import tango_posture.desktop_qt.screens.practice as practice_screen
+
+    worker_cfgs = []
+
+    class FastWorker(QObject):
+        failed = Signal(str)
+        finished = Signal()
+
+        def __init__(self, cfg, display, **kwargs):
+            super().__init__()
+            worker_cfgs.append(cfg)
+            self.display = display
+
+        @Slot()
+        def run(self):
+            self.finished.emit()
+
+    monkeypatch.setattr(practice_screen, "QtPracticeWorker", FastWorker)
+    discover_calls = []
+
+    def fake_discoverer(*, configured_index: int = 0):
+        discover_calls.append(configured_index)
+        return [
+            (0, "Camera 0 (1280x720 @ 30 fps)"),
+            (2, "Camera 2 (1920x1080 @ 60 fps)"),
+        ]
+
+    bridge = ServiceBridge(Config(data_dir=str(tmp_path), camera=0))
+    screen = PracticeScreen(bridge, Router(), camera_discoverer=fake_discoverer)
+    try:
+        assert screen.camera_combo.currentData() == 0
+        assert screen.scan_cameras_btn.text() == "Scan cameras"
+
+        screen.scan_cameras_btn.click()
+        assert discover_calls == [0]
+        assert [
+            (screen.camera_combo.itemData(i), screen.camera_combo.itemText(i))
+            for i in range(screen.camera_combo.count())
+        ] == [
+            (0, "Camera 0 (1280x720 @ 30 fps)"),
+            (2, "Camera 2 (1920x1080 @ 60 fps)"),
+        ]
+        # Preserves index 0 rather than falling back or dropping it
+        assert screen.camera_combo.currentData() == 0
+        assert "Found 2 cameras" in screen.status_label.text()
+
+        # Choose camera 2
+        idx_two = screen.camera_combo.findData(2)
+        assert idx_two >= 0
+        screen.camera_combo.setCurrentIndex(idx_two)
+        assert "Camera 2" in screen.status_label.text()
+
+        # Unrelated config update preserves the user's selected camera in Self Practice
+        bridge.update_config(
+            Config.model_validate({**bridge.config.model_dump(exclude={"axis_curve"}), "tango_bpm": 132.0})
+        )
+        assert screen.camera_combo.currentData() == 2
+
+        # Explicit camera change in config updates Self Practice selection
+        bridge.update_config(
+            Config.model_validate({**bridge.config.model_dump(exclude={"axis_curve"}), "camera": 1})
+        )
+        assert screen.camera_combo.currentData() == 1
+
+        # Re-scan and pick camera 2 before launching worker
+        screen.scan_cameras_btn.click()
+        assert discover_calls[-1] == 1
+        screen.camera_combo.setCurrentIndex(screen.camera_combo.findData(2))
+
+        screen._start_preview()
+        assert not screen.camera_combo.isEnabled()
+        assert not screen.scan_cameras_btn.isEnabled()
+        deadline = time.monotonic() + 2
+        while screen.worker_running and time.monotonic() < deadline:
+            qapp.processEvents()
+            time.sleep(0.01)
+        assert not screen.worker_running
+        assert screen.camera_combo.isEnabled()
+        assert screen.scan_cameras_btn.isEnabled()
+        assert len(worker_cfgs) == 1
+        assert worker_cfgs[0].camera == 2
+    finally:
+        screen.close()
+
+

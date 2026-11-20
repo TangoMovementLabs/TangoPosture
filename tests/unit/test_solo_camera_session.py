@@ -347,3 +347,80 @@ def test_quick_setup_completes_both_side_turns_with_occluded_far_joints():
         assert (passages[pid].passage.end - passages[pid].passage.start) <= 1.7
         assert "trunk_inclination" in passages[pid].eligible_metrics
         assert "head_forward" in passages[pid].eligible_metrics
+
+
+def test_turn_direction_enforcement_and_buffered_side_recording():
+    """Turn left requires looking left in real life (facing right in unmirrored image)
+    and buffered side poses (view_width up to max_view_width + margin) must be recorded."""
+    cfg = Config(side="left", facing="right", max_view_width=0.45)
+
+    def _buffered_side(facing: str, near_side: str) -> dict[str, Landmark]:
+        far_side = "right" if near_side == "left" else "left"
+        nose_x = 0.56 if facing == "right" else 0.44
+        # In 640x480: dx=0.09 -> 57.6px, dy=0.24 -> 115.2px => view_width = 0.50 (buffer zone 0.45..0.60)
+        return {
+            "nose": _lm(nose_x, 0.18),
+            "left_ear": _lm(0.51, 0.18),
+            "right_ear": _lm(0.49, 0.18, 0.4),
+            f"{near_side}_shoulder": _lm(0.545, 0.32, 0.95),
+            f"{far_side}_shoulder": _lm(0.455, 0.32, 0.5),
+            f"{near_side}_hip": _lm(0.545, 0.56, 0.95),
+            f"{far_side}_hip": _lm(0.455, 0.56, 0.5),
+            f"{near_side}_knee": _lm(0.51, 0.72, 0.95),
+            f"{far_side}_knee": _lm(0.49, 0.72, 0.5),
+            f"{near_side}_ankle": _lm(0.51, 0.90, 0.95),
+            f"{far_side}_ankle": _lm(0.49, 0.90, 0.5),
+        }
+
+    # Turn left (dancer looks left -> faces right of unmirrored image)
+    obs_look_left = FrameObservation(0.0, 640, 480, [_buffered_side("right", "left")])
+    obs_look_right = FrameObservation(0.0, 640, 480, [_buffered_side("left", "right")])
+
+    g_ok, _hint_ok = classify_guide_view(
+        obs_look_left, cfg, requested_view="side", turn_direction="left"
+    )
+    assert g_ok == "side"
+
+    g_wrong, hint_wrong = classify_guide_view(
+        obs_look_right, cfg, requested_view="side", turn_direction="left"
+    )
+    assert g_wrong == "uncertain"
+    assert "turn left" in hint_wrong.lower()
+
+    # Turn right (dancer looks right -> faces left of unmirrored image)
+    g_ok_r, _hint_ok_r = classify_guide_view(
+        obs_look_right, cfg, requested_view="side", turn_direction="right"
+    )
+    assert g_ok_r == "side"
+    g_wrong_r, hint_wrong_r = classify_guide_view(
+        obs_look_left, cfg, requested_view="side", turn_direction="right"
+    )
+    assert g_wrong_r == "uncertain"
+    assert "turn right" in hint_wrong_r.lower()
+
+    # SoloCameraSession records buffered side observations instead of dropping them at max_view_width=0.45
+    phases = [p for p in build_quick_setup_phases() if p.phase_id == "side_a"]
+    session = SoloCameraSession(cfg, now_monotonic=0.0, auto_detect_side_facing=True)
+    session.start_plan(phases, now_monotonic=0.0, speak_enabled=False)
+
+    # Wrong turn direction must keep waiting and give directional feedback
+    session.process_frame(FrameObservation(0.0, 640, 480, [_buffered_side("left", "right")]), now_monotonic=0.0)
+    assert session.state == "Wait for view and pose"
+    assert "turn left" in session.hint_message.lower()
+
+    # Correct turn direction ("left") enters Settle -> Capture and records buffered frames
+    session.process_frame(FrameObservation(0.1, 640, 480, [_buffered_side("right", "left")]), now_monotonic=0.1)
+    assert session.state == "Settle"
+    session.process_frame(FrameObservation(0.9, 640, 480, [_buffered_side("right", "left")]), now_monotonic=0.9)
+    assert session.state == "Capture"
+    for i in range(1, 17):
+        ts = 0.9 + i * 0.1
+        session.process_frame(
+            FrameObservation(ts, 640, 480, [_buffered_side("right", "left")]),
+            now_monotonic=ts,
+            speak_enabled=False,
+        )
+    assert session.state == "Review"
+    assert session.accepted_passages["side_a"].usable
+    assert session.accepted_passages["side_a"].eligible_metrics["trunk_inclination"] >= 1.0
+    assert session.accepted_passages["side_a"].detected_facing == "right"
