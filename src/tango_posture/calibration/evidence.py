@@ -155,9 +155,15 @@ def is_static_pose_run(
     return steps[len(steps) // 2] < max_median_step
 
 
-def single_dancer_anchors(evidence: Evidence, confidence: float) -> dict[int, int]:
+def single_dancer_anchors(
+    evidence: Evidence,
+    confidence: float,
+    *,
+    skip_static: bool = True,
+    allow_multi_pose_gaps: bool = False,
+) -> dict[int, int]:
     """Compute anchor frames to link a solo dancer across brief dropouts or cuts."""
-    if max((len(frame.poses) for frame in evidence.frames), default=0) > 1:
+    if not allow_multi_pose_gaps and max((len(frame.poses) for frame in evidence.frames), default=0) > 1:
         raise ValueError("Auto-link is only available for single-dancer clips")
     anchors: dict[int, int] = {}
     previous: tuple[float, float] | None = None
@@ -167,7 +173,7 @@ def single_dancer_anchors(evidence: Evidence, confidence: float) -> dict[int, in
     for index, frame in enumerate(evidence.frames):
         if index < skip_until:
             continue
-        if not frame.poses:
+        if len(frame.poses) != 1:
             need_anchor = True
             continue
         center = _hip_center(frame.poses[0], confidence)
@@ -181,7 +187,7 @@ def single_dancer_anchors(evidence: Evidence, confidence: float) -> dict[int, in
             or frame.timestamp - last_timestamp > evidence.max_gap
             or math.dist(previous, center) >= 0.25
         ):
-            if index > 0 and is_static_pose_run(evidence.frames, index):
+            if skip_static and index > 0 and is_static_pose_run(evidence.frames, index):
                 skip_until = contiguous_pose_run_end(evidence.frames, index)
                 need_anchor = True
                 continue

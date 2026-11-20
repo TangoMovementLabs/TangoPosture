@@ -93,6 +93,8 @@ class DancerAnalysisConfig(BaseModel):
     shot_cut_jump_torso_lengths: float = Field(default=1.50, gt=0.0)
     turn_exit_match_window_s: float = Field(default=3.00, gt=0.0)
     close_embrace_max_tilt_deg: float = Field(default=25.0, gt=0.0, le=90.0)
+    couple_axis_max_separation_m: float = Field(default=1.0, gt=0.0)
+    couple_axis_rejoin_separation_m: float = Field(default=0.80, gt=0.0)
     analyze_soundtrack: bool = False
     auto_turn_suggestions: bool = False
 
@@ -104,6 +106,10 @@ class DancerAnalysisConfig(BaseModel):
             raise ValueError("stop_speed must be below start_speed")
         if self.fixed_scale_min_ratio >= self.fixed_scale_max_ratio:
             raise ValueError("fixed_scale_min_ratio must be below fixed_scale_max_ratio")
+        if self.couple_axis_rejoin_separation_m > self.couple_axis_max_separation_m:
+            raise ValueError(
+                "couple_axis_rejoin_separation_m must not exceed couple_axis_max_separation_m"
+            )
         return self
 
 
@@ -111,11 +117,11 @@ class SoloCameraCalibrationConfig(BaseModel):
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
     speak_instructions: bool = True
     stable_time_s: float = Field(default=0.75, gt=0.0)
-    settle_drift_torso_lengths: float = Field(default=0.05, gt=0.0)
+    settle_drift_torso_lengths: float = Field(default=0.08, gt=0.0)
     hold_window_s: float = Field(default=2.5, gt=0.0)
     min_usable_hold_s: float = Field(default=2.0, gt=0.0)
     max_usable_gap_s: float = Field(default=0.20, gt=0.0)
-    front_view_width_margin: float = Field(default=0.10, ge=0.0)
+    front_view_width_margin: float = Field(default=0.15, ge=0.0)
     retry_hint_delay_s: float = Field(default=8.0, gt=0.0)
     camera_stall_timeout_s: float = Field(default=3.0, gt=0.0)
     walking_take_limit_s: float = Field(default=8.0, gt=0.0)
@@ -152,7 +158,7 @@ class Config(BaseModel):
     calibration_min_usable_samples: int = Field(default=2, ge=2)
     view_change_tolerance: float = Field(default=0.15, gt=0)
     smoothing: float = Field(default=0.25, gt=0)
-    overlay_smoothing: float = Field(default=0.20, ge=0)
+    overlay_smoothing: float = Field(default=0.35, ge=0)
     min_filter_time_constant: float = Field(default=0.0001, gt=0.0)
     entry_duration: float = Field(default=1.5, gt=0)
     clear_duration: float = Field(default=0.75, gt=0)
@@ -406,6 +412,8 @@ SETTING_GROUPS = {
         "dancer_analysis.overlay_smoothing_s",
         "dancer_analysis.axis_bridge_max_gap_s",
         "dancer_analysis.overlay_min_landmark_visibility",
+        "dancer_analysis.couple_axis_max_separation_m",
+        "dancer_analysis.couple_axis_rejoin_separation_m",
         "dancer_analysis.velocity_filter_window_s",
         "dancer_analysis.persistence_s",
         "dancer_analysis.pairing_window_s",
@@ -683,6 +691,12 @@ SETTING_DESCRIPTIONS: dict[str, str] = {
     ),
     "dancer_analysis.close_embrace_max_tilt_deg": (
         "Maximum individual torso tilt (degrees) accepted when splitting a merged close-embrace detection."
+    ),
+    "dancer_analysis.couple_axis_max_separation_m": (
+        "Estimated dancer separation (metres) above which the shared Couple midpoint axis line is hidden."
+    ),
+    "dancer_analysis.couple_axis_rejoin_separation_m": (
+        "Estimated dancer separation (metres) below which a hidden Couple midpoint axis line reappears (hysteresis)."
     ),
     "dancer_analysis.analyze_soundtrack": (
         "Extract optional soundtrack beat candidates for step timing alignment by default."

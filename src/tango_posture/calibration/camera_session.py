@@ -3,15 +3,17 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from itertools import pairwise
-from typing import Literal
+from typing import Any, Literal
 
 from ..config import Config
 from ..domain import FrameObservation, Landmark, MetricObservation
+from ..geometry import wrapped
 from ..quality import reliable
-from .measurements import measure_ranges, view_eligible
-from .models import METRIC_DETAILS, Passage
+from .measurements import measure_ranges, metric_samples, view_eligible
+from .models import CYCLIC_METRICS, METRIC_DETAILS, Passage
 from .statistics import repeat_check, summarize_examples
 
 SessionState = Literal[
@@ -45,6 +47,9 @@ class GuidePhaseSpec:
     check_id: str | None = None
     metrics: tuple[str, ...] = ()
     requires_stillness: bool = True
+    turn_direction: Literal["camera", "left", "right"] | None = None
+    hold_window_s: float | None = None
+    min_usable_hold_s: float | None = None
 
 
 @dataclass(frozen=True)
@@ -66,7 +71,7 @@ CHECK_SPECS: dict[str, CheckSpec] = {
         title="Head pitch · side",
         view="side",
         metrics=("head_pitch",),
-        neutral_instruction="Take up your usual tango stance, looking ahead.",
+        neutral_instruction="Turn left or right so you are side-on to the camera. Take up your usual tango stance, looking ahead.",
         changed_instruction="Lower your gaze a little. Keep your chest facing the same way.",
         expected_sign=-1,
     ),
@@ -75,7 +80,7 @@ CHECK_SPECS: dict[str, CheckSpec] = {
         title="Head position · side",
         view="side",
         metrics=("head_forward", "head_inclination"),
-        neutral_instruction="Take up your usual tango stance with your head balanced.",
+        neutral_instruction="Turn left or right so you are side-on to the camera. Take up your usual tango stance with your head balanced.",
         changed_instruction="Bring your head slightly forward while keeping your gaze level. Return to your usual position when prompted.",
         expected_sign=None,
     ),
@@ -84,7 +89,7 @@ CHECK_SPECS: dict[str, CheckSpec] = {
         title="Shoulders · front",
         view="front",
         metrics=("shoulder_clearance",),
-        neutral_instruction="Face the camera with both shoulders relaxed and settled.",
+        neutral_instruction="Turn to the camera with both shoulders relaxed and settled.",
         changed_instruction="Raise both shoulders gently. Keep looking ahead. Let both shoulders settle for the next hold.",
         expected_sign=-1,
     ),
@@ -93,7 +98,7 @@ CHECK_SPECS: dict[str, CheckSpec] = {
         title="Torso axis · front",
         view="front",
         metrics=("torso_axis_tilt",),
-        neutral_instruction="Face the camera in your upright ready-to-walk stance.",
+        neutral_instruction="Turn to the camera in your upright ready-to-walk stance.",
         changed_instruction="Let your torso incline a little toward the same side each time. Then return to your usual stance.",
         expected_sign=1,
     ),
@@ -102,7 +107,7 @@ CHECK_SPECS: dict[str, CheckSpec] = {
         title="Trunk inclination · side",
         view="side",
         metrics=("trunk_inclination",),
-        neutral_instruction="Take up your usual side-on tango stance.",
+        neutral_instruction="Turn left or right so you are side-on to the camera. Take up your usual tango stance.",
         changed_instruction="Incline your trunk forward a little, then return to your usual stance.",
         expected_sign=None,
     ),
@@ -111,7 +116,7 @@ CHECK_SPECS: dict[str, CheckSpec] = {
         title="Hip position · side",
         view="side",
         metrics=("hip_offset",),
-        neutral_instruction="Take up your usual side-on tango stance with ankles visible.",
+        neutral_instruction="Turn left or right so you are side-on to the camera. Take up your usual tango stance with ankles visible.",
         changed_instruction="If comfortable, shift your hips forward slightly, then return.",
         expected_sign=None,
     ),
@@ -120,7 +125,7 @@ CHECK_SPECS: dict[str, CheckSpec] = {
         title="Knee flexion · side",
         view="side",
         metrics=("knee_flexion",),
-        neutral_instruction="Stand in your usual soft-knee tango stance.",
+        neutral_instruction="Turn left or right so you are side-on to the camera. Stand in your usual soft-knee tango stance.",
         changed_instruction="Gently straighten your knees a little, keeping them comfortable.",
         expected_sign=-1,
     ),
@@ -144,36 +149,44 @@ def build_quick_setup_phases() -> list[GuidePhaseSpec]:
             plan_kind="quick",
             view="front",
             repetition=1,
-            instruction="Face the camera. Stand as you do when you’re ready to walk. Look ahead and let your shoulders settle.",
+            instruction="Turn to the camera in your ready-to-walk stance.",
             role="neutral",
             metrics=front_metrics,
+            turn_direction="camera",
         ),
         GuidePhaseSpec(
             phase_id="front_b",
             plan_kind="quick",
             view="front",
             repetition=2,
-            instruction="Relax for a moment. Now return to the same ready-to-walk stance.",
+            instruction="Relax, then turn to the camera in the same stance.",
             role="neutral",
             metrics=front_metrics,
+            turn_direction="camera",
         ),
         GuidePhaseSpec(
             phase_id="side_a",
             plan_kind="quick",
             view="side",
             repetition=1,
-            instruction="Turn side-on in the direction shown. Keep the camera where it is. Take up your usual tango stance.",
+            instruction="Turn left so you are side-on to the camera.",
             role="neutral",
             metrics=side_metrics,
+            turn_direction="left",
+            hold_window_s=1.5,
+            min_usable_hold_s=1.0,
         ),
         GuidePhaseSpec(
             phase_id="side_b",
             plan_kind="quick",
             view="side",
             repetition=2,
-            instruction="Relax, then return to the same stance. Keep looking in the same direction.",
+            instruction="Turn right so you are side-on to the camera.",
             role="neutral",
             metrics=side_metrics,
+            turn_direction="right",
+            hold_window_s=1.5,
+            min_usable_hold_s=1.0,
         ),
     ]
 
@@ -183,6 +196,7 @@ def build_check_phases(check_ids: list[str] | tuple[str, ...]) -> list[GuidePhas
     phases: list[GuidePhaseSpec] = []
     for cid in check_ids:
         spec = CHECK_SPECS[cid]
+        td: Literal["camera", "left", "right"] | None = "camera" if spec.view == "front" else None
         phases.extend([
             GuidePhaseSpec(
                 phase_id=f"{cid}_neutral_a",
@@ -193,6 +207,7 @@ def build_check_phases(check_ids: list[str] | tuple[str, ...]) -> list[GuidePhas
                 role="neutral",
                 check_id=cid,
                 metrics=spec.metrics,
+                turn_direction=td,
             ),
             GuidePhaseSpec(
                 phase_id=f"{cid}_changed_a",
@@ -203,6 +218,7 @@ def build_check_phases(check_ids: list[str] | tuple[str, ...]) -> list[GuidePhas
                 role="changed",
                 check_id=cid,
                 metrics=spec.metrics,
+                turn_direction=td,
             ),
             GuidePhaseSpec(
                 phase_id=f"{cid}_neutral_b",
@@ -213,6 +229,7 @@ def build_check_phases(check_ids: list[str] | tuple[str, ...]) -> list[GuidePhas
                 role="neutral",
                 check_id=cid,
                 metrics=spec.metrics,
+                turn_direction=td,
             ),
             GuidePhaseSpec(
                 phase_id=f"{cid}_changed_b",
@@ -223,6 +240,7 @@ def build_check_phases(check_ids: list[str] | tuple[str, ...]) -> list[GuidePhas
                 role="changed",
                 check_id=cid,
                 metrics=spec.metrics,
+                turn_direction=td,
             ),
         ])
     return phases
@@ -237,20 +255,22 @@ def build_walking_phases() -> list[GuidePhaseSpec]:
             plan_kind="walking",
             view="side",
             repetition=1,
-            instruction="Take up to four natural tango steps across the frame, keeping your shoes visible. Stop at the end.",
+            instruction="Turn left so you are side-on to the camera, then take up to four natural tango steps across the frame, keeping your shoes visible. Stop at the end.",
             role="walking",
             metrics=walking_metrics,
             requires_stillness=False,
+            turn_direction="left",
         ),
         GuidePhaseSpec(
             phase_id="walk_2",
             plan_kind="walking",
             view="side",
             repetition=2,
-            instruction="Take up to four natural tango steps across the frame, keeping your shoes visible. Stop at the end.",
+            instruction="Turn right so you are side-on to the camera, then take up to four natural tango steps across the frame, keeping your shoes visible. Stop at the end.",
             role="walking",
             metrics=walking_metrics,
             requires_stillness=False,
+            turn_direction="right",
         ),
     ]
 
@@ -269,6 +289,8 @@ class AcceptedPassageRecord:
     eligible_metrics: dict[str, float] = field(default_factory=dict)  # metric -> usable seconds
     unavailable_reasons: dict[str, str] = field(default_factory=dict)
     usable: bool = True
+    detected_side: Literal["left", "right"] | None = None
+    detected_facing: Literal["left", "right"] | None = None
 
 
 @dataclass(frozen=True)
@@ -292,21 +314,357 @@ def _in_frame(point: Landmark) -> bool:
 def _pose_torso_geometry(
     pose: dict[str, Landmark], width: int, height: int, confidence: float,
 ) -> tuple[tuple[float, float], float] | None:
-    keys = ("left_shoulder", "right_shoulder", "left_hip", "right_hip")
-    pts = [pose.get(k) for k in keys]
-    if any(p is None or not reliable(p, confidence) or not _in_frame(p) for p in pts):
+    shoulders = [
+        p
+        for k in ("left_shoulder", "right_shoulder")
+        if (p := pose.get(k)) is not None and reliable(p, confidence) and _in_frame(p)
+    ]
+    hips = [
+        p
+        for k in ("left_hip", "right_hip")
+        if (p := pose.get(k)) is not None and reliable(p, confidence) and _in_frame(p)
+    ]
+    if not shoulders or not hips:
         return None
-    ls, rs, lh, rh = (pts[0], pts[1], pts[2], pts[3])
-    assert ls and rs and lh and rh
-    smx = (ls.x + rs.x) * 0.5 * width
-    smy = (ls.y + rs.y) * 0.5 * height
-    hmx = (lh.x + rh.x) * 0.5 * width
-    hmy = (lh.y + rh.y) * 0.5 * height
+    smx = sum(p.x for p in shoulders) / len(shoulders) * width
+    smy = sum(p.y for p in shoulders) / len(shoulders) * height
+    hmx = sum(p.x for p in hips) / len(hips) * width
+    hmy = sum(p.y for p in hips) / len(hips) * height
     torso_px = math.hypot(smx - hmx, smy - hmy)
     if torso_px <= 1e-6:
         return None
     mid = ((smx + hmx) * 0.5, (smy + hmy) * 0.5)
     return mid, torso_px
+
+
+def _detect_side_orientation(
+    pose: dict[str, Landmark],
+    cfg: Config,
+) -> tuple[Literal["left", "right"], Literal["left", "right"], Landmark] | None:
+    """Return (detected_side, detected_facing, chosen_ear) from reliable profile landmarks."""
+    head_conf = min(cfg.confidence, 0.45)
+    nose = pose.get("nose")
+    if nose is None or not reliable(nose, head_conf) or not _in_frame(nose):
+        return None
+    candidates: dict[Literal["left", "right"], Landmark] = {}
+    for side in ("left", "right"):
+        pt = pose.get(f"{side}_ear")
+        if pt is not None and reliable(pt, head_conf) and _in_frame(pt):
+            candidates[side] = pt  # type: ignore[index]
+    if not candidates:
+        return None
+
+    def _side_torso_ok(s: Literal["left", "right"]) -> bool:
+        sh = pose.get(f"{s}_shoulder")
+        hip = pose.get(f"{s}_hip")
+        return (
+            sh is not None and reliable(sh, cfg.confidence) and _in_frame(sh)
+            and hip is not None and reliable(hip, cfg.confidence) and _in_frame(hip)
+        )
+
+    if len(candidates) == 1:
+        ear_side, ear = next(iter(candidates.items()))
+        dx = nose.x - ear.x
+        detected_facing: Literal["left", "right"] = "right" if dx > 0 else "left"
+        other_side: Literal["left", "right"] = "right" if ear_side == "left" else "left"
+        if _side_torso_ok(ear_side):
+            detected_side: Literal["left", "right"] = ear_side
+        elif _side_torso_ok(other_side):
+            detected_side = other_side
+        else:
+            detected_side = ear_side
+        return detected_side, detected_facing, ear
+
+    le = candidates["left"]
+    re = candidates["right"]
+    ear_mid_x = 0.5 * (le.x + re.x)
+    dx_mid = nose.x - ear_mid_x
+    if abs(dx_mid) >= 1e-6:
+        detected_facing = "right" if dx_mid > 0 else "left"
+    else:
+        best_side: Literal["left", "right"] = (
+            "left" if abs(nose.x - le.x) >= abs(nose.x - re.x) else "right"
+        )
+        detected_facing = "right" if (nose.x - candidates[best_side].x) > 0 else "left"
+
+    le_vis = le.visibility if le.visibility is not None else 0.0
+    re_vis = re.visibility if re.visibility is not None else 0.0
+    ls = pose.get("left_shoulder")
+    rs = pose.get("right_shoulder")
+
+    # Select the near-camera ear by visibility advantage, then 3D z-depth (smaller z is closer),
+    # then profile-trailing offset, avoiding tie-breaking on stale cfg.side.
+    if abs(le_vis - re_vis) >= 0.15:
+        ear_side = "left" if le_vis > re_vis else "right"
+    else:
+        z_votes: list[Literal["left", "right"]] = []
+        if (
+            le.z is not None and re.z is not None
+            and math.isfinite(le.z) and math.isfinite(re.z)
+            and abs(le.z - re.z) >= 0.02
+        ):
+            z_votes.append("left" if le.z < re.z else "right")
+        if (
+            ls is not None and rs is not None
+            and ls.z is not None and rs.z is not None
+            and math.isfinite(ls.z) and math.isfinite(rs.z)
+            and abs(ls.z - rs.z) >= 0.03
+        ):
+            z_votes.append("left" if ls.z < rs.z else "right")
+        if z_votes and len(set(z_votes)) == 1:
+            ear_side = z_votes[0]
+        else:
+            sign = 1.0 if detected_facing == "right" else -1.0
+            l_proj = (nose.x - le.x) * sign
+            r_proj = (nose.x - re.x) * sign
+            if abs(l_proj - r_proj) >= 0.005:
+                ear_side = "left" if l_proj > r_proj else "right"
+            else:
+                ear_side = "right" if detected_facing == "right" else "left"
+
+    other_side = "right" if ear_side == "left" else "left"
+    if _side_torso_ok(ear_side):
+        detected_side = ear_side
+    elif _side_torso_ok(other_side):
+        detected_side = other_side
+    else:
+        detected_side = ear_side
+
+    chosen_ear = candidates[ear_side]
+    sign = 1.0 if detected_facing == "right" else -1.0
+    if (nose.x - chosen_ear.x) * sign <= 0:
+        alt_ear = candidates[other_side]
+        if (nose.x - alt_ear.x) * sign > 0:
+            chosen_ear = alt_ear
+    return detected_side, detected_facing, chosen_ear
+
+
+def prepare_side_measurement_frame(frame: FrameObservation, cfg: Config) -> FrameObservation:
+    """Repair occluded far-side torso joints in side view so near-side measurements stay valid."""
+    if len(frame.poses) != 1:
+        return frame
+    pose = frame.poses[0]
+    near_side = cfg.side
+    far_side: Literal["left", "right"] = "right" if near_side == "left" else "left"
+    near_sh = pose.get(f"{near_side}_shoulder")
+    near_hip = pose.get(f"{near_side}_hip")
+    if (
+        near_sh is None or not reliable(near_sh, cfg.confidence) or not _in_frame(near_sh)
+        or near_hip is None or not reliable(near_hip, cfg.confidence) or not _in_frame(near_hip)
+    ):
+        return frame
+
+    torso_px = math.hypot(
+        (near_sh.x - near_hip.x) * frame.width,
+        (near_sh.y - near_hip.y) * frame.height,
+    )
+    updated_pose: dict[str, Landmark] | None = None
+    for joint, near_pt in (("shoulder", near_sh), ("hip", near_hip)):
+        far_key = f"{far_side}_{joint}"
+        far_pt = pose.get(far_key)
+        far_within_profile = (
+            far_pt is not None
+            and math.isfinite(far_pt.x)
+            and math.isfinite(far_pt.y)
+            and _in_frame(far_pt)
+            and torso_px > 1e-6
+            and math.hypot((far_pt.x - near_pt.x) * frame.width, (far_pt.y - near_pt.y) * frame.height)
+            <= cfg.max_view_width * torso_px
+        )
+        if far_pt is not None and reliable(far_pt, cfg.confidence) and _in_frame(far_pt) and far_within_profile:
+            continue
+        if updated_pose is None:
+            updated_pose = dict(pose)
+        if far_within_profile and far_pt is not None:
+            updated_pose[far_key] = Landmark(
+                x=far_pt.x,
+                y=far_pt.y,
+                visibility=max(far_pt.visibility or 0.0, cfg.confidence),
+                presence=max(far_pt.presence or 0.0, cfg.confidence),
+                z=far_pt.z,
+            )
+        else:
+            updated_pose[far_key] = near_pt
+
+    head_floor = min(cfg.confidence, 0.45)
+    for lm_key in ("nose", f"{near_side}_ear"):
+        pt = pose.get(lm_key)
+        if (
+            pt is not None
+            and _in_frame(pt)
+            and reliable(pt, head_floor)
+            and not reliable(pt, cfg.confidence)
+        ):
+            if updated_pose is None:
+                updated_pose = dict(pose)
+            updated_pose[lm_key] = Landmark(
+                x=pt.x,
+                y=pt.y,
+                visibility=max(pt.visibility or 0.0, cfg.confidence),
+                presence=max(pt.presence or 0.0, cfg.confidence),
+                z=pt.z,
+            )
+    near_ankle_key = f"{near_side}_ankle"
+    far_ankle_key = f"{far_side}_ankle"
+    near_ankle = pose.get(near_ankle_key)
+    if near_ankle is not None and _in_frame(near_ankle) and reliable(near_ankle, head_floor):
+        ankle_key, ankle_pt = near_ankle_key, near_ankle
+    else:
+        far_ankle = pose.get(far_ankle_key)
+        if far_ankle is not None and _in_frame(far_ankle) and reliable(far_ankle, head_floor):
+            ankle_key, ankle_pt = far_ankle_key, far_ankle
+        else:
+            ankle_key, ankle_pt = "", None
+    if ankle_pt is not None and not reliable(ankle_pt, cfg.confidence):
+        if updated_pose is None:
+            updated_pose = dict(pose)
+        updated_pose[ankle_key] = Landmark(
+            x=ankle_pt.x,
+            y=ankle_pt.y,
+            visibility=max(ankle_pt.visibility or 0.0, cfg.confidence),
+            presence=max(ankle_pt.presence or 0.0, cfg.confidence),
+            z=ankle_pt.z,
+        )
+
+    if updated_pose is None:
+        return frame
+    return FrameObservation(
+        timestamp=frame.timestamp,
+        width=frame.width,
+        height=frame.height,
+        poses=[updated_pose],
+        world_poses=list(frame.world_poses),
+    )
+
+
+def _raw_view_width(frame: FrameObservation, confidence: float) -> float | None:
+    if len(frame.poses) != 1:
+        return None
+    pose = frame.poses[0]
+    geom = _pose_torso_geometry(pose, frame.width, frame.height, confidence)
+    if geom is None:
+        return None
+    _, torso_px = geom
+    ls, rs = pose.get("left_shoulder"), pose.get("right_shoulder")
+    lh, rh = pose.get("left_hip"), pose.get("right_hip")
+    sh_ok = (
+        ls is not None and rs is not None
+        and reliable(ls, confidence) and reliable(rs, confidence)
+        and _in_frame(ls) and _in_frame(rs)
+    )
+    hip_ok = (
+        lh is not None and rh is not None
+        and reliable(lh, confidence) and reliable(rh, confidence)
+        and _in_frame(lh) and _in_frame(rh)
+    )
+    if not sh_ok and not hip_ok:
+        return None
+    sh_span = (
+        math.hypot((ls.x - rs.x) * frame.width, (ls.y - rs.y) * frame.height)
+        if sh_ok and ls is not None and rs is not None
+        else 0.0
+    )
+    hip_span = (
+        math.hypot((lh.x - rh.x) * frame.width, (lh.y - rh.y) * frame.height)
+        if hip_ok and lh is not None and rh is not None
+        else 0.0
+    )
+    return max(sh_span, hip_span) / torso_px
+
+
+def resolve_side_frame_config(
+    frame: FrameObservation,
+    base_cfg: Config,
+    ledger: Sequence[Mapping[str, Any]] | None = None,
+) -> tuple[FrameObservation, Config]:
+    """Resolve per-frame orientation and repair occluded far-side joints for side frames only."""
+    side_cutoff = base_cfg.max_view_width + base_cfg.solo_camera.front_view_width_margin
+    matched_side_rec: Mapping[str, Any] | None = None
+    if ledger:
+        for rec in ledger:
+            if not isinstance(rec, Mapping):
+                continue
+            start_t = float(rec.get("start", 0.0)) - 1e-5
+            end_t = float(rec.get("end", 0.0)) + 1e-5
+            if not (start_t <= frame.timestamp <= end_t):
+                continue
+            if rec.get("view") == "front":
+                return frame, base_cfg
+            if rec.get("view") == "side":
+                matched_side_rec = rec
+                break
+    vw = _raw_view_width(frame, base_cfg.confidence) if matched_side_rec is None else None
+    is_side_frame = matched_side_rec is not None or (
+        len(frame.poses) == 1 and vw is not None and vw <= side_cutoff
+    )
+    if not is_side_frame:
+        return frame, base_cfg
+
+    side_cfg = (
+        base_cfg.model_copy(update={"max_view_width": side_cutoff})
+        if ledger
+        else base_cfg
+    )
+    det_side: str | None = None
+    det_facing: str | None = None
+    if matched_side_rec is not None:
+        raw_side = matched_side_rec.get("detected_side")
+        raw_facing = matched_side_rec.get("detected_facing")
+        if raw_side in ("left", "right") and raw_facing in ("left", "right"):
+            det_side, det_facing = raw_side, raw_facing
+    if det_side is None and len(frame.poses) == 1:
+        orient = _detect_side_orientation(frame.poses[0], side_cfg)
+        if orient is not None:
+            det_side, det_facing = orient[0], orient[1]
+    if det_side in ("left", "right") and det_facing in ("left", "right"):
+        side_cfg = side_cfg.model_copy(update={"side": det_side, "facing": det_facing})
+    return prepare_side_measurement_frame(frame, side_cfg), side_cfg
+
+
+def ledger_metric_samples(
+    frames: Sequence[FrameObservation],
+    base_cfg: Config,
+    ledger: Sequence[Mapping[str, Any]],
+    *,
+    view: Literal["side", "front", "all"],
+) -> dict[str, list[tuple[float, float | None]]]:
+    """Compute metric time series honoring per-phase side/facing ledger entries."""
+    if view != "side":
+        return metric_samples(frames, base_cfg, view=view)
+    result: dict[str, list[tuple[float, float | None]]] = {key: [] for key in METRIC_DETAILS}
+    previous: dict[str, float] = {}
+    for frame in frames:
+        eval_frame, eval_cfg = resolve_side_frame_config(frame, base_cfg, ledger)
+        eval_cfg = eval_cfg.model_copy(update={"allow_all_angles": False})
+        obs = measure_ranges(eval_frame, eval_cfg)
+        eligible = view_eligible("side", obs.view_width, eval_cfg.max_view_width)
+        for key, series in result.items():
+            value = (
+                obs.values[key]
+                if eligible and obs.quality[key].valid
+                else None
+            )
+            if value is not None and key in CYCLIC_METRICS:
+                if key in previous:
+                    value = previous[key] + wrapped(value - previous[key])
+                previous[key] = value
+            series.append((frame.timestamp, value))
+    return result
+
+
+def _turn_hint(
+    requested_view: Literal["front", "side"] | None,
+    turn_direction: Literal["camera", "left", "right"] | None,
+) -> str:
+    if requested_view == "front" or turn_direction == "camera":
+        return "Turn to the camera with your head and shoulders level."
+    if turn_direction == "left":
+        return "Turn left so you are side-on to the camera."
+    if turn_direction == "right":
+        return "Turn right so you are side-on to the camera."
+    if requested_view == "side":
+        return "Turn left or right so you are side-on to the camera."
+    return "Turn to the camera, or turn left or right so you are side-on."
 
 
 def classify_guide_view(
@@ -315,82 +673,104 @@ def classify_guide_view(
     requested_view: Literal["front", "side"] | None = None,
     *,
     strict_facing: bool = True,
+    turn_direction: Literal["camera", "left", "right"] | None = None,
 ) -> tuple[GuideView, str]:
     """Classify the single-dancer view for guided capture using strict facial and torso cues."""
     if len(frame.poses) != 1:
         return "uncertain", "Ensure exactly one dancer is visible."
     pose = frame.poses[0]
     conf = cfg.confidence
-    for key in ("left_shoulder", "right_shoulder", "left_hip", "right_hip"):
-        pt = pose.get(key)
-        if pt is None or not reliable(pt, conf) or not _in_frame(pt):
-            return "uncertain", "Step back so shoulders and hips are clearly visible."
+    geom = _pose_torso_geometry(pose, frame.width, frame.height, conf)
+    if geom is None:
+        return "uncertain", "Step back so shoulders and hips are clearly visible."
+    _, torso_px = geom
 
-    ls, rs = pose["left_shoulder"], pose["right_shoulder"]
-    lh, rh = pose["left_hip"], pose["right_hip"]
+    ls, rs = pose.get("left_shoulder"), pose.get("right_shoulder")
+    lh, rh = pose.get("left_hip"), pose.get("right_hip")
     nose = pose.get("nose")
     le = pose.get("left_ear")
     re = pose.get("right_ear")
 
-    obs = measure_ranges(frame, cfg)
-    vw = obs.view_width
+    vw = _raw_view_width(frame, conf)
     if vw is None or not math.isfinite(vw):
-        smx = (ls.x + rs.x) * 0.5 * frame.width
-        smy = (ls.y + rs.y) * 0.5 * frame.height
-        hmx = (lh.x + rh.x) * 0.5 * frame.width
-        hmy = (lh.y + rh.y) * 0.5 * frame.height
-        torso_px = math.hypot(smx - hmx, smy - hmy)
-        if torso_px <= 1e-6:
-            return "uncertain", "Move to a clearer position so torso width can be measured."
-        sh_span = math.hypot((ls.x - rs.x) * frame.width, (ls.y - rs.y) * frame.height)
-        hip_span = math.hypot((lh.x - rh.x) * frame.width, (lh.y - rh.y) * frame.height)
-        vw = max(sh_span, hip_span) / torso_px
+        vw = 0.0
 
     front_cutoff = cfg.max_view_width + cfg.solo_camera.front_view_width_margin
 
-    # Front check: width above front_cutoff + front anatomical order + nose between ears
+    # Front check: width above front_cutoff + front anatomical order + centered nose
     if vw > front_cutoff:
-        anatomical_front = ls.x > rs.x and lh.x > rh.x
-        if (
-            anatomical_front
-            and nose is not None and reliable(nose, conf) and _in_frame(nose)
-            and le is not None and reliable(le, conf) and _in_frame(le)
-            and re is not None and reliable(re, conf) and _in_frame(re)
-        ):
-            ear_min = min(le.x, re.x)
-            ear_max = max(le.x, re.x)
-            if ear_min <= nose.x <= ear_max:
-                return "front", ""
-        return "uncertain", "Face the camera squarely with your head and shoulders level."
+        all_torso = all(
+            pt is not None and reliable(pt, conf) and _in_frame(pt)
+            for pt in (ls, rs, lh, rh)
+        )
+        nose_ok = nose is not None and reliable(nose, conf) and _in_frame(nose)
+        if all_torso and nose_ok:
+            assert ls and rs and lh and rh and nose
+            anatomical_front = ls.x > rs.x and lh.x > rh.x
+            if anatomical_front:
+                ear_conf = min(conf, 0.40)
+                if (
+                    le is not None and reliable(le, ear_conf) and _in_frame(le)
+                    and re is not None and reliable(re, ear_conf) and _in_frame(re)
+                ):
+                    centered = min(le.x, re.x) <= nose.x <= max(le.x, re.x)
+                else:
+                    centered = min(ls.x, rs.x) <= nose.x <= max(ls.x, rs.x)
+                if centered:
+                    hint = "" if requested_view in (None, "front") else _turn_hint(requested_view, turn_direction)
+                    return "front", hint
+        if requested_view == "side":
+            return "uncertain", _turn_hint(requested_view, turn_direction)
+        return "uncertain", "Turn to the camera with your head and shoulders level."
 
-    # Side check: width <= max_view_width + ear-to-nose horizontal sign matches facing
-    if vw <= cfg.max_view_width:
-        ear_key = f"{cfg.side}_ear"
-        ear = pose.get(ear_key)
-        if ear is None or not reliable(ear, conf) or not _in_frame(ear):
-            # Fallback to whichever ear is reliable if primary ear momentarily occluded
-            other_key = "right_ear" if cfg.side == "left" else "left_ear"
-            other = pose.get(other_key)
-            if other is not None and reliable(other, conf) and _in_frame(other):
-                ear = other
-        if nose is None or not reliable(nose, conf) or not _in_frame(nose) or ear is None:
+    # Side check: width <= max_view_width (or buffer zone with clear profile head) + ear-to-nose horizontal sign
+    orient = _detect_side_orientation(pose, cfg)
+    allow_buffer_side = (
+        requested_view == "side"
+        and vw <= front_cutoff
+        and orient is not None
+    )
+    if vw <= cfg.max_view_width or allow_buffer_side:
+        if orient is None:
             return "uncertain", "Keep your profile head (nose and ear) visible in the frame."
-        dx = nose.x - ear.x
-        if abs(dx) < 0.015:
-            return "uncertain", "Turn more clearly side-on so your profile direction is clear."
-        if not strict_facing:
-            return "side", ""
-        expected_sign = 1.0 if cfg.facing == "right" else -1.0
-        if dx * expected_sign > 0:
-            return "side", ""
-        return "uncertain", f"Face {cfg.facing} in the recorded image as shown."
+        _, detected_facing, ear = orient
+        assert nose is not None
+        head_conf = min(conf, 0.45)
+        dx_px = (nose.x - ear.x) * frame.width
+        min_dx_px = max(2.0, 0.03 * torso_px)
+        both_ears_ok = (
+            le is not None and reliable(le, head_conf) and _in_frame(le)
+            and re is not None and reliable(re, head_conf) and _in_frame(re)
+        )
+        mid_ok = True
+        if both_ears_ok:
+            assert le is not None and re is not None
+            dx_mid_px = (nose.x - 0.5 * (le.x + re.x)) * frame.width
+            mid_ok = abs(dx_mid_px) >= max(1.5, 0.02 * torso_px)
+        if abs(dx_px) < min_dx_px or not mid_ok:
+            if requested_view == "side" and turn_direction in ("left", "right"):
+                return (
+                    "uncertain",
+                    f"Body is side-on — turn {turn_direction} and look straight ahead in profile, not toward the camera.",
+                )
+            return "uncertain", "Keep your head in side profile, looking straight ahead rather than at the camera."
+        if requested_view == "side" and turn_direction in ("left", "right"):
+            # Turning to your own left faces the right side of the unmirrored image, and vice versa.
+            expected_facing: Literal["left", "right"] = "right" if turn_direction == "left" else "left"
+            if detected_facing != expected_facing:
+                return (
+                    "uncertain",
+                    f"Opposite side detected — turn {turn_direction} (to your own {turn_direction}) so you are side-on to the camera.",
+                )
+        elif strict_facing:
+            if detected_facing != cfg.facing:
+                turn_word = "left" if cfg.facing == "right" else "right"
+                return "uncertain", f"Turn {turn_word} so you are side-on to the camera (Face {cfg.facing})."
+        hint = "" if requested_view in (None, "side") else _turn_hint(requested_view, turn_direction)
+        return "side", hint
 
     # Ambiguous buffer zone between max_view_width and front_cutoff
-    if requested_view == "front":
-        return "uncertain", "Turn more squarely toward the camera."
-    if requested_view == "side":
-        return "uncertain", "Turn more fully side-on to the camera."
-    return "uncertain", "Turn clearly front-on or side-on."
+    return "uncertain", _turn_hint(requested_view, turn_direction)
 
 
 def check_full_body_framing(frame: FrameObservation, cfg: Config) -> tuple[bool, str]:
@@ -494,7 +874,7 @@ class SoloCameraSession:
         cfg: Config,
         *,
         now_monotonic: float = 0.0,
-        auto_detect_side_facing: bool = False,
+        auto_detect_side_facing: bool = True,
     ) -> None:
         self.cfg = cfg.model_copy(deep=True)
         self.auto_detect_side_facing = auto_detect_side_facing
@@ -523,6 +903,8 @@ class SoloCameraSession:
         self._phase_samples: dict[str, list[tuple[float, float | None]]] = {}
         self._phase_last_bad_reason: dict[str, str] = {}
         self._take_active: bool = False
+        self._settle_view_lost_since: float | None = None
+        self._capture_view_lost_since: float | None = None
 
     @property
     def current_phase(self) -> GuidePhaseSpec | None:
@@ -535,7 +917,7 @@ class SoloCameraSession:
         return dict(self._accepted_passages)
 
     def effective_max_gap(self) -> float:
-        return min(self.cfg.solo_camera.max_usable_gap_s, self.cfg.max_gap)
+        return max(self.cfg.solo_camera.max_usable_gap_s, self.cfg.max_gap)
 
     def start_plan(
         self,
@@ -575,6 +957,7 @@ class SoloCameraSession:
         self._wait_started_mono = now_monotonic
         self._settle_started_mono = None
         self._settle_anchor_mid = None
+        self._settle_view_lost_since = None
         self._take_active = False
         if phase is not None and not phase.requires_stillness:
             self.state = "Wait for take"
@@ -588,6 +971,8 @@ class SoloCameraSession:
         self._phase_last_bad_reason = {}
         self._settle_started_mono = None
         self._settle_anchor_mid = None
+        self._settle_view_lost_since = None
+        self._capture_view_lost_since = None
 
     def on_speech_finished(self, prompt_id: int, *, now_monotonic: float = 0.0, failed: bool = False) -> None:
         if prompt_id != self.active_prompt_id or self.state != "Prompt":
@@ -649,9 +1034,22 @@ class SoloCameraSession:
         ):
             phase = self.current_phase
             if phase is not None:
-                self.hint_message = (
-                    f"Still waiting for {phase.view} view. Check framing, facing, and lighting."
-                )
+                if phase.view == "front" or phase.turn_direction == "camera":
+                    self.hint_message = (
+                        "Still waiting for front view: turn to the camera and check framing and lighting."
+                    )
+                elif phase.turn_direction == "left":
+                    self.hint_message = (
+                        "Still waiting for side view: turn left so you are side-on to the camera."
+                    )
+                elif phase.turn_direction == "right":
+                    self.hint_message = (
+                        "Still waiting for side view: turn right so you are side-on to the camera."
+                    )
+                else:
+                    self.hint_message = (
+                        "Still waiting for side view: turn left or right so you are side-on to the camera."
+                    )
         return False
 
     def evaluate_frame(self, frame: FrameObservation) -> GateEvaluation:
@@ -721,26 +1119,26 @@ class SoloCameraSession:
             self.cfg,
             requested_view=req_view,
             strict_facing=not self.auto_detect_side_facing,
+            turn_direction=phase.turn_direction if phase is not None else None,
         )
         if self.auto_detect_side_facing and detected_view == "side":
-            pose = frame.poses[0]
-            nose = pose.get("nose")
-            le = pose.get("left_ear")
-            re = pose.get("right_ear")
-            ear = le if (le is not None and reliable(le, self.cfg.confidence)) else re
-            if nose is not None and ear is not None:
-                detected_facing: Literal["left", "right"] = "right" if (nose.x - ear.x) > 0 else "left"
-                detected_side: Literal["left", "right"] = (
-                    "left"
-                    if (le is not None and (re is None or (le.visibility or 0.0) >= (re.visibility or 0.0)))
-                    else "right"
-                )
+            orient = _detect_side_orientation(frame.poses[0], self.cfg)
+            if orient is not None:
+                detected_side, detected_facing, _ = orient
                 if self.cfg.facing != detected_facing or self.cfg.side != detected_side:
                     self.cfg = self.cfg.model_copy(
                         update={"facing": detected_facing, "side": detected_side}
                     )
         view_matches = req_view is not None and detected_view == req_view
-        obs = measure_ranges(frame, self.cfg)
+        if detected_view == "side":
+            eval_cfg = self.cfg.model_copy(
+                update={"max_view_width": self.cfg.max_view_width + self.cfg.solo_camera.front_view_width_margin}
+            )
+            eval_frame = prepare_side_measurement_frame(frame, eval_cfg)
+        else:
+            eval_cfg = self.cfg
+            eval_frame = frame
+        obs = measure_ranges(eval_frame, eval_cfg)
         framing_ok = view_matches or (req_view is None and check_full_body_framing(frame, self.cfg)[0])
         return GateEvaluation("ok", detected_view, view_matches, framing_ok, view_hint, mid, torso_px, obs)
 
@@ -790,15 +1188,21 @@ class SoloCameraSession:
                 self.state = "Settle"
                 self._settle_started_mono = now_monotonic
                 self._settle_anchor_mid = gate.torso_midpoint
+                self._settle_view_lost_since = None
                 self.hint_message = "Hold steady…"
             return gate
 
         if self.state == "Settle":
             if not gate.view_matches or gate.torso_midpoint is None or gate.torso_length_px is None:
-                self._settle_started_mono = None
-                self._settle_anchor_mid = None
-                self.state = "Wait for view and pose"
+                if self._settle_view_lost_since is None:
+                    self._settle_view_lost_since = now_monotonic
+                if now_monotonic - self._settle_view_lost_since > 0.25:
+                    self._settle_started_mono = None
+                    self._settle_anchor_mid = None
+                    self._settle_view_lost_since = None
+                    self.state = "Wait for view and pose"
                 return gate
+            self._settle_view_lost_since = None
             assert self._settle_anchor_mid is not None and self._settle_started_mono is not None
             drift = math.hypot(
                 gate.torso_midpoint[0] - self._settle_anchor_mid[0],
@@ -819,15 +1223,24 @@ class SoloCameraSession:
             return gate
 
         if self.state == "Capture":
+            target_hold_s = (
+                phase.hold_window_s
+                if (phase.hold_window_s is not None and phase.hold_window_s > 0)
+                else self.cfg.solo_camera.hold_window_s
+            )
             if not gate.view_matches or gate.observation is None:
-                # Prolonged loss of intended view discards active attempt and re-arms
-                self._reset_attempt_buffers()
-                self.state = "Wait for view and pose"
-                self.hint_message = gate.hint or "View lost; returning to waiting."
+                if self._capture_view_lost_since is None:
+                    self._capture_view_lost_since = now_monotonic
+                if now_monotonic - self._capture_view_lost_since > 0.35:
+                    # Prolonged loss of intended view discards active attempt and re-arms
+                    self._reset_attempt_buffers()
+                    self.state = "Wait for view and pose"
+                    self.hint_message = gate.hint or "View lost; returning to waiting."
                 return gate
+            self._capture_view_lost_since = None
             self._record_phase_observation(phase, frame.timestamp, gate.observation)
             assert self._phase_start_ts is not None
-            if frame.timestamp - self._phase_start_ts >= self.cfg.solo_camera.hold_window_s:
+            if frame.timestamp - self._phase_start_ts >= target_hold_s:
                 self._finish_current_phase(now_monotonic=now_monotonic, speak_enabled=speak_enabled)
             return gate
 
@@ -842,8 +1255,13 @@ class SoloCameraSession:
         if self._phase_start_ts is None:
             self._phase_start_ts = timestamp
         self._phase_end_ts = timestamp
+        side_cutoff = self.cfg.max_view_width + self.cfg.solo_camera.front_view_width_margin
         scoring_view_ok = (
-            view_eligible(phase.view, obs.view_width, self.cfg.max_view_width)
+            view_eligible(
+                phase.view,
+                obs.view_width,
+                side_cutoff if phase.view == "side" else self.cfg.max_view_width,
+            )
             if obs.view_width is not None
             else True
         )
@@ -871,7 +1289,16 @@ class SoloCameraSession:
             return None
         self.state = "Evaluate"
         max_gap = self.effective_max_gap()
-        min_usable = self.cfg.solo_camera.min_usable_hold_s
+        target_hold_s = (
+            phase.hold_window_s
+            if (phase.hold_window_s is not None and phase.hold_window_s > 0)
+            else self.cfg.solo_camera.hold_window_s
+        )
+        min_usable = (
+            min(phase.min_usable_hold_s, target_hold_s)
+            if (phase.min_usable_hold_s is not None and phase.min_usable_hold_s > 0)
+            else min(self.cfg.solo_camera.min_usable_hold_s, target_hold_s)
+        )
         eligible_metrics: dict[str, float] = {}
         reasons: dict[str, str] = {}
         for key in phase.metrics:
@@ -897,6 +1324,8 @@ class SoloCameraSession:
             eligible_metrics=eligible_metrics,
             unavailable_reasons=reasons,
             usable=bool(eligible_metrics),
+            detected_side=self.cfg.side,
+            detected_facing=self.cfg.facing,
         )
         if not record.usable:
             # Failed hold: keep previous accepted holds, re-arm current phase

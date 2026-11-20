@@ -320,7 +320,12 @@ def _compare_targets(
         observation = _coach_observation(entry, width, height, require_measurements=True)
         if entry.get("interpolated") is True:
             observation = FrameObservation(observation.timestamp, observation.width, observation.height, [])
-        measured = measure_targets(observation, cfg, targets)
+        frame_cfg = (
+            cfg.model_copy(update={"side": entry["side"], "facing": entry["facing"]})
+            if entry.get("side") in ("left", "right") and entry.get("facing") in ("left", "right")
+            else cfg
+        )
+        measured = measure_targets(observation, frame_cfg, targets)
         rows = []
         for key, evaluator in evaluators.items():
             raw_val = measured.values[key]

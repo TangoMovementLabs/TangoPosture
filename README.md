@@ -54,19 +54,21 @@ For the complete manual — covering desktop workspaces, posture metrics & formu
 
 ### Desktop installers (experimental)
 
-When available, download the macOS Apple Silicon `.dmg` or Windows x64 setup
-executable from the project's [GitHub Releases](https://github.com/derruba2000/TangoPosture/releases).
-The installers include Python and the verified pose model; a separate model
+When available, download the macOS Apple Silicon `.dmg`, Windows x64 setup
+executable, or Linux x64 `.tar.gz` bundle from the project's
+[GitHub Releases](https://github.com/derruba2000/TangoPosture/releases).
+The bundles include Python and the verified pose model; a separate model
 download is not needed. On macOS, drag the app into Applications; on Windows,
-run the installer and open TangoPosture from the Start menu.
+run the installer and open TangoPosture from the Start menu; on Linux, extract
+`TangoPosture-Linux-x64.tar.gz` and run `./TangoPosture/TangoPosture`.
 
 These builds are **unsigned** and the macOS build is **not notarized**. Your
 operating system may warn or block installation. Only install artifacts you
 trust, and compare them with the release's `SHA256SUMS.txt`. macOS Intel,
-Windows ARM, and Linux installers are not provided. Camera, microphone, and
+Windows ARM, and Linux ARM bundles are not provided. Camera, microphone, and
 recording functionality still require testing on the target machine; Windows
-support is experimental, and some media features depend on platform-specific
-tools or capabilities.
+and Linux desktop bundles are experimental, and some media features depend on
+platform-specific tools or capabilities.
 
 If macOS says **"Apple could not verify TangoPosture is free of malware"**,
 this is the expected Gatekeeper warning for these unnotarized builds, not a
@@ -79,10 +81,11 @@ Removing this warning for distributed builds requires an Apple Developer ID
 signature and Apple notarization; changing the logo does not remove it.
 
 Installed-app data and recordings are stored under
-`~/Library/Application Support/TangoPosture` on macOS and
-`%LOCALAPPDATA%\TangoPosture` on Windows. Uninstalling the app does not remove
-those files. Optional tools such as `ffmpeg`, `yt-dlp`, and Ollama are not
-included in the installers.
+`~/Library/Application Support/TangoPosture` on macOS,
+`%LOCALAPPDATA%\TangoPosture` on Windows, and
+`$XDG_DATA_HOME/TangoPosture` (default `~/.local/share/TangoPosture`) on Linux.
+Uninstalling the app does not remove those files. Optional tools such as
+`ffmpeg`, `yt-dlp`, and Ollama are not included in the bundles.
 
 ### Source installation
 

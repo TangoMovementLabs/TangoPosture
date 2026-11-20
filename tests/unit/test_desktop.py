@@ -99,6 +99,17 @@ def test_macos_desktop_data_directory(monkeypatch, tmp_path):
     assert desktop.data_directory() == tmp_path / "Library" / "Application Support" / "TangoPosture"
 
 
+def test_linux_desktop_data_directory(monkeypatch, tmp_path):
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    assert desktop.data_directory() == tmp_path / ".local" / "share" / "TangoPosture"
+
+    custom_xdg = tmp_path / "custom-xdg"
+    monkeypatch.setenv("XDG_DATA_HOME", str(custom_xdg))
+    assert desktop.data_directory() == custom_xdg / "TangoPosture"
+
+
 @pytest.mark.parametrize("fails", [False, True])
 def test_packaged_entry_logs_smoke_test_result(monkeypatch, tmp_path, fails):
     log = tmp_path / "smoke.log"

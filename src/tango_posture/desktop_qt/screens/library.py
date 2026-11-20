@@ -488,6 +488,7 @@ class LibraryScreen(QWidget):
                 self.import_status.setText(f"Approved calibration saved: {saved}")
         except (OSError, ValueError, TypeError, KeyError, RuntimeError) as error:
             self.import_status.setText(f"Cannot edit calibration: {error}")
+            QMessageBox.warning(self, "Cannot edit calibration", str(error))
 
     def _calibrate_reference(self, path: Path, *, couple: bool = False) -> None:
         from ..calibration.editor import CalibrationEditor
@@ -499,6 +500,7 @@ class LibraryScreen(QWidget):
                 self.import_status.setText(f"Approved calibration saved: {editor.saved_path}")
         except (OSError, ValueError, TypeError, KeyError, RuntimeError) as error:
             self.import_status.setText(f"Cannot create calibration: {error}")
+            QMessageBox.warning(self, "Cannot edit calibration", str(error))
 
     def _use_defaults(self, path: Path) -> None:
         try:

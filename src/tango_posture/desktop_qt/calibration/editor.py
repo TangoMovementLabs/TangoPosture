@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any
 
 import cv2
@@ -16,7 +17,6 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDoubleSpinBox,
-    QFileDialog,
     QFormLayout,
     QHBoxLayout,
     QLabel,
@@ -38,8 +38,16 @@ from ...archive import (
     read_analytics,
     read_movement_analysis,
 )
-from ...calibration.archives import read_range_profile, save_range_profile
+from ...calibration.archives import (
+    EMBEDDED_EVIDENCE_MEMBER,
+    extract_embedded_evidence,
+    has_embedded_evidence,
+    read_range_profile,
+    save_range_profile,
+)
+from ...calibration.camera_session import ledger_metric_samples, resolve_side_frame_config
 from ...calibration.evidence import (
+    Evidence,
     cached_couple_result,
     cached_evidence,
     contiguous_pose_run_end,
@@ -61,6 +69,7 @@ from ...calibration.models import (
 from ...calibration.statistics import repeat_check, summarize_examples
 from ...config import Config
 from ...domain import FrameObservation
+from ...geometry import PoseSmoother
 from ...movement import render_movement_overlay, validate_movement_analysis
 from ...quality import reliable
 from ...references.archives import reference_directory
@@ -162,30 +171,16 @@ def open_profile_calibration_editor(
     *,
     bridge: ServiceBridge | None = None,
 ) -> Path | None:
-    """Open CalibrationEditor for an existing .tpc profile, prompting if its .tpr moved."""
-    source_reference: Path | None = None
-    while True:
-        try:
-            editor = CalibrationEditor(
-                path,
-                cfg,
-                parent,
-                bridge=bridge,
-                source_reference=source_reference,
-            )
-            if editor.exec() == QDialog.DialogCode.Accepted:
-                return editor.saved_path
-            return None
-        except FileNotFoundError:
-            chosen, _ = QFileDialog.getOpenFileName(
-                parent,
-                "Locate Source Reference (.tpr)",
-                str(reference_directory(cfg.data_dir)),
-                "Reference archives (*.tpr);;All files (*)",
-            )
-            if not chosen:
-                raise
-            source_reference = Path(chosen)
+    """Open CalibrationEditor for an existing .tpc profile."""
+    editor = CalibrationEditor(
+        path,
+        cfg,
+        parent,
+        bridge=bridge,
+    )
+    if editor.exec() == QDialog.DialogCode.Accepted:
+        return editor.saved_path
+    return None
 
 
 class CalibrationEditor(QDialog):
@@ -202,17 +197,59 @@ class CalibrationEditor(QDialog):
         ledger: list[dict[str, Any]] | None = None,
         default_context: str | None = None,
         default_name: str | None = None,
+        omit_source_archive: bool = False,
+        prefer_cfg_orientation: bool = False,
+        auto_approve_drafts: bool = False,
     ) -> None:
         super().__init__(parent)
         suffix = path.suffix.lower()
+        self._profile_only = False
+        self._profile_only_reason = ""
+        self._omit_source_archive = omit_source_archive
+        self._prefer_cfg_orientation = prefer_cfg_orientation
+        self._auto_approve_drafts = auto_approve_drafts
+        self._embedded_temp_dir: TemporaryDirectory[str] | None = None
+        self._embedded_tpr_source: Path | None = None
+        tpr_path: Path | None = None
         if suffix == ".tpc":
             self._editing_profile_path: Path | None = path
             base_profile = base_profile or read_range_profile(path)
-            tpr_path = source_reference or _resolve_reference_for_profile(base_profile, path, cfg)
             self.setWindowTitle("Edit approved range calibration")
+            if source_reference is not None:
+                tpr_path = source_reference
+            elif has_embedded_evidence(path):
+                self._embedded_temp_dir = TemporaryDirectory(prefix="tango_tpc_ev_")
+                extracted = extract_embedded_evidence(path, Path(self._embedded_temp_dir.name))
+                if extracted is not None:
+                    tpr_path = extracted
+                    self._embedded_tpr_source = extracted
+                    self._omit_source_archive = True
+                    self._prefer_cfg_orientation = True
+            if tpr_path is None and suffix == ".tpc":
+                has_ref_hint = bool(
+                    base_profile.source.get("archive")
+                    or base_profile.source.get("archive_sha256")
+                    or (
+                        isinstance(base_profile.source.get("provenance"), dict)
+                        and base_profile.source["provenance"].get("sha256")
+                    )
+                )
+                if has_ref_hint:
+                    try:
+                        tpr_path = _resolve_reference_for_profile(base_profile, path, cfg)
+                    except FileNotFoundError as error:
+                        self._profile_only = True
+                        self._profile_only_reason = str(error)
+                else:
+                    self._profile_only = True
+                    self._profile_only_reason = (
+                        "Solo calibration profile (no reference video attached)."
+                    )
         elif suffix == ".tpr":
             self._editing_profile_path = None
             tpr_path = path
+            if omit_source_archive:
+                self._embedded_tpr_source = tpr_path
             self.setWindowTitle("Review evidence & approve calibration ranges")
         else:
             raise ValueError("Create a .tpr reference before approving calibration ranges")
@@ -223,8 +260,6 @@ class CalibrationEditor(QDialog):
         self.resize(1180, 800)
         self.cfg = cfg.model_copy(deep=True)
         self.bridge = bridge
-        self.evidence = cached_evidence(tpr_path, couple=True) if self.couple else cached_evidence(tpr_path)
-        self._source_hash = self.evidence.source["archive_sha256"]
         self.holds = holds or {}
         self._metric_passages: dict[str, list[Passage]] = dict(metric_passages or {})
         self._metric_views: dict[str, str] = dict(metric_views or {})
@@ -236,8 +271,6 @@ class CalibrationEditor(QDialog):
         self._default_context = default_context
         self._default_name = default_name
         self.base_profile = base_profile
-        if base_profile is not None and base_profile.model_hash != self.evidence.model_hash:
-            raise ValueError("Reference and camera measurement models differ; reanalyze the reference")
         self.saved_path: Path | None = None
         self.approved: dict[str, ApprovedRange] = (
             dict(base_profile.metrics)
@@ -252,12 +285,356 @@ class CalibrationEditor(QDialog):
         self._stats: dict[str, Any] | None = None
         self._track_start = 0
         self._anchors: dict[int, int] = {0: 0}
-        capture = self.evidence.capture_profile
+        self.evidence: Evidence | None = None
+        self._source_hash = ""
+        self._archive: PracticeArchive | None = None
+        self._reader: VideoReader | None = None
+        self._movement_data = None
+        self._coach_data: dict[str, Any] | None = None
+        auto_linked_single = False
+
+        if not self._profile_only and tpr_path is not None:
+            try:
+                self._load_reference_evidence(tpr_path, base_profile)
+                auto_linked_single = self._auto_linked_single
+            except (OSError, ValueError, TypeError, KeyError) as error:
+                if self._editing_profile_path is None or source_reference is not None:
+                    raise
+                self._profile_only = True
+                self._profile_only_reason = (
+                    f"{error}. Editing saved profile ranges directly."
+                )
+                self.evidence = None
+                self._source_hash = ""
+                self._couple_result = None
+
+        if self._profile_only:
+            assert base_profile is not None
+            capture = base_profile.capture_profile or {}
+            updates = {
+                key: capture[key]
+                for key in ("side", "facing", "width", "height", "capture_profile")
+                if key in capture
+            }
+            if updates:
+                self.cfg = Config.model_validate({**self.cfg.model_dump(), **updates})
+
+        layout = QVBoxLayout(self)
+        form = QHBoxLayout()
+        resolved_name = (
+            self._default_name
+            if self._default_name
+            else base_profile.name
+            if self._editing_profile_path is not None and base_profile is not None
+            else f"{base_profile.name} camera check"
+            if base_profile is not None
+            else f"{tpr_path.stem if tpr_path is not None else path.stem} calibration"
+        )
+        self.name_input = QLineEdit(resolved_name)
+        self.context_combo = QComboBox()
+        self.context_combo.addItems(PRACTICE_CONTEXTS)
+        self.context_combo.setToolTip(
+            "Describes the activity this profile was created for; it does not change "
+            "measurement rules or automatically detect the activity."
+        )
+        if self._default_context:
+            self.context_combo.setEditable(True)
+            self.context_combo.setCurrentText(self._default_context)
+        elif base_profile is not None:
+            self.context_combo.setEditable(True)
+            self.context_combo.setCurrentText(base_profile.context)
+        form.addWidget(QLabel("Profile name:"))
+        form.addWidget(self.name_input, 1)
+        form.addWidget(QLabel("Practice context:"))
+        form.addWidget(self.context_combo)
+        layout.addLayout(form)
+        warning = QLabel(
+            "A reference describes this dancer and passage, not a universal technique standard. "
+            "Separate standing/walking passages when their distributions differ. "
+            "Examples and acceptable limits are independent; only explicitly approved metrics are saved."
+        )
+        warning.setWordWrap(True)
+        layout.addWidget(warning)
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        layout.addWidget(splitter, 1)
+        video = QWidget()
+        video_layout = QVBoxLayout(video)
+        self.stage = VideoStage(
+            placeholder_text=(
+                "Source reference video is not attached.\n"
+                "You can edit the profile name, context, and approved metric ranges."
+                if self._profile_only
+                else "Video preview will appear here"
+            )
+        )
+        video_layout.addWidget(self.stage, 1)
+        if not self._profile_only and self._movement_data is None:
+            movement_info = QLabel(
+                "No cached movement analysis. Analyze this reference in Review to show "
+                "pivot rings and footprints."
+            )
+            movement_info.setWordWrap(True)
+            video_layout.addWidget(movement_info)
+        playback = QHBoxLayout()
+        self.play_button = QPushButton("Play")
+        self.play_button.clicked.connect(self._toggle_play)
+        playback.addWidget(self.play_button)
+        self.time_label = QLabel()
+        playback.addWidget(self.time_label)
+        video_layout.addLayout(playback)
+        self.play_timer = QTimer(self)
+        self.play_timer.setSingleShot(True)
+        self.play_timer.timeout.connect(self._advance_frame)
+        self.scrubber = QSlider(Qt.Orientation.Horizontal)
+        self.scrubber.setRange(
+            0, max(0, (self._reader.count - 1) if self._reader is not None else 0)
+        )
+        self.scrubber.valueChanged.connect(self._seek_frame)
+        video_layout.addWidget(self.scrubber)
+        selection = QHBoxLayout()
+        self.dancer_spin = QSpinBox()
+        max_dancers = (
+            max((len(frame.poses) for frame in self.evidence.frames), default=1)
+            if self.evidence is not None
+            else 1
+        )
+        self.dancer_spin.setRange(1, max(1, max_dancers))
+        self.dancer_spin.setValue(min(self._anchors.items())[1] + 1)
+        self.dancer_spin.valueChanged.connect(self._restart_track)
+        restart = QPushButton("Select dancer / restart track here")
+        restart.clicked.connect(self._restart_track)
+        self.auto_link_button = QPushButton("Auto-link single dancer")
+        self.auto_link_button.setEnabled(
+            not self._profile_only
+            and self.evidence is not None
+            and max((len(frame.poses) for frame in self.evidence.frames), default=0) == 1
+        )
+        self.auto_link_button.setToolTip(
+            "Automatically link single-dancer segments across brief pose dropouts"
+        )
+        self.auto_link_button.clicked.connect(self._auto_link_single_dancer)
+        selection.addWidget(QLabel("Dancer at playhead:"))
+        selection.addWidget(self.dancer_spin)
+        selection.addWidget(restart)
+        selection.addWidget(self.auto_link_button)
+        video_layout.addLayout(selection)
+        self.confirm_identity = QCheckBox("I confirm all manually linked passages follow the same dancer")
+        self.confirm_identity.setChecked(self._profile_only or len(self._anchors) == 1 or auto_linked_single)
+        video_layout.addWidget(self.confirm_identity)
+        save_selection = QPushButton("Save dancer selection in reference (.tpr)")
+        save_selection.clicked.connect(self._save_selection)
+        video_layout.addWidget(save_selection)
+        chart_header = QHBoxLayout()
+        chart_header.addWidget(QLabel(
+            "Metric chart · pink = playhead · dashed = limits · shaded = examples"
+        ), 1)
+        chart_header.addWidget(QLabel("X-axis zoom:"))
+        self.chart_zoom_combo = QComboBox()
+        for label, factor in (("1× (Fit)", 1.0), ("2×", 2.0), ("4×", 4.0), ("8×", 8.0)):
+            self.chart_zoom_combo.addItem(label, factor)
+        self.chart_zoom_combo.currentIndexChanged.connect(self._change_chart_zoom)
+        chart_header.addWidget(self.chart_zoom_combo)
+        video_layout.addLayout(chart_header)
+        video_layout.addWidget(QLabel(
+            "Approved state: green = within · orange = pending · red = alert"
+        ))
+        self.chart = MetricChart()
+        self.chart.setMinimumHeight(140)
+        self.chart.seek_requested.connect(self._seek_timestamp)
+        video_layout.addWidget(self.chart)
+        splitter.addWidget(video)
+        inspector = QWidget()
+        inspector.setMaximumWidth(360)
+        controls = QVBoxLayout(inspector)
+        self.step_combo = QComboBox()
+        self.step_combo.addItems(self.steps)
+        self.metric_combo = QComboBox()
+        self.step_combo.currentTextChanged.connect(self._change_step)
+        self.metric_combo.currentIndexChanged.connect(self._change_metric)
+        controls.addWidget(self.step_combo)
+        controls.addWidget(self.metric_combo)
+        self.metric_hint = QLabel()
+        self.metric_hint.setWordWrap(True)
+        controls.addWidget(self.metric_hint)
+        options = QFormLayout()
+        self.view_combo = QComboBox()
+        self.view_combo.addItems(["all"] if self.couple else ["side", "front", "all"])
+        options.addRow("Applicable view:", self.view_combo)
+        self.passages_input = QLineEdit()
+        self.passages_input.setPlaceholderText("Example seconds: 0-3; 5-9")
+        options.addRow("Example passages:", self.passages_input)
+        self.pose_combo = QComboBox()
+        self.pose_combo.addItems(["Neutral hold", "Changed hold", "Return hold", "Fresh repeat", "Walking drill"])
+        self.pose_combo.setVisible(bool(self.holds))
+        self.pose_combo.currentIndexChanged.connect(self._select_hold)
+        options.addRow("Use captured examples:", self.pose_combo)
+        self.lower_spin, self.upper_spin = QDoubleSpinBox(), QDoubleSpinBox()
+        for field in (self.lower_spin, self.upper_spin):
+            field.setRange(-10000, 10000)
+            field.setDecimals(5)
+        options.addRow("Acceptable minimum:", self.lower_spin)
+        options.addRow("Acceptable maximum:", self.upper_spin)
+        controls.addLayout(options)
+        suggest = QPushButton("Suggest middle 80% of examples")
+        suggest.clicked.connect(self._on_suggest_clicked)
+        controls.addWidget(suggest)
+        controls.addWidget(QLabel("Distribution · tinted area = acceptable range"))
+        self.distribution = QLabel()
+        controls.addWidget(self.distribution)
+        self.stats_label = QLabel()
+        self.stats_label.setWordWrap(True)
+        controls.addWidget(self.stats_label)
+        extreme_row = QHBoxLayout()
+        extreme_buttons: list[QPushButton] = []
+        for text, key in (("Show low example", "minimum_time"), ("Show high example", "maximum_time")):
+            button = QPushButton(text)
+            button.clicked.connect(
+                lambda _, key=key: self._seek_timestamp(self._stats[key]) if self._stats and key in self._stats else None
+            )
+            extreme_row.addWidget(button)
+            extreme_buttons.append(button)
+        controls.addLayout(extreme_row)
+        self.check_label = QLabel()
+        self.check_label.setWordWrap(True)
+        controls.addWidget(self.check_label)
+        self.live_check = QCheckBox("Approve this metric for this checked camera")
+        self.live_check.setToolTip(
+            "I confirm that the camera view and movement make this metric comparable to the reference. "
+            "A repeat check demonstrates response, not universal cross-camera accuracy."
+        )
+        controls.addWidget(self.live_check)
+        approve = QPushButton("Approve metric")
+        approve.clicked.connect(self._approve)
+        skip = QPushButton("Skip / remove metric")
+        skip.clicked.connect(self._skip)
+        self.approve_all_button = QPushButton("Approve all metrics")
+        self.approve_all_button.clicked.connect(self._approve_all_metrics)
+        controls.addWidget(approve)
+        controls.addWidget(skip)
+        controls.addWidget(self.approve_all_button)
+        next_step = QPushButton("Next: " + " → ".join(self.steps))
+        next_step.clicked.connect(
+            lambda: self.step_combo.setCurrentIndex((self.step_combo.currentIndex() + 1) % len(self.steps))
+        )
+        controls.addWidget(next_step)
+        self.approved_label = QLabel("No metrics approved")
+        self.approved_label.setWordWrap(True)
+        controls.addWidget(self.approved_label)
+        controls.addStretch()
+        save = QPushButton("Save approved .tpc profile")
+        save.clicked.connect(self._save)
+        controls.addWidget(save)
+        self.defaults_button = QPushButton("Use approved ranges as Settings defaults...")
+        self.defaults_button.setEnabled(bridge is not None and not self.couple)
+        self.defaults_button.clicked.connect(self._use_defaults)
+        controls.addWidget(self.defaults_button)
+        inspector_scroll = QScrollArea()
+        inspector_scroll.setWidgetResizable(True)
+        inspector_scroll.setMinimumWidth(340)
+        inspector_scroll.setMaximumWidth(380)
+        inspector_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        inspector_scroll.setWidget(inspector)
+        splitter.addWidget(inspector_scroll)
+        splitter.setSizes([820, 340])
+        self.status_label = QLabel()
+        self.status_label.setWordWrap(True)
+        layout.addWidget(self.status_label)
+        self.metric_combo.activated.connect(self._mark_current_metric_draft)
+        self.passages_input.editingFinished.connect(self._on_passages_edited)
+        self.lower_spin.valueChanged.connect(self._on_limits_edited)
+        self.upper_spin.valueChanged.connect(self._on_limits_edited)
+        self.view_combo.activated.connect(lambda: self._mark_current_metric_draft())
+        self.live_check.clicked.connect(lambda: self._mark_current_metric_draft())
+        self.view_combo.currentIndexChanged.connect(lambda: self._recompute())
+        self._samples: dict[str, list[tuple[float, float | None]]] = {}
+        if self._profile_only:
+            for widget in (
+                self.play_button,
+                self.scrubber,
+                self.dancer_spin,
+                restart,
+                self.auto_link_button,
+                save_selection,
+                self.confirm_identity,
+                self.chart_zoom_combo,
+                suggest,
+                self.approve_all_button,
+                *extreme_buttons,
+            ):
+                widget.setEnabled(False)
+            self.passages_input.setReadOnly(True)
+        if (
+            self._editing_profile_path is not None
+            and self.approved
+            and all(target.view == "all" for target in self.approved.values())
+        ):
+            self.view_combo.blockSignals(True)
+            self.view_combo.setCurrentText("all")
+            self.view_combo.blockSignals(False)
+        if self.couple:
+            self.dancer_spin.setEnabled(False)
+            restart.setEnabled(False)
+            save_selection.setEnabled(False)
+            self.auto_link_button.setEnabled(False)
+            self.confirm_identity.setText("I confirm dancer A and B identities throughout these passages")
+            self.confirm_identity.setChecked(False)
+        if self._omit_source_archive:
+            save_selection.setEnabled(False)
+        self._recompute()
+        if not self._profile_only and self._auto_approve_drafts and self._metric_passages:
+            self._preapprove_draft_metrics()
+        if self.approved:
+            self._approved_coach_data = self._evaluate_approved(self.approved)
+            self._update_approved_label()
+        initial_step = self.steps[0]
+        preferred_keys = set(self.approved) | set(self._metric_passages)
+        if preferred_keys:
+            for step in self.steps:
+                if any(
+                    group == step and key in preferred_keys
+                    for key, (group, _label, _unit) in self.metric_details.items()
+                ):
+                    initial_step = step
+                    break
+        self.step_combo.blockSignals(True)
+        self.step_combo.setCurrentText(initial_step)
+        self.step_combo.blockSignals(False)
+        self._change_step(initial_step)
+        initial_seek_ts: float | None = None
+        if self._ledger and not self._profile_only and self.evidence is not None:
+            initial_key = self.metric_combo.currentData()
+            initial_target = self.approved.get(initial_key) if initial_key is not None else None
+            if initial_target is not None and initial_target.passages:
+                initial_seek_ts = initial_target.passages[0].start
+        if initial_seek_ts is not None:
+            self._seek_timestamp(initial_seek_ts)
+        else:
+            self._seek_frame(0)
+        self.finished.connect(self._release)
+
+    def _load_reference_evidence(
+        self, tpr_path: Path, base_profile: RangeProfile | None
+    ) -> None:
+        evidence = (
+            cached_evidence(tpr_path, couple=True)
+            if self.couple
+            else cached_evidence(tpr_path)
+        )
+        self.evidence = evidence
+        self._source_hash = evidence.source["archive_sha256"]
+        if base_profile is not None and base_profile.model_hash != evidence.model_hash:
+            raise ValueError(
+                "Reference and camera measurement models differ; reanalyze the reference"
+            )
+        capture = evidence.capture_profile
         if not capture:
             raise ValueError("Reference capture settings are missing; reanalyze it in Review")
+        keys_to_copy = ("width", "height", "capture_profile") if self._prefer_cfg_orientation else (
+            "side", "facing", "width", "height", "capture_profile"
+        )
         self.cfg = Config.model_validate({
             **self.cfg.model_dump(),
-            **{key: capture[key] for key in ("side", "facing", "width", "height", "capture_profile")},
+            **{key: capture[key] for key in keys_to_copy},
         })
         self._archive = PracticeArchive(tpr_path)
         try:
@@ -265,13 +642,13 @@ class CalibrationEditor(QDialog):
                 raise ValueError("Reference changed while loading evidence; reopen it")
             segment = self._archive.manifest["segments"][0]
             descriptor = json.loads((self._archive.folder / "reference.json").read_text())
-            clip_starts_static = is_static_pose_run(self.evidence.frames, 0)
+            clip_starts_static = is_static_pose_run(evidence.frames, 0)
 
             def _is_stale_static_anchor(frame_index: int) -> bool:
                 return (
                     frame_index > 0
                     and not clip_starts_static
-                    and is_static_pose_run(self.evidence.frames, frame_index)
+                    and is_static_pose_run(evidence.frames, frame_index)
                 )
 
             anchors = None if self.couple else descriptor.get("dancer_anchors")
@@ -341,16 +718,41 @@ class CalibrationEditor(QDialog):
                         for index, frame in enumerate(self.evidence.frames)
                     },
                 }
-            auto_linked_single = False
-            if (
+            ledger_auto_link = (
+                not self.couple
+                and bool(self._ledger)
+                and anchors is None
+            )
+            self._auto_linked_single = (
                 anchors is None
                 and self._editing_profile_path is None
                 and has_coach_frames
                 and max((len(frame.poses) for frame in self.evidence.frames), default=0) == 1
-            ):
+            )
+            if ledger_auto_link:
+                ledger_anchors = single_dancer_anchors(
+                    self.evidence,
+                    self.cfg.confidence,
+                    skip_static=False,
+                    allow_multi_pose_gaps=True,
+                )
+                if self._editing_profile_path is None or len(self._anchors) <= 1:
+                    self._anchors = ledger_anchors
+                    self._track_start = min(self._anchors)
+                    self._auto_linked_single = True
+            elif self._auto_linked_single:
                 self._anchors = single_dancer_anchors(self.evidence, self.cfg.confidence)
                 self._track_start = min(self._anchors)
-                auto_linked_single = True
+            if (
+                not self._auto_linked_single
+                and not self.couple
+                and bool(self._ledger)
+                and self._editing_profile_path is not None
+                and self._anchors
+                and set(self._anchors.values()) == {0}
+                and max((len(frame.poses) for frame in self.evidence.frames), default=0) <= 1
+            ):
+                self._auto_linked_single = True
             self._movement_data = analytics.get("movement_data")
             if self._movement_data is None:
                 movement = read_movement_analysis(self._archive.folder, 0)
@@ -364,249 +766,40 @@ class CalibrationEditor(QDialog):
                 pose_recovery=coach.get("pose_recovery"),
                 movement_data=self._movement_data,
             )
-        except Exception:
-            if hasattr(self, "_reader"):
-                self._reader.close()
-            self._archive.close()
-            raise
+            if not has_coach_frames and self._coach_data is not None and self.cfg.overlay_smoothing > 0:
+                frames_map = self._coach_data.get("frames")
+                if isinstance(frames_map, dict):
+                    smoother = PoseSmoother(
+                        smoothing_sec=self.cfg.overlay_smoothing,
+                        max_gap=self.cfg.max_gap,
+                    )
+                    for idx_key in sorted(frames_map, key=int):
+                        entry = frames_map[idx_key]
+                        raw_list = entry.get("display_poses") or entry.get("measurement_poses") or []
+                        if raw_list:
+                            from ...references.coach import _deserialise_pose_list, _serialise_pose
 
-        layout = QVBoxLayout(self)
-        form = QHBoxLayout()
-        resolved_name = (
-            self._default_name
-            if self._default_name
-            else base_profile.name
-            if self._editing_profile_path is not None and base_profile is not None
-            else f"{base_profile.name} camera check"
-            if base_profile is not None
-            else f"{tpr_path.stem} calibration"
-        )
-        self.name_input = QLineEdit(resolved_name)
-        self.context_combo = QComboBox()
-        self.context_combo.addItems(PRACTICE_CONTEXTS)
-        self.context_combo.setToolTip(
-            "Describes the activity this profile was created for; it does not change "
-            "measurement rules or automatically detect the activity."
-        )
-        if self._default_context:
-            self.context_combo.setEditable(True)
-            self.context_combo.setCurrentText(self._default_context)
-        elif base_profile is not None:
-            self.context_combo.setEditable(True)
-            self.context_combo.setCurrentText(base_profile.context)
-        form.addWidget(QLabel("Profile name:"))
-        form.addWidget(self.name_input, 1)
-        form.addWidget(QLabel("Practice context:"))
-        form.addWidget(self.context_combo)
-        layout.addLayout(form)
-        warning = QLabel(
-            "A reference describes this dancer and passage, not a universal technique standard. "
-            "Separate standing/walking passages when their distributions differ. "
-            "Examples and acceptable limits are independent; only explicitly approved metrics are saved."
-        )
-        warning.setWordWrap(True)
-        layout.addWidget(warning)
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        layout.addWidget(splitter, 1)
-        video = QWidget()
-        video_layout = QVBoxLayout(video)
-        self.stage = VideoStage()
-        video_layout.addWidget(self.stage, 1)
-        if self._movement_data is None:
-            movement_info = QLabel(
-                "No cached movement analysis. Analyze this reference in Review to show "
-                "pivot rings and footprints."
-            )
-            movement_info.setWordWrap(True)
-            video_layout.addWidget(movement_info)
-        playback = QHBoxLayout()
-        self.play_button = QPushButton("Play")
-        self.play_button.clicked.connect(self._toggle_play)
-        playback.addWidget(self.play_button)
-        self.time_label = QLabel()
-        playback.addWidget(self.time_label)
-        video_layout.addLayout(playback)
-        self.play_timer = QTimer(self)
-        self.play_timer.setSingleShot(True)
-        self.play_timer.timeout.connect(self._advance_frame)
-        self.scrubber = QSlider(Qt.Orientation.Horizontal)
-        self.scrubber.setRange(0, self._reader.count - 1)
-        self.scrubber.valueChanged.connect(self._seek_frame)
-        video_layout.addWidget(self.scrubber)
-        selection = QHBoxLayout()
-        self.dancer_spin = QSpinBox()
-        self.dancer_spin.setRange(1, max(1, max(len(frame.poses) for frame in self.evidence.frames)))
-        self.dancer_spin.setValue(min(self._anchors.items())[1] + 1)
-        self.dancer_spin.valueChanged.connect(self._restart_track)
-        restart = QPushButton("Select dancer / restart track here")
-        restart.clicked.connect(self._restart_track)
-        self.auto_link_button = QPushButton("Auto-link single dancer")
-        self.auto_link_button.setEnabled(
-            max((len(frame.poses) for frame in self.evidence.frames), default=0) == 1
-        )
-        self.auto_link_button.setToolTip(
-            "Automatically link single-dancer segments across brief pose dropouts"
-        )
-        self.auto_link_button.clicked.connect(self._auto_link_single_dancer)
-        selection.addWidget(QLabel("Dancer at playhead:"))
-        selection.addWidget(self.dancer_spin)
-        selection.addWidget(restart)
-        selection.addWidget(self.auto_link_button)
-        video_layout.addLayout(selection)
-        self.confirm_identity = QCheckBox("I confirm all manually linked passages follow the same dancer")
-        self.confirm_identity.setChecked(len(self._anchors) == 1 or auto_linked_single)
-        video_layout.addWidget(self.confirm_identity)
-        save_selection = QPushButton("Save dancer selection in reference (.tpr)")
-        save_selection.clicked.connect(self._save_selection)
-        video_layout.addWidget(save_selection)
-        chart_header = QHBoxLayout()
-        chart_header.addWidget(QLabel(
-            "Metric chart · pink = playhead · dashed = limits · shaded = examples"
-        ), 1)
-        chart_header.addWidget(QLabel("X-axis zoom:"))
-        self.chart_zoom_combo = QComboBox()
-        for label, factor in (("1× (Fit)", 1.0), ("2×", 2.0), ("4×", 4.0), ("8×", 8.0)):
-            self.chart_zoom_combo.addItem(label, factor)
-        self.chart_zoom_combo.currentIndexChanged.connect(self._change_chart_zoom)
-        chart_header.addWidget(self.chart_zoom_combo)
-        video_layout.addLayout(chart_header)
-        video_layout.addWidget(QLabel(
-            "Approved state: green = within · orange = pending · red = alert"
-        ))
-        self.chart = MetricChart()
-        self.chart.setMinimumHeight(140)
-        self.chart.seek_requested.connect(self._seek_timestamp)
-        video_layout.addWidget(self.chart)
-        splitter.addWidget(video)
-        inspector = QWidget()
-        inspector.setMaximumWidth(360)
-        controls = QVBoxLayout(inspector)
-        self.step_combo = QComboBox()
-        self.step_combo.addItems(self.steps)
-        self.metric_combo = QComboBox()
-        self.step_combo.currentTextChanged.connect(self._change_step)
-        self.metric_combo.currentIndexChanged.connect(self._change_metric)
-        controls.addWidget(self.step_combo)
-        controls.addWidget(self.metric_combo)
-        self.metric_hint = QLabel()
-        self.metric_hint.setWordWrap(True)
-        controls.addWidget(self.metric_hint)
-        options = QFormLayout()
-        self.view_combo = QComboBox()
-        self.view_combo.addItems(["all"] if self.couple else ["side", "front", "all"])
-        options.addRow("Applicable view:", self.view_combo)
-        self.passages_input = QLineEdit()
-        self.passages_input.setPlaceholderText("Example seconds: 0-3; 5-9")
-        options.addRow("Example passages:", self.passages_input)
-        self.pose_combo = QComboBox()
-        self.pose_combo.addItems(["Neutral hold", "Changed hold", "Return hold", "Fresh repeat", "Walking drill"])
-        self.pose_combo.setVisible(bool(self.holds))
-        self.pose_combo.currentIndexChanged.connect(self._select_hold)
-        options.addRow("Use captured examples:", self.pose_combo)
-        self.lower_spin, self.upper_spin = QDoubleSpinBox(), QDoubleSpinBox()
-        for field in (self.lower_spin, self.upper_spin):
-            field.setRange(-10000, 10000)
-            field.setDecimals(5)
-        options.addRow("Acceptable minimum:", self.lower_spin)
-        options.addRow("Acceptable maximum:", self.upper_spin)
-        controls.addLayout(options)
-        suggest = QPushButton("Suggest middle 80% of examples")
-        suggest.clicked.connect(self._on_suggest_clicked)
-        controls.addWidget(suggest)
-        controls.addWidget(QLabel("Distribution · tinted area = acceptable range"))
-        self.distribution = QLabel()
-        controls.addWidget(self.distribution)
-        self.stats_label = QLabel()
-        self.stats_label.setWordWrap(True)
-        controls.addWidget(self.stats_label)
-        extreme_row = QHBoxLayout()
-        for text, key in (("Show low example", "minimum_time"), ("Show high example", "maximum_time")):
-            button = QPushButton(text)
-            button.clicked.connect(
-                lambda _, key=key: self._seek_timestamp(self._stats[key]) if self._stats else None
-            )
-            extreme_row.addWidget(button)
-        controls.addLayout(extreme_row)
-        self.check_label = QLabel()
-        self.check_label.setWordWrap(True)
-        controls.addWidget(self.check_label)
-        self.live_check = QCheckBox("Approve this metric for this checked camera")
-        self.live_check.setToolTip(
-            "I confirm that the camera view and movement make this metric comparable to the reference. "
-            "A repeat check demonstrates response, not universal cross-camera accuracy."
-        )
-        controls.addWidget(self.live_check)
-        approve = QPushButton("Approve metric")
-        approve.clicked.connect(self._approve)
-        skip = QPushButton("Skip / remove metric")
-        skip.clicked.connect(self._skip)
-        self.approve_all_button = QPushButton("Approve all metrics")
-        self.approve_all_button.clicked.connect(self._approve_all_metrics)
-        controls.addWidget(approve)
-        controls.addWidget(skip)
-        controls.addWidget(self.approve_all_button)
-        next_step = QPushButton("Next: " + " → ".join(self.steps))
-        next_step.clicked.connect(
-            lambda: self.step_combo.setCurrentIndex((self.step_combo.currentIndex() + 1) % len(self.steps))
-        )
-        controls.addWidget(next_step)
-        self.approved_label = QLabel("No metrics approved")
-        self.approved_label.setWordWrap(True)
-        controls.addWidget(self.approved_label)
-        controls.addStretch()
-        save = QPushButton("Save approved .tpc profile")
-        save.clicked.connect(self._save)
-        controls.addWidget(save)
-        self.defaults_button = QPushButton("Use approved ranges as Settings defaults...")
-        self.defaults_button.setEnabled(bridge is not None and not self.couple)
-        self.defaults_button.clicked.connect(self._use_defaults)
-        controls.addWidget(self.defaults_button)
-        inspector_scroll = QScrollArea()
-        inspector_scroll.setWidgetResizable(True)
-        inspector_scroll.setMinimumWidth(340)
-        inspector_scroll.setMaximumWidth(380)
-        inspector_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
-        inspector_scroll.setWidget(inspector)
-        splitter.addWidget(inspector_scroll)
-        splitter.setSizes([820, 340])
-        self.status_label = QLabel()
-        self.status_label.setWordWrap(True)
-        layout.addWidget(self.status_label)
-        self.metric_combo.activated.connect(self._mark_current_metric_draft)
-        self.passages_input.editingFinished.connect(self._on_passages_edited)
-        self.lower_spin.valueChanged.connect(self._on_limits_edited)
-        self.upper_spin.valueChanged.connect(self._on_limits_edited)
-        self.view_combo.activated.connect(lambda: self._mark_current_metric_draft())
-        self.live_check.clicked.connect(lambda: self._mark_current_metric_draft())
-        self.view_combo.currentIndexChanged.connect(lambda: self._recompute())
-        self._samples: dict[str, list[tuple[float, float | None]]] = {}
-        if (
-            self._editing_profile_path is not None
-            and self.approved
-            and all(target.view == "all" for target in self.approved.values())
-        ):
-            self.view_combo.blockSignals(True)
-            self.view_combo.setCurrentText("all")
-            self.view_combo.blockSignals(False)
-        if self.couple:
-            self.dancer_spin.setEnabled(False)
-            restart.setEnabled(False)
-            save_selection.setEnabled(False)
-            self.auto_link_button.setEnabled(False)
-            self.confirm_identity.setText("I confirm dancer A and B identities throughout these passages")
-            self.confirm_identity.setChecked(False)
-        self._recompute()
-        if self.approved:
-            self._approved_coach_data = self._evaluate_approved(self.approved)
-            self._update_approved_label()
-        self._change_step(self.steps[0])
-        self._seek_frame(0)
-        self.finished.connect(self._release)
+                            ts = float(entry.get("timestamp", 0.0))
+                            smoothed = smoother.update(_deserialise_pose_list(raw_list), ts)
+                            entry["display_poses"] = [_serialise_pose(p) for p in smoothed]
+        except Exception:
+            if self._reader is not None:
+                self._reader.close()
+                self._reader = None
+            if self._archive is not None:
+                self._archive.close()
+                self._archive = None
+            raise
 
     def _release(self, *_args: object) -> None:
         self.play_timer.stop()
-        self._reader.close()
-        self._archive.close()
+        if self._reader is not None:
+            self._reader.close()
+        if self._archive is not None:
+            self._archive.close()
+        if self._embedded_temp_dir is not None:
+            self._embedded_temp_dir.cleanup()
+            self._embedded_temp_dir = None
 
     def _mark_current_metric_draft(self, *_args: object) -> None:
         key = self.metric_combo.currentData()
@@ -655,6 +848,8 @@ class CalibrationEditor(QDialog):
             self.metric_combo.blockSignals(False)
 
     def _restart_track(self, *_args: object) -> None:
+        if self._profile_only or self.evidence is None:
+            return
         self._track_start = self.scrubber.value()
         self._anchors[self._track_start] = self.dancer_spin.value() - 1
         single_dancer = max((len(frame.poses) for frame in self.evidence.frames), default=0) <= 1
@@ -679,6 +874,8 @@ class CalibrationEditor(QDialog):
         self._seek_frame(self.scrubber.value())
 
     def _auto_link_single_dancer(self) -> None:
+        if self._profile_only or self.evidence is None:
+            return
         try:
             anchors = single_dancer_anchors(self.evidence, self.cfg.confidence)
         except ValueError as error:
@@ -699,6 +896,13 @@ class CalibrationEditor(QDialog):
             f"Auto-linked single dancer across {len(anchors)} segment(s) over the full clip."
         )
 
+    def _ledger_side_cfg(self, base_cfg: Config) -> Config:
+        if not self._ledger:
+            return base_cfg
+        return base_cfg.model_copy(
+            update={"max_view_width": base_cfg.max_view_width + base_cfg.solo_camera.front_view_width_margin}
+        )
+
     def _samples_for_view(self, view_mode: str) -> dict[str, list[tuple[float, float | None]]]:
         if self.couple:
             assert self._couple_result is not None
@@ -712,13 +916,20 @@ class CalibrationEditor(QDialog):
         if cached is not None:
             return cached
         cfg = self.cfg.model_copy(update={"allow_all_angles": view_mode != "side"})
-        computed = metric_samples(self._selected_frames, cfg, view=view_mode)  # type: ignore[arg-type]
+        if view_mode == "side" and self._ledger:
+            computed = ledger_metric_samples(self._selected_frames, cfg, self._ledger, view="side")
+        else:
+            computed = metric_samples(self._selected_frames, cfg, view=view_mode)  # type: ignore[arg-type]
         self._samples_by_view[view_mode] = computed
         return computed
 
     def _recompute(self, *_args: object, suggest: bool = True) -> None:
         from ...calibration.evidence import Evidence
 
+        if self._profile_only or self.evidence is None:
+            if self.metric_combo.currentData():
+                self._update_stats(suggest=False)
+            return
         if self.couple:
             self._selected_frames = self.evidence.frames
             self._samples = self._samples_for_view("all")
@@ -764,19 +975,22 @@ class CalibrationEditor(QDialog):
         hint = _METRIC_HINTS.get(key, "")
         self.metric_hint.setText(hint)
         self.metric_hint.setVisible(bool(hint))
-        first, last = self.evidence.frames[0].timestamp, self.evidence.frames[-1].timestamp
-        holds = self.holds.get(self.step_combo.currentText())
-        if key in self._metric_passages:
-            passages = self._metric_passages[key]
-        elif holds:
-            passages = [holds[0]]
-        else:
-            passages = [Passage(start=first, end=last + 1 / self._reader.fps)]
         draft_spec = self._draft_specs.get(key) if key in self._draft_keys else None
         approved = self.approved.get(key)
         target = approved or (
             self.base_profile.metrics.get(key) if self.base_profile is not None else None
         )
+        if self._profile_only or self.evidence is None or self._reader is None:
+            passages = target.passages if target is not None else []
+        else:
+            first, last = self.evidence.frames[0].timestamp, self.evidence.frames[-1].timestamp
+            holds = self.holds.get(self.step_combo.currentText())
+            if key in self._metric_passages:
+                passages = self._metric_passages[key]
+            elif holds:
+                passages = [holds[0]]
+            else:
+                passages = [Passage(start=first, end=last + 1 / self._reader.fps)]
         if draft_spec is not None:
             self.passages_input.setText(draft_spec["passages_text"])
             view_changed = self.view_combo.currentText() != draft_spec["view"]
@@ -806,6 +1020,8 @@ class CalibrationEditor(QDialog):
                 field.blockSignals(True)
                 field.setValue(val)
                 field.blockSignals(False)
+            self._update_stats(suggest=False)
+        elif self._profile_only:
             self._update_stats(suggest=False)
         elif key in self._metric_views:
             preferred_view = self._metric_views[key]
@@ -856,6 +1072,7 @@ class CalibrationEditor(QDialog):
         self._mark_current_metric_draft()
 
     def _parse_passages_text(self, text: str) -> list[Passage]:
+        assert self.evidence is not None and self._reader is not None
         passages = []
         origin = self.evidence.frames[0].timestamp
         end = self.evidence.frames[-1].timestamp + 1 / self._reader.fps
@@ -876,6 +1093,7 @@ class CalibrationEditor(QDialog):
             self.chart.set_x_zoom(float(factor))
 
     def _tracked_end_timestamp(self) -> float:
+        assert self.evidence is not None
         for selected_frame in reversed(self._selected_frames):
             if selected_frame.poses:
                 return selected_frame.timestamp
@@ -884,6 +1102,7 @@ class CalibrationEditor(QDialog):
     def _build_chart_series(
         self, key: str
     ) -> tuple[list[tuple[float, float | None]], list[list[tuple[float, float]]], float]:
+        assert self.evidence is not None
         origin = self.evidence.frames[0].timestamp
         points = [(t - origin, value) for t, value in self._samples[key]]
         segments: list[list[tuple[float, float]]] = []
@@ -907,6 +1126,7 @@ class CalibrationEditor(QDialog):
         return points, segments, origin
 
     def _first_dropout_time(self) -> float | None:
+        assert self.evidence is not None
         seen_linked = False
         skip_until = -1
         origin = self.evidence.frames[0].timestamp
@@ -926,9 +1146,125 @@ class CalibrationEditor(QDialog):
             return raw_frame.timestamp - origin
         return None
 
+    def _render_profile_only_visuals(
+        self, key: str, target: ApprovedRange, lo: float, hi: float
+    ) -> None:
+        from PySide6.QtCore import Qt
+        from PySide6.QtGui import QColor, QPainter, QPen, QPixmap
+
+        passages = list(getattr(target, "passages", ()) or ())
+        if passages:
+            origin = float(min(p.start for p in passages))
+            end_t = max(1.0, float(max(p.end for p in passages)) - origin)
+            intervals = [(float(p.start) - origin, float(p.end) - origin) for p in passages]
+            segments = [
+                [(float(p.start) - origin, float(target.median)), (float(p.end) - origin, float(target.median))]
+                for p in passages
+            ]
+        else:
+            dur = max(1.0, float(target.selected_duration or 5.0))
+            end_t = dur
+            intervals = [(0.0, dur)]
+            segments = [[(0.0, float(target.median)), (dur, float(target.median))]]
+        points: list[tuple[float, float | None]] = [(pt[0], pt[1]) for seg in segments for pt in seg]
+        self.chart.set_data(
+            MetricData(points, segments, {}, 0, 0),
+            end_t,
+            0.0,
+            bounds=(lo, hi),
+            reference_line=float(target.median),
+            intervals=intervals,
+            unit=self.metric_details[key][2],
+        )
+
+        pix = QPixmap(320, 100)
+        pix.fill(QColor("#111722"))
+        painter = QPainter(pix)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        span_lo = min(lo, float(target.p10), float(target.median))
+        span_hi = max(hi, float(target.p90), float(target.median))
+        pad = max(1e-3, (span_hi - span_lo) * 0.15)
+        vmin, vmax = span_lo - pad, span_hi + pad
+        span = max(1e-6, vmax - vmin)
+
+        def _x(val: float) -> float:
+            return 16.0 + ((val - vmin) / span) * 288.0
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#315748"))
+        x_lo, x_hi = _x(lo), _x(hi)
+        painter.drawRoundedRect(int(x_lo), 24, max(2, int(x_hi - x_lo)), 46, 4, 4)
+
+        painter.setBrush(QColor("#73d1b3"))
+        x_p10, x_p90 = _x(float(target.p10)), _x(float(target.p90))
+        painter.drawRoundedRect(int(x_p10), 38, max(2, int(x_p90 - x_p10)), 18, 3, 3)
+
+        painter.setPen(QPen(QColor("#f5f7fb"), 2))
+        x_med = int(_x(float(target.median)))
+        painter.drawLine(x_med, 18, x_med, 76)
+
+        painter.setPen(QColor("#9aa7bc"))
+        painter.drawText(16, 92, f"Range {lo:.3g}..{hi:.3g} | Median {target.median:.3g} {self.metric_details[key][2]}")
+        painter.end()
+        self.distribution.setPixmap(pix)
+
     def _update_stats(self, *, suggest: bool = False) -> None:
         key = self.metric_combo.currentData()
-        if key is None or not self._samples:
+        if key is None:
+            return
+        if self._profile_only or self.evidence is None:
+            self._stats = None
+            target = self.approved.get(key) or (
+                self.base_profile.metrics.get(key) if self.base_profile is not None else None
+            )
+            if target is None:
+                self.chart.set_data(None)
+                self.distribution.clear()
+                self.stats_label.setText("Not present in this saved profile (no source video attached).")
+                self.live_check.setEnabled(False)
+                self.check_label.setText(self._profile_only_reason or "No source video attached.")
+                self.status_label.setText(
+                    self._profile_only_reason or "Editing saved profile ranges directly."
+                )
+                return
+            lo, hi = self.lower_spin.value(), self.upper_spin.value()
+            if lo > hi:
+                self.chart.set_data(None)
+                self.distribution.clear()
+                self.stats_label.setText("Invalid range: acceptable minimum must be ≤ maximum.")
+                self.status_label.setText("Adjust minimum/maximum limits so minimum ≤ maximum.")
+                return
+            self._render_profile_only_visuals(key, target, lo, hi)
+            self._stats = {
+                "lower": lo,
+                "upper": hi,
+                "median": target.median,
+                "p10": target.p10,
+                "p90": target.p90,
+                "valid_duration": target.valid_duration,
+                "selected_duration": target.selected_duration,
+                "samples": target.samples,
+                "inside_fraction": target.inside_fraction,
+            }
+            self.stats_label.setText(
+                f"Saved median: {target.median:.4g} {self.metric_details[key][2]}\n"
+                f"Saved 10th–90th%: {target.p10:.4g} … {target.p90:.4g}\n"
+                f"Usable: {target.valid_duration:.2f} / {target.selected_duration:.2f}s "
+                f"({target.samples} samples)\nSaved inside fraction: {target.inside_fraction:.1%}"
+            )
+            is_camera = str(
+                (self.base_profile.capture_profile if self.base_profile else {}).get("source", "")
+            ).startswith("camera:")
+            self.live_check.setEnabled(is_camera)
+            self.check_label.setText(
+                self._profile_only_reason
+                or "Editing saved profile ranges directly (source video not attached)."
+            )
+            self.status_label.setText(
+                "Edit profile name, context, or limits, then click 'Approve metric' and 'Save approved .tpc profile'."
+            )
+            return
+        if not self._samples:
             return
         self._stats = None
         dropout_time = self._first_dropout_time()
@@ -967,8 +1303,8 @@ class CalibrationEditor(QDialog):
             if (
                 target is not None and self._approved_coach_data is not None
                 and target.view == self.view_combo.currentText()
-                and target.lower == self.lower_spin.value()
-                and target.upper == self.upper_spin.value()
+                and math.isclose(target.lower, self.lower_spin.value(), abs_tol=1e-5)
+                and math.isclose(target.upper, self.upper_spin.value(), abs_tol=1e-5)
             ):
                 for index, frame in enumerate(self._selected_frames):
                     entry = self._approved_coach_data["frames"][str(index)]
@@ -1077,6 +1413,19 @@ class CalibrationEditor(QDialog):
         camera_check_passed: bool,
     ) -> ApprovedRange:
         view_mode = view if view in ("side", "front", "all") else "side"
+        if self._profile_only or self.evidence is None:
+            existing = self.approved.get(key) or (
+                self.base_profile.metrics.get(key) if self.base_profile is not None else None
+            )
+            if existing is None:
+                raise ValueError("Cannot add a new metric without source video evidence")
+            return ApprovedRange.model_validate({
+                **existing.model_dump(),
+                "lower": float(existing.lower if lower is None else lower),
+                "upper": float(existing.upper if upper is None else upper),
+                "view": view_mode,
+                "camera_check_passed": camera_check_passed,
+            })
         samples = self._samples_for_view(view_mode).get(key, [])
         stats = summarize_examples(
             samples,
@@ -1097,6 +1446,28 @@ class CalibrationEditor(QDialog):
             "camera_check_passed": camera_check_passed,
         })
 
+    def _preapprove_draft_metrics(self) -> None:
+        if self._profile_only or self.evidence is None:
+            return
+        updated = dict(self.approved)
+        for key, passages in self._metric_passages.items():
+            if key not in self.metric_details:
+                continue
+            preferred_view = self._metric_views.get(key) or self.view_combo.currentText()
+            try:
+                updated[key] = self._build_approved_range(
+                    key,
+                    view=preferred_view,
+                    passages=passages,
+                    lower=None,
+                    upper=None,
+                    camera_check_passed=False,
+                )
+            except (ValueError, TypeError, KeyError):
+                continue
+        if updated:
+            self.approved = updated
+
     def _commit_pending_drafts(self) -> None:
         if not (self._editing_profile_path is not None or self.approved):
             return
@@ -1109,9 +1480,13 @@ class CalibrationEditor(QDialog):
             if not spec:
                 continue
             try:
-                passages = self._parse_passages_text(spec["passages_text"])
-                view = spec["view"] if spec["view"] in ("side", "front", "all") else "side"
                 existing = updated.get(key)
+                passages = (
+                    list(existing.passages)
+                    if (self._profile_only and existing is not None)
+                    else self._parse_passages_text(spec["passages_text"])
+                )
+                view = spec["view"] if spec["view"] in ("side", "front", "all") else "side"
                 if (
                     existing is not None
                     and existing.view == view
@@ -1145,10 +1520,18 @@ class CalibrationEditor(QDialog):
             return
         key = self.metric_combo.currentData()
         try:
+            existing = self.approved.get(key) or (
+                self.base_profile.metrics.get(key) if self.base_profile is not None else None
+            )
+            passages = (
+                list(existing.passages)
+                if (self._profile_only and existing is not None)
+                else self._passages()
+            )
             target = self._build_approved_range(
                 key,
                 view=self.view_combo.currentText(),
-                passages=self._passages(),
+                passages=passages,
                 lower=self.lower_spin.value(),
                 upper=self.upper_spin.value(),
                 camera_check_passed=self.live_check.isChecked(),
@@ -1168,6 +1551,8 @@ class CalibrationEditor(QDialog):
         self._seek_frame(self.scrubber.value())
 
     def _approve_all_metrics(self) -> None:
+        if self._profile_only or self.evidence is None or self._reader is None:
+            return
         current_key = self.metric_combo.currentData()
         updated = dict(self.approved)
         skipped: list[str] = []
@@ -1203,13 +1588,13 @@ class CalibrationEditor(QDialog):
                     lower, upper = spec["lower"], spec["upper"]
                     cam_ok = bool(spec["camera_check_passed"])
                 except (ValueError, TypeError, KeyError):
-                    passages = [holds[0]] if holds else fallback_passage
-                    preferred_view = self.view_combo.currentText()
+                    passages = self._metric_passages.get(key) or ([holds[0]] if holds else fallback_passage)
+                    preferred_view = self._metric_views.get(key) or self.view_combo.currentText()
                     lower, upper = None, None
                     cam_ok = False
             else:
-                passages = [holds[0]] if holds else fallback_passage
-                preferred_view = self.view_combo.currentText()
+                passages = self._metric_passages.get(key) or ([holds[0]] if holds else fallback_passage)
+                preferred_view = self._metric_views.get(key) or self.view_combo.currentText()
                 lower, upper = None, None
                 cam_ok = False
 
@@ -1278,7 +1663,9 @@ class CalibrationEditor(QDialog):
         self._update_stats()
         self._seek_frame(self.scrubber.value())
 
-    def _evaluate_approved(self, approved: dict[str, ApprovedRange]) -> dict[str, Any]:
+    def _evaluate_approved(self, approved: dict[str, ApprovedRange]) -> dict[str, Any] | None:
+        if self._profile_only or self.evidence is None:
+            return None
         if self.couple:
             samples = {key: dict(rows) for key, rows in self._samples_for_view("all").items()}
             return {"frames": {
@@ -1291,41 +1678,74 @@ class CalibrationEditor(QDialog):
                 ]}
                 for index, frame in enumerate(self._selected_frames)
             }}
+        eval_cfg = self._ledger_side_cfg(self.cfg)
+        frames_payload: dict[str, Any] = {}
+        for index, frame in enumerate(self._selected_frames):
+            if self._ledger:
+                eval_frame, eval_cfg_i = resolve_side_frame_config(frame, self.cfg, self._ledger)
+            else:
+                eval_frame, eval_cfg_i = frame, self.cfg
+            frame_entry: dict[str, Any] = {
+                "timestamp": eval_frame.timestamp,
+                "measurement_poses": [
+                    {name: [lm.x, lm.y, lm.z, lm.visibility, lm.presence]
+                     for name, lm in pose.items()}
+                    for pose in eval_frame.poses
+                ],
+            }
+            if self._ledger:
+                frame_entry["side"] = eval_cfg_i.side
+                frame_entry["facing"] = eval_cfg_i.facing
+            frames_payload[str(index)] = frame_entry
         data = {
             "width": self.evidence.frames[0].width,
             "height": self.evidence.frames[0].height,
-            "frames": {
-                str(index): {
-                    "timestamp": frame.timestamp,
-                    "measurement_poses": [
-                        {name: [lm.x, lm.y, lm.z, lm.visibility, lm.presence]
-                         for name, lm in pose.items()}
-                        for pose in frame.poses
-                    ],
-                }
-                for index, frame in enumerate(self._selected_frames)
-            },
+            "frames": frames_payload,
         }
-        return compare_approved_coach_data(data, self.cfg, approved)
+        return compare_approved_coach_data(data, eval_cfg, approved)
 
     def _approved_profile(self) -> RangeProfile:
         self._commit_pending_drafts()
+        if not self.approved:
+            raise ValueError("Approve at least one metric; skipped metrics will remain unavailable")
+        name = self.name_input.text().strip()
+        if self._profile_only or self.evidence is None or self._archive is None:
+            assert self.base_profile is not None
+            extra: dict[str, Any] = {}
+            if name == self.base_profile.name:
+                extra["id"] = self.base_profile.id
+                extra["created_at_utc"] = self.base_profile.created_at_utc
+            return RangeProfile(
+                **extra,
+                name=name,
+                context=self.context_combo.currentText(),
+                model_hash=self.base_profile.model_hash,
+                capture_profile=dict(self.base_profile.capture_profile),
+                source=dict(self.base_profile.source),
+                metrics=self.approved,
+                camera_checks=dict(self.base_profile.camera_checks),
+            )
         if file_sha256(self._archive.path) != self._source_hash:
             raise ValueError("Reference changed while reviewing; reopen it before saving a profile")
         if not self.confirm_identity.isChecked():
             raise ValueError("Confirm that manually linked passages follow the same dancer")
-        if not self.approved:
-            raise ValueError("Approve at least one metric; skipped metrics will remain unavailable")
-        name = self.name_input.text().strip()
+        base_source = dict(self.evidence.source)
+        if self._omit_source_archive:
+            base_source.pop("archive", None)
+            base_source.pop("archive_sha256", None)
+            if self._embedded_tpr_source is not None:
+                base_source["embedded_evidence"] = EMBEDDED_EVIDENCE_MEMBER
+            if not base_source.get("provenance"):
+                base_source.pop("provenance", None)
         source: dict[str, Any] = {
-            **self.evidence.source, "dancer_mode": "couple" if self.couple else "single",
+            **base_source, "dancer_mode": "couple" if self.couple else "single",
             "dancer_at_track_start": self.dancer_spin.value() - 1,
             "track_start_frame": self._track_start,
             "dancer_anchors": [
                 {"frame": frame, "dancer": dancer} for frame, dancer in sorted(self._anchors.items())
             ],
         }
-        extra: dict[str, Any] = {}
+        extra = {}
         if self._editing_profile_path is not None and self.base_profile is not None:
             if "target_reference" in self.base_profile.source:
                 source["target_reference"] = self.base_profile.source["target_reference"]
@@ -1334,10 +1754,14 @@ class CalibrationEditor(QDialog):
                 extra["created_at_utc"] = self.base_profile.created_at_utc
         elif self.base_profile is not None:
             source["target_reference"] = self.base_profile.source
+        capture_profile = dict(self.evidence.capture_profile)
+        if self._prefer_cfg_orientation:
+            capture_profile["side"] = self.cfg.side
+            capture_profile["facing"] = self.cfg.facing
         return RangeProfile(
             **extra,
             name=name, context=self.context_combo.currentText(),
-            model_hash=self.evidence.model_hash, capture_profile=self.evidence.capture_profile,
+            model_hash=self.evidence.model_hash, capture_profile=capture_profile,
             source=source,
             metrics=self.approved,
             camera_checks={
@@ -1374,7 +1798,12 @@ class CalibrationEditor(QDialog):
                     self._editing_profile_path is not None
                     and path.resolve() == self._editing_profile_path.resolve()
                 )
-            save_range_profile(path, result, overwrite=overwrite)
+            save_range_profile(
+                path,
+                result,
+                overwrite=overwrite,
+                embedded_evidence=self._embedded_tpr_source,
+            )
             self.saved_path = path
             self.accept()
         except (OSError, ValueError, TypeError) as error:
@@ -1383,6 +1812,8 @@ class CalibrationEditor(QDialog):
     def _save_selection(self) -> None:
         from ...archive import _archive_lock, _rewrite_members
 
+        if self._profile_only or self._archive is None or self.evidence is None:
+            return
         try:
             if not self.confirm_identity.isChecked():
                 raise ValueError("Confirm that the linked passages follow the same dancer first")
@@ -1404,31 +1835,46 @@ class CalibrationEditor(QDialog):
             self.status_label.setText("Dancer selection saved. Measurements and raw video are unchanged.")
         except (OSError, ValueError, TypeError, KeyError) as error:
             self.status_label.setText(f"Reference selection not saved: {error}")
+
     def _seek_timestamp(self, timestamp: float) -> None:
+        evidence = self.evidence
+        if self._profile_only or evidence is None:
+            return
         index = min(
-            range(len(self.evidence.frames)),
-            key=lambda index: abs(self.evidence.frames[index].timestamp - timestamp),
+            range(len(evidence.frames)),
+            key=lambda index: abs(evidence.frames[index].timestamp - timestamp),
         )
         self.scrubber.setValue(index)
 
     def _seek_frame(self, index: int) -> None:
+        evidence = self.evidence
+        reader = self._reader
+        coach_data = self._coach_data
+        if self._profile_only or evidence is None or reader is None or coach_data is None:
+            return
         try:
-            frame = self.evidence.frames[index]
+            frame = evidence.frames[index]
             image = render_coach_frame_overlay(
-                self._reader.frame(index), self._coach_data, index, self.cfg,
+                reader.frame(index), coach_data, index, self.cfg,
                 verbose_skeleton=True, show_vertical_axis=True, show_footer=False,
                 lines_only=True,
             )
             image = render_movement_overlay(
-                image, self._movement_data, index, self._reader.fps,
-                frame_timestamp=frame.timestamp - self.evidence.frames[0].timestamp,
+                image, self._movement_data, index, reader.fps,
+                frame_timestamp=frame.timestamp - evidence.frames[0].timestamp,
                 show_pivots=True, show_steps=True,
                 step_history_seconds=self.cfg.replay_step_history_seconds,
             )
             if self._approved_coach_data is not None and not self.couple:
                 entry = self._approved_coach_data["frames"][str(index)]
+                if self._ledger:
+                    draw_frame, draw_cfg = resolve_side_frame_config(
+                        self._selected_frames[index], self.cfg, self._ledger
+                    )
+                else:
+                    draw_frame, draw_cfg = self._selected_frames[index], self.cfg
                 image = render_approved_feedback(
-                    image, self._selected_frames[index], self.cfg, self.approved,
+                    image, draw_frame, draw_cfg, self.approved,
                     entry["calibration_rows"],
                 )
             height, width = image.shape[:2]
@@ -1443,16 +1889,16 @@ class CalibrationEditor(QDialog):
 
                 overlays = self._couple_result.get("frame_overlays", [])
                 overlay = next((row for row in overlays if row.get("frame_index") == index), None)
-                image = render_couple_frame_overlay(self._reader.frame(index), overlay)
+                image = render_couple_frame_overlay(reader.frame(index), overlay)
             self.stage.set_frame(numpy_to_qimage(image))
             self.chart.set_playhead(frame.timestamp)
             self.time_label.setText(f"{frame.timestamp:.3f}s · frame {index}")
             if self.play_button.text() == "Pause":
-                if index + 1 == len(self.evidence.frames):
+                if index + 1 == len(evidence.frames):
                     self.play_timer.stop()
                     self.play_button.setText("Play")
                 else:
-                    gap = self.evidence.frames[index + 1].timestamp - frame.timestamp
+                    gap = evidence.frames[index + 1].timestamp - frame.timestamp
                     self.play_timer.start(max(1, round(gap * 1000)))
         except (OSError, ValueError, RuntimeError) as error:
             self.status_label.setText(f"Cannot display reference frame: {error}")

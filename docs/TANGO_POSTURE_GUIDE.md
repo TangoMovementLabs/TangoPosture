@@ -378,11 +378,11 @@ Creating or editing a `.tpc` profile separates **example evidence selection** fr
    - Select your camera device, verify the recorded side and facing direction (**in the recorded image**, even if preview mirroring is enabled), toggle **Speak instructions** if desired, and click **Start camera preview**.
    - **Begin** unlocks once one dancer is cleanly tracked with full-body head and ankle/shoe landmarks.
 2. **Sample guided instructions**:
-   - *Front hold A*: "Face the camera. Stand as you do when you're ready to walk. Look ahead and let your shoulders settle."
-   - *Front hold B*: "Relax for a moment. Now return to the same ready-to-walk stance."
-   - *Side hold A*: "Turn side-on in the direction shown. Keep the camera where it is. Take up your usual tango stance."
-   - *Side hold B*: "Relax, then return to the same stance. Keep looking in the same direction."
-   - *Solo walking (2 passes)*: "Take up to four natural tango steps across the frame, keeping your shoes visible. Stop at the end."
+   - *Front hold A*: "Turn to the camera in your ready-to-walk stance."
+   - *Front hold B*: "Relax, then turn to the camera in the same stance."
+   - *Side hold A*: "Turn left so you are side-on to the camera."
+   - *Side hold B*: "Turn right so you are side-on to the camera."
+   - *Solo walking (2 passes)*: "Turn left so you are side-on to the camera, then take up to four natural tango steps across the frame, keeping your shoes visible. Stop at the end." / "Turn right so you are side-on to the camera, then take up to four natural tango steps across the frame, keeping your shoes visible. Stop at the end."
 3. **Individual measurement checks & saving**:
    - After standing holds complete, you can run optional **neutral A → changed A → neutral B → changed B** checks (e.g., gentle shoulder raise, gaze drop, knee straighten) to qualify metrics for live feedback, record **Solo walking**, or review and save **Front**, **Side**, and **Solo walking · Side** profiles atomically.
    - Use **Check with camera…** on any saved `.tpc` profile in **Calibration** to verify or re-check it against a live camera.
@@ -1753,6 +1753,22 @@ Maximum time window around turn end for pairing a couple turn exit marker.
 Maximum individual torso tilt accepted when splitting a merged close-embrace detection.
 
 **Example:** `25.0°` keeps split close-embrace torsos physically plausible.
+
+### Couple axis max separation (metres) - `dancer_analysis.couple_axis_max_separation_m`
+
+**Default:** `1.0 metres`; positive.
+
+Estimated horizontal separation between Dancer A and Dancer B (assuming `0.50 m` per torso length) above which the shared Couple midpoint axis line is hidden, leaving only individual dancer lines.
+
+**Example:** `1.0 m` hides the shared midpoint axis when partners walk apart in soltada while keeping it visible in close and open embrace.
+
+### Couple axis rejoin separation (metres) - `dancer_analysis.couple_axis_rejoin_separation_m`
+
+**Default:** `0.80 metres`; positive, at most `couple_axis_max_separation_m`.
+
+Hysteresis threshold below which the shared Couple midpoint axis line reappears once partners move back closer together.
+
+**Example:** `0.80 m` prevents the shared midpoint line from flickering on and off around `1.0 m`.
 
 ### Solo camera calibration settings
 

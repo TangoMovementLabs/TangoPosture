@@ -423,3 +423,60 @@ def test_portrait_video_measures_head_and_trunk_across_full_clip():
         assert all(val is not None for _, val in all_samples[key])
 
 
+def test_save_range_profile_embeds_and_extracts_evidence_tpr(tmp_path):
+    import cv2
+    import numpy as np
+
+    from tango_posture.archive import append_segment
+    from tango_posture.calibration.archives import (
+        EMBEDDED_EVIDENCE_MEMBER,
+        extract_embedded_evidence,
+        has_embedded_evidence,
+    )
+    from tango_posture.calibration.evidence import cached_evidence
+    from tango_posture.references.archives import promote_reference
+
+    video = tmp_path / "src.mp4"
+    report = tmp_path / "src.md"
+    practice = tmp_path / "src.tp"
+    writer = cv2.VideoWriter(str(video), cv2.VideoWriter.fourcc(*"mp4v"), 10, (160, 120))
+    assert writer.isOpened()
+    entries = []
+    for idx in range(3):
+        writer.write(np.zeros((120, 160, 3), dtype=np.uint8))
+        pose = frame(idx / 10.0).poses[0]
+        entries.append({"poses": [_serialise_pose(pose)]})
+    writer.release()
+    report.write_text("# Evidence\n", encoding="utf-8")
+    append_segment(
+        practice,
+        report,
+        video,
+        None,
+        [idx / 10.0 for idx in range(3)],
+        analytics={
+            "model_hash": MANIFEST["sha256"],
+            "capture_profile": profile(Config(), 160, 120, "video"),
+            "frames": entries,
+            "max_gap": 0.5,
+        },
+    )
+    tpr_path = tmp_path / "src.tpr"
+    promote_reference(practice, tpr_path, "Source Evidence")
+
+    tpc_path = tmp_path / "Embedded.tpc"
+    original = range_profile()
+    save_range_profile(tpc_path, original, embedded_evidence=tpr_path)
+
+    assert read_manifest(tpc_path)["segments"] == []
+    assert read_range_profile(tpc_path) == original
+    assert has_embedded_evidence(tpc_path)
+    with ZipFile(tpc_path) as archive:
+        assert EMBEDDED_EVIDENCE_MEMBER in archive.namelist()
+
+    extracted = extract_embedded_evidence(tpc_path, tmp_path / "extracted")
+    assert extracted is not None and extracted.is_file()
+    ev = cached_evidence(extracted)
+    assert len(ev.frames) == 3
+
+

@@ -14,7 +14,8 @@ def main() -> None:
             sizes=[(size, size) for size in (16, 24, 32, 48, 64, 128, 256)],
         )
         icon.save(output / "TangoPosture.icns")
-    print(f"Prepared macOS and Windows icons in {output}")
+        icon.resize((256, 256), Image.Resampling.LANCZOS).save(output / "TangoPosture.png")
+    print(f"Prepared macOS, Windows, and Linux icons in {output}")
 
 
 if __name__ == "__main__":

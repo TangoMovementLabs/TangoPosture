@@ -36,6 +36,7 @@ from ...archive import (
     read_analytics,
     store_analytics,
 )
+from ...config import Config
 from ...core.entities import ReferenceSummary
 from ...core.session_state import (
     SessionState,
@@ -56,7 +57,13 @@ from ...couple import classify_opening_window
 from ...domain import FrameObservation
 from ..components.beat_strip import BeatStrip
 from ..components.video_stage import VideoStage
-from ..practice.worker import PracticeThread, QtPracticeDisplay, QtPracticeWorker
+from ..practice.worker import (
+    PracticeThread,
+    QtPracticeDisplay,
+    QtPracticeWorker,
+    discover_cameras,
+    populate_camera_combo,
+)
 from ..router import Router
 from ..service_bridge import ServiceBridge, numpy_to_qimage
 from ..theme import (
@@ -72,10 +79,19 @@ from ..theme import (
 class PracticeScreen(QWidget):
     stopped = Signal()
 
-    def __init__(self, bridge: ServiceBridge, router: Router, parent: QWidget | None = None):
+    def __init__(
+        self,
+        bridge: ServiceBridge,
+        router: Router,
+        parent: QWidget | None = None,
+        *,
+        camera_discoverer: Callable[..., list[tuple[int, str]]] = discover_cameras,
+    ):
         super().__init__(parent)
         self.bridge = bridge
         self.router = router
+        self._camera_discoverer = camera_discoverer
+        self._last_bridge_camera = self.bridge.config.camera
         self.state = SessionState()
         self._references: dict[str, ReferenceSummary] = {}
         self._active_reference: ReferenceSummary | None = None
@@ -110,18 +126,21 @@ class PracticeScreen(QWidget):
 
         setup_card = QFrame()
         setup_card.setProperty("class", "card")
-        setup_layout = QHBoxLayout(setup_card)
+        setup_layout = QVBoxLayout(setup_card)
         setup_layout.setContentsMargins(14, 10, 14, 10)
-        setup_layout.setSpacing(10)
+        setup_layout.setSpacing(8)
 
-        setup_layout.addWidget(QLabel("Practice name:"))
+        primary_row = QHBoxLayout()
+        primary_row.setSpacing(10)
+
+        primary_row.addWidget(QLabel("Practice name:"))
         self.session_title = QLineEdit(
             f"Practice_{time.strftime('%Y%m%d_%H%M%S')}"
         )
         self.session_title.setAccessibleName("Practice archive name")
-        setup_layout.addWidget(self.session_title, 1)
+        primary_row.addWidget(self.session_title, 1)
 
-        setup_layout.addWidget(QLabel("Mode:"))
+        primary_row.addWidget(QLabel("Mode:"))
         self.mode_combo = QComboBox()
         self.mode_combo.addItem("Auto-detect", "auto")
         self.mode_combo.addItem("Single dancer", "single")
@@ -129,17 +148,37 @@ class PracticeScreen(QWidget):
         mode_idx = self.mode_combo.findData(self.bridge.config.dancer_analysis.default_dancer_mode)
         if mode_idx >= 0:
             self.mode_combo.setCurrentIndex(mode_idx)
-        setup_layout.addWidget(self.mode_combo)
+        primary_row.addWidget(self.mode_combo)
 
         self.preview_btn = QPushButton("Start Preview")
         self.preview_btn.setProperty("class", "primary")
         self.preview_btn.clicked.connect(self._toggle_preview)
-        setup_layout.addWidget(self.preview_btn)
+        primary_row.addWidget(self.preview_btn)
 
         self.record_btn = QPushButton("Start Record (R)")
         self.record_btn.setProperty("class", "accent")
         self.record_btn.clicked.connect(self._toggle_recording)
-        setup_layout.addWidget(self.record_btn)
+        primary_row.addWidget(self.record_btn)
+        setup_layout.addLayout(primary_row)
+
+        camera_row = QHBoxLayout()
+        camera_row.setSpacing(10)
+        camera_row.addWidget(QLabel("Camera:"))
+        self.camera_combo = QComboBox()
+        self.camera_combo.setAccessibleName("Practice camera")
+        self.camera_combo.setMinimumWidth(220)
+        self.camera_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToContents)
+        self.camera_combo.addItem(
+            f"Camera {self.bridge.config.camera}", self.bridge.config.camera
+        )
+        self.camera_combo.currentIndexChanged.connect(self._on_camera_changed)
+        camera_row.addWidget(self.camera_combo)
+
+        self.scan_cameras_btn = QPushButton("Scan cameras")
+        self.scan_cameras_btn.clicked.connect(self._scan_cameras)
+        camera_row.addWidget(self.scan_cameras_btn)
+        camera_row.addStretch()
+        setup_layout.addLayout(camera_row)
 
         # Keep hidden compatibility widgets without cluttering the UI
         self.source_combo = QComboBox()
@@ -285,6 +324,7 @@ class PracticeScreen(QWidget):
             shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
             shortcut.activated.connect(lambda action=action: self._run_shortcut(action))
             self._shortcuts.append(shortcut)
+        self.bridge.config_changed.connect(self._on_config_changed)
         self.refresh()
         self._update_source_controls()
         self._sync_controls()
@@ -386,6 +426,59 @@ class PracticeScreen(QWidget):
             auto_record=auto_record,
         )
 
+    def _selected_camera(self) -> int:
+        data = self.camera_combo.currentData()
+        return self.bridge.config.camera if data is None else int(data)
+
+    def _selected_practice_config(self) -> Config:
+        cam_idx = self._selected_camera()
+        base_cfg = self.bridge.config
+        if cam_idx == base_cfg.camera:
+            return base_cfg
+        return Config.model_validate({
+            **base_cfg.model_dump(exclude={"axis_curve"}),
+            "camera": cam_idx,
+        })
+
+    def _scan_cameras(self) -> None:
+        if self.worker_running:
+            return
+        discovered = populate_camera_combo(
+            self.camera_combo,
+            self._camera_discoverer,
+            fallback_index=self.bridge.config.camera,
+        )
+        if not discovered:
+            self.status_label.setText("No cameras detected.")
+        elif len(discovered) == 1:
+            self.status_label.setText(
+                f"Camera scan complete: {self.camera_combo.currentText()}."
+            )
+        else:
+            self.status_label.setText(
+                f"Found {len(discovered)} cameras. Selected: {self.camera_combo.currentText()}."
+            )
+
+    def _on_camera_changed(self) -> None:
+        if not self.worker_running and self.camera_combo.currentText():
+            self.status_label.setText(f"Selected {self.camera_combo.currentText()}.")
+
+    def _on_config_changed(self, cfg: object = None) -> None:
+        active_cfg = cfg if isinstance(cfg, Config) else self.bridge.config
+        if active_cfg.camera == self._last_bridge_camera:
+            return
+        self._last_bridge_camera = active_cfg.camera
+        self.camera_combo.blockSignals(True)
+        try:
+            pos = self.camera_combo.findData(active_cfg.camera)
+            if pos < 0:
+                self.camera_combo.addItem(f"Camera {active_cfg.camera}", active_cfg.camera)
+                pos = self.camera_combo.findData(active_cfg.camera)
+            if pos >= 0:
+                self.camera_combo.setCurrentIndex(pos)
+        finally:
+            self.camera_combo.blockSignals(False)
+
     def _launch_worker(
         self,
         *,
@@ -405,7 +498,7 @@ class PracticeScreen(QWidget):
         if auto_record and not calibration_only:
             display.recording.set()
         worker = QtPracticeWorker(
-            self.bridge.config,
+            self._selected_practice_config(),
             display,
             reference_id=reference.id if reference else None,
             reference_path=reference.path if reference else None,
@@ -804,6 +897,8 @@ class PracticeScreen(QWidget):
         self.preview_btn.setEnabled(not calibrating)
         self.session_title.setEnabled(not running)
         self.mode_combo.setEnabled(not running)
+        self.camera_combo.setEnabled(not running)
+        self.scan_cameras_btn.setEnabled(not running)
         self.auto_song_cb.setEnabled(running and not calibrating)
         active = running and not calibrating
         self.record_btn.setEnabled(not self._save_pending and not calibrating)
