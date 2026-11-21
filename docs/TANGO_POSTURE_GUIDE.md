@@ -289,6 +289,44 @@ MediaPipe Pose Landmarker detects 33 landmarks per person. Tango Posture Coach n
 | **Pelvis & Legs** | `left_hip`, `right_hip`, `left_knee`, `right_knee`, `left_ankle`, `right_ankle` | Core torso length (`min_torso`), hip midpoint, 3D hip yaw (pivots), knee flexion, hip offset, slow-tango lift |
 | **Feet** | `left_heel`, `right_heel`, `left_foot_index`, `right_foot_index` | Offline step placement (`movement.py`) and rendered floor footprints |
 
+The full **33-point MediaPipe Pose Landmarker** index map (`0–32`, verified in `pose/constants.py` and `pose/mediapipe_backend.py`):
+
+| Index | MediaPipe Landmark | Status in TangoPosture | Role / Notes |
+| --- | --- | --- | --- |
+| `0` | `nose` | Retained | Head pitch, hip-offset head proxy, framing check |
+| `1` | `left_eye_inner` | Ignored | Extra face landmark discarded at extraction |
+| `2` | `left_eye` | Ignored | Extra face landmark discarded at extraction |
+| `3` | `left_eye_outer` | Ignored | Extra face landmark discarded at extraction |
+| `4` | `right_eye_inner` | Ignored | Extra face landmark discarded at extraction |
+| `5` | `right_eye` | Ignored | Extra face landmark discarded at extraction |
+| `6` | `right_eye_outer` | Ignored | Extra face landmark discarded at extraction |
+| `7` | `left_ear` | Retained | Head pitch, head-forward, head inclination, shoulder clearance |
+| `8` | `right_ear` | Retained | Head pitch, head-forward, head inclination, shoulder clearance |
+| `9` | `mouth_left` | Ignored | Extra face landmark discarded at extraction |
+| `10` | `mouth_right` | Ignored | Extra face landmark discarded at extraction |
+| `11` | `left_shoulder` | Retained | Torso axis, trunk inclination, shoulder clearance, embrace/role |
+| `12` | `right_shoulder` | Retained | Torso axis, trunk inclination, shoulder clearance, embrace/role |
+| `13` | `left_elbow` | Retained | Leader/Follower role, embrace geometry, overlay skeleton |
+| `14` | `right_elbow` | Retained | Leader/Follower role, embrace geometry, overlay skeleton |
+| `15` | `left_wrist` | Retained | Leader/Follower arm posture, embrace compactness |
+| `16` | `right_wrist` | Retained | Leader/Follower arm posture, embrace compactness |
+| `17` | `left_pinky` | Ignored | Extra hand landmark discarded at extraction |
+| `18` | `right_pinky` | Ignored | Extra hand landmark discarded at extraction |
+| `19` | `left_index` | Ignored | Extra hand landmark discarded at extraction |
+| `20` | `right_index` | Ignored | Extra hand landmark discarded at extraction |
+| `21` | `left_thumb` | Ignored | Extra hand landmark discarded at extraction |
+| `22` | `right_thumb` | Ignored | Extra hand landmark discarded at extraction |
+| `23` | `left_hip` | Retained | Core torso scale (`min_torso`), hip offset, 3D pivot yaw, knee flexion |
+| `24` | `right_hip` | Retained | Core torso scale (`min_torso`), hip offset, 3D pivot yaw, knee flexion |
+| `25` | `left_knee` | Retained | Knee flexion angle, closed-embrace knee check |
+| `26` | `right_knee` | Retained | Knee flexion angle, closed-embrace knee check |
+| `27` | `left_ankle` | Retained | Knee flexion, hip-offset ankle endpoint, framing, steps |
+| `28` | `right_ankle` | Retained | Knee flexion, hip-offset ankle endpoint, framing, steps |
+| `29` | `left_heel` | Retained | Offline step placement & floor footprint overlays |
+| `30` | `right_heel` | Retained | Offline step placement & floor footprint overlays |
+| `31` | `left_foot_index` | Retained | Offline step toe point & floor footprint direction/length |
+| `32` | `right_foot_index` | Retained | Offline step toe point & floor footprint direction/length |
+
 **Coordinate transformation**: Normalized MediaPipe image coordinates `(x_norm, y_norm) in [0, 1]` are multiplied by the actual decoded video dimensions `(width, height)` before any angle or length computation so non-square aspect ratios never distort angles:
 
 ```text
