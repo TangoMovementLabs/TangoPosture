@@ -65,17 +65,48 @@ def smoke_test() -> None:
     print(f"Desktop smoke test passed (OpenCV {cv2.__version__}, sounddevice {sounddevice.__version__})")
 
 
+def _parse_desktop_args(argv: list[str]) -> tuple[bool, Path | None]:
+    """Accept only troubleshoot flags in packaged desktop mode; reject unexpected arguments."""
+    troubleshoot = os.environ.get("TANGOPOSTURE_TROUBLESHOOT", "").strip() == "1"
+    log_dir: Path | None = None
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg in ("--troubleshoot", "troubleshoot"):
+            troubleshoot = True
+            i += 1
+        elif arg == "--log-dir":
+            if i + 1 >= len(argv):
+                raise ValueError("The desktop application does not accept command-line arguments")
+            log_dir = Path(argv[i + 1])
+            i += 2
+        elif arg.startswith("--log-dir="):
+            log_dir = Path(arg.split("=", 1)[1])
+            i += 1
+        else:
+            raise ValueError("The desktop application does not accept command-line arguments")
+    if log_dir is not None and not troubleshoot:
+        raise ValueError("The desktop application does not accept command-line arguments")
+    return troubleshoot, log_dir
+
+
 def main() -> int:
     if sys.argv[1:] == ["--smoke-test"]:
         smoke_test()
         return 0
-    if sys.argv[1:]:
-        raise ValueError("The desktop application does not accept command-line arguments")
+    troubleshoot, log_dir = _parse_desktop_args(sys.argv[1:])
 
     from .config import load, startup_config_path
     from .desktop_qt import launch_qt
+    from .troubleshoot import enable_troubleshoot, log_config
 
     directory = data_directory()
     directory.mkdir(parents=True, exist_ok=True)
     os.chdir(directory)
-    return launch_qt(load(startup_config_path(None), {"model_path": str(bundled_model())}))
+    if troubleshoot:
+        log_path = enable_troubleshoot(log_dir=log_dir or (directory / "logs"), source="desktop")
+        print(f"Troubleshoot logging enabled: {log_path}", file=sys.stderr, flush=True)
+    cfg = load(startup_config_path(None), {"model_path": str(bundled_model())})
+    if troubleshoot:
+        log_config(cfg, source="desktop")
+    return launch_qt(cfg)

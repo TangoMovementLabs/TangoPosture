@@ -34,6 +34,9 @@ from ..domain import (
     Calibration,
     FrameObservation,
     Landmark,
+    PoseOrigin,
+    infer_pose_origin,
+    normalize_pose_origin,
 )
 from ..geometry import (
     knee_geometry_kwargs,
@@ -96,18 +99,47 @@ def _coach_observation(
     if require_measurements and "measurement_poses" not in entry:
         raise ValueError("This cache has display landmarks only. Analyze posture again before comparing.")
     raw_poses = entry.get("measurement_poses", entry.get("poses"))
+    using_display = False
     if use_display_poses and not require_measurements and "display_poses" in entry:
         raw_poses = entry["display_poses"]
+        using_display = True
     if require_measurements and not isinstance(raw_poses, list):
         raise TypeError("Invalid cached measurement poses. Analyze posture again.")
     if not isinstance(raw_poses, list):
         raw_poses = [entry.get("pose")]
+    raw_pose_origins = (
+        entry.get("display_pose_origins")
+        if using_display
+        else entry.get("measurement_pose_origins")
+    )
+    if not isinstance(raw_pose_origins, list) and not using_display:
+        raw_pose_origins = entry.get("pose_origins")
+    raw_lm_origins = (
+        entry.get("display_landmark_origins")
+        if using_display
+        else entry.get("measurement_landmark_origins")
+    )
+    if not isinstance(raw_lm_origins, list) and not using_display:
+        raw_lm_origins = entry.get("landmark_origins")
     poses = []
-    for raw_pose in raw_poses:
+    pose_origins: list[PoseOrigin] = []
+    for pose_idx, raw_pose in enumerate(raw_poses):
         if require_measurements and not isinstance(raw_pose, dict):
             raise TypeError("Invalid cached measurement pose. Analyze posture again.")
         if not isinstance(raw_pose, dict) or not raw_pose:
             continue
+        default_origin: PoseOrigin = (
+            normalize_pose_origin(raw_pose_origins[pose_idx])
+            if isinstance(raw_pose_origins, list) and pose_idx < len(raw_pose_origins)
+            else ("display_interpolated" if using_display and entry.get("interpolated") else "detected")
+        )
+        lm_origin_map = (
+            raw_lm_origins[pose_idx]
+            if isinstance(raw_lm_origins, list)
+            and pose_idx < len(raw_lm_origins)
+            and isinstance(raw_lm_origins[pose_idx], Mapping)
+            else {}
+        )
         pose = {}
         for name, coords in raw_pose.items():
             if require_measurements and (
@@ -115,15 +147,24 @@ def _coach_observation(
             ):
                 raise ValueError("Invalid cached measurement landmark. Analyze posture again.")
             if isinstance(coords, list | tuple) and len(coords) >= 3:
+                lm_origin = normalize_pose_origin(lm_origin_map.get(str(name)), default_origin)
                 pose[str(name)] = Landmark(
                     x=float(coords[0]), y=float(coords[1]),
                     z=float(coords[2]) if coords[2] is not None else None,
                     visibility=float(coords[3]) if len(coords) >= 4 and coords[3] is not None else None,
                     presence=float(coords[4]) if len(coords) >= 5 and coords[4] is not None else None,
+                    origin=lm_origin,
                 )
         if pose:
             poses.append(pose)
-    return FrameObservation(float(entry.get("timestamp", 0.0)), width, height, poses)
+            pose_origins.append(
+                normalize_pose_origin(
+                    raw_pose_origins[pose_idx]
+                    if isinstance(raw_pose_origins, list) and pose_idx < len(raw_pose_origins)
+                    else infer_pose_origin(pose),
+                )
+            )
+    return FrameObservation(float(entry.get("timestamp", 0.0)), width, height, poses, pose_origins=pose_origins)
 
 
 def _data_media_sha256(data: Mapping[str, Any]) -> str | None:
@@ -600,11 +641,46 @@ def interpolate_coach_data(
                 for j in interp_lower:
                     diag.setdefault(j, "Recovered for display")
         forward_raw = orig_entry.get("poses") or orig_entry.get("measurement_poses") or []
+        orig_pose_origins = orig_entry.get("measurement_pose_origins") or []
+        orig_lm_origins = orig_entry.get("measurement_landmark_origins") or []
+        disp_pose_origins: list[PoseOrigin] = []
+        disp_lm_origins: list[dict[str, PoseOrigin]] = []
+        for p_idx, pose in enumerate(obs.poses):
+            base_pose_origin = (
+                normalize_pose_origin(orig_pose_origins[p_idx])
+                if isinstance(orig_pose_origins, list) and p_idx < len(orig_pose_origins)
+                else infer_pose_origin(pose)
+            )
+            base_lm_map = (
+                orig_lm_origins[p_idx]
+                if isinstance(orig_lm_origins, list)
+                and p_idx < len(orig_lm_origins)
+                and isinstance(orig_lm_origins[p_idx], Mapping)
+                else {}
+            )
+            p_lm_map: dict[str, PoseOrigin] = {}
+            any_interp = False
+            all_interp = bool(pose)
+            for j, lm in pose.items():
+                if origins.get(j) in ("interpolated", "backward"):
+                    p_lm_map[j] = "display_interpolated"
+                    any_interp = True
+                else:
+                    p_lm_map[j] = normalize_pose_origin(base_lm_map.get(j), base_pose_origin)
+                    all_interp = False
+            disp_lm_origins.append(p_lm_map)
+            disp_pose_origins.append(
+                "display_interpolated"
+                if (all_interp and any_interp) or base_pose_origin == "display_interpolated"
+                else base_pose_origin
+            )
         new_frames[index] = {
             **orig_entry,
             "display_poses": [_serialise_pose(pose) for pose in obs.poses],
             "display_forward_poses": forward_raw,
             "display_joint_origins": origins,
+            "display_pose_origins": disp_pose_origins,
+            "display_landmark_origins": disp_lm_origins,
             "display_diagnostics": diag,
             "display_status_summary": status_txt,
         }

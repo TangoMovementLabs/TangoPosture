@@ -296,6 +296,9 @@ uv run tango-posture run --camera 0 --side left --facing right
 # Open a named practice; R records, E saves a segment, Q saves and quits
 uv run tango-posture run --camera 0 --side left --facing right \
    --practice-name 'Evening practice'
+# Capture a timestamped low-level telemetry log (logs/troubleshoot_*.log)
+uv run tango-posture --troubleshoot
+uv run tango-posture --troubleshoot --log-dir logs run --camera 0
 # Use the CLI launcher:
 ./run_practice.sh --cli --calibration latest --confirm-camera-unchanged
 ```
@@ -379,6 +382,7 @@ Common settings:
 - **`calibrations/<name>.tpc`**: Version-2 calibration ZIP with `profile.json` and a manifest: explicitly approved ranges, units, views, context, evidence coverage, provenance, model and measurement versions. It needs no source video to score. Version-1 `.tpc` files remain readable as neutral baselines, without invented distributions. Legacy JSON baselines also remain readable.
 - **Legacy `reports/` and `videos/`**: Existing loose files remain untouched and readable; new practice reports and recordings are archived instead.
 - **`data/tango.sqlite3` & `data/exports/SESSION_ID/`**: SQLite session storage (`summary.json`, `observations.csv`, `events.csv`).
+- **`logs/troubleshoot_YYYYMMDD_HHMMSS_ffffff_pid<PID>.log`**: Created per run when launched with `--troubleshoot`, `troubleshoot`, `--log-dir <path>`, or `TANGOPOSTURE_TROUBLESHOOT=1` (uses `<data_dir>/logs/` in packaged desktop builds). Records machine/OS specs, macOS TCC permissions, all installed Python package versions, live imports, OpenCV capture/writer telemetry, MediaPipe pose inference timings, `sounddevice` audio telemetry, Qt/multimedia devices, config snapshots, and crashes.
 
 ---
 

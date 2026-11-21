@@ -158,8 +158,14 @@ def interpolate_poses(
                     pose[name] = Landmark(
                         x=x, y=y,
                         visibility=1.0, presence=1.0,
+                        origin="display_interpolated",
                     )
-                    result[index] = replace(result[index], poses=[pose])
+                    new_origins = (
+                        list(result[index].pose_origins)
+                        if result[index].pose_origins
+                        else (["display_interpolated"] if not existing_pose else [])
+                    )
+                    result[index] = replace(result[index], poses=[pose], pose_origins=new_origins)
                     if origins_out is not None:
                         origins_out[index][name] = "interpolated"
     return result
@@ -243,12 +249,22 @@ def interpolate_tracked_dancer_poses(
                         y=float(p0.y + alpha * (p1.y - p0.y)),
                         visibility=1.0,
                         presence=1.0,
+                        origin="display_interpolated",
                     )
                     new_display = dict(existing)
                     new_display[name] = interp_lm
-                    result[idx] = replace(
-                        slot,
-                        display_pose=new_display,
-                        interpolated_display=True,
+                    existing_lm_origins = dict(
+                        getattr(slot, "landmark_origins", None)
+                        or {k: lm.origin for k, lm in existing.items()}
                     )
+                    existing_lm_origins[name] = "display_interpolated"
+                    replace_kwargs: dict[str, Any] = {
+                        "display_pose": new_display,
+                        "interpolated_display": True,
+                    }
+                    if hasattr(slot, "landmark_origins"):
+                        replace_kwargs["landmark_origins"] = existing_lm_origins
+                    if hasattr(slot, "pose_origin") and getattr(slot, "raw_pose", None) is None:
+                        replace_kwargs["pose_origin"] = "display_interpolated"
+                    result[idx] = replace(slot, **replace_kwargs)
     return result

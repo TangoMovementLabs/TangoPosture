@@ -46,6 +46,7 @@ class MediaPipeEstimator:
                         landmarks[i].visibility,
                         landmarks[i].presence,
                         getattr(landmarks[i], "z", None),
+                        origin="detected",
                     )
                     for name, i in NAMES.items()
                 }
@@ -60,13 +61,21 @@ class MediaPipeEstimator:
                             getattr(w_landmarks[i], "visibility", landmarks[i].visibility),
                             getattr(w_landmarks[i], "presence", landmarks[i].presence),
                             getattr(w_landmarks[i], "z", 0.0),
+                            origin="detected",
                         )
                         for name, i in NAMES.items()
                     }
                 )
             else:
                 world_poses.append({})
-        return FrameObservation(timestamp, image.shape[1], image.shape[0], poses, world_poses)
+        return FrameObservation(
+            timestamp,
+            image.shape[1],
+            image.shape[0],
+            poses,
+            world_poses,
+            ["detected"] * len(poses),
+        )
 
     def close(self) -> None:
         self.detector.close()

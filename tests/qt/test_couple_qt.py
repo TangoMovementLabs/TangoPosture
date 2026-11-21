@@ -1296,3 +1296,113 @@ def test_reference_calibration_button_matches_engine(qapp, tmp_path, couple):
         assert ("Edit calibration" in labels) == (not couple)
     finally:
         window.close()
+
+
+def test_couple_qt_p1_evidence_statuses_denominators_and_turn_ids(qapp, tmp_path):
+    cfg = Config(data_dir=str(tmp_path / "data"))
+    cfg.dancer_analysis.auto_turn_suggestions = True
+    practice_dir = Path(cfg.data_dir) / "practice"
+    arch, vsha, _ = _make_archive_with_runs(
+        practice_dir / "P1UiCouple.tp",
+        cfg,
+        include_single=False,
+        include_couple=True,
+        couple_run_id="p1-ui-run",
+    )
+
+    # Real rebuild inputs: 1 confirmed turn + 4 estimated pivot candidates + 1 unmatched turn_start + 0 slow events
+    analytics_payload = read_analytics(arch, 0)
+    assert analytics_payload is not None
+    couple_res = dict(analytics_payload["dancer_analysis"]["runs"]["couple"]["couple_result"])
+    couple_res["automated_candidates"] = [
+        c for c in (couple_res.get("automated_candidates") or []) if c.get("event_type") != "slow"
+    ]
+    couple_res.setdefault("series", {})["pivot_candidates"] = [
+        {"start_time": 2.20 + i * 1.0, "end_time": 2.40 + i * 1.0, "subject": "pair"}
+        for i in range(4)
+    ]
+    couple_res.setdefault("annotations", {}).setdefault("items", []).append(
+        {
+            "annotation_id": "orphan_ts_1",
+            "event_type": "turn_start",
+            "timestamp": 1.80,
+            "subject": "B",
+            "status": "user_confirmed",
+            "turn_id": "tid_orphan_b",
+        }
+    )
+    from tango_posture.archive import store_analytics
+
+    store_analytics(
+        arch,
+        0,
+        {},
+        expected_video_sha256=vsha,
+        dancer_analysis_run={
+            "run_id": "p1-ui-run",
+            "requested_mode": "couple",
+            "resolved_mode": "couple",
+            "auto_decision": couple_res.get("auto_decision"),
+            "couple_result": couple_res,
+        },
+    )
+
+    window = MainWindow(cfg)
+    try:
+        # 1. Analytics renders denominator beside coverage, "Unavailable" for 0-window transitions, and "mixed" turns
+        window.router.navigate(Route.ANALYTICS)
+        qapp.processEvents()
+        analytics = window.screens[Route.ANALYTICS]
+        idx = next(
+            i for i in range(analytics.session_combo.count())
+            if "P1UiCouple" in analytics.session_combo.itemText(i)
+        )
+        analytics.session_combo.setCurrentIndex(idx)
+        qapp.processEvents()
+
+        cov_text = analytics.couple_axis_coverage_labels["torso_tilt_a"].text()
+        assert "/" in cov_text and "frames" in cov_text
+        tr_tbl = analytics._couple_summary_tables["transitions"]
+        tr_items = {
+            tr_tbl.item(r, 0).text(): (tr_tbl.item(r, 1).text(), tr_tbl.item(r, 3).text())
+            for r in range(tr_tbl.rowCount())
+        }
+        assert tr_items["secondary speed peaks"] == ("Unavailable", "unavailable")
+        assert tr_items["evaluated window count"] == ("0.000", "unavailable")
+        turn_tbl = analytics._couple_summary_tables["turns_exits"]
+        turn_items = {
+            turn_tbl.item(r, 0).text(): (turn_tbl.item(r, 1).text(), turn_tbl.item(r, 3).text())
+            for r in range(turn_tbl.rowCount())
+        }
+        assert turn_items["turn count"] == ("5.000", "mixed")
+        assert turn_items["unmatched count"] == ("1.000", "mixed")
+
+        # 2. Review assigns matching turn_id for A's turn_start -> turn_end and preserves unmatched B marker
+        window.router.navigate(
+            Route.REVIEW,
+            {"archive_path": arch, "segment_index": 0, "run_id": "p1-ui-run", "timestamp": 0.40},
+        )
+        qapp.processEvents()
+        review = window.screens[Route.REVIEW]
+        subj_idx = review.couple_event_subject_combo.findData("A")
+        review.couple_event_subject_combo.setCurrentIndex(subj_idx)
+        ts_idx = review.couple_event_type_combo.findData("turn_start")
+        review.couple_event_type_combo.setCurrentIndex(ts_idx)
+        review.current_time_sec = 0.40
+        review._add_couple_event()
+        te_idx = review.couple_event_type_combo.findData("turn_end")
+        review.couple_event_type_combo.setCurrentIndex(te_idx)
+        review.current_time_sec = 0.85
+        review._add_couple_event()
+        b_idx = review.couple_event_subject_combo.findData("B")
+        review.couple_event_subject_combo.setCurrentIndex(b_idx)
+        review.couple_event_type_combo.setCurrentIndex(ts_idx)
+        review.current_time_sec = 0.50
+        review._add_couple_event()
+
+        events = review._couple_result["events"]
+        a_turns = [e for e in events if e.get("event_type") == "turn" and e.get("subject") == "A"]
+        assert len(a_turns) >= 1 and a_turns[-1].get("turn_id")
+        assert "(2 unmatched)" in review.couple_markers_summary.text()
+    finally:
+        window.close()

@@ -115,7 +115,10 @@ class ServiceBridge(QObject):
         return self.cfg
 
     def update_config(self, new_cfg: Config) -> None:
+        from ..troubleshoot import log_config
+
         self.cfg = new_cfg
+        log_config(new_cfg, source="settings_update")
         self.config_changed.emit(new_cfg)
         self.status_message.emit("Settings updated.")
 

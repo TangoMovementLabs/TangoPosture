@@ -28,7 +28,7 @@ from ..couple.tracking import (
     _translate_pose,
     _wide_ankle_span_for_pair,
 )
-from ..domain import Calibration, FrameObservation, PoseEstimator
+from ..domain import Calibration, FrameObservation, PoseEstimator, infer_pose_origin
 from ..engines import (
     CommonEngineContext,
     build_needs_selection_result,
@@ -236,11 +236,16 @@ def analyze_clip(
                     dx = cur_mid[0] - last_primary_mid[0]
                     dy = cur_mid[1] - last_primary_mid[1]
                     if math.hypot(dx, dy) <= 0.05:
+                        propagated_poses = [
+                            _translate_pose(p, dx, dy, origin="propagated")
+                            for p in last_split_pair
+                        ]
                         auto_obs = FrameObservation(
                             obs.timestamp,
                             obs.width,
                             obs.height,
-                            [_translate_pose(p, dx, dy) for p in last_split_pair],
+                            propagated_poses,
+                            pose_origins=["propagated"] * len(propagated_poses),
                         )
                         propagated = True
                 if not propagated and idx % 3 == 0:
@@ -249,7 +254,11 @@ def analyze_clip(
                     )
                     if len(resolved_poses) >= 2:
                         auto_obs = FrameObservation(
-                            obs.timestamp, obs.width, obs.height, resolved_poses
+                            obs.timestamp,
+                            obs.width,
+                            obs.height,
+                            resolved_poses,
+                            pose_origins=[infer_pose_origin(p) for p in resolved_poses],
                         )
                         last_split_pos = idx
                         last_primary_mid = cur_mid
@@ -274,7 +283,13 @@ def analyze_clip(
                     item.image, obs.poses[0], _get_image_detector(), obs.width, obs.height, cfg
                 )
                 if len(resolved_poses) >= 2:
-                    auto_obs = FrameObservation(obs.timestamp, obs.width, obs.height, resolved_poses)
+                    auto_obs = FrameObservation(
+                        obs.timestamp,
+                        obs.width,
+                        obs.height,
+                        resolved_poses,
+                        pose_origins=[infer_pose_origin(p) for p in resolved_poses],
+                    )
             auto_observations.append((item.frame_index, auto_obs))
             frame_times.append((item.frame_index, item.source_time, item.clip_time))
             if progress_callback is not None and (idx % 5 == 0 or idx + 1 >= expected_frames):

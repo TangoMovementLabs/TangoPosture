@@ -11,6 +11,9 @@ from typing import Any
 from ..domain import (
     FrameObservation,
     Landmark,
+    PoseOrigin,
+    infer_pose_origin,
+    normalize_pose_origin,
 )
 from ..quality import reliable
 
@@ -72,10 +75,31 @@ def _cached_evidence(path: Path, index: int, *, couple: bool = False) -> Evidenc
         raw_poses = entry.get("measurement_poses", []) if from_coach else entry.get("poses", [])
         if not isinstance(raw_poses, list):
             raise TypeError("Invalid cached frame / pose list")
+        raw_pose_origins = (
+            entry.get("measurement_pose_origins", []) if from_coach else entry.get("pose_origins", [])
+        )
+        raw_lm_origins = (
+            entry.get("measurement_landmark_origins", [])
+            if from_coach
+            else entry.get("landmark_origins", [])
+        )
         poses = []
-        for raw in raw_poses:
+        pose_origins: list[PoseOrigin] = []
+        for pose_idx, raw in enumerate(raw_poses):
             if not isinstance(raw, dict):
                 raise TypeError("Invalid cached pose")
+            default_pose_origin: PoseOrigin = (
+                normalize_pose_origin(raw_pose_origins[pose_idx])
+                if isinstance(raw_pose_origins, list) and pose_idx < len(raw_pose_origins)
+                else "detected"
+            )
+            lm_origin_map = (
+                raw_lm_origins[pose_idx]
+                if isinstance(raw_lm_origins, list)
+                and pose_idx < len(raw_lm_origins)
+                and isinstance(raw_lm_origins[pose_idx], dict)
+                else {}
+            )
             pose = {}
             for name, coordinates in raw.items():
                 if not isinstance(coordinates, list) or len(coordinates) != 5:
@@ -84,12 +108,21 @@ def _cached_evidence(path: Path, index: int, *, couple: bool = False) -> Evidenc
                     raise TypeError("Cached landmark coordinates must be numbers or unknown")
                 if coordinates[0] is None or coordinates[1] is None:
                     raise ValueError("Cached landmark image coordinates are missing")
+                lm_origin = normalize_pose_origin(lm_origin_map.get(name), default_pose_origin)
                 pose[name] = Landmark(
                     coordinates[0], coordinates[1], coordinates[3],
                     coordinates[4], coordinates[2],
+                    origin=lm_origin,
                 )
             poses.append(pose)
-        frames.append(FrameObservation(timestamp, width, height, poses))
+            pose_origins.append(
+                normalize_pose_origin(
+                    raw_pose_origins[pose_idx]
+                    if isinstance(raw_pose_origins, list) and pose_idx < len(raw_pose_origins)
+                    else infer_pose_origin(pose),
+                )
+            )
+        frames.append(FrameObservation(timestamp, width, height, poses, pose_origins=pose_origins))
     if not frames or (not couple and not any(frame.poses for frame in frames)):
         raise ValueError("No usable landmark cache; reanalyze this recording")
     if "max_gap" not in data:

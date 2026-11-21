@@ -1,11 +1,14 @@
 import csv
 import json
+import logging
 import sqlite3
 from contextlib import closing
 from dataclasses import asdict
 from pathlib import Path
 
 from .domain import Calibration
+
+_logger = logging.getLogger(__name__)
 
 DATABASE_TABLES = ("calibrations", "sessions", "events", "observations")
 
@@ -46,10 +49,12 @@ def clear_database(path: Path) -> dict[str, int]:
 class Storage:
     def __init__(self, data_dir: Path):
         data_dir.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(data_dir / "tango.sqlite3")
+        db_path = data_dir / "tango.sqlite3"
+        self.db = sqlite3.connect(db_path)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA foreign_keys=ON")
         version = self.db.execute("PRAGMA user_version").fetchone()[0]
+        _logger.debug("Opened SQLite storage path=%s schema_version=%s", db_path, version)
         if version not in (0, 1):
             self.db.close()
             raise ValueError(f"Unsupported database schema version {version}")
@@ -192,4 +197,5 @@ class Storage:
         return output
 
     def close(self) -> None:
+        _logger.debug("Closing SQLite storage")
         self.db.close()

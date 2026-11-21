@@ -2538,8 +2538,16 @@ class ReviewScreen(QWidget):
         ):
             ps = posture.get(p_key) or {}
             if isinstance(ps, dict) and ps.get("median_deg") is not None:
+                cov_cnt = ps.get("eligible_count", ps.get("sample_count"))
+                cov_denom = ps.get("coverage_denominator", ps.get("total_frame_count"))
+                cov_ratio_txt = (
+                    f" ({int(cov_cnt)}/{int(cov_denom)} frames)"
+                    if isinstance(cov_cnt, int) and isinstance(cov_denom, int) and cov_denom > 0
+                    else ""
+                )
+                st_txt = str(ps.get("status") or "measured")
                 detail_lines.append(
-                    f"{p_lbl}: median {float(ps['median_deg']):+.1f}° · coverage {float(ps.get('coverage') or 0.0) * 100:.0f}%"
+                    f"{p_lbl}: median {float(ps['median_deg']):+.1f}° · coverage {float(ps.get('coverage') or 0.0) * 100:.0f}%{cov_ratio_txt} [{st_txt}]"
                 )
         for c_key, c_lbl in (
             ("start_lag_ms", "Start lag (B−A)"),
@@ -2547,7 +2555,9 @@ class ReviewScreen(QWidget):
         ):
             cs = coord.get(c_key) or {}
             if isinstance(cs, dict) and cs.get("value") is not None:
-                detail_lines.append(f"{c_lbl}: {float(cs['value']):+.0f} ms")
+                detail_lines.append(
+                    f"{c_lbl}: {float(cs['value']):+.0f} ms [{cs.get('status', 'measured')}]"
+                )
         return {
             "titles": titles,
             "values": values,
@@ -3190,6 +3200,7 @@ class ReviewScreen(QWidget):
         events = [ev for ev in (res.get("events") or []) if isinstance(ev, dict)]
         planned = list(ann.get("planned_transitions") or [])
         marker_parts: list[str] = []
+        unmatched_turn_cnt = 0
         for ev in events:
             if ev.get("deleted"):
                 continue
@@ -3199,7 +3210,17 @@ class ReviewScreen(QWidget):
             etype = str(ev.get("event_type", ""))
             subj = str(ev.get("subject", "pair"))
             status = str(ev.get("status", "measured"))
-            detail = str(ev.get("pivot_behavior") or ev.get("label") or "")
+            meta = ev.get("metadata") or {}
+            is_unmatched = bool(meta.get("unmatched")) if isinstance(meta, dict) else False
+            if is_unmatched:
+                unmatched_turn_cnt += 1
+            turn_id = str(ev.get("turn_id") or (meta.get("turn_id") if isinstance(meta, dict) else "") or "")
+            detail_bits = [
+                str(ev.get("pivot_behavior") or ev.get("label") or "").strip(),
+                f"[{turn_id}]" if turn_id else "",
+                f"unmatched: {ev.get('reason')}" if is_unmatched and ev.get("reason") else "",
+            ]
+            detail = " ".join(b for b in detail_bits if b)
             t_item = QTableWidgetItem(f"{ts:.2f}")
             t_item.setData(Qt.ItemDataRole.UserRole, ev)
             self.couple_events_table.setItem(r, 0, t_item)
@@ -3213,8 +3234,11 @@ class ReviewScreen(QWidget):
             if isinstance(pm, dict):
                 marker_parts.append(f"{pm.get('kind', 'planned')}@{float(pm.get('timestamp', 0.0)):.1f}s")
 
+        unmatched_suffix = f" ({unmatched_turn_cnt} unmatched)" if unmatched_turn_cnt else ""
         self.couple_markers_summary.setText(
-            "Timeline markers: " + (", ".join(marker_parts) if marker_parts else "none")
+            "Timeline markers: "
+            + (", ".join(marker_parts) if marker_parts else "none")
+            + unmatched_suffix
         )
         self.couple_undo_btn.setEnabled(bool(self._annotation_undo_stack))
         self.couple_save_annotations_btn.setEnabled(True)
@@ -3272,6 +3296,42 @@ class ReviewScreen(QWidget):
         self._rebuild_local_couple_preview(ann)
         self.couple_evidence_status.setText(f"Marked {kind} at {ts:.2f}s; click Save Annotations to persist.")
 
+    def _resolve_turn_id_for_new_marker(
+        self, ann: CoupleAnnotations, etype: str, subject: str, timestamp: float
+    ) -> str | None:
+        if etype == "turn_start":
+            return f"turn-{uuid4().hex[:8]}"
+        if etype not in ("turn_end", "exit"):
+            return None
+        selected = self._selected_couple_event()
+        if selected is not None and str(selected.get("subject") or "") == subject:
+            sel_tid = selected.get("turn_id") or (selected.get("metadata") or {}).get("turn_id")
+            if isinstance(sel_tid, str) and sel_tid.strip():
+                return sel_tid.strip()
+        starts = [
+            i
+            for i in ann.items
+            if not i.deleted
+            and i.event_type == "turn_start"
+            and i.subject == subject
+            and i.turn_id
+            and i.timestamp <= timestamp + 1e-6
+        ]
+        if etype == "turn_end":
+            closed_tids = {
+                i.turn_id
+                for i in ann.items
+                if not i.deleted and i.event_type == "turn_end" and i.subject == subject and i.turn_id
+            }
+            open_starts = [s for s in starts if s.turn_id not in closed_tids]
+            if open_starts:
+                open_starts.sort(key=lambda s: s.timestamp)
+                return open_starts[-1].turn_id
+        if starts:
+            starts.sort(key=lambda s: s.timestamp)
+            return starts[-1].turn_id
+        return None
+
     def _add_couple_event(self) -> None:
         if not isinstance(self._couple_result, dict):
             return
@@ -3281,6 +3341,7 @@ class ReviewScreen(QWidget):
         subj = str(self.couple_event_subject_combo.currentData() or "pair")
         pb = str(self.couple_pivot_behavior_combo.currentData() or "unknown")
         ts = float(self.current_time_sec)
+        turn_id = self._resolve_turn_id_for_new_marker(ann, etype, subj, ts)
         ann.items.append(
             CoupleAnnotationItem(
                 annotation_id=f"ann-{uuid4().hex[:8]}",
@@ -3289,6 +3350,7 @@ class ReviewScreen(QWidget):
                 subject=subj,  # type: ignore[arg-type]
                 status="user_confirmed",
                 pivot_behavior=pb if etype in ("turn_start", "turn_end", "exit") else None,  # type: ignore[arg-type]
+                turn_id=turn_id,
             )
         )
         self._rebuild_local_couple_preview(ann)
@@ -3320,6 +3382,7 @@ class ReviewScreen(QWidget):
             existing.status = "user_confirmed"
             existing.deleted = False
         else:
+            ev_tid = ev.get("turn_id") or (ev.get("metadata") or {}).get("turn_id")
             ann.items.append(
                 CoupleAnnotationItem(
                     annotation_id=f"conf-{uuid4().hex[:8]}",
@@ -3331,6 +3394,7 @@ class ReviewScreen(QWidget):
                     source_candidate_id=ev_id or None,
                     pivot_behavior=ev.get("pivot_behavior"),
                     label=str(ev.get("label") or ""),
+                    turn_id=str(ev_tid) if ev_tid else None,
                 )
             )
         self._rebuild_local_couple_preview(ann)
@@ -3356,6 +3420,7 @@ class ReviewScreen(QWidget):
             existing.status = "user_confirmed"
             existing.pivot_behavior = pb if etype in ("turn_start", "turn_end", "exit") else None  # type: ignore[assignment]
         else:
+            ev_tid = ev.get("turn_id") or (ev.get("metadata") or {}).get("turn_id")
             ann.items.append(
                 CoupleAnnotationItem(
                     annotation_id=f"edit-{uuid4().hex[:8]}",
@@ -3366,6 +3431,7 @@ class ReviewScreen(QWidget):
                     status="user_confirmed",
                     source_candidate_id=ev_id or None,
                     pivot_behavior=pb if etype in ("turn_start", "turn_end", "exit") else None,  # type: ignore[arg-type]
+                    turn_id=str(ev_tid) if ev_tid else None,
                 )
             )
         self._rebuild_local_couple_preview(ann)
@@ -3385,6 +3451,7 @@ class ReviewScreen(QWidget):
         if existing is not None:
             existing.deleted = True
         else:
+            ev_tid = ev.get("turn_id") or (ev.get("metadata") or {}).get("turn_id")
             ann.items.append(
                 CoupleAnnotationItem(
                     annotation_id=f"del-{uuid4().hex[:8]}",
@@ -3394,6 +3461,7 @@ class ReviewScreen(QWidget):
                     status="user_confirmed",
                     source_candidate_id=ev_id or None,
                     deleted=True,
+                    turn_id=str(ev_tid) if ev_tid else None,
                 )
             )
         self._rebuild_local_couple_preview(ann)

@@ -97,6 +97,7 @@ class DancerAnalysisConfig(BaseModel):
     couple_axis_rejoin_separation_m: float = Field(default=0.80, gt=0.0)
     analyze_soundtrack: bool = False
     auto_turn_suggestions: bool = False
+    pose_origin_policy: Literal["measured_only", "allow_propagated_estimates"] = "measured_only"
 
     @model_validator(mode="after")
     def validated_thresholds(self) -> "DancerAnalysisConfig":
@@ -401,6 +402,7 @@ SETTING_GROUPS = {
         "dancer_analysis.shot_cut_max_frame_gap_s",
         "dancer_analysis.shot_cut_jump_torso_lengths",
         "dancer_analysis.close_embrace_max_tilt_deg",
+        "dancer_analysis.pose_origin_policy",
     ),
     "Couple · Temporal / Smoothing": (
         "dancer_analysis.calibration_smoothing_s",
@@ -703,6 +705,9 @@ SETTING_DESCRIPTIONS: dict[str, str] = {
     ),
     "dancer_analysis.auto_turn_suggestions": (
         "Generate optional estimated turn marker suggestions when supported by torso rotation cues."
+    ),
+    "dancer_analysis.pose_origin_policy": (
+        "Measurement eligibility policy for propagated poses ('measured_only' excludes translated poses from measured metrics; 'allow_propagated_estimates' includes them as estimates)."
     ),
     "ollama_base_url": "Address of the local or reachable Ollama server.",
     "ollama_model": "Model name installed on that Ollama server.",

@@ -9,13 +9,20 @@ from typing import Any
 import numpy as np
 
 from ..config import Config
-from ..domain import FrameObservation, Landmark
+from ..domain import (
+    FrameObservation,
+    Landmark,
+    PoseOrigin,
+    infer_pose_origin,
+    normalize_pose_origin,
+)
 from ..pose.constants import NAMES
 from ..quality import reliable
 from .models import (
     CandidatePreview,
     DancerAnchor,
     PairedFrameSample,
+    PoseOriginPolicy,
     SampleQualityStatus,
     TrackedDancerSample,
 )
@@ -53,6 +60,24 @@ class PoseCandidate:
     head_eligible: bool
     bbox: tuple[float, float, float, float]
     confidence: float
+    pose_origin: PoseOrigin = "detected"
+
+
+def _origin_priority(origin: PoseOrigin) -> int:
+    return {
+        "detected": 3,
+        "crop_detected": 2,
+        "propagated": 1,
+        "display_interpolated": 0,
+    }.get(origin, 0)
+
+
+def _origin_is_measurement_eligible(origin: PoseOrigin, policy: str) -> bool:
+    if origin in ("detected", "crop_detected"):
+        return True
+    if origin == "propagated":
+        return policy == "allow_propagated_estimates"
+    return False
 
 
 def _core_confidence(pose: dict[str, Landmark]) -> float:
@@ -77,8 +102,13 @@ def extract_pose_candidate(
     width: int,
     height: int,
     cfg: Config,
+    *,
+    pose_origin: PoseOrigin | None = None,
 ) -> PoseCandidate:
     """Extract canonical pixel features and eligibility flags for one pose."""
+    resolved_origin = normalize_pose_origin(
+        pose_origin if pose_origin is not None else infer_pose_origin(pose)
+    )
     conf = float(cfg.confidence)
     l_hip = pose.get("left_hip")
     r_hip = pose.get("right_hip")
@@ -139,6 +169,7 @@ def extract_pose_candidate(
         head_eligible=head_eligible,
         bbox=bbox,
         confidence=_core_confidence(pose),
+        pose_origin=resolved_origin,
     )
 
 
@@ -182,7 +213,15 @@ def filter_and_deduplicate_poses(
     candidates: list[PoseCandidate] = []
     for idx, pose in enumerate(obs.poses):
         world = obs.world_poses[idx] if idx < len(obs.world_poses) else None
-        cand = extract_pose_candidate(idx, pose, world, obs.width, obs.height, cfg)
+        cand = extract_pose_candidate(
+            idx,
+            pose,
+            world,
+            obs.width,
+            obs.height,
+            cfg,
+            pose_origin=obs.pose_origin_at(idx),
+        )
         if not cand.hip_eligible and not cand.torso_eligible:
             continue
         if analysis_region is not None:
@@ -200,7 +239,11 @@ def filter_and_deduplicate_poses(
 
     kept: list[PoseCandidate] = []
     dup_thresh = float(cfg.dancer_analysis.duplicate_pose_max_distance_torso_lengths)
-    for cand in sorted(candidates, key=lambda c: c.confidence, reverse=True):
+    for cand in sorted(
+        candidates,
+        key=lambda c: (_origin_priority(c.pose_origin), c.confidence),
+        reverse=True,
+    ):
         if any(
             _are_near_duplicate_poses(
                 cand, prev, obs.width, obs.height, float(cfg.confidence), max_dist_tl=dup_thresh
@@ -308,10 +351,23 @@ def _make_sample(
     *,
     innovation: float | None = None,
     margin: float | None = None,
+    pose_origin_policy: PoseOriginPolicy = "measured_only",
 ) -> TrackedDancerSample:
-    status: SampleQualityStatus = (
-        "measured" if cand.torso_eligible else ("estimated" if cand.hip_eligible else "unavailable")
-    )
+    pose_origin = cand.pose_origin
+    lm_origins: dict[str, PoseOrigin] = {
+        name: normalize_pose_origin(getattr(lm, "origin", pose_origin), pose_origin)
+        for name, lm in cand.pose.items()
+    }
+    allowed = _origin_is_measurement_eligible(pose_origin, pose_origin_policy)
+    eff_torso = bool(cand.torso_eligible and allowed)
+    eff_hip = bool(cand.hip_eligible and allowed)
+    eff_head = bool(cand.head_eligible and allowed)
+    if pose_origin == "propagated":
+        status: SampleQualityStatus = "estimated" if (allowed and (eff_hip or eff_torso)) else "unavailable"
+    elif pose_origin in ("detected", "crop_detected"):
+        status = "measured" if eff_torso else ("estimated" if eff_hip else "unavailable")
+    else:
+        status = "unavailable"
     return TrackedDancerSample(
         timestamp=timestamp,
         frame_index=frame_index,
@@ -322,14 +378,16 @@ def _make_sample(
         hip_px=cand.hip_px,
         shoulder_px=cand.shoulder_px,
         torso_length_px=cand.torso_length_px,
-        torso_eligible=cand.torso_eligible,
-        hip_eligible=cand.hip_eligible,
-        head_eligible=cand.head_eligible,
-        view_usable=cand.torso_eligible,
+        torso_eligible=eff_torso,
+        hip_eligible=eff_hip,
+        head_eligible=eff_head,
+        view_usable=eff_torso,
         interpolated_display=False,
         innovation_torso_lengths=innovation,
         assignment_margin_torso_lengths=margin,
         quality_status=status,
+        pose_origin=pose_origin,
+        landmark_origins=lm_origins,
     )
 
 
@@ -338,8 +396,17 @@ def _fixed_scale_for_track(
     baseline_passages: list[tuple[float, float]] | None,
 ) -> float | None:
     torso_samples = [
-        s for s in samples if s is not None and s.torso_eligible and s.torso_length_px is not None
+        s
+        for s in samples
+        if s is not None
+        and s.torso_eligible
+        and s.torso_length_px is not None
+        and s.pose_origin in ("detected", "crop_detected")
     ]
+    if not torso_samples:
+        torso_samples = [
+            s for s in samples if s is not None and s.torso_eligible and s.torso_length_px is not None
+        ]
     if not torso_samples:
         return None
     if baseline_passages:
@@ -393,6 +460,7 @@ def track_couple_frames(
     analysis_region: dict[str, float] | None = None,
     anchors: list[DancerAnchor] | None = None,
     baseline_passages: list[tuple[float, float]] | None = None,
+    pose_origin_policy: PoseOriginPolicy | None = None,
 ) -> CoupleTrackingOutput:
     """Track Dancer A and Dancer B with 1-to-1 gated association across frames."""
     sorted_obs = sorted(observations, key=lambda item: (item[1].timestamp, item[0]))
@@ -400,6 +468,11 @@ def track_couple_frames(
         return CoupleTrackingOutput([], None, None, None, [], [])
 
     da_cfg = cfg.dancer_analysis
+    origin_policy: PoseOriginPolicy = (
+        pose_origin_policy
+        if pose_origin_policy in ("measured_only", "allow_propagated_estimates")
+        else da_cfg.pose_origin_policy
+    )
     max_innov = float(da_cfg.identity_max_innovation_torso_lengths)
     margin_min = float(da_cfg.identity_margin_torso_lengths)
     max_gap = float(da_cfg.max_observation_gap_s)
@@ -507,11 +580,11 @@ def track_couple_frames(
             remaining = [c for c in ordered if c.pose_index != init_a.pose_index]
             init_b = anchored_b or (remaining[0] if remaining else None)
             track_a.update(t, init_a)
-            sa = _make_sample(t, frame_index, init_a)
+            sa = _make_sample(t, frame_index, init_a, pose_origin_policy=origin_policy)
             sb = None
             if init_b is not None:
                 track_b.update(t, init_b)
-                sb = _make_sample(t, frame_index, init_b)
+                sb = _make_sample(t, frame_index, init_b, pose_origin_policy=origin_policy)
             paired_frames.append(
                 PairedFrameSample(
                     timestamp=t,
@@ -536,10 +609,14 @@ def track_couple_frames(
 
         if anchored_a is not None:
             used_indices.add(anchored_a.pose_index)
-            sample_a = _make_sample(t, frame_index, anchored_a, innovation=0.0, margin=1.0)
+            sample_a = _make_sample(
+                t, frame_index, anchored_a, innovation=0.0, margin=1.0, pose_origin_policy=origin_policy
+            )
         if anchored_b is not None and anchored_b.pose_index not in used_indices:
             used_indices.add(anchored_b.pose_index)
-            sample_b = _make_sample(t, frame_index, anchored_b, innovation=0.0, margin=1.0)
+            sample_b = _make_sample(
+                t, frame_index, anchored_b, innovation=0.0, margin=1.0, pose_origin_policy=origin_policy
+            )
 
         rem_cands = [c for c in candidates if c.pose_index not in used_indices]
         need_a = track_a.active and sample_a is None
@@ -582,8 +659,22 @@ def track_couple_frames(
                     innov_b = _assignment_cost(track_b, best_b, t, default_scale)
                     track_a.update(t, best_a)
                     track_b.update(t, best_b)
-                    sample_a = _make_sample(t, frame_index, best_a, innovation=innov_a, margin=margin if math.isfinite(margin) else None)
-                    sample_b = _make_sample(t, frame_index, best_b, innovation=innov_b, margin=margin if math.isfinite(margin) else None)
+                    sample_a = _make_sample(
+                        t,
+                        frame_index,
+                        best_a,
+                        innovation=innov_a,
+                        margin=margin if math.isfinite(margin) else None,
+                        pose_origin_policy=origin_policy,
+                    )
+                    sample_b = _make_sample(
+                        t,
+                        frame_index,
+                        best_b,
+                        innovation=innov_b,
+                        margin=margin if math.isfinite(margin) else None,
+                        pose_origin_policy=origin_policy,
+                    )
             elif long_gap or shot_cut:
                 identity_break = True
         elif rem_cands and (need_a or need_b):
@@ -597,7 +688,9 @@ def track_couple_frames(
                 cost, chosen = cands_sorted[0]
                 if cost <= max_innov * (1.6 if track_a.gap_broken else 1.0):
                     track_a.update(t, chosen)
-                    sample_a = _make_sample(t, frame_index, chosen, innovation=cost)
+                    sample_a = _make_sample(
+                        t, frame_index, chosen, innovation=cost, pose_origin_policy=origin_policy
+                    )
             elif need_b and not need_a:
                 cands_sorted = sorted(
                     ((_assignment_cost(track_b, c, t, default_scale), c) for c in rem_cands),
@@ -606,7 +699,9 @@ def track_couple_frames(
                 cost, chosen = cands_sorted[0]
                 if cost <= max_innov * (1.6 if track_b.gap_broken else 1.0):
                     track_b.update(t, chosen)
-                    sample_b = _make_sample(t, frame_index, chosen, innovation=cost)
+                    sample_b = _make_sample(
+                        t, frame_index, chosen, innovation=cost, pose_origin_policy=origin_policy
+                    )
             elif need_a and need_b and len(rem_cands) == 1:
                 cost_a = _assignment_cost(track_a, best_cand, t, default_scale)
                 cost_b = _assignment_cost(track_b, best_cand, t, default_scale)
@@ -614,10 +709,24 @@ def track_couple_frames(
                 if min(cost_a, cost_b) <= max_innov and diff >= margin_min:
                     if cost_a < cost_b:
                         track_a.update(t, best_cand)
-                        sample_a = _make_sample(t, frame_index, best_cand, innovation=cost_a, margin=diff)
+                        sample_a = _make_sample(
+                            t,
+                            frame_index,
+                            best_cand,
+                            innovation=cost_a,
+                            margin=diff,
+                            pose_origin_policy=origin_policy,
+                        )
                     else:
                         track_b.update(t, best_cand)
-                        sample_b = _make_sample(t, frame_index, best_cand, innovation=cost_b, margin=diff)
+                        sample_b = _make_sample(
+                            t,
+                            frame_index,
+                            best_cand,
+                            innovation=cost_b,
+                            margin=diff,
+                            pose_origin_policy=origin_policy,
+                        )
                 else:
                     identity_break = True
 
@@ -631,7 +740,7 @@ def track_couple_frames(
             chosen_a = anchored_a or ordered[0]
             track_a.update(t, chosen_a)
             used_indices.add(chosen_a.pose_index)
-            sample_a = _make_sample(t, frame_index, chosen_a)
+            sample_a = _make_sample(t, frame_index, chosen_a, pose_origin_policy=origin_policy)
         elif track_a.active and not track_b.active:
             leftover = [
                 c
@@ -643,7 +752,7 @@ def track_couple_frames(
                 chosen_b = anchored_b or leftover[0]
                 track_b.update(t, chosen_b)
                 used_indices.add(chosen_b.pose_index)
-                sample_b = _make_sample(t, frame_index, chosen_b)
+                sample_b = _make_sample(t, frame_index, chosen_b, pose_origin_policy=origin_policy)
 
         paired_frames.append(
             PairedFrameSample(
@@ -790,7 +899,17 @@ def extract_single_target_observations(
         if chosen is not None and chosen.raw_pose is not None:
             worlds = [chosen.world_pose] if chosen.world_pose is not None else []
             out.append(
-                (pf.frame_index, FrameObservation(pf.timestamp, width, height, [chosen.raw_pose], worlds))
+                (
+                    pf.frame_index,
+                    FrameObservation(
+                        pf.timestamp,
+                        width,
+                        height,
+                        [chosen.raw_pose],
+                        worlds,
+                        [chosen.pose_origin],
+                    ),
+                )
             )
         else:
             out.append((pf.frame_index, FrameObservation(pf.timestamp, width, height, [], [])))
@@ -809,9 +928,15 @@ def _pose_torso_mid_norm(pose: dict[str, Landmark], conf: float) -> tuple[float,
     )
 
 
-def _translate_pose(pose: dict[str, Landmark], dx: float, dy: float) -> dict[str, Landmark]:
+def _translate_pose(
+    pose: dict[str, Landmark],
+    dx: float,
+    dy: float,
+    *,
+    origin: PoseOrigin = "propagated",
+) -> dict[str, Landmark]:
     return {
-        name: replace(lm, x=float(lm.x) + dx, y=float(lm.y) + dy)
+        name: replace(lm, x=float(lm.x) + dx, y=float(lm.y) + dy, origin=origin)
         for name, lm in pose.items()
     }
 
@@ -835,6 +960,7 @@ def _mp_landmarks_to_pose(
     crop_y0: float = 0.0,
     crop_w: float = 1.0,
     crop_h: float = 1.0,
+    origin: PoseOrigin = "crop_detected",
 ) -> dict[str, Landmark]:
     return {
         name: Landmark(
@@ -843,6 +969,7 @@ def _mp_landmarks_to_pose(
             float(landmarks[i].visibility),
             float(landmarks[i].presence),
             float(getattr(landmarks[i], "z", 0.0) or 0.0),
+            origin=origin,
         )
         for name, i in NAMES.items()
     }

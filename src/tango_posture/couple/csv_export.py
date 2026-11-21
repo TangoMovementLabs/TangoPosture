@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 from typing import Any
 
 CSV_COLUMNS = [
@@ -18,6 +19,12 @@ CSV_COLUMNS = [
     "status",
     "timestamp_or_bracket",
     "coverage_or_reason",
+    "turn_id",
+    "pose_origin",
+    "eligible_count",
+    "coverage_denominator",
+    "evaluated_window_count",
+    "status_counts",
 ]
 
 
@@ -27,6 +34,12 @@ def _fmt_val(val: Any) -> str:
     if isinstance(val, float):
         return f"{val:.4f}".rstrip("0").rstrip(".") or "0"
     return str(val)
+
+
+def _fmt_status_counts(val: Any) -> str:
+    if isinstance(val, dict) and val:
+        return json.dumps(val, sort_keys=True, separators=(",", ":"))
+    return ""
 
 
 def export_couple_csv(
@@ -60,6 +73,12 @@ def export_couple_csv(
                     item.get("status", "unavailable"),
                     item.get("timestamp_or_bracket", ""),
                     item.get("reason") or f"coverage={item.get('coverage', 0.0)}",
+                    "",
+                    "",
+                    _fmt_val(item.get("eligible_count")),
+                    _fmt_val(item.get("coverage_denominator")),
+                    "",
+                    _fmt_status_counts(item.get("status_counts")),
                 ]
             )
 
@@ -79,6 +98,12 @@ def export_couple_csv(
                 st.get("status", "unavailable"),
                 "",
                 f"contacts={st.get('contact_count', 0)},matched={st.get('matched_count', 0)}",
+                "",
+                "",
+                _fmt_val(st.get("eligible_count")),
+                _fmt_val(st.get("coverage_denominator")),
+                "",
+                _fmt_status_counts(st.get("status_counts")),
             ]
         )
 
@@ -97,6 +122,12 @@ def export_couple_csv(
                 trans.get("status", "unavailable"),
                 "",
                 trans.get("reason") or f"coverage={trans.get('coverage', 0.0)}",
+                "",
+                "",
+                _fmt_val(trans.get("eligible_count")),
+                _fmt_val(trans.get("coverage_denominator")),
+                _fmt_val(trans.get("evaluated_window_count")),
+                _fmt_status_counts(trans.get("status_counts")),
             ]
         )
 
@@ -130,6 +161,12 @@ def export_couple_csv(
                 item.get("status", "unavailable"),
                 "",
                 item.get("reason") or f"coverage={item.get('coverage', 0.0)}",
+                "",
+                "",
+                _fmt_val(item.get("eligible_count")),
+                _fmt_val(item.get("coverage_denominator")),
+                "",
+                _fmt_status_counts(item.get("status_counts")),
             ]
         )
 
@@ -146,7 +183,13 @@ def export_couple_csv(
             "seconds",
             turns.get("status", "unavailable"),
             "",
-            f"turns={turns.get('turn_count', 0)},overlaps={turns.get('overlap_count', 0)}",
+            f"turns={turns.get('turn_count', 0)},overlaps={turns.get('overlap_count', 0)},unmatched={turns.get('unmatched_count', 0)}",
+            "",
+            "",
+            _fmt_val(turns.get("eligible_count")),
+            _fmt_val(turns.get("coverage_denominator")),
+            "",
+            _fmt_status_counts(turns.get("status_counts")),
         ]
     )
     writer.writerow(
@@ -162,6 +205,12 @@ def export_couple_csv(
             turns.get("status", "unavailable"),
             "",
             f"pair_hip_coverage={coverage.get('pair_hip_coverage', 0.0)}",
+            "",
+            "",
+            _fmt_val(turns.get("eligible_count")),
+            _fmt_val(turns.get("coverage_denominator")),
+            "",
+            _fmt_status_counts(turns.get("status_counts")),
         ]
     )
 
@@ -183,6 +232,9 @@ def export_couple_csv(
             if ev.get("lag_ms") is not None or ev.get("beat_offset_ms") is not None
             else ev.get("unit", "")
         )
+        meta = ev.get("metadata") or {}
+        ev_turn_id = ev.get("turn_id") or (meta.get("turn_id") if isinstance(meta, dict) else "") or ""
+        ev_origin = meta.get("pose_origin", "") if isinstance(meta, dict) else ""
         writer.writerow(
             [
                 "event",
@@ -196,6 +248,12 @@ def export_couple_csv(
                 ev.get("status", "measured"),
                 bracket,
                 ev.get("reason", ""),
+                ev_turn_id,
+                ev_origin,
+                "",
+                "",
+                "",
+                "",
             ]
         )
 

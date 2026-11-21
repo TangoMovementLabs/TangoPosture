@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import tempfile
 import urllib.request
 from collections.abc import Callable
@@ -13,6 +14,8 @@ if TYPE_CHECKING:
     from .config import Config
 
 ModelVariant = Literal["lite", "full", "heavy"]
+
+_logger = logging.getLogger(__name__)
 
 MANIFEST = json.loads(files("tango_posture").joinpath("model_manifest.json").read_text())
 
@@ -40,16 +43,26 @@ def analysis_model_path(cfg: Config) -> Path:
 
 def verify(path: Path, variant: ModelVariant = "lite") -> str:
     if not path.is_file():
+        _logger.debug("Model missing path=%s variant=%s", path, variant)
         raise ValueError(
             "Model missing: run 'tango-posture models fetch' for Live Practice, "
             "or start analysis to download the selected analysis model"
         )
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
-    if digest != model_manifest(variant)["sha256"]:
+    expected = model_manifest(variant)["sha256"]
+    if digest != expected:
+        _logger.error(
+            "Model checksum mismatch path=%s variant=%s got=%s expected=%s",
+            path,
+            variant,
+            digest,
+            expected,
+        )
         raise ValueError(
             f"{variant.capitalize()} model checksum mismatch; obtain its exact pinned file "
             "identified in models/manifest.json"
         )
+    _logger.debug("Model verified path=%s variant=%s sha256=%s", path, variant, digest[:16])
     return digest
 
 
@@ -73,7 +86,9 @@ def fetch(
         if progress_callback is not None:
             progress_callback(0, 100, f"{label}...")
         check_cancel()
-        with urllib.request.urlopen(model_manifest(variant)["source_url"], timeout=60) as response:
+        source_url = model_manifest(variant)["source_url"]
+        _logger.info("Fetching model variant=%s url=%s dest=%s", variant, source_url, destination)
+        with urllib.request.urlopen(source_url, timeout=60) as response:
             total = int(getattr(response, "headers", {}).get("Content-Length", 0))
             downloaded = 0
             with temporary.open("wb") as output:
@@ -91,6 +106,7 @@ def fetch(
         verify(temporary, variant)
         check_cancel()
         temporary.replace(destination)
+        _logger.info("Fetched and cached model variant=%s bytes=%d dest=%s", variant, downloaded, destination)
         if progress_callback is not None:
             progress_callback(100, 100, f"{variant.capitalize()} analysis model verified and cached.")
     finally:

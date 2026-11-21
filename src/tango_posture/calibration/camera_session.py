@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
@@ -15,6 +16,8 @@ from ..quality import reliable
 from .measurements import measure_ranges, metric_samples, view_eligible
 from .models import CYCLIC_METRICS, METRIC_DETAILS, Passage
 from .statistics import repeat_check, summarize_examples
+
+_logger = logging.getLogger(__name__)
 
 SessionState = Literal[
     "Preview",
@@ -940,12 +943,20 @@ class SoloCameraSession:
         phase = self.current_phase
         if phase is None:
             self.state = "Review"
+            _logger.debug("SoloCameraSession -> Review (no remaining phases)")
             return self.active_prompt_id
         self.active_prompt_id += 1
         self.current_instruction = phase.instruction
         self.hint_message = ""
         self._reset_attempt_buffers()
         use_speech = self.cfg.solo_camera.speak_instructions if speak_enabled is None else speak_enabled
+        _logger.debug(
+            "SoloCameraSession entering phase=%s view=%s prompt_id=%d speak=%s",
+            phase.phase_id,
+            phase.view,
+            self.active_prompt_id,
+            use_speech,
+        )
         if use_speech:
             self.state = "Prompt"
         else:
@@ -963,6 +974,11 @@ class SoloCameraSession:
             self.state = "Wait for take"
         else:
             self.state = "Wait for view and pose"
+        _logger.debug(
+            "SoloCameraSession -> %s phase=%s",
+            self.state,
+            phase.phase_id if phase else None,
+        )
 
     def _reset_attempt_buffers(self) -> None:
         self._phase_start_ts = None
@@ -1326,6 +1342,13 @@ class SoloCameraSession:
             usable=bool(eligible_metrics),
             detected_side=self.cfg.side,
             detected_facing=self.cfg.facing,
+        )
+        _logger.info(
+            "SoloCameraSession finished phase=%s usable=%s eligible=%s reasons=%s",
+            phase.phase_id,
+            record.usable,
+            list(eligible_metrics.keys()),
+            reasons,
         )
         if not record.usable:
             # Failed hold: keep previous accepted holds, re-arm current phase

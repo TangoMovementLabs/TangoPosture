@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 import subprocess
 import sys
@@ -28,6 +29,7 @@ from ...practice import GuiDisplay
 from ...storage import Storage
 
 PRACTICE_ERRORS = (OSError, ValueError, RuntimeError, ImportError, sqlite3.Error, cv2.error)
+_logger = logging.getLogger(__name__)
 
 
 def _pad_wav_silence(src_wav: Path, dst_wav: Path, silence_s: float) -> bool:
@@ -148,6 +150,7 @@ class SpeechManager(QObject):
                     self._active_proc = None
 
     def _run_utterance(self, text: str, gen: int, cancel_event: threading.Event) -> bool:
+        _logger.debug("Speech utterance gen=%d text_len=%d", gen, len(text))
         if Path("/usr/bin/afplay").is_file() and self._tail_silence_s > 0:
             with TemporaryDirectory(prefix="tango-say-", ignore_cleanup_errors=True) as td:
                 td_path = Path(td)
@@ -193,6 +196,12 @@ class SpeechManager(QObject):
                         return False
 
         rc_direct, cancelled_direct = self._run_proc(["/usr/bin/say", text], gen)
+        _logger.debug(
+            "Speech direct /usr/bin/say gen=%d rc=%s cancelled=%s",
+            gen,
+            rc_direct,
+            cancelled_direct,
+        )
         if cancelled_direct:
             return False
         if rc_direct is None or rc_direct != 0:
@@ -279,7 +288,14 @@ def discover_cameras(max_indices: int = 5, *, configured_index: int = 0) -> list
                 cap.release()
     if configured_index not in seen:
         found.insert(0, (configured_index, f"Camera {configured_index}"))
-    return sorted(found, key=lambda item: item[0])
+    result = sorted(found, key=lambda item: item[0])
+    _logger.debug(
+        "Discovered cameras configured_index=%d max_indices=%d result=%s",
+        configured_index,
+        max_indices,
+        result,
+    )
+    return result
 
 
 def populate_camera_combo(
@@ -364,6 +380,12 @@ class QtPracticeWorker(QObject):
 
     def run(self) -> None:
         storage: Storage | None = None
+        _logger.info(
+            "QtPracticeWorker.run starting video=%r reference_id=%r calibration_only=%s",
+            self.video,
+            self.reference_id,
+            self.calibration_only,
+        )
         try:
             storage = Storage(Path(self.cfg.data_dir))
             reference = None
@@ -398,8 +420,10 @@ class QtPracticeWorker(QObject):
                 name=self.reference_name,
             ).run()
         except PRACTICE_ERRORS as error:
+            _logger.exception("QtPracticeWorker.run failed")
             self.failed.emit(f"{type(error).__name__}: {error}")
         finally:
+            _logger.info("QtPracticeWorker.run finished")
             if storage is not None:
                 storage.close()
             self.finished.emit()

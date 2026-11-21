@@ -1,5 +1,6 @@
 import argparse
 import json
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -9,23 +10,68 @@ from .config import load, startup_config_path
 from .display import PracticeDisplay
 from .models import fetch
 from .storage import Storage
+from .troubleshoot import enable_troubleshoot, log_config
+
+_SUBCOMMANDS = frozenset({"gui", "qt", "troubleshoot", "models", "run", "sessions", "calibrations"})
+_VALUE_OPTIONS = frozenset({"--config", "--data-dir", "--log-dir"})
+
+
+def _normalize_argv(arguments: list[str]) -> list[str]:
+    if not arguments:
+        return ["gui"]
+    if any(tok in ("-h", "--help") for tok in arguments):
+        return arguments
+    i = 0
+    while i < len(arguments):
+        tok = arguments[i]
+        if tok in _SUBCOMMANDS:
+            return arguments
+        if tok in _VALUE_OPTIONS:
+            i += 2
+            continue
+        if tok.startswith("--"):
+            i += 1
+            continue
+        # Unknown positional token -> let argparse report it normally
+        return arguments
+    return [*arguments, "gui"]
 
 
 def parser() -> argparse.ArgumentParser:
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument(
+        "--troubleshoot",
+        action="store_true",
+        default=argparse.SUPPRESS,
+        help="Record detailed low-level telemetry (camera, MediaPipe, libraries, system specs) to logs/",
+    )
+    common.add_argument(
+        "--log-dir",
+        type=Path,
+        default=argparse.SUPPRESS,
+        help="Directory for troubleshoot log files (default: logs)",
+    )
+
     p = argparse.ArgumentParser(
-        description="Local side-view movement observation relative to your reference"
+        description="Local side-view movement observation relative to your reference",
+        parents=[common],
     )
     p.add_argument("--config", type=Path, help="Validated TOML configuration")
     p.add_argument("--data-dir", help="Local SQLite and exports directory")
     sub = p.add_subparsers(dest="command", required=True)
-    gui_p = sub.add_parser("gui", help="Open the PySide6 Qt desktop interface")
+    gui_p = sub.add_parser("gui", parents=[common], help="Open the PySide6 Qt desktop interface")
     gui_p.add_argument("--qt", action="store_true", help=argparse.SUPPRESS)
-    sub.add_parser("qt", help="Open the PySide6 Qt desktop interface (alias for gui)")
-    models = sub.add_parser("models")
-    models.add_subparsers(dest="action", required=True).add_parser("fetch").add_argument(
+    sub.add_parser("qt", parents=[common], help="Open the PySide6 Qt desktop interface (alias for gui)")
+    sub.add_parser(
+        "troubleshoot",
+        parents=[common],
+        help="Open the PySide6 Qt desktop interface with low-level troubleshoot logging enabled",
+    )
+    models = sub.add_parser("models", parents=[common])
+    models.add_subparsers(dest="action", required=True).add_parser("fetch", parents=[common]).add_argument(
         "--output", type=Path, help="Model destination; explicit setup-only network operation"
     )
-    run = sub.add_parser("run")
+    run = sub.add_parser("run", parents=[common])
     source = run.add_mutually_exclusive_group()
     source.add_argument("--camera", type=int)
     source.add_argument("--video")
@@ -70,18 +116,29 @@ def parser() -> argparse.ArgumentParser:
         metavar="PATH",
         help="Record raw and overlay video into a .tp practice archive; PATH is a legacy option",
     )
-    sessions = sub.add_parser("sessions").add_subparsers(dest="action", required=True)
-    sessions.add_parser("list")
-    export = sessions.add_parser("export")
+    sessions = sub.add_parser("sessions", parents=[common]).add_subparsers(dest="action", required=True)
+    sessions.add_parser("list", parents=[common])
+    export = sessions.add_parser("export", parents=[common])
     export.add_argument("session_id")
     export.add_argument("--output", required=True, type=Path)
-    sub.add_parser("calibrations").add_subparsers(dest="action", required=True).add_parser("list")
+    sub.add_parser("calibrations", parents=[common]).add_subparsers(dest="action", required=True).add_parser(
+        "list", parents=[common]
+    )
     return p
 
 
 def main(argv: list[str] | None = None, *, display: PracticeDisplay | None = None) -> int:
     arguments = sys.argv[1:] if argv is None else argv
-    args = parser().parse_args(arguments or ["gui"])
+    args = parser().parse_args(_normalize_argv(list(arguments)))
+    troubleshoot_active = (
+        bool(getattr(args, "troubleshoot", False))
+        or args.command == "troubleshoot"
+        or os.environ.get("TANGOPOSTURE_TROUBLESHOOT", "").strip() == "1"
+    )
+    if troubleshoot_active:
+        log_dir = getattr(args, "log_dir", None)
+        log_path = enable_troubleshoot(log_dir=log_dir, source=f"cli:{args.command}")
+        print(f"Troubleshoot logging enabled: {log_path}", file=sys.stderr, flush=True)
     storage = None
     try:
         overrides = {
@@ -96,9 +153,15 @@ def main(argv: list[str] | None = None, *, display: PracticeDisplay | None = Non
                 "mirror",
             )
         }
-        config_path = startup_config_path(args.config) if args.command in ("gui", "qt") else args.config
+        config_path = (
+            startup_config_path(args.config)
+            if args.command in ("gui", "qt", "troubleshoot")
+            else args.config
+        )
         cfg = load(config_path, overrides)
-        if args.command in ("gui", "qt"):
+        if troubleshoot_active:
+            log_config(cfg, source=f"cli:{args.command}")
+        if args.command in ("gui", "qt", "troubleshoot"):
             from .desktop_qt import launch_qt
 
             return launch_qt(cfg)

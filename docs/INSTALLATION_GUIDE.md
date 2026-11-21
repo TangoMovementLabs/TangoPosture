@@ -266,3 +266,27 @@ Run these checks once after installing to confirm your CPU, camera, audio, and p
    - Confirm smooth skeleton tracking and banner text reading **`"Full body framed and ready."`**.
 3. **Optional Microphone Check (Beat Tracking)**:
    - Play a tango track in the room during **Self Practice** preview and check that `Beat:` advances from `Waiting for song to begin...` to `Understanding beats (X/30s)` once music reaches audible room volume.
+
+---
+
+## 6. Low-Level Troubleshooting Logs (`--troubleshoot`)
+
+If a camera fails to open, frame reads stall, MediaPipe tracking drops, audio beat tracking stays idle, or Qt hits a platform issue, launch with **`--troubleshoot`** (or **`troubleshoot`**) to capture a full per-execution diagnostic log:
+
+```bash
+# Source install (creates ./logs/troubleshoot_YYYYMMDD_HHMMSS_ffffff_pid<PID>.log)
+uv run tango-posture --troubleshoot
+uv run tango-posture troubleshoot
+
+# Optional custom log directory or CLI subcommand
+uv run tango-posture --troubleshoot --log-dir /tmp/tango_logs run --camera 0
+
+# Packaged macOS / Windows / Linux desktop app (writes under <data_dir>/logs/)
+open -a TangoPosture --args --troubleshoot          # macOS
+.\TangoPosture.exe --troubleshoot                   # Windows PowerShell
+./TangoPosture/TangoPosture --troubleshoot          # Linux
+```
+
+You can also set `TANGOPOSTURE_TROUBLESHOOT=1` in the environment. When troubleshooting is not enabled, no instrumentation hooks are installed.
+
+Each log file begins with machine specs (OS, CPU, RAM, macOS hardware/camera/audio/display profiler and TCC camera/mic permissions, disk space, Python paths) and every installed Python package (`name==version`), then records timestamped `DEBUG`-level telemetry for OpenCV `VideoCapture`/`VideoWriter`, MediaPipe `PoseLandmarker` calls, `sounddevice` audio streams, Qt screens/`QMediaDevices`, module imports, settings changes, warnings/exceptions, and periodic memory/CPU heartbeats.

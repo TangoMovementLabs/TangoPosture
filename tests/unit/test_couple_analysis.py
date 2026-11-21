@@ -722,3 +722,517 @@ def test_torso_tilt_pearson_correlation_and_couple_threshold_params():
     ]
     gap_tracked = track_couple_frames(gap_obs, cfg)
     assert gap_tracked.frames[1].shot_cut is True
+
+
+def test_p1_pose_origins_archive_round_trip_and_propagated_policy(tmp_path):
+    from tango_posture.archive import append_segment, file_sha256, read_analytics, store_analytics
+    from tango_posture.calibration.evidence import cached_evidence
+    from tango_posture.calibration.normalization import extract_coach_observations
+    from tango_posture.couple.tracking import _translate_pose
+    from tango_posture.domain import tag_pose_origin
+    from tango_posture.pose.interpolation import interpolate_tracked_dancer_poses
+    from tango_posture.references.coach import _coach_observation, _serialise_pose
+
+    cfg = Config(data_dir=str(tmp_path / "data"))
+    pa0 = tag_pose_origin(_make_person_pose(hip_x=0.32, shoulder_dx=0.02, torso_dy=0.24), "crop_detected")
+    pb0 = tag_pose_origin(_make_person_pose(hip_x=0.52, shoulder_dx=-0.02, torso_dy=0.24), "crop_detected")
+    pa1 = _translate_pose(pa0, 0.01, 0.0, origin="propagated")
+    pb1 = _translate_pose(pb0, 0.01, 0.0, origin="propagated")
+    pa2 = _translate_pose(pa0, 0.02, 0.0, origin="propagated")
+    pb2 = _translate_pose(pb0, 0.02, 0.0, origin="propagated")
+
+    obs_list = [
+        (0, FrameObservation(0.0, 640, 480, [pa0, pb0], pose_origins=["crop_detected", "crop_detected"])),
+        (1, FrameObservation(0.05, 640, 480, [pa1, pb1], pose_origins=["propagated", "propagated"])),
+        (2, FrameObservation(0.10, 640, 480, [pa2, pb2], pose_origins=["propagated", "propagated"])),
+    ]
+
+    # 1. Default measured_only excludes propagated samples from coverage & measurement series while keeping display overlays
+    res_measured = run_couple_analysis(
+        obs_list,
+        cfg,
+        clip_in=0.0,
+        clip_out=0.15,
+        request=CoupleAnalysisRequest(requested_mode="couple", forced_override=True),
+        video_sha256="sha-p1-origin",
+        run_id="run-origin-1",
+    ).to_dict()
+
+    assert res_measured["coverage"]["pair_hip_coverage"] == pytest.approx(1.0 / 3.0, abs=1e-3)
+    assert res_measured["coverage"]["pair_torso_coverage"] == pytest.approx(1.0 / 3.0, abs=1e-3)
+    assert res_measured["coverage"]["measurement_origin_policy"] == "measured_only"
+    assert res_measured["coverage"]["origin_counts"]["pair"]["crop_detected"] == 1
+    assert res_measured["coverage"]["origin_counts"]["pair"]["propagated"] == 2
+    assert res_measured["series"]["torso_tilt_a"][0]["status"] == "measured"
+    assert res_measured["series"]["torso_tilt_a"][0]["pose_origin"] == "crop_detected"
+    assert res_measured["series"]["torso_tilt_a"][1]["value"] is None
+    assert res_measured["series"]["torso_tilt_a"][1]["status"] == "unavailable"
+    assert res_measured["series"]["torso_tilt_a"][1]["reason"] == "propagated_pose_excluded"
+    assert res_measured["series"]["torso_tilt_a"][1]["pose_origin"] == "propagated"
+    assert res_measured["frame_overlays"][1]["dancer_a"] is not None
+    assert res_measured["frame_overlays"][1]["dancer_a"]["pose_origin"] == "propagated"
+
+    # 2. Explicit allow_propagated_estimates includes propagated samples cleanly as estimated -> mixed summary
+    res_est = run_couple_analysis(
+        obs_list,
+        cfg,
+        clip_in=0.0,
+        clip_out=0.15,
+        request=CoupleAnalysisRequest(
+            requested_mode="couple",
+            forced_override=True,
+            pose_origin_policy="allow_propagated_estimates",
+        ),
+        video_sha256="sha-p1-origin",
+        run_id="run-origin-est",
+    ).to_dict()
+    assert res_est["coverage"]["pair_torso_coverage"] == pytest.approx(1.0, abs=1e-3)
+    assert res_est["coverage"]["measured_only_coverage"]["pair_torso_coverage"] == pytest.approx(1.0 / 3.0, abs=1e-3)
+    assert res_est["series"]["torso_tilt_a"][1]["status"] == "estimated"
+    assert res_est["series"]["torso_tilt_a"][1]["pose_origin"] == "propagated"
+    assert res_est["summaries"]["posture"]["torso_tilt_a"]["status"] == "mixed"
+    assert res_est["summaries"]["posture"]["torso_tilt_a"]["status_counts"]["measured"] == 1
+    assert res_est["summaries"]["posture"]["torso_tilt_a"]["status_counts"]["estimated"] == 2
+
+    # 3. Archive round-trip preserves both couple_result origins and coach measurement_pose_origins
+    arch = Path(cfg.data_dir) / "practice" / "OriginRoundTrip.tp"
+    vid = tmp_path / "dummy.mp4"
+    vid.write_bytes(b"synthetic-video-bytes")
+    rep = tmp_path / "rep.md"
+    rep.write_text("# Origin test\n", encoding="utf-8")
+    timestamps = [0.0, 0.05, 0.10]
+    append_segment(arch, rep, vid, None, timestamps)
+    vsha = file_sha256(vid)
+
+    coach_frames = {
+        str(idx): {
+            "timestamp": ts,
+            "poses": [_serialise_pose(obs.poses[0])],
+            "measurement_poses": [_serialise_pose(p) for p in obs.poses],
+            "measurement_pose_origins": [obs.pose_origin_at(i) for i in range(len(obs.poses))],
+            "measurement_landmark_origins": [
+                {k: lm.origin for k, lm in p.items()} for p in obs.poses
+            ],
+        }
+        for idx, (ts, obs) in enumerate([(t, o) for t, (_, o) in zip(timestamps, obs_list)])
+    }
+    coach_payload = {
+        "version": 1,
+        "model_hash": "hash-origin",
+        "capture_profile": {"side": "left", "facing": "right", "width": 640, "height": 480},
+        "width": 640,
+        "height": 480,
+        "frames": coach_frames,
+    }
+    store_analytics(
+        arch,
+        0,
+        {
+            "model_hash": "hash-origin",
+            "capture_profile": {"side": "left", "facing": "right", "width": 640, "height": 480},
+            "max_gap": 0.25,
+            "frame_timestamps": timestamps,
+            "frames": [],
+            "coach_data": coach_payload,
+            "movement_data": {"steps": [], "pivots": []},
+        },
+        expected_video_sha256=vsha,
+        dancer_analysis_run={
+            "run_id": "run-origin-1",
+            "requested_mode": "couple",
+            "resolved_mode": "couple",
+            "couple_result": res_measured,
+        },
+    )
+    loaded_analytics = read_analytics(arch, 0)
+    assert loaded_analytics is not None
+    loaded_couple = loaded_analytics["dancer_analysis"]["runs"]["couple"]["couple_result"]
+    assert [f["dancer_a"] for f in loaded_couple["series"]["frame_pose_origins"]] == [
+        "crop_detected",
+        "propagated",
+        "propagated",
+    ]
+    assert loaded_couple["frame_overlays"][0]["dancer_a"]["pose_origin"] == "crop_detected"
+    assert loaded_couple["frame_overlays"][1]["dancer_a"]["pose_origin"] == "propagated"
+
+    ev = cached_evidence(arch, 0, couple=False)
+    assert [f.pose_origin_at(0) for f in ev.frames] == ["crop_detected", "propagated", "propagated"]
+    assert ev.frames[0].poses[0]["left_hip"].origin == "crop_detected"
+    assert ev.frames[1].poses[0]["left_hip"].origin == "propagated"
+    parsed_obs = extract_coach_observations(loaded_analytics["coach_data"])
+    assert [o.pose_origin_at(0) for o in parsed_obs] == ["crop_detected", "propagated", "propagated"]
+    single_obs = _coach_observation(loaded_analytics["coach_data"]["frames"]["1"], 640, 480)
+    assert single_obs.pose_origin_at(0) == "propagated"
+
+    # 4. Display interpolation stamps display_interpolated without mutating raw_pose
+    tracked = track_couple_frames(obs_list[:1] + [(2, FrameObservation(0.10, 640, 480, [pa2, pb2], pose_origins=["crop_detected", "crop_detected"]))], cfg)
+    sa0, sa2 = tracked.frames[0].dancer_a, tracked.frames[1].dancer_a
+    interp_samples = interpolate_tracked_dancer_poses(
+        [sa0, None, sa2],
+        max_gap_s=0.20,
+        confidence=cfg.confidence,
+        timestamps=[0.0, 0.05, 0.10],
+        frame_indices=[0, 1, 2],
+        sample_factory=lambda t, fidx: track_couple_frames([(fidx, FrameObservation(t, 640, 480, []))], cfg).frames[0].dancer_a
+        or tracked.frames[0].dancer_a.__class__(
+            timestamp=t,
+            frame_index=fidx,
+            pose_index=None,
+            raw_pose=None,
+            display_pose={},
+            world_pose=None,
+            hip_px=None,
+            shoulder_px=None,
+            torso_length_px=None,
+            torso_eligible=False,
+            hip_eligible=False,
+            head_eligible=False,
+            view_usable=False,
+            interpolated_display=True,
+            quality_status="unavailable",
+            pose_origin="display_interpolated",
+        ),
+    )
+    assert interp_samples[1].pose_origin == "display_interpolated"
+    assert interp_samples[1].raw_pose is None
+    assert interp_samples[1].display_pose["left_hip"].origin == "display_interpolated"
+    assert interp_samples[0].raw_pose["left_hip"].origin == "crop_detected"
+
+
+def test_p1_transition_elapsed_support_breaks_gaps_dedup_and_per_phase_reference():
+    from tango_posture.couple.measurements import _evaluate_transitions
+
+    cfg = Config()
+    cfg.dancer_analysis.persistence_s = 0.20
+    cfg.dancer_analysis.secondary_speed_rise = 0.15
+    cfg.dancer_analysis.stop_speed = 0.10
+    cfg.dancer_analysis.max_observation_gap_s = 0.10
+    cfg.dancer_analysis.transition_min_coverage = 0.50
+
+    # 1. Final-frame spike produces 0 cues (never reaches tk + persistence_s)
+    ts_final = [round(i * 0.05, 4) for i in range(12)]  # 0.00..0.55
+    vp_final = [0.60, 0.60, 0.60, 0.20, 0.20, 0.20, 0.20, 0.20, 0.20, 0.20, 0.20, 0.90]
+    cues_final, sum_final = _evaluate_transitions(
+        ts_final,
+        vp_final,
+        [True] * len(ts_final),
+        [False] * len(ts_final),
+        [{"timestamp": 0.15}],
+        [],
+        CoupleAnnotations(),
+        cfg,
+    )
+    assert cues_final == []
+    assert sum_final["evaluated_window_count"] >= 1
+    assert sum_final["secondary_speed_peaks"] == 0
+
+    # 2. Spike cut short by a shot cut OR excessive gap before reaching persistence_s produces 0 cues
+    ts_cut = [round(i * 0.05, 4) for i in range(14)]
+    vp_cut = [0.60, 0.60, 0.60, 0.20, 0.20, 0.55, 0.55, 0.55, 0.20, 0.20, 0.20, 0.20, 0.20, 0.20]
+    brk_cut = [False] * len(ts_cut)
+    brk_cut[7] = True  # cuts off after only 0.05s from 0.25..0.30 (< 0.20s persistence)
+    cues_cut, sum_cut = _evaluate_transitions(
+        ts_cut,
+        vp_cut,
+        [True] * len(ts_cut),
+        brk_cut,
+        [{"timestamp": 0.15}],
+        [],
+        CoupleAnnotations(),
+        cfg,
+    )
+    assert cues_cut == []
+    assert sum_cut["secondary_speed_peaks"] == 0
+
+    ts_gap = [0.0, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.50, 0.55, 0.60]  # 0.20s gap between 0.30 and 0.50 (> 0.10s)
+    vp_gap = [0.60, 0.60, 0.60, 0.20, 0.20, 0.65, 0.65, 0.65, 0.65, 0.20]
+    cues_gap, _ = _evaluate_transitions(
+        ts_gap,
+        vp_gap,
+        [True] * len(ts_gap),
+        [False] * len(ts_gap),
+        [{"timestamp": 0.15}],
+        [],
+        CoupleAnnotations(),
+        cfg,
+    )
+    assert cues_gap == []
+
+    # 3. Genuine sustained rise + overlapping windows deduplicates into 1 canonical episode
+    ts_ok = [round(i * 0.05, 4) for i in range(20)]  # 0.00..0.95
+    vp_ok = [
+        0.60, 0.60, 0.60,  # steady pre-slow
+        0.20, 0.20, 0.20,  # slowing
+        0.55, 0.55, 0.55, 0.55, 0.55, 0.55,  # sustained secondary speed peak >= 0.25s
+        0.15, 0.15, 0.15, 0.05, 0.05, 0.05, 0.05, 0.05,
+    ]
+    cues_ok, sum_ok = _evaluate_transitions(
+        ts_ok,
+        vp_ok,
+        [True] * len(ts_ok),
+        [False] * len(ts_ok),
+        [{"timestamp": 0.15}, {"timestamp": 0.20}],  # overlapping slow windows
+        [{"timestamp": 0.80}],
+        CoupleAnnotations(),
+        cfg,
+    )
+    speed_peaks = [c for c in cues_ok if c["metadata"]["cue_kind"] == "secondary_speed_peak"]
+    assert len(speed_peaks) == 1
+    assert sum_ok["secondary_speed_peaks"] == 1
+    assert speed_peaks[0]["metadata"]["episode_id"].startswith("ep_speed_peak_")
+    assert speed_peaks[0]["metadata"]["support_duration_s"] >= 0.20
+
+    # 4. Per-phase reversal reference: Phase 1 (+0.7 -> +0.2) is shorter than Phase 2 (-0.8 -> -0.2 -> +0.5 reversal)
+    ts_phase = [round(i * 0.05, 4) for i in range(44)]  # 0.00..2.15
+    vp_phase = (
+        [0.70] * 6       # 0.00..0.25 Phase 1 +
+        + [0.20] * 6     # 0.30..0.55 Phase 1 slow (+ direction, NOT a reversal!)
+        + [0.00] * 4     # 0.60..0.75 settled pause
+        + [-0.80] * 14   # 0.80..1.45 longer Phase 2 - (drives old clip-wide sign to -1!)
+        + [-0.20] * 5    # 1.50..1.70 Phase 2 slow
+        + [0.50] * 7     # 1.75..2.05 genuine reversal in Phase 2
+        + [0.00] * 2
+    )
+    cues_phase, sum_phase = _evaluate_transitions(
+        ts_phase,
+        vp_phase,
+        [True] * len(ts_phase),
+        [False] * len(ts_phase),
+        [{"timestamp": 0.30}, {"timestamp": 1.50}],
+        [{"timestamp": 0.65}, {"timestamp": 2.10}],
+        CoupleAnnotations(),
+        cfg,
+    )
+    reversals = [c for c in cues_phase if c["metadata"]["cue_kind"] == "unintended_reversal"]
+    assert len(reversals) == 1
+    assert reversals[0]["timestamp"] == pytest.approx(1.75, abs=0.06)
+    assert reversals[0]["metadata"]["phase_reference_sign"] == -1.0
+    assert sum_phase["unintended_reversals"] == 1
+
+
+def test_p1_turn_matching_by_subject_turn_id_and_unmatched_preservation():
+    from tango_posture.couple.measurements import _turn_events_from_annotations_and_candidates
+
+    anns = CoupleAnnotations(
+        items=[
+            # Overlapping A and B turns with explicit turn_id
+            CoupleAnnotationItem("a_s", "turn_start", 1.0, subject="A", turn_id="turn_A_1"),
+            CoupleAnnotationItem("b_s", "turn_start", 1.2, subject="B", turn_id="turn_B_1"),
+            CoupleAnnotationItem("b_e", "turn_end", 1.8, subject="B", turn_id="turn_B_1"),
+            CoupleAnnotationItem("a_e", "turn_end", 2.0, subject="A", turn_id="turn_A_1"),
+            CoupleAnnotationItem("b_x", "exit", 1.90, subject="B", turn_id="turn_B_1"),
+            CoupleAnnotationItem("a_x", "exit", 2.15, subject="A", turn_id="turn_A_1"),
+            # Legacy overlapping A/B turns without turn_id -> still matched strictly per subject
+            CoupleAnnotationItem("la_s", "turn_start", 4.0, subject="A"),
+            CoupleAnnotationItem("lb_s", "turn_start", 4.1, subject="B"),
+            CoupleAnnotationItem("lb_e", "turn_end", 4.5, subject="B"),
+            CoupleAnnotationItem("la_e", "turn_end", 4.9, subject="A"),
+            CoupleAnnotationItem("la_x", "exit", 5.05, subject="A"),
+            CoupleAnnotationItem("lb_x", "exit", 4.60, subject="B"),
+            # Explicit shared pair turn
+            CoupleAnnotationItem("p_s", "turn_start", 7.0, subject="pair", turn_id="turn_pair_1"),
+            CoupleAnnotationItem("p_e", "turn_end", 7.6, subject="pair", turn_id="turn_pair_1"),
+            # Unmatched turn_start (missing end)
+            CoupleAnnotationItem("orphan_s", "turn_start", 9.0, subject="A", turn_id="turn_open"),
+            # Reversed order with turn_id -> rejected & preserved unmatched
+            CoupleAnnotationItem("bad_s", "turn_start", 11.0, subject="B", turn_id="turn_bad"),
+            CoupleAnnotationItem("bad_e", "turn_end", 10.5, subject="B", turn_id="turn_bad"),
+            # Legacy orphan exit for B -> preserved unmatched
+            CoupleAnnotationItem("orphan_x", "exit", 15.0, subject="B"),
+        ]
+    )
+
+    events, turn_sum = _turn_events_from_annotations_and_candidates(
+        anns, auto_turn_suggestions=False, pivot_candidates=[], turn_exit_match_window_s=3.0
+    )
+    matched = [e for e in events if e["event_type"] == "turn"]
+    unmatched = [e for e in events if e["event_type"] != "turn"]
+
+    assert turn_sum["turn_count"] == 5
+    by_tid = {e["turn_id"]: e for e in matched}
+    assert by_tid["turn_A_1"]["subject"] == "A"
+    assert by_tid["turn_A_1"]["value"] == pytest.approx(1.0, abs=1e-4)
+    assert by_tid["turn_A_1"]["metadata"]["exit_minus_turn_end_ms"] == pytest.approx(150.0, abs=0.1)
+
+    assert by_tid["turn_B_1"]["subject"] == "B"
+    assert by_tid["turn_B_1"]["value"] == pytest.approx(0.6, abs=1e-4)
+    assert by_tid["turn_B_1"]["metadata"]["exit_minus_turn_end_ms"] == pytest.approx(100.0, abs=0.1)
+
+    assert by_tid["turn_pair_1"]["metadata"]["shared_pair_turn"] is True
+    assert any(e["subject"] == "A" and e["value"] == pytest.approx(0.9, abs=1e-4) for e in matched)
+    assert any(e["subject"] == "B" and e["value"] == pytest.approx(0.4, abs=1e-4) for e in matched)
+
+    # Unmatched markers are preserved for correction (missing end, invalid order, orphan exit)
+    unmatched_ids = {m["annotation_id"]: m for m in turn_sum["unmatched_markers"]}
+    assert turn_sum["unmatched_count"] == 4
+    assert unmatched_ids["orphan_s"]["reason"] == "missing_turn_end"
+    assert unmatched_ids["bad_s"]["reason"] == "invalid_turn_marker_order"
+    assert unmatched_ids["bad_e"]["reason"] == "invalid_turn_marker_order"
+    assert unmatched_ids["orphan_x"]["reason"] == "unmatched_exit_no_matching_turn"
+    assert len(unmatched) == 4
+
+    # Mismatched subject sharing a turn_id is rejected and preserved unmatched
+    mismatch_anns = CoupleAnnotations(
+        items=[
+            CoupleAnnotationItem("ms", "turn_start", 1.0, subject="A", turn_id="tid_mix"),
+            CoupleAnnotationItem("me", "turn_end", 1.5, subject="B", turn_id="tid_mix"),
+        ]
+    )
+    _, mismatch_sum = _turn_events_from_annotations_and_candidates(
+        mismatch_anns, auto_turn_suggestions=False, pivot_candidates=[]
+    )
+    assert mismatch_sum["turn_count"] == 0
+    assert mismatch_sum["unmatched_count"] == 2
+    assert all(m["reason"] == "turn_id_subject_mismatch" for m in mismatch_sum["unmatched_markers"])
+    assert any("mismatched marker subjects" in w for w in mismatch_sum["warnings"])
+
+    # Nested same-subject legacy turns without turn_id emit an ambiguity warning
+    nested_anns = CoupleAnnotations(
+        items=[
+            CoupleAnnotationItem("ns1", "turn_start", 1.0, subject="A"),
+            CoupleAnnotationItem("ns2", "turn_start", 1.2, subject="A"),
+            CoupleAnnotationItem("ne1", "turn_end", 1.5, subject="A"),
+            CoupleAnnotationItem("ne2", "turn_end", 1.9, subject="A"),
+        ]
+    )
+    _, nested_sum = _turn_events_from_annotations_and_candidates(
+        nested_anns, auto_turn_suggestions=False, pivot_candidates=[]
+    )
+    assert any("Overlapping legacy turn_start" in w for w in nested_sum["warnings"])
+
+
+def test_p1_summary_evidence_status_mixed_unavailable_and_coordination():
+    from tango_posture.couple.measurements import (
+        _apply_annotations_to_candidates,
+        _turn_events_from_annotations_and_candidates,
+    )
+
+    cfg = Config()
+
+    # 1. One confirmed turn + four estimated auto turns -> "mixed" (never "user_confirmed")
+    anns_one_turn = CoupleAnnotations(
+        items=[
+            CoupleAnnotationItem("ts", "turn_start", 1.0, subject="pair", turn_id="t_conf", status="user_confirmed"),
+            CoupleAnnotationItem("te", "turn_end", 1.5, subject="pair", turn_id="t_conf", status="user_confirmed"),
+        ]
+    )
+    pivots = [
+        {"start_time": 2.0 + i * 1.0, "end_time": 2.4 + i * 1.0, "subject": "pair"}
+        for i in range(4)
+    ]
+    _, mixed_turn_sum = _turn_events_from_annotations_and_candidates(
+        anns_one_turn, auto_turn_suggestions=True, pivot_candidates=pivots
+    )
+    assert mixed_turn_sum["turn_count"] == 5
+    assert mixed_turn_sum["status"] == "mixed"
+    assert mixed_turn_sum["status_counts"]["user_confirmed"] == 1
+    assert mixed_turn_sum["status_counts"]["estimated"] == 4
+    assert mixed_turn_sum["eligible_count"] == 5
+
+    # 2. No evaluated transition window -> "unavailable" with None counts (never measured 0)
+    series_no_slow = {
+        "velocity_pair": [
+            {"timestamp": i * 0.05, "value": 0.5, "pair_hip_eligible": True, "break_flag": False}
+            for i in range(10)
+        ],
+        "torso_tilt_a": [{"timestamp": i * 0.05, "value": 1.0, "status": "measured"} for i in range(10)],
+        "torso_tilt_b": [{"timestamp": i * 0.05, "value": 1.0, "status": "measured"} for i in range(10)],
+        "couple_midpoint_tilt": [{"timestamp": i * 0.05, "value": 1.0, "status": "measured"} for i in range(10)],
+        "torso_separation": [{"timestamp": i * 0.05, "value": 0.0, "status": "measured"} for i in range(10)],
+        "head_pitch_a": [],
+        "head_pitch_b": [],
+        "pair_breaks": [],
+    }
+    coverage_full = {
+        "frame_count": 10,
+        "a_torso_coverage": 1.0,
+        "b_torso_coverage": 1.0,
+        "pair_torso_coverage": 1.0,
+        "pair_hip_coverage": 1.0,
+    }
+    _, sum_no_win = _apply_annotations_to_candidates(
+        automated_candidates=[],
+        annotations=CoupleAnnotations(),
+        pivot_candidates=[],
+        series=series_no_slow,
+        coverage=coverage_full,
+        cfg=cfg,
+    )
+    tr_sum = sum_no_win["transitions"]
+    assert tr_sum["status"] == "unavailable"
+    assert tr_sum["evaluated_window_count"] == 0
+    assert tr_sum["secondary_speed_peaks"] is None
+    assert tr_sum["unintended_reversals"] is None
+
+    # 3. Coordination & step_timing reflect edited/mixed status rather than hardcoding "measured"
+    candidates = [
+        {
+            "event_id": "cand_A_start_0",
+            "event_type": "start",
+            "subject": "A",
+            "timestamp": 1.00,
+            "status": "measured",
+            "metadata": {},
+        },
+        {
+            "event_id": "cand_B_start_0",
+            "event_type": "start",
+            "subject": "B",
+            "timestamp": 1.12,
+            "status": "measured",
+            "metadata": {},
+        },
+        {
+            "event_id": "cand_A_contact_0",
+            "event_type": "contact",
+            "subject": "A",
+            "timestamp": 1.05,
+            "status": "estimated",
+            "metadata": {},
+        },
+    ]
+    anns_edited_a = CoupleAnnotations(
+        items=[
+            CoupleAnnotationItem(
+                annotation_id="edit_a",
+                event_type="start",
+                subject="A",
+                timestamp=1.02,
+                status="user_confirmed",
+                source_candidate_id="cand_A_start_0",
+            ),
+            CoupleAnnotationItem(
+                annotation_id="conf_contact_a",
+                event_type="contact",
+                subject="A",
+                timestamp=1.25,
+                status="user_confirmed",
+            ),
+        ]
+    )
+    _, sum_mixed_coord = _apply_annotations_to_candidates(
+        automated_candidates=candidates,
+        annotations=anns_edited_a,
+        pivot_candidates=[],
+        series=series_no_slow,
+        coverage=coverage_full,
+        cfg=cfg,
+    )
+    coord_start = sum_mixed_coord["coordination"]["start_lag_ms"]
+    assert coord_start["status"] == "mixed"
+    assert coord_start["status_counts"]["user_confirmed"] == 1
+    assert coord_start["status_counts"]["measured"] == 1
+    assert sum_mixed_coord["step_timing"]["A"]["status"] == "mixed"
+
+    # CSV export leaves unavailable transition counts blank (not "0") and carries status_counts & evaluated_window_count
+    mock_res = {
+        "run_id": "r-p1-4",
+        "coverage": coverage_full,
+        "summaries": sum_no_win,
+        "events": [],
+    }
+    csv_rows = list(csv.DictReader(io.StringIO(export_couple_csv(mock_res, "Clip", 0))))
+    tr_row = next(r for r in csv_rows if r["measure"] == "secondary_speed_peaks")
+    assert tr_row["status"] == "unavailable"
+    assert tr_row["value"] == ""
+    assert tr_row["evaluated_window_count"] == "0"

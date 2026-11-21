@@ -16,6 +16,7 @@ build/
 docs/licenses/
 reports/
 calibrations/
+logs/
 requirements/
 /practice/
 /references/

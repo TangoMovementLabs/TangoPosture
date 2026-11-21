@@ -90,19 +90,19 @@ An automatic **contact** is an apparent foot placement inferred from movement an
 | `iqr_beat_offset_ms` | Middle-half spread of contact offsets | Offsets −100, 0, 100, 200, 300 ms → IQR 200 ms. |
 | `beat_fraction` / `median_beat_fraction` | Offset divided by target interval | +100 ms with a 500 ms interval → +0.20. With half-beat subdivision (250 ms), the same offset → +0.40. |
 
-Beat subdivision inserts targets between beats; beat offset shifts the whole target grid. Manual beats take precedence when supplied. Starts can also carry per-event beat offsets, but step summaries aggregate contacts. No usable target means no numeric beat offset, even if contacts exist. A summary marked user confirmed can currently contain other estimated events; inspect individual events.
+Beat subdivision inserts targets between beats; beat offset shifts the whole target grid. Manual beats take precedence when supplied. Starts can also carry per-event beat offsets, but step summaries aggregate contacts. No usable target means no numeric beat offset, even if contacts exist. Whenever confirmed and estimated contacts or beats coexist, the step summary reports `mixed` rather than `user_confirmed`; inspect `status_counts` and individual events to verify what was reviewed.
 
 ### 3. Transitions: what happened while slowing or changing direction?
 
 | Output | Meaning | Example |
 | --- | --- | --- |
-| `secondary_speed_peaks` | Count of detected speed rises during inspected transitions, excluding matching planned settling/pause marks | Pair speed falls to 0.10 then rises to 0.30 torso lengths/s: rise 0.20. It becomes a cue only if configured threshold and persistence checks pass. |
-| `unintended_reversals` | Reversals relative to the implementation's dominant motion sign without a matching planned-reversal mark | Travel changes from positive to sufficiently negative for long enough. “Unintended” means unannotated here; the software cannot know intention. |
+| `secondary_speed_peaks` | Count of sustained speed rises during evaluated transition windows (excluding matching planned settling/pause marks), deduplicated per episode | Pair speed falls to 0.10 then rises to 0.30 torso lengths/s for at least `persistence_s`: rise 0.20 with observed elapsed support. Single-frame spikes at the end of a window do not trigger. |
+| `unintended_reversals` | Sustained reversals relative to the local motion phase's pre-slowing travel direction, excluding matching planned-reversal marks | Travel changes direction for at least `persistence_s` inside an unbroken segment. “Unintended” means unannotated here; the software cannot know intention. |
 | `planned_pauses`, `planned_reversals`, `settling_steps` | Counts of user-supplied marks | Marking a deliberate settling step helps distinguish it from an unexplained speed rise. Counts record annotations, not independent confirmation. |
-| Transition `coverage` | Mean usable pair-hip frame fraction across inspected windows | Windows with 80% and 100% coverage give mean 90%, regardless of their relative duration. |
-| Transition `status` | Whether the summary passed the implemented coverage logic | A low-coverage window may be unavailable. Zero cues is not proof the entire passage was clean. |
+| Transition `coverage` & `evaluated_window_count` | Mean usable pair-hip frame fraction across inspected windows and count of windows meeting coverage + elapsed-support gates | Two windows with 80% and 100% coverage give mean 90% and `evaluated_window_count = 2`. |
+| Transition `status` | Evidence state from evaluated windows (`measured`, `mixed`, `estimated`, or `unavailable`) | If `evaluated_window_count == 0`, `status` is `unavailable` and unintended counts are blank/`None` instead of a misleading `0`. |
 
-Windows usually run from slowing to a later settle, or a bounded fallback end; planned windows and a whole-clip reversal fallback also exist. Windows can overlap, so cue totals should not be treated as guaranteed counts of distinct physical incidents. See the audit for persistence and empty-window edge cases.
+Windows run from slowing to a later settle (or a bounded fallback end), or around planned transition marks when no slow event occurred. Each window is partitioned into unbroken eligible intervals (splitting on cuts, occlusion, or gaps exceeding `max_observation_gap_s`), cues require full elapsed support reaching `tk + persistence_s`, and stable episode IDs prevent overlapping windows from double-counting the same rise or reversal. For a plain-English walkthrough of the P1 reliability fixes, see [the P1 Data-Trust Manual for Dummies](P1_DATA_TRUST_MANUAL_FOR_DUMMIES.md).
 
 ### 4. Posture: the two axes and the line between their midpoints
 
@@ -132,7 +132,7 @@ Coverage is reported separately for A/B hips, torsos and heads, and for pair hip
 | `overlap_count` | Turns whose matched exit happens before turn end | The −200 ms example contributes one overlap. This is a temporal label, not an error verdict. |
 | `pivot_behavior_a`, `pivot_behavior_b`, `embrace_opening` | Human annotations attached to turns | “Stepping pivot” or a description of opening records the reviewer’s observation; no physical embrace-opening angle is calculated here. |
 
-A missing exit makes exit timing unavailable, not zero. Automatic suggestions come from per-dancer pivot candidates. The summary can combine suggestions with confirmed turns. Current turn assembly pairs chronologically without checking matching subjects; review overlapping A/B marks carefully until the audit recommendation is implemented.
+A missing exit makes exit timing unavailable, not zero. Automatic suggestions come from per-dancer pivot candidates. When a summary combines suggestions with confirmed turns, the turn summary displays `mixed` evidence (alongside `status_counts`) rather than claiming `user_confirmed`. Turn assembly associates `turn_start`, `turn_end`, and `exit` by persistent `turn_id` and matching `subject` (`A`, `B`, or explicit shared `pair`), warns on mismatched or ambiguous overlapping legacy sequences, and preserves unmatched markers for correction.
 
 ### A complete couple example
 
@@ -1770,6 +1770,14 @@ Hysteresis threshold below which the shared Couple midpoint axis line reappears 
 
 **Example:** `0.80 m` prevents the shared midpoint line from flickering on and off around `1.0 m`.
 
+### Pose origin policy - `dancer_analysis.pose_origin_policy`
+
+**Default:** `"measured_only"`; options `"measured_only"`, `"allow_propagated_estimates"`.
+
+Controls whether translated close-embrace propagated poses are excluded from measured Couple metrics (`"measured_only"`) or included strictly as estimated samples (`"allow_propagated_estimates"`).
+
+**Example:** `"measured_only"` keeps measured coverage grounded in detected and crop-split frames while still rendering display overlays on propagated frames.
+
 ### Solo camera calibration settings
 
 ### Speak calibration instructions - `solo_camera.speak_instructions`
@@ -2056,7 +2064,7 @@ Key module boundaries:
 
 | Area | Owning Modules | Responsibility |
 | --- | --- | --- |
-| **Launch & Config** | `cli.py`, `desktop.py`, `config.py`, `domain.py` | Validated Pydantic TOML configuration, core immutable/domain dataclasses, `PoseEstimator` protocol |
+| **Launch & Config** | `cli.py`, `desktop.py`, `troubleshoot.py`, `config.py`, `domain.py` | Validated Pydantic TOML configuration, core immutable/domain dataclasses, `PoseEstimator` protocol, opt-in `--troubleshoot` low-level telemetry |
 | **Desktop Shell & Screens** | `desktop_qt/shell.py`, `router.py`, `service_bridge.py`, `desktop_qt/screens/*` | Navigation rail, stacked screens, reusable `MetricChart` (`desktop_qt/components/metric_chart.py`), background worker coordination |
 | **Calibration Engine** | `calibration/models.py`, `archives.py`, `evidence.py`, `measurements.py`, `statistics.py`, `baseline.py` | Version-2 `.tpc` range profiles, dancer spatial association, raw per-view measurements, passage percentiles |
 | **Offline Analysis & Replay** | `references/pipeline.py`, `coach.py`, `archives.py`, `movement.py`, `replay.py`, `overlay.py` | Clip decoding, MediaPipe inference, cached frame analytics, step/pivot detection, video playback/rendering |
@@ -2071,6 +2079,7 @@ Key module boundaries:
 | `references/<name>.tpr` | Replayable reference video ZIP storing raw media, cached raw `measurement_poses`, movement data, and saved dancer selection metadata. |
 | `calibrations/<name>.tpc` | Lightweight version-2 approved range ZIP (`profile.json` + manifest) storing explicit metric bounds (`lower`, `upper`), `view`, `unit`, approved passages, and model/capture identity. |
 | `<data_dir>/tango.sqlite3` | Optional SQLite v1 session metadata database. Portable `.tp`, `.tpr`, and `.tpc` archives work independently of `tango.sqlite3`. |
+| `logs/troubleshoot_<UTC>_pid<PID>.log` | Created only when launched with `--troubleshoot`, `troubleshoot`, or `TANGOPOSTURE_TROUBLESHOOT=1` (defaults to `./logs/` in CLI mode or `<data_dir>/logs/` in packaged desktop mode, overrideable via `--log-dir`). Stores timestamped diagnostics locally on disk; never transmitted anywhere. |
 
 **Offline & Privacy**: Pose estimation, calibration, video playback, and analytics operate 100% locally on disk. Network access is requested *only* when you start analysis with a missing `full`/`heavy` MediaPipe model (downloaded once and SHA-256 verified) or when you explicitly click **Check Ollama** / **Analyze Selected Report** in **AI Coach**. Source code is licensed under [Apache-2.0](../LICENSE); see [Third-Party Notices](../THIRD_PARTY_NOTICES.md) and `docs/licenses/` for dependency terms.
 
@@ -2085,6 +2094,36 @@ Key module boundaries:
 | Overlay colors or text don't react when toggling layers in Review | You are viewing the **Annotated overlay** stream whose pixels are already baked into the video | Switch stream selector to **Raw video** so Review renders dynamic layers live. |
 | Footprints missing in Review during walking steps | Heel or forefoot landmarks cropped/occluded, travel below `0.075` body scales, or camera cut interrupted tracking | Ensure full body and shoes stay comfortably in frame with contrast against the floor; use `full` or `heavy` model if feet jitter. |
 | Calibration comparison rejected in Review as incompatible | Source model hash mismatch or legacy/display-only pose cache | Re-analyze the video and reference with the same `analysis_model` and create/update a compatible `.tpc` profile. |
+
+### Low-Level Diagnostics Log (`--troubleshoot`)
+
+When debugging camera stalls, MediaPipe detection dropouts, audio/beat issues, Qt display scaling, or crashes, launch TangoPosture with **`--troubleshoot`** (or the **`troubleshoot`** subcommand):
+
+```bash
+# Launch the Qt desktop UI with low-level telemetry enabled
+uv run tango-posture --troubleshoot
+uv run tango-posture troubleshoot
+
+# Or attach --troubleshoot to any CLI subcommand / custom log directory
+uv run tango-posture --troubleshoot --log-dir logs sessions list
+uv run tango-posture --troubleshoot run --camera 0 --side left --facing right
+
+# Environment variable equivalent (works for both CLI and packaged desktop launches)
+TANGOPOSTURE_TROUBLESHOOT=1 uv run tango-posture qt
+```
+
+In packaged desktop builds (`TangoPosture` on macOS/Windows/Linux), you can also pass `--troubleshoot`, `troubleshoot`, and optional `--log-dir <path>` directly to the executable (on macOS: `open -a TangoPosture --args --troubleshoot`). Unexpected desktop arguments continue to be rejected.
+
+**Per-execution log output (`logs/troubleshoot_YYYYMMDD_HHMMSS_ffffff_pid<PID>.log`):**
+- Defaults to `./logs/` for CLI/source launches and `<data_dir>/logs/` for packaged desktop launches; zero runtime instrumentation overhead is installed when troubleshooting is off.
+- Every line records an exact UTC ISO-8601 timestamp, monotonic offset (`+  0.000000s`), severity level, thread name/ID, and subsystem tag:
+  - **`system.specs`**: OS/kernel, CPU/RAM/disk, macOS `sysctl`/`system_profiler` cameras/audio/displays, macOS TCC camera & microphone permissions, Python executable/paths, CLI `argv`, and sanitized environment variables.
+  - **`python.packages` & `python.import`**: Exact `name==version` of all installed Python distributions plus live module import timings (`elapsed_ms`).
+  - **`config.*`**: Initial `Config` JSON snapshot and every live update applied from **Settings**.
+  - **`cv2.*` / `camera.cv2.*` / `video.cv2.*`**: OpenCV build info and verbose backend logs, `VideoCapture` opens/backends/`CAP_PROP_*` properties, per-frame read timings/shapes/mean sample brightness/dropped frames/stalls, and `VideoWriter` frame stats.
+  - **`mediapipe.*`**: `PoseLandmarker` model path, byte size, delegate/options, per-frame `detect_for_video`/`detect` inference latency, pose/world-pose counts, landmark visibility stats, and key coordinates.
+  - **`audio.sd.*`**: `sounddevice`/PortAudio versions, audio input devices, `InputStream` setup, and non-blocking queued callback/overflow telemetry.
+  - **`qt.*`, `py.*`, `stderr`, crashes & `runtime.heartbeat`**: Qt message handler, `QScreen` & `QMediaDevices` state, root Python `DEBUG` logs, warnings, uncaught thread/main exceptions, `faulthandler`, and a 5-second memory/CPU/thread/GC heartbeat.
 
 ### Glossary
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
@@ -11,7 +12,7 @@ from uuid import uuid4
 import numpy as np
 
 from ..config import Config
-from ..domain import FrameObservation
+from ..domain import VALID_POSE_ORIGINS, FrameObservation, PoseOrigin, normalize_pose_origin
 from ..geometry import head_horizontal_alignment
 from ..movement import analyse_movement_observations, wrapped_angle_diff
 from ..pose.interpolation import interpolate_tracked_dancer_poses
@@ -20,10 +21,13 @@ from .models import (
     AutoDecisionResult,
     CoupleAnalysisRequest,
     CoupleAnalysisResult,
+    CoupleAnnotationItem,
     CoupleAnnotations,
     CoupleEvent,
     CoupleSummaryValue,
     PairedFrameSample,
+    PoseOriginPolicy,
+    SummaryEvidenceStatus,
     TrackedDancerSample,
 )
 from .overlay import smooth_couple_frame_overlays
@@ -196,12 +200,13 @@ def _detect_motion_events_for_track(
     slowing_fraction: float,
     persistence_s: float,
     max_gap_s: float,
+    sample_origins: Sequence[str | None] | None = None,
 ) -> list[CoupleEvent]:
     """Detect start/restart, slowing, and settled events along one subject's travel speed curve."""
     events: list[CoupleEvent] = []
     # Partition into contiguous finite speed segments
-    segments: list[list[tuple[float, float]]] = []
-    cur: list[tuple[float, float]] = []
+    segments: list[list[tuple[float, float, str | None]]] = []
+    cur: list[tuple[float, float, str | None]] = []
     last_t: float | None = None
     for idx, (t, v) in enumerate(zip(timestamps, velocities)):
         if break_mask[idx]:
@@ -215,7 +220,8 @@ def _detect_motion_events_for_track(
             if cur:
                 segments.append(cur)
             cur = []
-        cur.append((float(t), abs(float(v))))
+        org = sample_origins[idx] if sample_origins is not None and idx < len(sample_origins) else None
+        cur.append((float(t), abs(float(v)), org))
         last_t = float(t)
     if cur:
         segments.append(cur)
@@ -223,20 +229,44 @@ def _detect_motion_events_for_track(
     for seg in segments:
         if len(seg) < 3:
             continue
+        seg_tv = [(t, sp) for t, sp, _ in seg]
         state = "IDLE"
         active_speeds: list[float] = []
         slowing_emitted = False
+        if (
+            len(seg) >= 3
+            and seg[0][1] > start_speed
+            and _stays_above(seg_tv, 0, start_speed, persistence_s)
+        ):
+            state = "TRAVELLING"
 
-        for pos, (t, sp) in enumerate(seg):
+        def _bracket_status(
+            p0: int,
+            p1: int,
+            segment: Sequence[tuple[float, float, str | None]] = seg,
+        ) -> tuple[str, str | None]:
+            orgs = [
+                segment[k][2]
+                for k in range(max(0, p0), min(len(segment), p1 + 1))
+                if segment[k][2]
+            ]
+            if "propagated" in orgs:
+                return ("estimated", "propagated")
+            if "crop_detected" in orgs:
+                return ("measured", "crop_detected")
+            return ("measured", orgs[0] if orgs else "detected")
+
+        for pos, (t, sp, _) in enumerate(seg):
             if state == "IDLE":
                 if (
                     sp > start_speed
                     and pos > 0
                     and seg[pos - 1][1] <= start_speed
-                    and _stays_above(seg, pos, start_speed, persistence_s)
+                    and _stays_above(seg_tv, pos, start_speed, persistence_s)
                 ):
-                    t_prev, sp_prev = seg[pos - 1]
+                    t_prev, sp_prev, _ = seg[pos - 1]
                     t_cross = _interpolate_crossing(t_prev, sp_prev, t, sp, start_speed)
+                    ev_status, ev_origin = _bracket_status(pos - 1, pos)
                     events.append(
                         CoupleEvent(
                             event_id=f"cand_{subject}_start_{len(events)}",
@@ -247,7 +277,8 @@ def _detect_motion_events_for_track(
                             bracket_end=float(t),
                             value=round(start_speed, 4),
                             unit="torso_lengths/s",
-                            status="measured",
+                            status=ev_status,  # type: ignore[arg-type]
+                            metadata={"pose_origin": ev_origin} if ev_origin else {},
                         )
                     )
                     state = "TRAVELLING"
@@ -265,10 +296,11 @@ def _detect_motion_events_for_track(
                         and v_med > start_speed
                         and sp < slow_thresh
                         and seg[pos - 1][1] >= slow_thresh
-                        and _stays_below(seg, pos, slow_thresh, persistence_s)
+                        and _stays_below(seg_tv, pos, slow_thresh, persistence_s)
                     ):
-                        t_prev, sp_prev = seg[pos - 1]
+                        t_prev, sp_prev, _ = seg[pos - 1]
                         t_cross = _interpolate_crossing(t_prev, sp_prev, t, sp, slow_thresh)
+                        ev_status, ev_origin = _bracket_status(pos - 1, pos)
                         events.append(
                             CoupleEvent(
                                 event_id=f"cand_{subject}_slow_{len(events)}",
@@ -279,8 +311,11 @@ def _detect_motion_events_for_track(
                                 bracket_end=float(t),
                                 value=round(slow_thresh, 4),
                                 unit="torso_lengths/s",
-                                status="measured",
-                                metadata={"steady_median_speed": round(v_med, 4)},
+                                status=ev_status,  # type: ignore[arg-type]
+                                metadata={
+                                    "steady_median_speed": round(v_med, 4),
+                                    **({"pose_origin": ev_origin} if ev_origin else {}),
+                                },
                             )
                         )
                         slowing_emitted = True
@@ -290,10 +325,11 @@ def _detect_motion_events_for_track(
                     pos > 0
                     and sp < stop_speed
                     and seg[pos - 1][1] >= stop_speed
-                    and _stays_below(seg, pos, stop_speed, persistence_s)
+                    and _stays_below(seg_tv, pos, stop_speed, persistence_s)
                 ):
-                    t_prev, sp_prev = seg[pos - 1]
+                    t_prev, sp_prev, _ = seg[pos - 1]
                     t_cross = _interpolate_crossing(t_prev, sp_prev, t, sp, stop_speed)
+                    ev_status, ev_origin = _bracket_status(pos - 1, pos)
                     events.append(
                         CoupleEvent(
                             event_id=f"cand_{subject}_settle_{len(events)}",
@@ -304,7 +340,8 @@ def _detect_motion_events_for_track(
                             bracket_end=float(t),
                             value=round(stop_speed, 4),
                             unit="torso_lengths/s",
-                            status="measured",
+                            status=ev_status,  # type: ignore[arg-type]
+                            metadata={"pose_origin": ev_origin} if ev_origin else {},
                         )
                     )
                     state = "IDLE"
@@ -440,6 +477,112 @@ def _attach_beat_offsets(events: list[dict[str, Any]], beat_targets: list[dict[s
         ev["metadata"]["beat_status"] = b["status"]
 
 
+_CANONICAL_STATUSES = ("measured", "estimated", "user_confirmed", "unavailable")
+
+
+def _count_statuses(statuses: Sequence[str | None]) -> dict[str, int]:
+    counts = {k: 0 for k in _CANONICAL_STATUSES}
+    for st in statuses:
+        s = str(st or "unavailable")
+        if s in counts:
+            counts[s] += 1
+        elif s:
+            counts[s] = counts.get(s, 0) + 1
+    return counts
+
+
+def _count_origins(origins: Sequence[str | None]) -> dict[str, int]:
+    counts = {org: 0 for org in VALID_POSE_ORIGINS}
+    for org in origins:
+        if isinstance(org, str) and org in counts:
+            counts[org] += 1
+    return counts
+
+
+def _summarize_evidence_status(
+    statuses: Sequence[str | None],
+    *,
+    eligible_count: int | None = None,
+    min_required: int = 1,
+    unavailable_status: SummaryEvidenceStatus = "unavailable",
+) -> tuple[SummaryEvidenceStatus, dict[str, int]]:
+    counts = _count_statuses(statuses)
+    active_kinds = [
+        kind for kind in ("measured", "estimated", "user_confirmed") if counts.get(kind, 0) > 0
+    ]
+    eff_eligible = (
+        sum(counts.get(kind, 0) for kind in ("measured", "estimated", "user_confirmed"))
+        if eligible_count is None
+        else int(eligible_count)
+    )
+    if eff_eligible < min_required or not active_kinds:
+        return (unavailable_status, counts)
+    if len(active_kinds) == 1:
+        return (active_kinds[0], counts)  # type: ignore[return-value]
+    return ("mixed", counts)
+
+
+def _partition_contiguous_eligible_intervals(
+    timestamps: Sequence[float],
+    v_pair: Sequence[float | None],
+    pair_hip_eligible: Sequence[bool],
+    break_mask: Sequence[bool],
+    max_gap_s: float,
+) -> list[list[tuple[int, float, float]]]:
+    """Split velocity samples into contiguous eligible intervals broken by cuts, gaps, or drop-outs."""
+    intervals: list[list[tuple[int, float, float]]] = []
+    cur: list[tuple[int, float, float]] = []
+    last_t: float | None = None
+    for idx, (t, v, elig, brk) in enumerate(zip(timestamps, v_pair, pair_hip_eligible, break_mask)):
+        if brk:
+            if cur:
+                intervals.append(cur)
+                cur = []
+            last_t = None
+        if not elig or v is None or not math.isfinite(float(v)):
+            if cur:
+                intervals.append(cur)
+                cur = []
+            last_t = None
+            continue
+        tf = float(t)
+        if last_t is not None and (tf - last_t) > max_gap_s + 1e-9:
+            if cur:
+                intervals.append(cur)
+            cur = []
+        cur.append((idx, tf, float(v)))
+        last_t = tf
+    if cur:
+        intervals.append(cur)
+    return intervals
+
+
+def _has_elapsed_support(
+    pts: Sequence[tuple[int, float, float]],
+    start_k: int,
+    persistence_s: float,
+    max_gap_s: float,
+    predicate: Any,
+) -> tuple[bool, float, float]:
+    """Require actual observed elapsed support across ``[tk, tk + persistence_s]``."""
+    if start_k < 0 or start_k >= len(pts):
+        return (False, 0.0, 0.0)
+    _, t0, v0 = pts[start_k]
+    if not predicate(v0):
+        return (False, t0, 0.0)
+    prev_t = t0
+    for m in range(start_k + 1, len(pts)):
+        _, tm, vm = pts[m]
+        if (tm - prev_t) > max_gap_s + 1e-9:
+            return (False, t0, 0.0)
+        if not predicate(vm):
+            return (False, t0, 0.0)
+        prev_t = tm
+        if (tm - t0) >= persistence_s - 1e-6:
+            return (True, tm, tm - t0)
+    return (False, t0, 0.0)
+
+
 def _evaluate_transitions(
     timestamps: list[float],
     v_pair: list[float | None],
@@ -449,6 +592,9 @@ def _evaluate_transitions(
     settle_events: list[dict[str, Any]],
     annotations: CoupleAnnotations,
     cfg: Config,
+    *,
+    max_gap_s: float | None = None,
+    v_origins: Sequence[str | None] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Evaluate secondary speed peaks and direction reversals inside transition windows."""
     da_cfg = cfg.dancer_analysis
@@ -456,9 +602,10 @@ def _evaluate_transitions(
     rise_thresh = float(da_cfg.secondary_speed_rise)
     stop_speed = float(da_cfg.stop_speed)
     min_cov = float(da_cfg.transition_min_coverage)
+    eff_max_gap = float(max_gap_s if max_gap_s is not None else da_cfg.max_observation_gap_s)
 
-    # Identify transition brackets [t_slow, t_end]
-    windows: list[tuple[float, float]] = []
+    # Identify candidate transition brackets (t0, t1, source_slow_t)
+    windows: list[tuple[float, float, float | None]] = []
     for ev in sorted(slow_events, key=lambda e: float(e["timestamp"])):
         t0 = float(ev["timestamp"])
         after = [
@@ -466,21 +613,23 @@ def _evaluate_transitions(
             for s in settle_events
             if float(s["timestamp"]) > t0 + 0.05
         ]
-        t1 = min(after) if after else min(timestamps[-1], t0 + 2.0) if timestamps else t0 + 2.0
+        t1 = min(after) if after else (min(timestamps[-1], t0 + 2.0) if timestamps else t0 + 2.0)
         if t1 > t0:
-            windows.append((t0, t1))
+            windows.append((t0, t1, t0))
 
     if not windows and len(timestamps) >= 3:
-        # Also inspect any interval between sign reversal or transition marks
         for mark in annotations.planned_transitions:
-            t0 = float(mark.timestamp) - 0.5
-            t1 = float(mark.window_end if mark.window_end is not None else mark.timestamp) + 0.5
+            m0 = float(mark.timestamp)
+            m1 = float(mark.window_end if mark.window_end is not None else mark.timestamp)
+            t0 = m0 - 0.5
+            t1 = m1 + 0.5
             if t1 > t0:
-                windows.append((t0, t1))
+                windows.append((t0, t1, m0))
 
-    # Determine dominant motion sign per phase for reversal check
-    non_null_v = [float(v) for v in v_pair if v is not None and abs(v) > stop_speed]
-    dom_sign = 1.0 if (sum(1.0 if v >= 0 else -1.0 for v in non_null_v) >= 0) else -1.0
+    windows.sort(key=lambda item: (item[0], item[1]))
+    intervals = _partition_contiguous_eligible_intervals(
+        timestamps, v_pair, pair_hip_eligible, break_mask, eff_max_gap
+    )
 
     cue_events: list[dict[str, Any]] = []
     planned_marks = list(annotations.planned_transitions)
@@ -495,163 +644,284 @@ def _evaluate_transitions(
                 return True
         return False
 
+    seen_episodes: dict[str, list[tuple[float, float, str]]] = {
+        "speed_peak": [],
+        "reversal": [],
+    }
+
+    def _episode_is_duplicate(cue_group: str, onset_t: float, support_end_t: float) -> bool:
+        dedup_tol = max(persistence_s, 0.25)
+        for prev_start, prev_end, _ in seen_episodes[cue_group]:
+            if prev_start - persistence_s <= support_end_t and prev_end + persistence_s >= onset_t:
+                return True
+            if abs(prev_start - onset_t) <= dedup_tol:
+                return True
+        return False
+
+    def _phase_reference_sign(
+        interval: Sequence[tuple[int, float, float]],
+        sub: Sequence[tuple[int, float, float]],
+        anchor_t: float | None,
+    ) -> float:
+        ref_t = anchor_t if anchor_t is not None else sub[0][1]
+        ref_vals = [
+            v
+            for _, t, v in interval
+            if ref_t - 1.5 <= t <= ref_t + 1e-6 and abs(v) > stop_speed
+        ]
+        if not ref_vals:
+            earlier = [v for _, t, v in interval if t <= ref_t + 1e-6 and abs(v) > stop_speed]
+            ref_vals = earlier[-10:]
+        if not ref_vals:
+            # Anchor at very start of contiguous interval: use initial moving run inside sub before any sign flip
+            first_sign: float | None = None
+            for _, _, v in sub:
+                if abs(v) <= stop_speed:
+                    if ref_vals:
+                        break
+                    continue
+                cur_s = 1.0 if v >= 0.0 else -1.0
+                if first_sign is None:
+                    first_sign = cur_s
+                elif cur_s != first_sign:
+                    break
+                ref_vals.append(v)
+        if not ref_vals:
+            return 0.0
+        med = float(np.median(ref_vals))
+        return 1.0 if med >= 0.0 else -1.0
+
+    def _sub_origin(sub: Sequence[tuple[int, float, float]]) -> PoseOrigin | None:
+        if v_origins is None:
+            return None
+        orgs = [
+            v_origins[idx]
+            for idx, _, _ in sub
+            if 0 <= idx < len(v_origins) and v_origins[idx]
+        ]
+        if "propagated" in orgs:
+            return "propagated"
+        if "crop_detected" in orgs:
+            return "crop_detected"
+        if "detected" in orgs:
+            return "detected"
+        return None
+
     total_win_covs: list[float] = []
     unintended_peaks = 0
     unintended_reversals = 0
     planned_pauses = sum(1 for m in planned_marks if m.kind == "planned_pause")
     planned_reversals = sum(1 for m in planned_marks if m.kind == "planned_reversal")
     settling_steps = sum(1 for m in planned_marks if m.kind == "settling_step")
+    candidate_window_count = 0
+    evaluated_window_count = 0
     unavailable_windows = 0
+    evaluated_origins: list[str | None] = []
 
-    for w_idx, (t0, t1) in enumerate(windows):
+    for w_idx, (t0, t1, anchor_t) in enumerate(windows):
         in_idx = [i for i, t in enumerate(timestamps) if t0 - 1e-6 <= t <= t1 + 1e-6]
         if not in_idx:
             continue
+        candidate_window_count += 1
         cov = sum(1 for i in in_idx if pair_hip_eligible[i]) / len(in_idx)
         total_win_covs.append(cov)
         if cov < min_cov:
             unavailable_windows += 1
             continue
 
-        # Build valid speeds inside window
-        win_pts = [(timestamps[i], v_pair[i], break_mask[i]) for i in in_idx if v_pair[i] is not None]
-        if len(win_pts) < 3:
+        # Partition window into contiguous eligible sub-intervals with enough duration for elapsed support
+        win_subs: list[tuple[list[tuple[int, float, float]], list[tuple[int, float, float]]]] = []
+        for iv in intervals:
+            sub = [pt for pt in iv if t0 - 1e-6 <= pt[1] <= t1 + 1e-6]
+            if len(sub) >= 2 and (sub[-1][1] - sub[0][1]) >= persistence_s - 1e-6:
+                win_subs.append((iv, sub))
+
+        if not win_subs:
+            unavailable_windows += 1
             continue
 
-        # 1) Secondary speed peak check after slowing onset
-        running_min = abs(float(win_pts[0][1]))  # type: ignore[arg-type]
-        peak_found = False
-        for k, (tk, vk, bk) in enumerate(win_pts):
-            if bk:
-                running_min = abs(float(vk))  # type: ignore[arg-type]
-                continue
-            sp = abs(float(vk))  # type: ignore[arg-type]
-            if sp < running_min:
-                running_min = sp
-            elif not peak_found and (sp - running_min) >= rise_thresh:
-                # Confirm sustained rise for persistence_s
-                end_t = tk + persistence_s
-                sustained = all(
-                    abs(float(win_pts[m][1])) - running_min >= rise_thresh * 0.6  # type: ignore[arg-type]
-                    for m in range(k, len(win_pts))
-                    if win_pts[m][0] <= end_t
-                )
-                if sustained:
-                    is_settling_step = _overlaps_planned(tk, end_t, "settling_step") or _overlaps_planned(
-                        tk, end_t, "planned_pause"
-                    )
-                    if not is_settling_step:
-                        unintended_peaks += 1
-                    cue_events.append(
-                        CoupleEvent(
-                            event_id=f"cand_speed_peak_{w_idx}_{k}",
-                            event_type="speed_cue",
-                            subject="pair",
-                            timestamp=round(tk, 4),
-                            end_timestamp=round(min(t1, end_t), 4),
-                            value=round(sp - running_min, 4),
-                            unit="pair_torso_lengths/s",
-                            status="user_confirmed" if is_settling_step else "measured",
-                            reason="planned_settling_step" if is_settling_step else "secondary_speed_peak",
-                            metadata={
-                                "cue_kind": "planned_settling_step" if is_settling_step else "secondary_speed_peak",
-                                "window_index": w_idx,
-                            },
-                        ).to_dict()
-                    )
-                    peak_found = True
+        evaluated_window_count += 1
+        for iv, sub in win_subs:
+            sub_org = _sub_origin(sub)
+            evaluated_origins.append(sub_org)
 
-        # 2) Direction reversal check
-        in_rev_start: float | None = None
-        for k, (tk, vk, bk) in enumerate(win_pts):
-            if bk:
-                in_rev_start = None
-                continue
-            vv = float(vk)  # type: ignore[arg-type]
-            opposite = (vv * dom_sign) < -stop_speed
-            if opposite:
-                if in_rev_start is None:
-                    in_rev_start = tk
-                if (tk - in_rev_start) >= persistence_s - 1e-6:
-                    is_planned = _overlaps_planned(in_rev_start, tk, "planned_reversal")
-                    if not is_planned:
-                        unintended_reversals += 1
-                    cue_events.append(
-                        CoupleEvent(
-                            event_id=f"cand_reversal_{w_idx}_{k}",
-                            event_type="speed_cue",
-                            subject="pair",
-                            timestamp=round(in_rev_start, 4),
-                            end_timestamp=round(tk, 4),
-                            value=round(abs(vv), 4),
-                            unit="pair_torso_lengths/s",
-                            status="user_confirmed" if is_planned else "measured",
-                            reason="planned_reversal" if is_planned else "unintended_reversal",
-                            metadata={
-                                "cue_kind": "planned_reversal" if is_planned else "unintended_reversal",
-                                "window_index": w_idx,
-                            },
-                        ).to_dict()
+            # 1) Secondary speed peak check inside contiguous eligible interval
+            running_min = abs(sub[0][2])
+            for k, (_, tk, vk) in enumerate(sub):
+                sp = abs(vk)
+                if sp < running_min:
+                    running_min = sp
+                elif (sp - running_min) >= rise_thresh:
+                    thresh = rise_thresh * 0.6
+                    ok, support_end_t, support_dur = _has_elapsed_support(
+                        sub,
+                        k,
+                        persistence_s,
+                        eff_max_gap,
+                        lambda val, rmin=running_min, th=thresh: (abs(val) - rmin) >= th,
                     )
-                    break
-            else:
-                in_rev_start = None
-
-    # If user gave no slow event triggers but clip itself reverses direction, inspect whole clip once
-    if not windows and len(timestamps) >= 3:
-        cov = sum(1 for ok in pair_hip_eligible if ok) / len(timestamps)
-        total_win_covs.append(cov)
-        if cov < min_cov:
-            unavailable_windows += 1
-        else:
-            in_rev_start = None
-            for idx, (tk, vk, bk) in enumerate(zip(timestamps, v_pair, break_mask)):
-                if vk is None or bk:
-                    in_rev_start = None
-                    continue
-                opposite = (vk * dom_sign) < -stop_speed
-                if opposite:
-                    if in_rev_start is None:
-                        in_rev_start = tk
-                    if (tk - in_rev_start) >= persistence_s - 1e-6:
-                        is_planned = _overlaps_planned(in_rev_start, tk, "planned_reversal")
-                        if not is_planned:
-                            unintended_reversals += 1
-                        cue_events.append(
-                            CoupleEvent(
-                                event_id=f"cand_reversal_clip_{idx}",
-                                event_type="speed_cue",
-                                subject="pair",
-                                timestamp=round(in_rev_start, 4),
-                                end_timestamp=round(tk, 4),
-                                value=round(abs(vk), 4),
-                                unit="pair_torso_lengths/s",
-                                status="user_confirmed" if is_planned else "measured",
-                                reason="planned_reversal" if is_planned else "unintended_reversal",
-                                metadata={
-                                    "cue_kind": "planned_reversal" if is_planned else "unintended_reversal",
-                                },
-                            ).to_dict()
-                        )
+                    if ok:
+                        if not _episode_is_duplicate("speed_peak", tk, support_end_t):
+                            ep_id = f"ep_speed_peak_{round(tk * 1000)}ms"
+                            seen_episodes["speed_peak"].append((tk, support_end_t, ep_id))
+                            is_settling_step = _overlaps_planned(
+                                tk, support_end_t, "settling_step"
+                            ) or _overlaps_planned(tk, support_end_t, "planned_pause")
+                            if not is_settling_step:
+                                unintended_peaks += 1
+                            base_status = (
+                                "user_confirmed"
+                                if is_settling_step
+                                else ("estimated" if sub_org == "propagated" else "measured")
+                            )
+                            cue_events.append(
+                                CoupleEvent(
+                                    event_id=f"cand_speed_peak_{round(tk * 1000)}ms",
+                                    event_type="speed_cue",
+                                    subject="pair",
+                                    timestamp=round(tk, 4),
+                                    end_timestamp=round(min(t1, support_end_t), 4),
+                                    value=round(sp - running_min, 4),
+                                    unit="pair_torso_lengths/s",
+                                    status=base_status,  # type: ignore[arg-type]
+                                    reason=(
+                                        "planned_settling_step"
+                                        if is_settling_step
+                                        else "secondary_speed_peak"
+                                    ),
+                                    metadata={
+                                        "cue_kind": (
+                                            "planned_settling_step"
+                                            if is_settling_step
+                                            else "secondary_speed_peak"
+                                        ),
+                                        "episode_id": ep_id,
+                                        "support_duration_s": round(support_dur, 4),
+                                        "window_index": w_idx,
+                                        **({"pose_origin": sub_org} if sub_org else {}),
+                                    },
+                                ).to_dict()
+                            )
                         break
-                else:
-                    in_rev_start = None
+
+            # 2) Direction reversal check against phase-specific reference direction
+            phase_sign = _phase_reference_sign(iv, sub, anchor_t)
+            if phase_sign != 0.0:
+                for k, (_, tk, vk) in enumerate(sub):
+                    is_opp = (vk * phase_sign) < -stop_speed
+                    prev_opp = k > 0 and (sub[k - 1][2] * phase_sign) < -stop_speed
+                    if is_opp and not prev_opp:
+                        ok, support_end_t, support_dur = _has_elapsed_support(
+                            sub,
+                            k,
+                            persistence_s,
+                            eff_max_gap,
+                            lambda val, ps=phase_sign: (val * ps) < -stop_speed,
+                        )
+                        if ok:
+                            if not _episode_is_duplicate("reversal", tk, support_end_t):
+                                ep_id = f"ep_reversal_{round(tk * 1000)}ms"
+                                seen_episodes["reversal"].append((tk, support_end_t, ep_id))
+                                is_planned = _overlaps_planned(
+                                    tk, support_end_t, "planned_reversal"
+                                )
+                                if not is_planned:
+                                    unintended_reversals += 1
+                                base_status = (
+                                    "user_confirmed"
+                                    if is_planned
+                                    else ("estimated" if sub_org == "propagated" else "measured")
+                                )
+                                cue_events.append(
+                                    CoupleEvent(
+                                        event_id=f"cand_reversal_{round(tk * 1000)}ms",
+                                        event_type="speed_cue",
+                                        subject="pair",
+                                        timestamp=round(tk, 4),
+                                        end_timestamp=round(min(t1, support_end_t), 4),
+                                        value=round(abs(vk), 4),
+                                        unit="pair_torso_lengths/s",
+                                        status=base_status,  # type: ignore[arg-type]
+                                        reason=(
+                                            "planned_reversal"
+                                            if is_planned
+                                            else "unintended_reversal"
+                                        ),
+                                        metadata={
+                                            "cue_kind": (
+                                                "planned_reversal"
+                                                if is_planned
+                                                else "unintended_reversal"
+                                            ),
+                                            "episode_id": ep_id,
+                                            "support_duration_s": round(support_dur, 4),
+                                            "phase_reference_sign": phase_sign,
+                                            "window_index": w_idx,
+                                            **({"pose_origin": sub_org} if sub_org else {}),
+                                        },
+                                    ).to_dict()
+                                )
+                            break
 
     mean_cov = float(np.mean(total_win_covs)) if total_win_covs else 0.0
-    summary_status = (
-        "unavailable"
-        if (total_win_covs and unavailable_windows == len(total_win_covs))
-        else "measured"
-    )
+    if evaluated_window_count == 0:
+        reason = (
+            "no_evaluated_transition_windows"
+            if candidate_window_count == 0
+            else "insufficient_transition_window_coverage"
+        )
+        return cue_events, {
+            "status": "unavailable",
+            "coverage": round(mean_cov, 4),
+            "reason": reason,
+            "secondary_speed_peaks": None,
+            "unintended_reversals": None,
+            "planned_pauses": planned_pauses,
+            "planned_reversals": planned_reversals,
+            "settling_steps": settling_steps,
+            "candidate_window_count": candidate_window_count,
+            "evaluated_window_count": 0,
+            "unavailable_window_count": unavailable_windows,
+            "eligible_count": 0,
+            "coverage_denominator": candidate_window_count,
+            "status_counts": _count_statuses([]),
+            "origin_counts": _count_origins([]),
+        }
+
+    cue_statuses = [str(ev.get("status", "measured")) for ev in cue_events]
+    cue_origins = [ev.get("metadata", {}).get("pose_origin") for ev in cue_events]
+    if cue_statuses:
+        summary_status, status_counts = _summarize_evidence_status(
+            cue_statuses, eligible_count=len(cue_statuses)
+        )
+        # Reclassifying an observed kinematic transition via planned marks combines measured + user marks.
+        if summary_status == "user_confirmed":
+            summary_status = "mixed"
+    else:
+        win_statuses = [
+            "estimated" if org == "propagated" else "measured"
+            for org in (evaluated_origins or ["detected"])
+        ]
+        summary_status, status_counts = _summarize_evidence_status(
+            win_statuses, eligible_count=evaluated_window_count
+        )
+    origin_counts = _count_origins(cue_origins if cue_origins else evaluated_origins)
     trans_summary = {
         "status": summary_status,
         "coverage": round(mean_cov, 4),
-        "reason": "insufficient_transition_coverage" if summary_status == "unavailable" else "",
-        "secondary_speed_peaks": unintended_peaks if summary_status != "unavailable" else None,
-        "unintended_reversals": unintended_reversals if summary_status != "unavailable" else None,
+        "reason": "",
+        "secondary_speed_peaks": unintended_peaks,
+        "unintended_reversals": unintended_reversals,
         "planned_pauses": planned_pauses,
         "planned_reversals": planned_reversals,
         "settling_steps": settling_steps,
+        "candidate_window_count": candidate_window_count,
+        "evaluated_window_count": evaluated_window_count,
+        "unavailable_window_count": unavailable_windows,
+        "eligible_count": evaluated_window_count,
+        "coverage_denominator": candidate_window_count,
+        "status_counts": status_counts,
+        "origin_counts": origin_counts,
     }
     return cue_events, trans_summary
 
@@ -663,97 +933,293 @@ def _turn_events_from_annotations_and_candidates(
     *,
     turn_exit_match_window_s: float = 3.0,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Build paired turn duration, exit timing, pivot behavior, and embrace opening events."""
+    """Build paired turn duration, exit timing, pivot behavior, and unmatched turn markers safely."""
     items = [item for item in annotations.items if not item.deleted]
-    turn_starts = sorted(
-        [i for i in items if i.event_type == "turn_start"],
-        key=lambda i: i.timestamp,
-    )
-    turn_ends = sorted(
-        [i for i in items if i.event_type == "turn_end"],
-        key=lambda i: i.timestamp,
-    )
-    exits = sorted([i for i in items if i.event_type == "exit"], key=lambda i: i.timestamp)
+    turn_items = [i for i in items if i.event_type in ("turn_start", "turn_end", "exit")]
 
     turns: list[dict[str, Any]] = []
-    used_ends: set[int] = set()
-    used_exits: set[int] = set()
+    unmatched_records: list[dict[str, Any]] = []
+    warnings: list[str] = []
 
-    for idx_s, st in enumerate(turn_starts):
-        end_idx = next(
-            (j for j, en in enumerate(turn_ends) if j not in used_ends and en.timestamp >= st.timestamp),
-            None,
-        )
-        if end_idx is None:
-            continue
-        used_ends.add(end_idx)
-        en = turn_ends[end_idx]
+    def _add_unmatched(item: CoupleAnnotationItem, reason: str) -> None:
+        rec = {
+            "event_id": f"unmatched_{item.annotation_id}",
+            "annotation_id": item.annotation_id,
+            "turn_id": item.turn_id,
+            "event_type": item.event_type,
+            "subject": item.subject,
+            "timestamp": float(item.timestamp),
+            "end_timestamp": float(item.end_timestamp) if item.end_timestamp is not None else None,
+            "bracket_start": None,
+            "bracket_end": None,
+            "value": None,
+            "unit": "",
+            "status": item.status,
+            "paired_event_id": None,
+            "lag_ms": None,
+            "beat_offset_ms": None,
+            "beat_fraction": None,
+            "reason": reason,
+            "metadata": {
+                **dict(item.metadata),
+                "unmatched": True,
+                "marker_event_type": item.event_type,
+                "pivot_behavior": item.pivot_behavior,
+                "label": item.label,
+            },
+        }
+        unmatched_records.append(rec)
+
+    def _build_turn_event(
+        turn_id: str,
+        st: CoupleAnnotationItem,
+        en: CoupleAnnotationItem,
+        exit_item: CoupleAnnotationItem | None,
+        *,
+        association: str,
+        ambiguous_legacy: bool = False,
+    ) -> dict[str, Any]:
         duration_s = en.timestamp - st.timestamp
-
-        # Match closest exit after turn_start within turn_exit_match_window_s of turn_end
-        exit_idx: int | None = None
-        best_dt = math.inf
-        for je, ex in enumerate(exits):
-            if je in used_exits:
-                continue
-            if ex.timestamp >= st.timestamp - 0.10:
-                dt = abs(ex.timestamp - en.timestamp)
-                if dt < best_dt and dt <= float(turn_exit_match_window_s):
-                    best_dt = dt
-                    exit_idx = je
-        exit_item = exits[exit_idx] if exit_idx is not None else None
-        if exit_idx is not None:
-            used_exits.add(exit_idx)
-
         exit_diff_ms: float | None = None
         overlap = False
         if exit_item is not None:
             exit_diff_ms = (exit_item.timestamp - en.timestamp) * 1000.0
             overlap = exit_item.timestamp < en.timestamp
+        marker_statuses = [st.status, en.status] + ([exit_item.status] if exit_item else [])
+        ev_status, _ = _summarize_evidence_status(marker_statuses, eligible_count=len(marker_statuses))
+        shared_pair = st.subject == "pair"
+        return {
+            "event_id": turn_id,
+            "annotation_id": st.annotation_id,
+            "turn_id": turn_id,
+            "event_type": "turn",
+            "subject": st.subject,
+            "timestamp": float(st.timestamp),
+            "end_timestamp": float(en.timestamp),
+            "bracket_start": float(st.timestamp),
+            "bracket_end": float(en.timestamp),
+            "value": round(duration_s, 4),
+            "unit": "seconds",
+            "status": ev_status,
+            "paired_event_id": exit_item.annotation_id if exit_item else None,
+            "lag_ms": round(exit_diff_ms, 2) if exit_diff_ms is not None else None,
+            "beat_offset_ms": None,
+            "beat_fraction": None,
+            "reason": "exit_occurred_during_turn" if overlap else "",
+            "metadata": {
+                "turn_id": turn_id,
+                "association": association,
+                "shared_pair_turn": shared_pair,
+                "ambiguous_legacy_match": ambiguous_legacy,
+                "start_annotation_id": st.annotation_id,
+                "end_annotation_id": en.annotation_id,
+                "exit_annotation_id": exit_item.annotation_id if exit_item else None,
+                "turn_duration_s": round(duration_s, 4),
+                "exit_timestamp": float(exit_item.timestamp) if exit_item else None,
+                "exit_minus_turn_end_ms": round(exit_diff_ms, 2) if exit_diff_ms is not None else None,
+                "overlap": overlap,
+                "pivot_behavior_a": st.metadata.get("pivot_behavior_a", st.pivot_behavior or "unknown"),
+                "pivot_behavior_b": st.metadata.get("pivot_behavior_b", en.pivot_behavior or "unknown"),
+                "embrace_opening": st.label or en.label or "",
+            },
+        }
+
+    # 1) Explicit turn_id groups
+    by_turn_id: dict[str, list[CoupleAnnotationItem]] = {}
+    legacy_items: list[CoupleAnnotationItem] = []
+    for item in turn_items:
+        if item.turn_id:
+            by_turn_id.setdefault(item.turn_id, []).append(item)
+        else:
+            legacy_items.append(item)
+
+    legacy_exits_pending: dict[str, list[CoupleAnnotationItem]] = {}
+
+    for tid, group in by_turn_id.items():
+        subjects = {g.subject for g in group}
+        if len(subjects) > 1:
+            warnings.append(f"Turn ID '{tid}' has mismatched marker subjects ({sorted(subjects)}).")
+            for g in group:
+                _add_unmatched(g, "turn_id_subject_mismatch")
+            continue
+
+        starts = sorted([g for g in group if g.event_type == "turn_start"], key=lambda g: g.timestamp)
+        ends = sorted([g for g in group if g.event_type == "turn_end"], key=lambda g: g.timestamp)
+        ex_list = sorted([g for g in group if g.event_type == "exit"], key=lambda g: g.timestamp)
+
+        if len(starts) > 1:
+            warnings.append(f"Turn ID '{tid}' has duplicate turn_start markers.")
+            for extra in starts[1:]:
+                _add_unmatched(extra, "duplicate_turn_id_marker")
+            starts = starts[:1]
+        if len(ends) > 1:
+            warnings.append(f"Turn ID '{tid}' has duplicate turn_end markers.")
+            for extra in ends[1:]:
+                _add_unmatched(extra, "duplicate_turn_id_marker")
+            ends = ends[:1]
+        if len(ex_list) > 1:
+            warnings.append(f"Turn ID '{tid}' has duplicate exit markers.")
+            for extra in ex_list[1:]:
+                _add_unmatched(extra, "duplicate_turn_id_marker")
+            ex_list = ex_list[:1]
+
+        if not starts and not ends:
+            for g in ex_list:
+                _add_unmatched(g, "unmatched_exit")
+            continue
+        if starts and not ends:
+            _add_unmatched(starts[0], "missing_turn_end")
+            for g in ex_list:
+                _add_unmatched(g, "missing_turn_end_for_exit")
+            continue
+        if ends and not starts:
+            _add_unmatched(ends[0], "missing_turn_start")
+            for g in ex_list:
+                _add_unmatched(g, "missing_turn_start_for_exit")
+            continue
+
+        st, en = starts[0], ends[0]
+        if en.timestamp < st.timestamp:
+            warnings.append(f"Turn ID '{tid}' has turn_end before turn_start.")
+            _add_unmatched(st, "invalid_turn_marker_order")
+            _add_unmatched(en, "invalid_turn_marker_order")
+            for g in ex_list:
+                _add_unmatched(g, "invalid_turn_marker_order")
+            continue
+
+        exit_item: CoupleAnnotationItem | None = None
+        if ex_list:
+            cand_ex = ex_list[0]
+            if cand_ex.timestamp < st.timestamp - 0.10:
+                warnings.append(f"Turn ID '{tid}' has exit before turn_start.")
+                _add_unmatched(cand_ex, "invalid_exit_order")
+            else:
+                exit_item = cand_ex
 
         turns.append(
-            {
-                "event_id": f"turn_{idx_s}",
-                "event_type": "turn",
-                "subject": st.subject,
-                "timestamp": float(st.timestamp),
-                "end_timestamp": float(en.timestamp),
-                "bracket_start": float(st.timestamp),
-                "bracket_end": float(en.timestamp),
-                "value": round(duration_s, 4),
-                "unit": "seconds",
-                "status": "user_confirmed",
-                "paired_event_id": exit_item.annotation_id if exit_item else None,
-                "lag_ms": round(exit_diff_ms, 2) if exit_diff_ms is not None else None,
-                "beat_offset_ms": None,
-                "beat_fraction": None,
-                "reason": "exit_occurred_during_turn" if overlap else "",
-                "metadata": {
-                    "turn_duration_s": round(duration_s, 4),
-                    "exit_timestamp": float(exit_item.timestamp) if exit_item else None,
-                    "exit_minus_turn_end_ms": round(exit_diff_ms, 2) if exit_diff_ms is not None else None,
-                    "overlap": overlap,
-                    "pivot_behavior_a": st.metadata.get("pivot_behavior_a", st.pivot_behavior or "unknown"),
-                    "pivot_behavior_b": st.metadata.get("pivot_behavior_b", en.pivot_behavior or "unknown"),
-                    "embrace_opening": st.label or en.label or "",
-                },
-            }
+            _build_turn_event(tid, st, en, exit_item, association="turn_id")
         )
+
+    # 2) Legacy markers without turn_id: strictly partitioned per subject
+    legacy_subjects = sorted({item.subject for item in legacy_items})
+    for subj in legacy_subjects:
+        subj_starts = sorted(
+            [i for i in legacy_items if i.subject == subj and i.event_type == "turn_start"],
+            key=lambda i: i.timestamp,
+        )
+        subj_ends = sorted(
+            [i for i in legacy_items if i.subject == subj and i.event_type == "turn_end"],
+            key=lambda i: i.timestamp,
+        )
+        subj_exits = sorted(
+            [i for i in legacy_items if i.subject == subj and i.event_type == "exit"],
+            key=lambda i: i.timestamp,
+        )
+
+        # Detect nested/overlapping same-subject legacy starts before a closing turn_end
+        combined_seq = sorted(
+            [(s.timestamp, 0, s) for s in subj_starts] + [(e.timestamp, 1, e) for e in subj_ends],
+            key=lambda row: (row[0], row[1]),
+        )
+        open_depth = 0
+        ambiguous_legacy = False
+        for _, kind_ord, _ in combined_seq:
+            if kind_ord == 0:
+                open_depth += 1
+                if open_depth > 1:
+                    ambiguous_legacy = True
+            else:
+                open_depth = max(0, open_depth - 1)
+        if ambiguous_legacy:
+            warnings.append(
+                f"Overlapping legacy turn_start markers for subject '{subj}' without explicit turn_id."
+            )
+
+        used_ends: set[int] = set()
+        subj_turns: list[dict[str, Any]] = []
+        for idx_s, st in enumerate(subj_starts):
+            end_idx = next(
+                (j for j, en in enumerate(subj_ends) if j not in used_ends and en.timestamp >= st.timestamp),
+                None,
+            )
+            if end_idx is None:
+                _add_unmatched(st, "missing_turn_end")
+                continue
+            used_ends.add(end_idx)
+            en = subj_ends[end_idx]
+            tid = f"turn_{subj}_{idx_s}"
+            turn_ev = _build_turn_event(
+                tid,
+                st,
+                en,
+                None,
+                association="legacy_subject_sequence",
+                ambiguous_legacy=ambiguous_legacy,
+            )
+            subj_turns.append(turn_ev)
+
+        for j, en in enumerate(subj_ends):
+            if j not in used_ends:
+                _add_unmatched(en, "missing_turn_start")
+
+        # Attach legacy exits strictly within the same subject
+        legacy_exits_pending[subj] = subj_exits
+        used_exits: set[int] = set()
+        for t_ev in subj_turns:
+            st_t = float(t_ev["timestamp"])
+            en_t = float(t_ev["end_timestamp"])
+            best_idx: int | None = None
+            best_dt = math.inf
+            for je, ex in enumerate(subj_exits):
+                if je in used_exits:
+                    continue
+                if ex.timestamp >= st_t - 0.10:
+                    dt = abs(ex.timestamp - en_t)
+                    if dt < best_dt and dt <= float(turn_exit_match_window_s):
+                        best_dt = dt
+                        best_idx = je
+            if best_idx is not None:
+                used_exits.add(best_idx)
+                ex_item = subj_exits[best_idx]
+                exit_diff_ms = (ex_item.timestamp - en_t) * 1000.0
+                overlap = ex_item.timestamp < en_t
+                t_ev["paired_event_id"] = ex_item.annotation_id
+                t_ev["lag_ms"] = round(exit_diff_ms, 2)
+                if overlap:
+                    t_ev["reason"] = "exit_occurred_during_turn"
+                t_ev["metadata"]["exit_annotation_id"] = ex_item.annotation_id
+                t_ev["metadata"]["exit_timestamp"] = float(ex_item.timestamp)
+                t_ev["metadata"]["exit_minus_turn_end_ms"] = round(exit_diff_ms, 2)
+                t_ev["metadata"]["overlap"] = overlap
+                marker_statuses = [t_ev["status"], ex_item.status]
+                t_ev["status"], _ = _summarize_evidence_status(
+                    marker_statuses, eligible_count=len(marker_statuses)
+                )
+        for je, ex in enumerate(subj_exits):
+            if je not in used_exits:
+                _add_unmatched(ex, "unmatched_exit_no_matching_turn")
+
+        turns.extend(subj_turns)
 
     if auto_turn_suggestions:
         for p_idx, piv in enumerate(pivot_candidates):
             p_start = float(piv.get("start_time", 0.0))
             p_end = float(piv.get("end_time", p_start))
+            p_subj = str(piv.get("subject", "pair"))
             overlaps_user = any(
-                t["timestamp"] - 0.3 <= p_end and t["end_timestamp"] + 0.3 >= p_start
+                (t.get("subject") in (p_subj, "pair") or p_subj == "pair")
+                and t["timestamp"] - 0.3 <= p_end
+                and t["end_timestamp"] + 0.3 >= p_start
                 for t in turns
             )
             if not overlaps_user and p_end > p_start:
+                auto_tid = f"auto_turn_{p_subj}_{p_idx}"
                 turns.append(
                     {
-                        "event_id": f"auto_turn_{p_idx}",
+                        "event_id": auto_tid,
+                        "turn_id": auto_tid,
                         "event_type": "turn",
-                        "subject": str(piv.get("subject", "pair")),
+                        "subject": p_subj,
                         "timestamp": round(p_start, 4),
                         "end_timestamp": round(p_end, 4),
                         "bracket_start": round(p_start, 4),
@@ -767,6 +1233,8 @@ def _turn_events_from_annotations_and_candidates(
                         "beat_fraction": None,
                         "reason": "auto_turn_suggestion",
                         "metadata": {
+                            "turn_id": auto_tid,
+                            "shared_pair_turn": p_subj == "pair",
                             "turn_duration_s": round(p_end - p_start, 4),
                             "overlap": False,
                             "pivot_behavior_a": "unknown",
@@ -783,6 +1251,25 @@ def _turn_events_from_annotations_and_candidates(
     ]
     dur_med, dur_iqr = _median_iqr(durations)
     exit_med, exit_iqr = _median_iqr(exit_timings)
+    turn_statuses = [str(t.get("status", "estimated")) for t in turns]
+    summary_status, status_counts = _summarize_evidence_status(
+        turn_statuses, eligible_count=len(turns)
+    )
+    unmatched_summaries = [
+        {
+            "annotation_id": rec["annotation_id"],
+            "turn_id": rec["turn_id"],
+            "event_type": rec["event_type"],
+            "subject": rec["subject"],
+            "timestamp": rec["timestamp"],
+            "reason": rec["reason"],
+        }
+        for rec in unmatched_records
+    ]
+    turn_reason = ""
+    if not turns:
+        turn_reason = "unmatched_turn_markers_only" if unmatched_records else "no_turns_recorded"
+
     turn_summary = {
         "turn_count": len(turns),
         "overlap_count": sum(1 for t in turns if t["metadata"].get("overlap")),
@@ -790,21 +1277,35 @@ def _turn_events_from_annotations_and_candidates(
         "iqr_turn_duration_s": dur_iqr,
         "median_exit_minus_turn_end_ms": exit_med,
         "iqr_exit_minus_turn_end_ms": exit_iqr,
-        "status": "user_confirmed" if any(t["status"] == "user_confirmed" for t in turns) else (
-            "estimated" if turns else "unavailable"
-        ),
+        "status": summary_status,
+        "reason": turn_reason,
+        "status_counts": status_counts,
+        "eligible_count": len(turns),
+        "coverage_denominator": len(turns) + len(unmatched_records),
+        "unmatched_count": len(unmatched_records),
+        "unmatched_markers": unmatched_summaries,
+        "warnings": warnings,
     }
-    return turns, turn_summary
+    return turns + unmatched_records, turn_summary
 
 
 def _extract_finite_series_samples(
     entries: list[dict[str, Any]] | list[tuple[float, float | None]],
+    *,
+    allow_propagated_estimates: bool = False,
 ) -> list[tuple[float, float]]:
+    allowed_statuses = {"measured", "user_confirmed", ""}
+    if allow_propagated_estimates:
+        allowed_statuses.add("estimated")
     samples: list[tuple[float, float]] = []
     for item in entries:
         if isinstance(item, dict):
+            if item.get("pose_origin") == "display_interpolated":
+                continue
             status = item.get("status")
-            if status is not None and status not in ("measured", "user_confirmed", ""):
+            if status is not None and status not in allowed_statuses:
+                continue
+            if status == "estimated" and item.get("pose_origin") not in ("propagated", None):
                 continue
             raw_t = item.get("timestamp")
             raw_v = item.get("value")
@@ -827,10 +1328,15 @@ def compute_torso_tilt_pearson_correlation(
     series_b: list[dict[str, Any]] | list[tuple[float, float | None]],
     *,
     min_samples: int = 3,
+    allow_propagated_estimates: bool = False,
 ) -> tuple[float | None, int, str]:
     """Compute Pearson correlation ``r`` between Dancer A and B torso tilts on aligned samples."""
-    pts_a = _extract_finite_series_samples(series_a)
-    pts_b = _extract_finite_series_samples(series_b)
+    pts_a = _extract_finite_series_samples(
+        series_a, allow_propagated_estimates=allow_propagated_estimates
+    )
+    pts_b = _extract_finite_series_samples(
+        series_b, allow_propagated_estimates=allow_propagated_estimates
+    )
     pairs: list[tuple[float, float]] = []
     ia = 0
     ib = 0
@@ -870,19 +1376,33 @@ def _compute_summaries_from_events_and_series(
     turn_summary: dict[str, Any],
     coverage: dict[str, Any],
     baseline_passages: list[tuple[float, float]],
+    allow_propagated_estimates: bool = False,
 ) -> dict[str, Any]:
     """Build structured summary metrics across all 5 Couple domains."""
-    # 1. Coordination
+    # 1. Coordination (inspect both A and paired B event statuses)
     coord: dict[str, Any] = {}
     for etype in ("start", "slow", "settle"):
-        ev_a = [e for e in events if e.get("event_type") == etype and e.get("subject") == "A"]
-        lags = [float(e["lag_ms"]) for e in ev_a if e.get("lag_ms") is not None]
+        ev_type_all = [e for e in events if e.get("event_type") == etype]
+        ev_by_id = {str(e.get("event_id")): e for e in ev_type_all}
+        ev_a = [e for e in ev_type_all if e.get("subject") == "A"]
+        ev_b = [e for e in ev_type_all if e.get("subject") == "B"]
+        paired_a = [e for e in ev_a if e.get("lag_ms") is not None]
+        lags = [float(e["lag_ms"]) for e in paired_a]
         med, iqr = _median_iqr(lags)
-        unpaired = sum(
-            1
-            for e in events
-            if e.get("event_type") == etype and e.get("lag_ms") is None
+        unpaired = sum(1 for e in ev_type_all if e.get("lag_ms") is None)
+        contributing_statuses: list[str] = []
+        contributing_origins: list[str | None] = []
+        for ea in paired_a:
+            contributing_statuses.append(str(ea.get("status") or "measured"))
+            contributing_origins.append((ea.get("metadata") or {}).get("pose_origin"))
+            eb = ev_by_id.get(str(ea.get("paired_event_id") or ""))
+            if eb is not None:
+                contributing_statuses.append(str(eb.get("status") or "measured"))
+                contributing_origins.append((eb.get("metadata") or {}).get("pose_origin"))
+        lag_status, lag_status_counts = _summarize_evidence_status(
+            contributing_statuses, eligible_count=len(lags)
         )
+        lag_denom = max(len(ev_a), len(ev_b), len(lags))
         coord[f"{etype}_lag_ms"] = CoupleSummaryValue(
             measure=f"{etype}_lag_ms",
             subject="B-A",
@@ -890,10 +1410,14 @@ def _compute_summaries_from_events_and_series(
             iqr=round(iqr, 2) if iqr is not None else None,
             count=len(lags),
             unit="ms",
-            status="measured" if lags else "unavailable",
+            status=lag_status,
             coverage=float(coverage.get("pair_hip_coverage", 0.0)),
             reason="" if lags else "no_paired_events",
             timestamp_or_bracket="",
+            status_counts=lag_status_counts,
+            origin_counts=_count_origins(contributing_origins),
+            eligible_count=len(lags),
+            coverage_denominator=lag_denom,
         ).to_dict()
         coord[f"{etype}_paired_count"] = len(lags)
         coord[f"{etype}_unpaired_count"] = unpaired
@@ -901,52 +1425,92 @@ def _compute_summaries_from_events_and_series(
     # 2. Step and beat timing
     step_timing: dict[str, Any] = {}
     for subj in ("A", "B"):
-        offsets = [
-            float(e["beat_offset_ms"])
-            for e in events
-            if e.get("event_type") == "contact" and e.get("subject") == subj and e.get("beat_offset_ms") is not None
-        ]
+        contacts = [e for e in events if e.get("event_type") == "contact" and e.get("subject") == subj]
+        matched_contacts = [e for e in contacts if e.get("beat_offset_ms") is not None]
+        offsets = [float(e["beat_offset_ms"]) for e in matched_contacts]
         fracs = [
             float(e["beat_fraction"])
-            for e in events
-            if e.get("event_type") == "contact" and e.get("subject") == subj and e.get("beat_fraction") is not None
+            for e in matched_contacts
+            if e.get("beat_fraction") is not None
         ]
-        contacts_total = sum(1 for e in events if e.get("event_type") == "contact" and e.get("subject") == subj)
+        contacts_total = len(contacts)
         med_ms, iqr_ms = _median_iqr(offsets)
         med_fr, _ = _median_iqr(fracs)
+        contact_statuses = [str(e.get("status") or "estimated") for e in contacts]
+        beat_statuses = [
+            str((e.get("metadata") or {}).get("beat_status"))
+            for e in matched_contacts
+            if (e.get("metadata") or {}).get("beat_status")
+        ]
+        combined_statuses = contact_statuses + (beat_statuses if matched_contacts else [])
+        step_status, _step_status_counts = _summarize_evidence_status(
+            combined_statuses, eligible_count=contacts_total
+        )
+        beat_status_agg, _ = _summarize_evidence_status(
+            beat_statuses, eligible_count=len(beat_statuses)
+        )
         step_timing[subj] = {
             "contact_count": contacts_total,
             "matched_count": len(offsets),
             "median_beat_offset_ms": round(med_ms, 2) if med_ms is not None else None,
             "iqr_beat_offset_ms": round(iqr_ms, 2) if iqr_ms is not None else None,
             "median_beat_fraction": round(med_fr, 4) if med_fr is not None else None,
-            "status": (
-                "user_confirmed"
-                if any(e.get("status") == "user_confirmed" for e in events if e.get("event_type") == "contact" and e.get("subject") == subj)
-                else ("estimated" if contacts_total else "unavailable")
-            ),
+            "status": step_status,
+            "beat_status": beat_status_agg,
+            "status_counts": _count_statuses(contact_statuses),
+            "eligible_count": len(offsets) if beat_statuses else contacts_total,
+            "coverage_denominator": contacts_total,
         }
 
     # 3. Posture & axes
+    total_frames = max(
+        int(coverage.get("frame_count") or 0),
+        len(series.get("torso_tilt_a") or []),
+        len(series.get("torso_tilt_b") or []),
+    )
+    allowed_posture_statuses = (
+        {"measured", "user_confirmed", "estimated"}
+        if allow_propagated_estimates
+        else {"measured", "user_confirmed"}
+    )
+
     def _angle_summary(key: str, subject: str, cov_key: str) -> dict[str, Any]:
         pts = series.get(key) or []
-        vals = [
-            float(p["value"])
+        eligible_pts = [
+            p
             for p in pts
-            if p.get("value") is not None and p.get("status") in ("measured", "user_confirmed")
+            if p.get("value") is not None
+            and p.get("status") in allowed_posture_statuses
+            and p.get("pose_origin") != "display_interpolated"
         ]
+        vals = [float(p["value"]) for p in eligible_pts]
         med, iqr = _median_iqr(vals)
         base_change: float | None = None
-        if baseline_passages and pts:
+        if baseline_passages and eligible_pts:
             bvals = [
                 float(p["value"])
-                for p in pts
-                if p.get("value") is not None
-                and any(t0 <= float(p["timestamp"]) <= t1 for t0, t1 in baseline_passages)
+                for p in eligible_pts
+                if any(t0 <= float(p["timestamp"]) <= t1 for t0, t1 in baseline_passages)
             ]
             if len(bvals) >= 3 and med is not None:
                 ref = float(np.median(bvals))
                 base_change = round(wrapped_angle_diff(med, ref), 2)
+
+        all_statuses = [str(p.get("status") or "unavailable") for p in pts]
+        all_origins = [p.get("pose_origin") for p in pts if p.get("pose_origin") is not None]
+        elig_statuses = [str(p.get("status") or "measured") for p in eligible_pts]
+        summary_st, _ = _summarize_evidence_status(elig_statuses, eligible_count=len(vals))
+        all_status_counts = _count_statuses(all_statuses)
+        all_origin_counts = _count_origins(all_origins)
+        denom = max(total_frames, len(pts), 1)
+        reason = ""
+        if not vals:
+            if any(p.get("reason") == "propagated_pose_excluded" for p in pts):
+                reason = "propagated_poses_excluded"
+            elif pts:
+                reason = "no_eligible_frames"
+            else:
+                reason = "no_frames"
         return {
             "measure": key,
             "subject": subject,
@@ -954,14 +1518,60 @@ def _compute_summaries_from_events_and_series(
             "iqr_deg": round(iqr, 2) if iqr is not None else None,
             "baseline_change_deg": base_change,
             "sample_count": len(vals),
+            "eligible_count": len(vals),
+            "total_frame_count": len(pts) or total_frames,
+            "coverage_denominator": denom,
+            "coverage_denominator_label": f"{len(vals)}/{denom} frames",
             "coverage": float(coverage.get(cov_key, 0.0)),
-            "status": "measured" if vals else "unavailable",
+            "status": summary_st,
+            "status_counts": all_status_counts,
+            "origin_counts": all_origin_counts,
+            "reason": reason,
         }
 
+    tilt_a_pts = series.get("torso_tilt_a") or []
+    tilt_b_pts = series.get("torso_tilt_b") or []
     r_val, r_cnt, r_reason = compute_torso_tilt_pearson_correlation(
-        series.get("torso_tilt_a") or [],
-        series.get("torso_tilt_b") or [],
+        tilt_a_pts,
+        tilt_b_pts,
+        allow_propagated_estimates=allow_propagated_estimates,
     )
+    # Determine paired sample statuses/origins for Pearson r
+    aligned_statuses: list[str] = []
+    aligned_origins: list[str | None] = []
+    map_b_by_t = {
+        round(float(p["timestamp"]), 4): p
+        for p in tilt_b_pts
+        if isinstance(p, dict)
+        and p.get("value") is not None
+        and p.get("status") in allowed_posture_statuses
+        and p.get("pose_origin") != "display_interpolated"
+    }
+    for pa in tilt_a_pts:
+        if not isinstance(pa, dict):
+            continue
+        if (
+            pa.get("value") is None
+            or pa.get("status") not in allowed_posture_statuses
+            or pa.get("pose_origin") == "display_interpolated"
+        ):
+            continue
+        pb = map_b_by_t.get(round(float(pa["timestamp"]), 4))
+        if pb is not None:
+            aligned_statuses.extend([str(pa.get("status")), str(pb.get("status"))])
+            aligned_origins.extend([pa.get("pose_origin"), pb.get("pose_origin")])
+
+    if r_val is not None:
+        pearson_st, pearson_status_counts = _summarize_evidence_status(
+            aligned_statuses, eligible_count=r_cnt
+        )
+    elif 0 < r_cnt < 3:
+        pearson_st = "insufficient_evidence"
+        pearson_status_counts = _count_statuses(aligned_statuses)
+    else:
+        pearson_st = "unavailable"
+        pearson_status_counts = _count_statuses(aligned_statuses)
+    pair_denom = max(total_frames, len(tilt_a_pts), len(tilt_b_pts), 1)
     posture = {
         "torso_tilt_a": _angle_summary("torso_tilt_a", "A", "a_torso_coverage"),
         "torso_tilt_b": _angle_summary("torso_tilt_b", "B", "b_torso_coverage"),
@@ -972,9 +1582,14 @@ def _compute_summaries_from_events_and_series(
             "subject": "pair",
             "value": r_val,
             "sample_count": r_cnt,
+            "eligible_count": r_cnt,
+            "coverage_denominator": pair_denom,
+            "coverage_denominator_label": f"{r_cnt}/{pair_denom} frames",
             "coverage": float(coverage.get("pair_torso_coverage", 0.0)),
             "unit": "r",
-            "status": "measured" if r_val is not None else "unavailable",
+            "status": pearson_st,
+            "status_counts": pearson_status_counts,
+            "origin_counts": _count_origins(aligned_origins),
             "reason": r_reason,
         },
         "head_pitch_a": _angle_summary("head_pitch_a", "A", "a_head_coverage"),
@@ -997,6 +1612,8 @@ def _apply_annotations_to_candidates(
     series: dict[str, list[dict[str, Any]]],
     coverage: dict[str, Any],
     cfg: Config,
+    *,
+    allow_propagated_estimates: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Merge automated candidates with user confirmations, edits, deletions, beats, transitions, and turns."""
     by_source = {
@@ -1072,11 +1689,21 @@ def _apply_annotations_to_candidates(
     v_pair = [p["value"] for p in vel_pts]
     hip_ok = [bool(p.get("pair_hip_eligible", True)) for p in vel_pts]
     breaks = [bool(p.get("break_flag", False)) for p in vel_pts]
+    v_origins = [p.get("pose_origin") for p in vel_pts]
     slow_evs = [e for e in paired if e.get("event_type") == "slow"]
     settle_evs = [e for e in paired if e.get("event_type") == "settle"]
     non_cue = [e for e in paired if e.get("event_type") != "speed_cue"]
     trans_cues, trans_summary = _evaluate_transitions(
-        timestamps, v_pair, hip_ok, breaks, slow_evs, settle_evs, annotations, cfg
+        timestamps,
+        v_pair,
+        hip_ok,
+        breaks,
+        slow_evs,
+        settle_evs,
+        annotations,
+        cfg,
+        max_gap_s=float(cfg.dancer_analysis.max_observation_gap_s),
+        v_origins=v_origins,
     )
     paired = non_cue + trans_cues
 
@@ -1088,7 +1715,9 @@ def _apply_annotations_to_candidates(
         pivot_candidates,
         turn_exit_match_window_s=float(cfg.dancer_analysis.turn_exit_match_window_s),
     )
-    paired = [e for e in paired if e.get("event_type") != "turn"] + turns
+    paired = [
+        e for e in paired if e.get("event_type") not in ("turn", "turn_start", "turn_end", "exit")
+    ] + turns
     paired.sort(key=lambda e: float(e.get("timestamp", 0.0)))
 
     summaries = _compute_summaries_from_events_and_series(
@@ -1098,6 +1727,7 @@ def _apply_annotations_to_candidates(
         turn_summary=turn_summary,
         coverage=coverage,
         baseline_passages=annotations.baseline_passages,
+        allow_propagated_estimates=allow_propagated_estimates,
     )
     return paired, summaries
 
@@ -1137,6 +1767,11 @@ def run_couple_analysis(
     """Execute full Couple tracking, display interpolation, and 5-domain measurements."""
     req = CoupleAnalysisRequest.from_dict(request)
     da_cfg = cfg.dancer_analysis
+    origin_policy: PoseOriginPolicy = (
+        req.pose_origin_policy
+        if req.pose_origin_policy in ("measured_only", "allow_propagated_estimates")
+        else da_cfg.pose_origin_policy
+    )
     decision = auto_decision or classify_opening_window(
         observations,
         cfg,
@@ -1154,6 +1789,7 @@ def run_couple_analysis(
         analysis_region=req.analysis_region,
         anchors=req.annotations.anchors,
         baseline_passages=req.annotations.baseline_passages,
+        pose_origin_policy=origin_policy,
     )
     frames = tracking.frames
     if not frames:
@@ -1181,6 +1817,8 @@ def run_couple_analysis(
             view_usable=False,
             interpolated_display=True,
             quality_status="unavailable",
+            pose_origin="display_interpolated",
+            landmark_origins={},
         )
 
     disp_a = interpolate_tracked_dancer_poses(
@@ -1307,25 +1945,84 @@ def run_couple_analysis(
     def _norm_from_canonical(pt: tuple[float, float], w: int, h: int) -> list[float]:
         return [round(pt[0] / max(1, w - 1), 6), round(-pt[1] / max(1, h - 1), 6)]
 
+    def _pair_pose_origin(
+        da: TrackedDancerSample | None,
+        db: TrackedDancerSample | None,
+    ) -> PoseOrigin | None:
+        if da is None or db is None:
+            return None
+        orgs = (da.pose_origin, db.pose_origin)
+        for cand in ("display_interpolated", "propagated", "crop_detected", "detected"):
+            if cand in orgs:
+                return cand  # type: ignore[return-value]
+        return None
+
+    def _sample_unavail_reason(sample: TrackedDancerSample | None, default_reason: str) -> str:
+        if sample is None:
+            return default_reason
+        if sample.pose_origin == "propagated":
+            return "propagated_pose_excluded"
+        if sample.pose_origin == "display_interpolated":
+            return "display_interpolated_only"
+        return default_reason
+
     for pf in frames:
         t = float(pf.timestamp)
         ta: float | None = None
         tb: float | None = None
+        org_a = pf.dancer_a.pose_origin if pf.dancer_a else None
+        org_b = pf.dancer_b.pose_origin if pf.dancer_b else None
+        org_pair = _pair_pose_origin(pf.dancer_a, pf.dancer_b)
+
         if pf.dancer_a and pf.dancer_a.torso_eligible and pf.dancer_a.hip_px and pf.dancer_a.shoulder_px:
             dx = pf.dancer_a.shoulder_px[0] - pf.dancer_a.hip_px[0]
             dy = pf.dancer_a.shoulder_px[1] - pf.dancer_a.hip_px[1]
             ta = math.degrees(math.atan2(dx, dy))
-            tilt_a_series.append({"timestamp": t, "value": round(ta, 3), "status": "measured", "reason": ""})
+            st_a = "estimated" if org_a == "propagated" else "measured"
+            tilt_a_series.append(
+                {
+                    "timestamp": t,
+                    "value": round(ta, 3),
+                    "status": st_a,
+                    "reason": "propagated_estimate" if st_a == "estimated" else "",
+                    "pose_origin": org_a,
+                }
+            )
         else:
-            tilt_a_series.append({"timestamp": t, "value": None, "status": "unavailable", "reason": "torso_occluded"})
+            tilt_a_series.append(
+                {
+                    "timestamp": t,
+                    "value": None,
+                    "status": "unavailable",
+                    "reason": _sample_unavail_reason(pf.dancer_a, "torso_occluded"),
+                    "pose_origin": org_a,
+                }
+            )
 
         if pf.dancer_b and pf.dancer_b.torso_eligible and pf.dancer_b.hip_px and pf.dancer_b.shoulder_px:
             dx = pf.dancer_b.shoulder_px[0] - pf.dancer_b.hip_px[0]
             dy = pf.dancer_b.shoulder_px[1] - pf.dancer_b.hip_px[1]
             tb = math.degrees(math.atan2(dx, dy))
-            tilt_b_series.append({"timestamp": t, "value": round(tb, 3), "status": "measured", "reason": ""})
+            st_b = "estimated" if org_b == "propagated" else "measured"
+            tilt_b_series.append(
+                {
+                    "timestamp": t,
+                    "value": round(tb, 3),
+                    "status": st_b,
+                    "reason": "propagated_estimate" if st_b == "estimated" else "",
+                    "pose_origin": org_b,
+                }
+            )
         else:
-            tilt_b_series.append({"timestamp": t, "value": None, "status": "unavailable", "reason": "torso_occluded"})
+            tilt_b_series.append(
+                {
+                    "timestamp": t,
+                    "value": None,
+                    "status": "unavailable",
+                    "reason": _sample_unavail_reason(pf.dancer_b, "torso_occluded"),
+                    "pose_origin": org_b,
+                }
+            )
 
         hip_only_norm: list[float] | None = None
         pair_hip_norm: list[float] | None = None
@@ -1364,8 +2061,26 @@ def run_couple_analysis(
             mid_tilt = math.degrees(math.atan2(sp[0] - hp[0], sp[1] - hp[1]))
             assert ta is not None and tb is not None
             sep = abs(wrapped_angle_diff(ta, tb))
-            midpoint_series.append({"timestamp": t, "value": round(mid_tilt, 3), "status": "measured", "reason": ""})
-            separation_series.append({"timestamp": t, "value": round(sep, 3), "status": "measured", "reason": ""})
+            st_pair = "estimated" if org_pair == "propagated" else "measured"
+            reason_pair = "propagated_estimate" if st_pair == "estimated" else ""
+            midpoint_series.append(
+                {
+                    "timestamp": t,
+                    "value": round(mid_tilt, 3),
+                    "status": st_pair,
+                    "reason": reason_pair,
+                    "pose_origin": org_pair,
+                }
+            )
+            separation_series.append(
+                {
+                    "timestamp": t,
+                    "value": round(sep, 3),
+                    "status": st_pair,
+                    "reason": reason_pair,
+                    "pose_origin": org_pair,
+                }
+            )
             if draw_pair_axis:
                 pair_hip_norm = _norm_from_canonical(hp, pf.width, pf.height)
                 pair_sh_norm = _norm_from_canonical(sp, pf.width, pf.height)
@@ -1383,23 +2098,75 @@ def run_couple_analysis(
                     "value": None,
                     "status": "unavailable",
                     "reason": "shoulder_occluded_hip_only_travel_point",
+                    "pose_origin": org_pair,
                 }
             )
-            separation_series.append({"timestamp": t, "value": None, "status": "unavailable", "reason": "shoulder_occluded"})
+            separation_series.append(
+                {
+                    "timestamp": t,
+                    "value": None,
+                    "status": "unavailable",
+                    "reason": "shoulder_occluded",
+                    "pose_origin": org_pair,
+                }
+            )
         else:
-            midpoint_series.append({"timestamp": t, "value": None, "status": "unavailable", "reason": "pair_unavailable"})
-            separation_series.append({"timestamp": t, "value": None, "status": "unavailable", "reason": "pair_unavailable"})
+            unavail_pair_reason = (
+                "propagated_pose_excluded"
+                if org_pair == "propagated"
+                else (
+                    "display_interpolated_only"
+                    if "display_interpolated" in (org_a, org_b)
+                    else "pair_unavailable"
+                )
+            )
+            midpoint_series.append(
+                {
+                    "timestamp": t,
+                    "value": None,
+                    "status": "unavailable",
+                    "reason": unavail_pair_reason,
+                    "pose_origin": org_pair,
+                }
+            )
+            separation_series.append(
+                {
+                    "timestamp": t,
+                    "value": None,
+                    "status": "unavailable",
+                    "reason": unavail_pair_reason,
+                    "pose_origin": org_pair,
+                }
+            )
 
         # Optional per-dancer head pitch from raw pose
         for d_sample, dest in ((pf.dancer_a, head_a_series), (pf.dancer_b, head_b_series)):
+            d_org = d_sample.pose_origin if d_sample else None
             if d_sample and d_sample.raw_pose and d_sample.head_eligible:
                 hp_res = head_horizontal_alignment(
                     d_sample.raw_pose, pf.width, pf.height, float(cfg.head_neutral_offset)
                 )
                 if hp_res is not None:
-                    dest.append({"timestamp": t, "value": round(float(hp_res[0]), 3), "status": "measured", "reason": ""})
+                    h_st = "estimated" if d_org == "propagated" else "measured"
+                    dest.append(
+                        {
+                            "timestamp": t,
+                            "value": round(float(hp_res[0]), 3),
+                            "status": h_st,
+                            "reason": "propagated_estimate" if h_st == "estimated" else "",
+                            "pose_origin": d_org,
+                        }
+                    )
                     continue
-            dest.append({"timestamp": t, "value": None, "status": "unavailable", "reason": "head_landmarks_unavailable"})
+            dest.append(
+                {
+                    "timestamp": t,
+                    "value": None,
+                    "status": "unavailable",
+                    "reason": _sample_unavail_reason(d_sample, "head_landmarks_unavailable"),
+                    "pose_origin": d_org,
+                }
+            )
 
         def _serialize_display_pose(d_sample: TrackedDancerSample | None) -> dict[str, Any] | None:
             if d_sample is None or not d_sample.display_pose:
@@ -1412,6 +2179,14 @@ def run_couple_analysis(
                 },
                 "interpolated_display": bool(d_sample.interpolated_display),
                 "quality_status": d_sample.quality_status,
+                "pose_origin": d_sample.pose_origin,
+                "landmark_origins": {
+                    k: normalize_pose_origin(
+                        d_sample.landmark_origins.get(k, lm.origin), d_sample.pose_origin
+                    )
+                    for k, lm in d_sample.display_pose.items()
+                    if k in _AXIS_OVERLAY_LANDMARKS
+                },
             }
 
         frame_overlays.append(
@@ -1451,6 +2226,9 @@ def run_couple_analysis(
     )
 
     # §4.1 Motion event candidates
+    a_origins = [pf.dancer_a.pose_origin if pf.dancer_a else None for pf in frames]
+    b_origins = [pf.dancer_b.pose_origin if pf.dancer_b else None for pf in frames]
+    pair_origins = [_pair_pose_origin(pf.dancer_a, pf.dancer_b) for pf in frames]
     motion_candidates = (
         _detect_motion_events_for_track(
             "A",
@@ -1462,6 +2240,7 @@ def run_couple_analysis(
             slowing_fraction=float(da_cfg.slowing_fraction),
             persistence_s=float(da_cfg.persistence_s),
             max_gap_s=float(da_cfg.max_observation_gap_s),
+            sample_origins=a_origins,
         )
         + _detect_motion_events_for_track(
             "B",
@@ -1473,10 +2252,11 @@ def run_couple_analysis(
             slowing_fraction=float(da_cfg.slowing_fraction),
             persistence_s=float(da_cfg.persistence_s),
             max_gap_s=float(da_cfg.max_observation_gap_s),
+            sample_origins=b_origins,
         )
     )
 
-    # §4.2 Per-dancer apparent step contacts and pivot candidates from raw poses via existing Movement engine
+    # §4.2 Per-dancer apparent step contacts and pivot candidates from eligible poses via Movement engine
     w0, h0 = frames[0].width, frames[0].height
     span_t = max(0.05, timestamps[-1] - timestamps[0])
     est_fps = len(frames) / span_t if len(frames) > 1 else 30.0
@@ -1492,11 +2272,13 @@ def run_couple_analysis(
                     pf.timestamp,
                     pf.width,
                     pf.height,
-                    [getter(pf).raw_pose] if (getter(pf) and getter(pf).raw_pose) else [],
-                    [getter(pf).world_pose] if (getter(pf) and getter(pf).world_pose) else [],
+                    [d.raw_pose] if (d is not None and d.raw_pose is not None and d.hip_eligible) else [],
+                    [d.world_pose] if (d is not None and d.world_pose is not None and d.hip_eligible and d.world_pose) else [],
+                    [d.pose_origin] if (d is not None and d.raw_pose is not None and d.hip_eligible) else [],
                 ),
             )
             for pf in frames
+            for d in (getter(pf),)
         ]
         if any(o.poses for _, o in obs_list):
             mv = analyse_movement_observations(
@@ -1552,11 +2334,29 @@ def run_couple_analysis(
 
     series: dict[str, list[dict[str, Any]]] = {
         "velocity_a": [
-            {"timestamp": float(pf.timestamp), "value": round(v, 4) if v is not None else None}
+            {
+                "timestamp": float(pf.timestamp),
+                "value": round(v, 4) if v is not None else None,
+                "status": (
+                    "unavailable"
+                    if v is None
+                    else ("estimated" if pf.dancer_a and pf.dancer_a.pose_origin == "propagated" else "measured")
+                ),
+                "pose_origin": pf.dancer_a.pose_origin if pf.dancer_a else None,
+            }
             for pf, v in zip(frames, vel_a)
         ],
         "velocity_b": [
-            {"timestamp": float(pf.timestamp), "value": round(v, 4) if v is not None else None}
+            {
+                "timestamp": float(pf.timestamp),
+                "value": round(v, 4) if v is not None else None,
+                "status": (
+                    "unavailable"
+                    if v is None
+                    else ("estimated" if pf.dancer_b and pf.dancer_b.pose_origin == "propagated" else "measured")
+                ),
+                "pose_origin": pf.dancer_b.pose_origin if pf.dancer_b else None,
+            }
             for pf, v in zip(frames, vel_b)
         ],
         "velocity_pair": [
@@ -1565,8 +2365,11 @@ def run_couple_analysis(
                 "value": round(v, 4) if v is not None else None,
                 "pair_hip_eligible": bool(pf.pair_hip_eligible),
                 "break_flag": bool(pf.shot_cut or pf.identity_break),
+                "pose_origin": org_p,
+                "pose_origin_a": pf.dancer_a.pose_origin if pf.dancer_a else None,
+                "pose_origin_b": pf.dancer_b.pose_origin if pf.dancer_b else None,
             }
-            for pf, v in zip(frames, vel_pair)
+            for pf, v, org_p in zip(frames, vel_pair, pair_origins)
         ],
         "torso_tilt_a": tilt_a_series,
         "torso_tilt_b": tilt_b_series,
@@ -1574,21 +2377,83 @@ def run_couple_analysis(
         "torso_separation": separation_series,
         "head_pitch_a": head_a_series,
         "head_pitch_b": head_b_series,
+        "frame_pose_origins": [
+            {
+                "frame_index": pf.frame_index,
+                "timestamp": float(pf.timestamp),
+                "dancer_a": pf.dancer_a.pose_origin if pf.dancer_a else None,
+                "dancer_b": pf.dancer_b.pose_origin if pf.dancer_b else None,
+                "pair": org_p,
+                "a_hip_eligible": bool(pf.dancer_a and pf.dancer_a.hip_eligible),
+                "b_hip_eligible": bool(pf.dancer_b and pf.dancer_b.hip_eligible),
+                "pair_hip_eligible": bool(pf.pair_hip_eligible),
+                "a_torso_eligible": bool(pf.dancer_a and pf.dancer_a.torso_eligible),
+                "b_torso_eligible": bool(pf.dancer_b and pf.dancer_b.torso_eligible),
+                "pair_torso_eligible": bool(pf.pair_torso_eligible),
+            }
+            for pf, org_p in zip(frames, pair_origins)
+        ],
         "pair_breaks": [{"timestamp": float(pf.timestamp)} for pf in frames if pf.shot_cut or pf.identity_break],
         "pivot_candidates": pivot_candidates,
     }
 
     total_n = max(1, len(frames))
+    eligible_counts = {
+        "a_hip": sum(1 for pf in frames if pf.dancer_a and pf.dancer_a.hip_eligible),
+        "b_hip": sum(1 for pf in frames if pf.dancer_b and pf.dancer_b.hip_eligible),
+        "pair_hip": sum(1 for pf in frames if pf.pair_hip_eligible),
+        "a_torso": sum(1 for pf in frames if pf.dancer_a and pf.dancer_a.torso_eligible),
+        "b_torso": sum(1 for pf in frames if pf.dancer_b and pf.dancer_b.torso_eligible),
+        "pair_torso": sum(1 for pf in frames if pf.pair_torso_eligible),
+        "a_head": sum(1 for pf in frames if pf.dancer_a and pf.dancer_a.head_eligible),
+        "b_head": sum(1 for pf in frames if pf.dancer_b and pf.dancer_b.head_eligible),
+    }
+    strict_origins = {"detected", "crop_detected"}
+    measured_only_coverage = {
+        "a_hip_coverage": round(
+            sum(1 for pf in frames if pf.dancer_a and pf.dancer_a.hip_eligible and pf.dancer_a.pose_origin in strict_origins) / total_n,
+            4,
+        ),
+        "b_hip_coverage": round(
+            sum(1 for pf in frames if pf.dancer_b and pf.dancer_b.hip_eligible and pf.dancer_b.pose_origin in strict_origins) / total_n,
+            4,
+        ),
+        "pair_hip_coverage": round(
+            sum(1 for pf, op in zip(frames, pair_origins) if pf.pair_hip_eligible and op in strict_origins) / total_n,
+            4,
+        ),
+        "a_torso_coverage": round(
+            sum(1 for pf in frames if pf.dancer_a and pf.dancer_a.torso_eligible and pf.dancer_a.pose_origin in strict_origins) / total_n,
+            4,
+        ),
+        "b_torso_coverage": round(
+            sum(1 for pf in frames if pf.dancer_b and pf.dancer_b.torso_eligible and pf.dancer_b.pose_origin in strict_origins) / total_n,
+            4,
+        ),
+        "pair_torso_coverage": round(
+            sum(1 for pf, op in zip(frames, pair_origins) if pf.pair_torso_eligible and op in strict_origins) / total_n,
+            4,
+        ),
+    }
     coverage = {
         "frame_count": len(frames),
-        "a_hip_coverage": round(sum(1 for pf in frames if pf.dancer_a and pf.dancer_a.hip_eligible) / total_n, 4),
-        "b_hip_coverage": round(sum(1 for pf in frames if pf.dancer_b and pf.dancer_b.hip_eligible) / total_n, 4),
-        "pair_hip_coverage": round(sum(1 for pf in frames if pf.pair_hip_eligible) / total_n, 4),
-        "a_torso_coverage": round(sum(1 for pf in frames if pf.dancer_a and pf.dancer_a.torso_eligible) / total_n, 4),
-        "b_torso_coverage": round(sum(1 for pf in frames if pf.dancer_b and pf.dancer_b.torso_eligible) / total_n, 4),
-        "pair_torso_coverage": round(sum(1 for pf in frames if pf.pair_torso_eligible) / total_n, 4),
-        "a_head_coverage": round(sum(1 for pf in frames if pf.dancer_a and pf.dancer_a.head_eligible) / total_n, 4),
-        "b_head_coverage": round(sum(1 for pf in frames if pf.dancer_b and pf.dancer_b.head_eligible) / total_n, 4),
+        "a_hip_coverage": round(eligible_counts["a_hip"] / total_n, 4),
+        "b_hip_coverage": round(eligible_counts["b_hip"] / total_n, 4),
+        "pair_hip_coverage": round(eligible_counts["pair_hip"] / total_n, 4),
+        "a_torso_coverage": round(eligible_counts["a_torso"] / total_n, 4),
+        "b_torso_coverage": round(eligible_counts["b_torso"] / total_n, 4),
+        "pair_torso_coverage": round(eligible_counts["pair_torso"] / total_n, 4),
+        "a_head_coverage": round(eligible_counts["a_head"] / total_n, 4),
+        "b_head_coverage": round(eligible_counts["b_head"] / total_n, 4),
+        "measurement_origin_policy": origin_policy,
+        "denominator_explanation": f"eligible frames / {len(frames)} total frames in clip",
+        "eligible_counts": eligible_counts,
+        "measured_only_coverage": measured_only_coverage,
+        "origin_counts": {
+            "a": _count_origins(a_origins),
+            "b": _count_origins(b_origins),
+            "pair": _count_origins(pair_origins),
+        },
     }
 
     auto_turns = (
@@ -1611,6 +2476,7 @@ def run_couple_analysis(
         series,
         coverage,
         cfg_effective,
+        allow_propagated_estimates=(origin_policy == "allow_propagated_estimates"),
     )
 
     post_diags = detect_post_window_scene_changes(frames, decision, cfg)
@@ -1662,6 +2528,12 @@ def rebuild_couple_result_with_annotations(
     automated_candidates = [dict(c) for c in (updated.get("automated_candidates") or [])]
     pivot_candidates = list(series.get("pivot_candidates") or [])
     coverage = dict(updated.get("coverage") or {})
+    stored_policy = (
+        (updated.get("request") or {}).get("pose_origin_policy")
+        or coverage.get("measurement_origin_policy")
+        or cfg.dancer_analysis.pose_origin_policy
+    )
+    allow_prop = stored_policy == "allow_propagated_estimates"
 
     events, summaries = _apply_annotations_to_candidates(
         automated_candidates,
@@ -1670,6 +2542,7 @@ def rebuild_couple_result_with_annotations(
         series,
         coverage,
         cfg,
+        allow_propagated_estimates=allow_prop,
     )
     updated["annotations"] = annotations.to_dict()
     updated["events"] = events

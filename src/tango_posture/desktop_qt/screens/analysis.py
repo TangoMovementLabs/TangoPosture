@@ -1071,35 +1071,45 @@ class AnalysisScreen(QWidget):
                         pitem = pos_sum.get(pkey)
                         if isinstance(pitem, dict):
                             pval = pitem.get("median_deg")
+                            cov = float(pitem.get("coverage") or 0.0)
+                            cnt = int(pitem.get("eligible_count") or pitem.get("sample_count") or 0)
+                            denom = int(pitem.get("coverage_denominator") or pitem.get("total_frame_count") or 0)
+                            cov_txt = f" ({cnt}/{denom} frames, {cov:.0%})" if denom > 0 else ""
                             self._append_couple_result_row(
                                 plabel,
-                                f"{float(pval):+.1f} deg" if isinstance(pval, (int, float)) else "Unavailable",
+                                f"{float(pval):+.1f} deg{cov_txt}" if isinstance(pval, (int, float)) else "Unavailable",
                                 str(pitem.get("status") or "unavailable"),
                             )
 
                 trans_sum = summaries.get("transitions") or {}
                 if isinstance(trans_sum, dict) and trans_sum:
+                    tr_status = str(trans_sum.get("status") or "unavailable")
+                    eval_cnt = trans_sum.get("evaluated_window_count")
                     peaks = trans_sum.get("secondary_speed_peaks")
                     revs = trans_sum.get("unintended_reversals")
-                    trans_txt = (
-                        f"peaks={peaks}, reversals={revs}"
-                        if peaks is not None or revs is not None
-                        else "Unavailable"
-                    )
+                    if tr_status in ("unavailable", "insufficient_evidence") or (
+                        peaks is None and revs is None
+                    ):
+                        trans_txt = "Unavailable (0 evaluated windows)" if eval_cnt == 0 else "Unavailable"
+                    else:
+                        win_part = f", windows={eval_cnt}" if eval_cnt is not None else ""
+                        trans_txt = f"peaks={peaks}, reversals={revs}{win_part}"
                     self._append_couple_result_row(
                         "Transitions (unintended cues)",
                         trans_txt,
-                        str(trans_sum.get("status") or "unavailable"),
+                        tr_status,
                     )
 
                 turn_sum = summaries.get("turns") or {}
                 if isinstance(turn_sum, dict) and turn_sum:
                     tcnt = int(turn_sum.get("turn_count") or 0)
+                    ucnt = int(turn_sum.get("unmatched_count") or 0)
                     tdur = turn_sum.get("median_turn_duration_s")
                     dur_part = f" (median {float(tdur):.2f} s)" if isinstance(tdur, (int, float)) else ""
+                    unm_part = f", {ucnt} unmatched" if ucnt else ""
                     self._append_couple_result_row(
                         "Turns recorded",
-                        f"{tcnt}{dur_part}",
+                        f"{tcnt}{dur_part}{unm_part}",
                         str(turn_sum.get("status") or "unavailable"),
                     )
 

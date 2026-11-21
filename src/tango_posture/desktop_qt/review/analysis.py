@@ -114,21 +114,31 @@ def render_couple_review_report(
         med = s.get("median_deg")
         iqr = s.get("iqr_deg")
         cov = float(s.get("coverage") or 0.0) * 100.0
-        n = int(s.get("sample_count") or 0)
+        n = int(s.get("eligible_count") or s.get("sample_count") or 0)
+        denom = s.get("coverage_denominator") or s.get("total_frame_count")
+        count_txt = f"{n}/{int(denom)} frames" if isinstance(denom, int) and denom > 0 else f"{n} samples"
+        st_txt = str(s.get("status") or "unavailable")
         if med is None:
-            return f"- **{label}**: unavailable (coverage {cov:.0f}%)"
-        return f"- **{label}**: median `{float(med):+.1f}°` (IQR `{float(iqr or 0.0):.1f}°`, {n} samples, {cov:.0f}% coverage)"
+            return f"- **{label}**: unavailable (`{st_txt}`, {count_txt}, coverage {cov:.0f}%)"
+        return (
+            f"- **{label}**: median `{float(med):+.1f}°` (IQR `{float(iqr or 0.0):.1f}°`, "
+            f"{count_txt}, {cov:.0f}% coverage, status `{st_txt}`)"
+        )
 
     def _fmt_lag(key: str, label: str) -> str:
         s = coord.get(key) or {}
+        st_txt = str(s.get("status") or "unavailable") if isinstance(s, dict) else "unavailable"
         if not isinstance(s, dict) or s.get("value") is None:
             reason = str(s.get("reason") or "unavailable") if isinstance(s, dict) else "unavailable"
-            return f"- **{label}**: unavailable ({reason})"
+            return f"- **{label}**: unavailable (`{st_txt}` · {reason})"
         val = float(s["value"])
         iqr = s.get("iqr")
         cnt = int(s.get("count") or 0)
         iqr_txt = f", IQR {float(iqr):.0f} ms" if isinstance(iqr, int | float) else ""
-        return f"- **{label}**: `{val:+.0f} ms` ({cnt} paired events{iqr_txt}; positive = {b_name} later)"
+        return (
+            f"- **{label}**: `{val:+.0f} ms` ({cnt} paired events{iqr_txt}, "
+            f"status `{st_txt}`; positive = {b_name} later)"
+        )
 
     lines = [
         f"# Couple Axis & Coordination Report — {title}",
@@ -153,10 +163,26 @@ def render_couple_review_report(
         "## Transitions & Turns",
         (
             f"- **Transitions**: `{trans.get('status', 'unavailable')}`"
-            + (f" · secondary rises: {trans.get('secondary_speed_peaks')}" if trans.get("secondary_speed_peaks") is not None else "")
+            + (
+                f" · evaluated windows: {trans.get('evaluated_window_count')}"
+                if trans.get("evaluated_window_count") is not None
+                else ""
+            )
+            + (
+                f" · secondary rises: {trans.get('secondary_speed_peaks')}, reversals: {trans.get('unintended_reversals')}"
+                if trans.get("secondary_speed_peaks") is not None
+                or trans.get("unintended_reversals") is not None
+                else " · unavailable (no evaluated transition window)"
+            )
         ),
         (
-            f"- **Turns & exits**: {int(turns.get('turn_count') or 0)} marked/detected turns · status `{turns.get('status', 'unavailable')}`"
+            f"- **Turns & exits**: {int(turns.get('turn_count') or 0)} matched turns"
+            + (
+                f", {int(turns.get('unmatched_count') or 0)} unmatched markers"
+                if int(turns.get("unmatched_count") or 0) > 0
+                else ""
+            )
+            + f" · status `{turns.get('status', 'unavailable')}`"
         ),
         "",
     ]

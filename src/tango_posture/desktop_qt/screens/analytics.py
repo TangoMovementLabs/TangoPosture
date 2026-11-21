@@ -1306,6 +1306,8 @@ class AnalyticsScreen(QWidget):
 
             trans_sum = summaries.get("transitions") or {}
             if isinstance(trans_sum, dict) and trans_sum:
+                tr_status = str(trans_sum.get("status") or "unavailable")
+                tr_unavail = tr_status in ("unavailable", "insufficient_evidence")
                 for tkey in (
                     "secondary_speed_peaks",
                     "unintended_reversals",
@@ -1314,15 +1316,30 @@ class AnalyticsScreen(QWidget):
                     "settling_steps",
                 ):
                     if tkey in trans_sum:
+                        val = (
+                            None
+                            if tr_unavail and tkey in ("secondary_speed_peaks", "unintended_reversals")
+                            else trans_sum.get(tkey)
+                        )
                         self._append_summary_row(
                             self._couple_summary_tables["transitions"],
                             tkey,
                             {
-                                "value": trans_sum.get(tkey),
+                                "value": val,
                                 "unit": "count",
-                                "status": trans_sum.get("status", "unavailable"),
+                                "status": tr_status,
                             },
                         )
+                if "evaluated_window_count" in trans_sum:
+                    self._append_summary_row(
+                        self._couple_summary_tables["transitions"],
+                        "evaluated_window_count",
+                        {
+                            "value": trans_sum.get("evaluated_window_count"),
+                            "unit": "windows",
+                            "status": tr_status,
+                        },
+                    )
 
             pos_sum = summaries.get("posture") or {}
             if isinstance(pos_sum, dict):
@@ -1352,12 +1369,15 @@ class AnalyticsScreen(QWidget):
 
             turn_sum = summaries.get("turns") or {}
             if isinstance(turn_sum, dict) and turn_sum:
-                for ukey, unit in (
+                turn_keys: list[tuple[str, str]] = [
                     ("median_turn_duration_s", "s"),
                     ("median_exit_minus_turn_end_ms", "ms"),
                     ("turn_count", "count"),
                     ("overlap_count", "count"),
-                ):
+                ]
+                if int(turn_sum.get("unmatched_count") or 0) > 0:
+                    turn_keys.append(("unmatched_count", "count"))
+                for ukey, unit in turn_keys:
                     if ukey in turn_sum:
                         self._append_summary_row(
                             self._couple_summary_tables["turns_exits"],
@@ -1418,6 +1438,7 @@ class AnalyticsScreen(QWidget):
             t_item.setData(Qt.ItemDataRole.UserRole, ev)
             meta = ev.get("metadata") or {}
             detail = ""
+            turn_tid = ev.get("turn_id") or (meta.get("turn_id") if isinstance(meta, dict) else None)
             if isinstance(ev.get("lag_ms"), (int, float)):
                 detail = f"lag {float(ev['lag_ms']):+.0f} ms"
             elif isinstance(ev.get("beat_offset_ms"), (int, float)):
@@ -1430,6 +1451,8 @@ class AnalyticsScreen(QWidget):
                 detail = str(ev["reason"])
             elif ev.get("label"):
                 detail = str(ev["label"])
+            if turn_tid:
+                detail = f"[{turn_tid}] {detail}".strip()
             tbl.setItem(r, 0, t_item)
             tbl.setItem(r, 1, QTableWidgetItem(etype))
             tbl.setItem(r, 2, QTableWidgetItem(str(ev.get("subject", "pair"))))
@@ -1533,26 +1556,51 @@ class AnalyticsScreen(QWidget):
             smoothed_axes["torso_tilt_b"],
         )
         pos_sum_map = summaries.get("posture") if isinstance(summaries, dict) else None
+        stored_pr = (
+            pos_sum_map.get("torso_tilt_pearson_r")
+            if isinstance(pos_sum_map, dict) and isinstance(pos_sum_map.get("torso_tilt_pearson_r"), dict)
+            else None
+        )
         if (
             pearson_r is None
             and not smoothed_axes["torso_tilt_a"]
             and not smoothed_axes["torso_tilt_b"]
-            and isinstance(pos_sum_map, dict)
-            and isinstance(pos_sum_map.get("torso_tilt_pearson_r"), dict)
+            and isinstance(stored_pr, dict)
         ):
-            stored_pr = pos_sum_map["torso_tilt_pearson_r"]
             pearson_r = finite_number(stored_pr.get("value"))
             pearson_n = int(stored_pr.get("sample_count") or 0)
             pearson_reason = str(stored_pr.get("reason") or "")
 
+        cov_map = couple_result.get("coverage") or {}
+        pair_denom = int(
+            (stored_pr.get("coverage_denominator") if isinstance(stored_pr, dict) else None)
+            or cov_map.get("frame_count")
+            or max(len(smoothed_axes["torso_tilt_a"]), len(smoothed_axes["torso_tilt_b"]), pearson_n, 1)
+        )
+        if pearson_r is not None:
+            pr_status = (
+                str(stored_pr.get("status"))
+                if isinstance(stored_pr, dict)
+                and stored_pr.get("status") in ("measured", "estimated", "mixed", "user_confirmed")
+                else "measured"
+            )
+        elif 0 < pearson_n < 3:
+            pr_status = "insufficient_evidence"
+        else:
+            pr_status = "unavailable"
         pr_item = {
             "measure": "torso_tilt_pearson_r",
             "subject": "pair",
             "value": pearson_r,
             "sample_count": pearson_n,
-            "coverage": float((couple_result.get("coverage") or {}).get("pair_torso_coverage", 0.0)),
+            "eligible_count": pearson_n,
+            "coverage_denominator": pair_denom,
+            "coverage": float(cov_map.get("pair_torso_coverage", 0.0)),
             "unit": "r",
-            "status": "measured" if pearson_r is not None else "unavailable",
+            "status": pr_status,
+            "status_counts": (
+                dict(stored_pr.get("status_counts") or {}) if isinstance(stored_pr, dict) else {}
+            ),
             "reason": pearson_reason,
         }
         if isinstance(couple_result, dict):
@@ -1574,13 +1622,13 @@ class AnalyticsScreen(QWidget):
                 interp = "Weak or independent torso tilt coupling across paired frames."
             cov_pct = (finite_number(pr_item["coverage"]) or 0.0) * 100.0
             self.couple_pearson_detail_label.setText(
-                f"Paired samples: {pearson_n} · Pair torso coverage: {cov_pct:.0f}% · {interp}"
+                f"Paired samples: {pearson_n}/{pair_denom} frames · Pair torso coverage: {cov_pct:.0f}% · Status: {pr_status} · {interp}"
             )
         else:
             self.couple_pearson_value_label.setText("Pearson r: Unavailable")
             reason_txt = pearson_reason.replace("_", " ") if pearson_reason else "insufficient paired samples"
             self.couple_pearson_detail_label.setText(
-                f"Paired samples: {pearson_n} · Reason: {reason_txt}"
+                f"Paired samples: {pearson_n}/{pair_denom} · Status: {pr_status} · Reason: {reason_txt}"
             )
 
         pearson_banner = (
@@ -1640,10 +1688,17 @@ class AnalyticsScreen(QWidget):
             if med is not None and isinstance(pos_item, dict):
                 iqr = finite_number(pos_item.get("iqr_deg")) or 0.0
                 cov = finite_number(pos_item.get("coverage")) or 0.0
-                cnt = int(pos_item.get("sample_count") or 0)
+                cnt = int(pos_item.get("eligible_count") or pos_item.get("sample_count") or 0)
+                denom = int(
+                    pos_item.get("coverage_denominator")
+                    or pos_item.get("total_frame_count")
+                    or cov_map.get("frame_count")
+                    or max(cnt, len(rel_pts), 1)
+                )
+                st_lbl = str(pos_item.get("status") or "measured")
                 self.couple_axis_coverage_labels[key].setText(
                     f"Median: {med:+.1f}° · IQR: {iqr:.1f}° · Ref: {ref_val:.1f}° · "
-                    f"Coverage: {cov:.0%} ({cnt} samples){pearson_suffix}"
+                    f"Coverage: {cov:.0%} ({cnt}/{denom} frames, {st_lbl}){pearson_suffix}"
                 )
             elif segments:
                 valid_count = sum(1 for _, v in rel_pts if v is not None)

@@ -146,7 +146,9 @@ def _draw_dancer(
     landmarks: dict[str, list[float]] = dancer_data.get("landmarks") or {}
     if not landmarks:
         return
-    interpolated = bool(dancer_data.get("interpolated_display", False))
+    interpolated = bool(dancer_data.get("interpolated_display", False)) or (
+        dancer_data.get("pose_origin") in ("propagated", "display_interpolated")
+    )
 
     ls = landmarks.get("left_shoulder")
     rs = landmarks.get("right_shoulder")
@@ -465,15 +467,20 @@ def smooth_couple_frame_overlays(
                     d_data = {
                         "landmarks": {},
                         "interpolated_display": True,
-                        "quality_status": "estimated",
+                        "quality_status": "unavailable",
+                        "pose_origin": "display_interpolated",
+                        "landmark_origins": {},
                     }
                     fo[dancer_key] = d_data
                 elif was_missing:
                     d_data["interpolated_display"] = True
                 lms = d_data.setdefault("landmarks", {})
+                lm_origins = d_data.setdefault("landmark_origins", {})
                 if isinstance(lms, dict):
                     vis = vis_list[idx] if vis_list[idx] is not None else 0.75
                     lms[lm_key] = [round(sm_x[idx], 5), round(sm_y[idx], 5), round(vis, 3)]  # type: ignore[arg-type]
+                    if was_missing and isinstance(lm_origins, dict):
+                        lm_origins[lm_key] = "display_interpolated"
 
     # Populate missing pair midpoint endpoints from smoothed dancer landmarks, then smooth pair points
     def _dancer_mid_norm(d_data: Any, k1: str, k2: str) -> tuple[float, float] | None:

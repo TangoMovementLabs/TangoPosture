@@ -1,6 +1,7 @@
 """Desktop controller. Headless and GUI use the same observation/session pipeline."""
 
 import json
+import logging
 import platform
 import shutil
 import subprocess
@@ -33,6 +34,8 @@ from .capture import Capture
 from .config import Config
 from .display import PracticeDisplay
 from .domain import Calibration, FrameObservation, MetricObservation, PoseEstimator
+
+_logger = logging.getLogger(__name__)
 from .geometry import (
     AnkleStepTracker,
     AxisCurveTracker,
@@ -249,6 +252,12 @@ class Application:
         self.notice = ""
         self.latencies.clear()
         self.inference_times.clear()
+        _logger.info(
+            "Session started id=%s source=%s ref_id=%s",
+            self.session.id,
+            "video" if self.video else "webcam",
+            self.reference.id if self.reference else None,
+        )
 
     def performance(self) -> dict:
         mean_duration = float(np.mean(self.inference_times)) if self.inference_times else 0.0
@@ -272,7 +281,14 @@ class Application:
 
     def finish(self, timestamp: float, status: str) -> None:
         if self.session and not self.session.finished:
-            summary = self.session.finish(timestamp, status, self.performance())
+            perf = self.performance()
+            _logger.info(
+                "Finishing session id=%s status=%s perf=%s",
+                self.session.id,
+                status,
+                perf,
+            )
+            summary = self.session.finish(timestamp, status, perf)
             self.last_summary = summary
             output = self.storage.export(
                 self.session.id, Path(self.cfg.data_dir) / "exports" / self.session.id
@@ -389,6 +405,7 @@ class Application:
     def _speak(self, text: str) -> None:
         if not self._audio_cues_enabled():
             return
+        _logger.debug("App._speak launching /usr/bin/say text_len=%d", len(text))
         with suppress(OSError):
             subprocess.Popen(
                 ["/usr/bin/say", text],
@@ -399,6 +416,7 @@ class Application:
     def _beep(self) -> None:
         if not self._audio_cues_enabled():
             return
+        _logger.debug("App._beep launching /usr/bin/afplay")
         with suppress(OSError):
             subprocess.Popen(
                 ["/usr/bin/afplay", "/System/Library/Sounds/Ping.aiff"],
@@ -408,6 +426,11 @@ class Application:
 
     def accept(self) -> None:
         if self.candidate:
+            _logger.info(
+                "Accepting calibration candidate name=%r calibration_only=%s",
+                self.candidate.name,
+                self.calibration_only,
+            )
             cal_dir = calibration_directory(self.cfg.data_dir)
             if self.calibration_only:
                 self.release_writers()

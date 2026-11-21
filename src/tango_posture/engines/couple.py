@@ -11,7 +11,7 @@ from typing import Any
 
 from ..couple import resolve_close_embrace_frame_poses, run_couple_analysis
 from ..couple.tracking import _pose_torso_mid_norm, _translate_pose
-from ..domain import METRIC_VERSION, FrameObservation, PoseEstimator
+from ..domain import METRIC_VERSION, FrameObservation, PoseEstimator, infer_pose_origin
 from ..references.errors import ImportCancelledError
 from ..references.results import ClipAnalysisResult, RunManifest
 from ..references.soundtrack import SoundtrackAnalysisSummary
@@ -152,9 +152,15 @@ def _resolve_close_embrace_fallback(
                     dx = cur_mid[0] - last_primary_mid[0]
                     dy = cur_mid[1] - last_primary_mid[1]
                     if math.hypot(dx, dy) <= 0.05:
-                        split_poses = [_translate_pose(p, dx, dy) for p in last_split_pair]
+                        split_poses = [
+                            _translate_pose(p, dx, dy, origin="propagated") for p in last_split_pair
+                        ]
                         cur_obs = FrameObservation(
-                            cur_obs.timestamp, cur_obs.width, cur_obs.height, split_poses
+                            cur_obs.timestamp,
+                            cur_obs.width,
+                            cur_obs.height,
+                            split_poses,
+                            pose_origins=["propagated"] * len(split_poses),
                         )
                         propagated = True
                 if not propagated:
@@ -168,7 +174,11 @@ def _resolve_close_embrace_fallback(
                     )
                     if len(split_poses) >= 2:
                         cur_obs = FrameObservation(
-                            cur_obs.timestamp, cur_obs.width, cur_obs.height, split_poses
+                            cur_obs.timestamp,
+                            cur_obs.width,
+                            cur_obs.height,
+                            split_poses,
+                            pose_origins=[infer_pose_origin(p) for p in split_poses],
                         )
                         last_split_pos = pos
                         last_primary_mid = cur_mid

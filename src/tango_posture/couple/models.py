@@ -5,11 +5,20 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any, Literal
 
-from ..domain import Landmark
+from ..domain import Landmark, PoseOrigin
 
 DancerMode = Literal["auto", "single", "couple"]
 ResolvedDancerMode = Literal["single", "couple", "needs_selection"]
 SampleQualityStatus = Literal["measured", "estimated", "user_confirmed", "unavailable"]
+SummaryEvidenceStatus = Literal[
+    "measured",
+    "estimated",
+    "user_confirmed",
+    "mixed",
+    "insufficient_evidence",
+    "unavailable",
+]
+PoseOriginPolicy = Literal["measured_only", "allow_propagated_estimates"]
 DancerId = Literal["A", "B"]
 PivotFootBehavior = Literal["appears_planted", "rotates_in_place", "repositions", "unknown"]
 TransitionMarkKind = Literal["planned_pause", "planned_reversal", "settling_step"]
@@ -115,6 +124,7 @@ class CoupleAnnotationItem:
     pivot_behavior: PivotFootBehavior | None = None
     label: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
+    turn_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -129,11 +139,14 @@ class CoupleAnnotationItem:
             "pivot_behavior": self.pivot_behavior,
             "label": self.label,
             "metadata": dict(self.metadata),
+            "turn_id": self.turn_id,
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> CoupleAnnotationItem:
         end_raw = data.get("end_timestamp")
+        raw_turn_id = data.get("turn_id")
+        turn_id = str(raw_turn_id).strip() if isinstance(raw_turn_id, str) and raw_turn_id.strip() else None
         return cls(
             annotation_id=str(data["annotation_id"]),
             event_type=data["event_type"],
@@ -146,6 +159,7 @@ class CoupleAnnotationItem:
             pivot_behavior=data.get("pivot_behavior"),
             label=str(data.get("label", "")),
             metadata=dict(data.get("metadata") or {}),
+            turn_id=turn_id,
         )
 
 
@@ -222,6 +236,7 @@ class CoupleAnalysisRequest:
     analyze_soundtrack: bool | None = None
     auto_turn_suggestions: bool | None = None
     annotations: CoupleAnnotations = field(default_factory=CoupleAnnotations)
+    pose_origin_policy: PoseOriginPolicy | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -231,6 +246,7 @@ class CoupleAnalysisRequest:
             "analyze_soundtrack": self.analyze_soundtrack,
             "auto_turn_suggestions": self.auto_turn_suggestions,
             "annotations": self.annotations.to_dict(),
+            "pose_origin_policy": self.pose_origin_policy,
         }
 
     @classmethod
@@ -249,6 +265,12 @@ class CoupleAnalysisRequest:
             if isinstance(region_raw, dict)
             else None
         )
+        raw_policy = data.get("pose_origin_policy")
+        policy: PoseOriginPolicy | None = (
+            raw_policy
+            if raw_policy in ("measured_only", "allow_propagated_estimates")
+            else None  # type: ignore[assignment]
+        )
         return cls(
             requested_mode=mode,
             forced_override=bool(data.get("forced_override", False)),
@@ -264,6 +286,7 @@ class CoupleAnalysisRequest:
                 else None
             ),
             annotations=CoupleAnnotations.from_dict(data.get("annotations")),
+            pose_origin_policy=policy,
         )
 
 
@@ -372,6 +395,8 @@ class TrackedDancerSample:
     innovation_torso_lengths: float | None = None
     assignment_margin_torso_lengths: float | None = None
     quality_status: SampleQualityStatus = "unavailable"
+    pose_origin: PoseOrigin = "detected"
+    landmark_origins: dict[str, PoseOrigin] = field(default_factory=dict)
 
 
 @dataclass
@@ -410,6 +435,7 @@ class CoupleEvent:
     beat_fraction: float | None = None
     reason: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
+    turn_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -425,10 +451,14 @@ class CoupleSummaryValue:
     iqr: float | None
     count: int
     unit: str
-    status: SampleQualityStatus
+    status: SummaryEvidenceStatus
     coverage: float
     reason: str = ""
     timestamp_or_bracket: str = ""
+    status_counts: dict[str, int] = field(default_factory=dict)
+    origin_counts: dict[str, int] = field(default_factory=dict)
+    eligible_count: int | None = None
+    coverage_denominator: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

@@ -11,6 +11,7 @@ from PySide6.QtGui import QIcon, QPixmap
 from PySide6.QtWidgets import QApplication
 
 from ..config import Config
+from ..troubleshoot import current_log_path, is_troubleshoot_enabled, log_qt_environment
 from .screens.splash import SplashScreen
 from .shell import MainWindow
 
@@ -55,6 +56,8 @@ def launch_qt(cfg: Config) -> int:
 
     app.setApplicationName("TangoPosture Studio")
     app.setOrganizationName("TangoPosture")
+    if is_troubleshoot_enabled():
+        log_qt_environment(app)
 
     logo = _load_logo()
     if not logo.isNull():
@@ -62,5 +65,8 @@ def launch_qt(cfg: Config) -> int:
         app.setWindowIcon(QIcon(pixmap))
 
     window = MainWindow(cfg)
+    log_path = current_log_path()
+    if log_path is not None:
+        window.bridge.status_message.emit(f"Troubleshoot log: {log_path}")
     show_startup_splash(window, logo)
     return app.exec()

@@ -1,12 +1,25 @@
 """Records shared by the pure pipeline, adapters and persistence."""
 
-from dataclasses import dataclass, field
-from typing import Any, Protocol
+from collections.abc import Mapping
+from dataclasses import dataclass, field, replace
+from typing import Any, Literal, Protocol
 from uuid import uuid4
 
 METRICS = ("head_forward", "head_inclination", "trunk_inclination")
 METRIC_VERSION = "1.0"
 UNITS = dict(zip(METRICS, ("torso_lengths", "degrees", "degrees")))
+
+PoseOrigin = Literal["detected", "crop_detected", "propagated", "display_interpolated"]
+VALID_POSE_ORIGINS: frozenset[str] = frozenset(
+    {"detected", "crop_detected", "propagated", "display_interpolated"}
+)
+
+
+def normalize_pose_origin(value: Any, default: PoseOrigin = "detected") -> PoseOrigin:
+    """Return a valid ``PoseOrigin`` string, falling back cleanly for legacy values."""
+    if isinstance(value, str) and value in VALID_POSE_ORIGINS:
+        return value  # type: ignore[return-value]
+    return default
 
 
 @dataclass(frozen=True)
@@ -16,6 +29,34 @@ class Landmark:
     visibility: float | None = None
     presence: float | None = None
     z: float | None = None
+    origin: PoseOrigin = "detected"
+
+
+def infer_pose_origin(
+    pose: Mapping[str, Landmark] | None,
+    default: PoseOrigin = "detected",
+) -> PoseOrigin:
+    """Infer pose-level origin from constituent landmarks without mutating geometry."""
+    if not pose:
+        return default
+    origins = {
+        lm.origin
+        for lm in pose.values()
+        if getattr(lm, "origin", None) in VALID_POSE_ORIGINS
+    }
+    if not origins:
+        return default
+    if origins == {"display_interpolated"}:
+        return "display_interpolated"
+    for cand in ("propagated", "crop_detected", "detected", "display_interpolated"):
+        if cand in origins:
+            return cand  # type: ignore[return-value]
+    return default
+
+
+def tag_pose_origin(pose: Mapping[str, Landmark], origin: PoseOrigin) -> dict[str, Landmark]:
+    """Return a shallow copy of ``pose`` with every landmark stamped with ``origin``."""
+    return {name: replace(lm, origin=origin) for name, lm in pose.items()}
 
 
 @dataclass(frozen=True)
@@ -25,6 +66,15 @@ class FrameObservation:
     height: int
     poses: list[dict[str, Landmark]]
     world_poses: list[dict[str, Landmark]] = field(default_factory=list)
+    pose_origins: list[PoseOrigin] = field(default_factory=list)
+
+    def pose_origin_at(self, index: int) -> PoseOrigin:
+        """Return explicit pose origin at ``index``, or infer from landmarks if omitted."""
+        if 0 <= index < len(self.pose_origins):
+            return normalize_pose_origin(self.pose_origins[index])
+        if 0 <= index < len(self.poses):
+            return infer_pose_origin(self.poses[index])
+        return "detected"
 
 
 @dataclass(frozen=True)

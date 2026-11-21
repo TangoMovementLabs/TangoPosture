@@ -511,6 +511,12 @@ def _evaluate_solo_frames(
             )
         coach_pending[frame_index] = coach_entry
         coach_entry["measurement_poses"] = [_serialise_pose(pose) for pose in frame_obs.poses]
+        coach_entry["measurement_pose_origins"] = [
+            frame_obs.pose_origin_at(i) for i in range(len(frame_obs.poses))
+        ]
+        coach_entry["measurement_landmark_origins"] = [
+            {k: lm.origin for k, lm in pose.items()} for pose in frame_obs.poses
+        ]
         coach_frame_meta[frame_index] = coach_meta
 
         frame_log.append(

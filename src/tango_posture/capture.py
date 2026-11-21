@@ -2,6 +2,7 @@
 
 import ctypes
 import ctypes.util
+import logging
 import math
 import queue
 import sys
@@ -14,6 +15,8 @@ from typing import Any
 import cv2
 
 from .config import Config
+
+_logger = logging.getLogger(__name__)
 
 
 def _mac_camera_status() -> int | None:
@@ -63,15 +66,26 @@ class Capture:
         ):
             video = str(Path("videos") / Path(video).name)
         self.video = video
-        self.cap = cv2.VideoCapture(video if video is not None else cfg.camera)
+        source = video if video is not None else cfg.camera
+        _logger.debug("Opening capture source=%r (requested=%dx%d)", source, cfg.width, cfg.height)
+        self.cap = cv2.VideoCapture(source)
         if not self.cap.isOpened() and video is None:
+            tcc_status = _mac_camera_status()
+            _logger.warning(
+                "Initial webcam open failed (camera=%s tcc_status=%s); polling up to 30s",
+                cfg.camera,
+                tcc_status,
+            )
             deadline = time.monotonic() + 30
             while _mac_camera_status() == 0 and time.monotonic() < deadline:
                 time.sleep(0.25)
-            if _mac_camera_status() == 3:
+            final_tcc = _mac_camera_status()
+            _logger.debug("Post-wait macOS camera TCC status=%s", final_tcc)
+            if final_tcc == 3:
                 self.cap.release()
                 self.cap = cv2.VideoCapture(cfg.camera)
         if not self.cap.isOpened():
+            _logger.error("Capture open failed source=%r", source)
             self.cap.release()
             if video:
                 if not Path(video).is_file():
@@ -86,6 +100,14 @@ class Capture:
             self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cfg.height)
         self.fps = self.cap.get(cv2.CAP_PROP_FPS)
         self.frame_count = self.cap.get(cv2.CAP_PROP_FRAME_COUNT)
+        _logger.info(
+            "Capture opened source=%r fps=%.3f frame_count=%.0f width=%.0f height=%.0f",
+            source,
+            self.fps,
+            self.frame_count,
+            self.cap.get(cv2.CAP_PROP_FRAME_WIDTH),
+            self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT),
+        )
         self.index = 0
         self.last = -1.0
         self.fallback = False
@@ -101,10 +123,12 @@ class Capture:
             self.thread.start()
 
     def _produce(self) -> None:
+        _logger.debug("Webcam producer thread started")
         while not self.stop.is_set():
             ok, image = self.cap.read()
             now = time.monotonic()
             if not ok:
+                _logger.error("Webcam producer cap.read() returned ok=False")
                 self.failed.set()
                 break
             frame = Captured(image, now - self.origin, now)
@@ -114,6 +138,8 @@ class Capture:
                 try:
                     self.queue.get_nowait()
                     self.dropped += 1
+                    if self.dropped == 1 or self.dropped % 25 == 0:
+                        _logger.debug("Webcam producer dropped stale frame count=%d", self.dropped)
                 except queue.Empty:
                     pass
                 self.queue.put_nowait(frame)
@@ -125,15 +151,22 @@ class Capture:
             try:
                 frame = self.queue.get(timeout=0.03)
                 if time.monotonic() - frame.captured_at > 0.5:
+                    _logger.error("Camera stalled: frame age %.3fs > 0.5s", time.monotonic() - frame.captured_at)
                     raise OSError("Camera stalled: no fresh frame")
                 return frame
             except queue.Empty:
                 if time.monotonic() - self.origin - max(self.last, 0) > 3:
+                    _logger.error("Camera stalled or permissions denied after 3s")
                     raise OSError("Camera stalled or permissions denied")
                 return None
         ok, image = self.cap.read()
         if not ok:
             if self.frame_count > 0 and self.index < self.frame_count - 1:
+                _logger.error(
+                    "Video decode EOF early index=%d frame_count=%.0f",
+                    self.index,
+                    self.frame_count,
+                )
                 raise OSError("Video decoding stopped before declared EOF")
             return None
         timestamp = self.cap.get(cv2.CAP_PROP_POS_MSEC) / 1000
@@ -144,6 +177,14 @@ class Capture:
                 )
             if self.fallback_offset is None:
                 self.fallback_offset = max(0, self.last + 1 / self.fps - self.index / self.fps)
+                _logger.warning(
+                    "Activating video timestamp fallback at index=%d raw_ts=%.4f last=%.4f offset=%.4f fps=%.3f",
+                    self.index,
+                    timestamp,
+                    self.last,
+                    self.fallback_offset,
+                    self.fps,
+                )
             self.fallback = True
             timestamp = self.index / self.fps + self.fallback_offset
         self.last = timestamp
@@ -151,6 +192,13 @@ class Capture:
         return Captured(image, timestamp, time.monotonic())
 
     def close(self) -> None:
+        _logger.debug(
+            "Closing capture source=%r frames=%d dropped=%d fallback=%s",
+            self.video if self.video is not None else "webcam",
+            self.index,
+            self.dropped,
+            self.fallback,
+        )
         self.stop.set()
         if self.thread:
             self.thread.join(timeout=1)

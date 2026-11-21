@@ -14,7 +14,13 @@ from zipfile import BadZipFile, ZipFile
 
 import numpy as np
 
-from ..domain import FrameObservation, Landmark
+from ..domain import (
+    FrameObservation,
+    Landmark,
+    PoseOrigin,
+    infer_pose_origin,
+    normalize_pose_origin,
+)
 from ..geometry import wrapped
 from ..normalization_models import (
     HoldSourceIdentity,
@@ -186,7 +192,12 @@ def frames_fingerprint(observations: Sequence[FrameObservation]) -> str:
     return hasher.hexdigest()
 
 
-def _parse_raw_pose(raw_pose: Any) -> dict[str, Landmark]:
+def _parse_raw_pose(
+    raw_pose: Any,
+    *,
+    default_origin: PoseOrigin = "detected",
+    landmark_origins: Mapping[str, Any] | None = None,
+) -> dict[str, Landmark]:
     if not isinstance(raw_pose, Mapping) or not raw_pose:
         return {}
     pose: dict[str, Landmark] = {}
@@ -195,12 +206,18 @@ def _parse_raw_pose(raw_pose: Any) -> dict[str, Landmark]:
             continue
         if coords[0] is None or coords[1] is None:
             continue
+        lm_origin = (
+            normalize_pose_origin(landmark_origins.get(str(name)), default_origin)
+            if isinstance(landmark_origins, Mapping)
+            else default_origin
+        )
         pose[str(name)] = Landmark(
             x=float(coords[0]),
             y=float(coords[1]),
             z=float(coords[2]) if coords[2] is not None else None,
             visibility=float(coords[3]) if len(coords) >= 4 and coords[3] is not None else None,
             presence=float(coords[4]) if len(coords) >= 5 and coords[4] is not None else None,
+            origin=lm_origin,
         )
     return pose
 
@@ -233,13 +250,39 @@ def extract_coach_observations(data: Mapping[str, Any]) -> list[FrameObservation
             raw_poses = entry.get("poses")
         if raw_poses is None and "pose" in entry and "display_poses" not in entry:
             raw_poses = [entry.get("pose")]
+        raw_pose_origins = entry.get("measurement_pose_origins")
+        raw_lm_origins = entry.get("measurement_landmark_origins")
         poses: list[dict[str, Landmark]] = []
+        pose_origins: list[PoseOrigin] = []
         if isinstance(raw_poses, list):
-            for raw_pose in raw_poses:
-                parsed = _parse_raw_pose(raw_pose)
+            for p_idx, raw_pose in enumerate(raw_poses):
+                default_origin = (
+                    normalize_pose_origin(raw_pose_origins[p_idx])
+                    if isinstance(raw_pose_origins, list) and p_idx < len(raw_pose_origins)
+                    else "detected"
+                )
+                lm_map = (
+                    raw_lm_origins[p_idx]
+                    if isinstance(raw_lm_origins, list)
+                    and p_idx < len(raw_lm_origins)
+                    and isinstance(raw_lm_origins[p_idx], Mapping)
+                    else None
+                )
+                parsed = _parse_raw_pose(
+                    raw_pose,
+                    default_origin=default_origin,
+                    landmark_origins=lm_map,
+                )
                 if parsed:
                     poses.append(parsed)
-        observations.append(FrameObservation(ts, width, height, poses))
+                    pose_origins.append(
+                        normalize_pose_origin(
+                            raw_pose_origins[p_idx]
+                            if isinstance(raw_pose_origins, list) and p_idx < len(raw_pose_origins)
+                            else infer_pose_origin(parsed),
+                        )
+                    )
+        observations.append(FrameObservation(ts, width, height, poses, pose_origins=pose_origins))
     return observations
 
 
