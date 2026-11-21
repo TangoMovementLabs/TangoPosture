@@ -2123,7 +2123,7 @@ In packaged desktop builds (`TangoPosture` on macOS/Windows/Linux), you can also
   - **`cv2.*` / `camera.cv2.*` / `video.cv2.*`**: OpenCV build info and verbose backend logs, `VideoCapture` opens/backends/`CAP_PROP_*` properties, per-frame read timings/shapes/mean sample brightness/dropped frames/stalls, and `VideoWriter` frame stats.
   - **`mediapipe.*`**: `PoseLandmarker` model path, byte size, delegate/options, per-frame `detect_for_video`/`detect` inference latency, pose/world-pose counts, landmark visibility stats, and key coordinates.
   - **`audio.sd.*`**: `sounddevice`/PortAudio versions, audio input devices, `InputStream` setup, and non-blocking queued callback/overflow telemetry.
-  - **`qt.*`, `py.*`, `stderr`, crashes & `runtime.heartbeat`**: Qt message handler, `QScreen` & `QMediaDevices` state, root Python `DEBUG` logs, warnings, uncaught thread/main exceptions, `faulthandler`, and a 5-second memory/CPU/thread/GC heartbeat.
+  - **`qt.*`, `ui.*`, `py.*`, `stderr`, crashes & `runtime.heartbeat`**: Qt message handler, `QScreen` & `QMediaDevices` state, every menu/screen route entered (`ui.route`, `ui.screen`), submenus/tabs (`ui.submenu`, `ui.menu.action`, `ui.menubar`, `ui.tab`), buttons/checkboxes/combos/sliders/list items clicked (`ui.button`, `ui.combo`, `ui.input`, `ui.slider`, `ui.item`), windows/dialogs opened & closed (`ui.window`), keyboard shortcuts (`ui.shortcut`, `ui.key`), root Python `DEBUG` logs, warnings, uncaught thread/main exceptions, `faulthandler`, and a 5-second memory/CPU/thread/GC heartbeat.
 
 ### Glossary
 

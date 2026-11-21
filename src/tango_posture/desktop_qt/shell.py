@@ -199,14 +199,20 @@ class MainWindow(QMainWindow):
         return None
 
     def _navigate_shortcut(self, route: Route) -> None:
+        from ..troubleshoot import log_event
+
         focused_widget = QApplication.focusWidget()
         while focused_widget is not None:
             if isinstance(focused_widget, (QLineEdit, QPlainTextEdit, QTextEdit)):
                 return
             focused_widget = focused_widget.parentWidget()
+        log_event("ui.shortcut", f"Navigation shortcut -> menu {route.value!r}")
         self.router.navigate(route)
 
     def _show_about(self) -> None:
+        from ..troubleshoot import log_event
+
+        log_event("ui.menu", "Entered About dialog")
         if self.about_dialog is None:
             self.about_dialog = AboutDialog(self.brand_pixmap, self)
         self.about_dialog.show()
@@ -235,6 +241,13 @@ class MainWindow(QMainWindow):
 
         screen = self.screens.get(route)
         if screen:
+            from ..troubleshoot import log_event
+
+            log_event(
+                "ui.screen",
+                f"Activated screen={type(screen).__name__} route={route.value!r}",
+                level="DEBUG",
+            )
             self.stack.setCurrentWidget(screen)
             if hasattr(screen, "refresh"):
                 screen.refresh()

@@ -22,6 +22,8 @@ import sys
 import threading
 import time
 import traceback
+import warnings
+import weakref
 from contextlib import suppress
 from datetime import datetime
 from pathlib import Path
@@ -127,6 +129,386 @@ def log_qt_environment(app: Any) -> None:
         )
     except Exception as exc:  # noqa: BLE001
         session.write_line("DEBUG", "qt.multimedia", f"QMediaDevices unavailable: {exc!r}")
+
+    session.install_qt_ui_telemetry(app)
+
+
+def install_qt_ui_telemetry(app: Any) -> None:
+    """Install the Qt UI event filter capturing menus, tabs, buttons, and dialogs."""
+    session = _get_session()
+    if session is None or app is None:
+        return
+    session.install_qt_ui_telemetry(app)
+
+
+def _widget_label(widget: Any) -> str:
+    for getter in ("text", "title", "windowTitle", "accessibleName", "toolTip"):
+        fn = getattr(widget, getter, None)
+        if callable(fn):
+            with suppress(Exception):
+                val = str(fn() or "").strip()
+                if val:
+                    return val.replace("\n", " ")[:80]
+    return ""
+
+
+def _widget_breadcrumb(widget: Any) -> str:
+    parts: list[str] = []
+    cur = widget
+    depth = 0
+    while cur is not None and depth < 5:
+        cls = type(cur).__name__
+        obj_name = ""
+        with suppress(Exception):
+            obj_name = str(cur.objectName() or "").strip()
+        is_win = False
+        with suppress(Exception):
+            is_win = bool(cur.isWindow())
+        if depth == 0 or obj_name or is_win or cls not in ("QWidget", "QFrame"):
+            token = f"{cls}#{obj_name}" if obj_name else cls
+            parts.append(token)
+        with suppress(Exception):
+            cur = cur.parentWidget()
+            depth += 1
+            continue
+        break
+    path = " > ".join(reversed(parts)) if parts else type(widget).__name__
+    label = _widget_label(widget)
+    return f"{path} ({label!r})" if label else path
+
+
+def _menu_path(menu: Any) -> str:
+    parts: list[str] = []
+    cur = menu
+    depth = 0
+    while cur is not None and depth < 6:
+        title = ""
+        with suppress(Exception):
+            title = str(cur.title() or "").strip()
+        if not title:
+            with suppress(Exception):
+                title = str(cur.objectName() or "").strip()
+        if not title:
+            title = type(cur).__name__
+        parts.append(title)
+        with suppress(Exception):
+            parent = cur.parent()
+            cls_name = type(parent).__name__ if parent is not None else ""
+            if cls_name == "QMenu":
+                cur = parent
+                depth += 1
+                continue
+        break
+    return " > ".join(reversed(parts))
+
+
+def _create_qt_ui_filter(session: TroubleshootSession, app: Any) -> Any:
+    from PySide6.QtCore import QEvent, QObject, Qt
+    from PySide6.QtWidgets import (
+        QAbstractButton,
+        QAbstractItemView,
+        QAbstractSlider,
+        QComboBox,
+        QDialog,
+        QDoubleSpinBox,
+        QMenu,
+        QMenuBar,
+        QMessageBox,
+        QSpinBox,
+        QTabBar,
+    )
+
+    relevant_events = {
+        QEvent.Type.Show,
+        QEvent.Type.Hide,
+        QEvent.Type.Close,
+        QEvent.Type.WindowActivate,
+        QEvent.Type.ChildPolished,
+        QEvent.Type.MouseButtonPress,
+        QEvent.Type.KeyPress,
+        QEvent.Type.Shortcut,
+    }
+
+    class _TroubleshootQtEventFilter(QObject):
+        def __init__(self, parent: Any = None) -> None:
+            super().__init__(parent)
+            self._hooked: weakref.WeakSet[Any] = weakref.WeakSet()
+            self._last_hover_id: int | None = None
+
+        def _connect_widget(self, w: Any) -> None:
+            if w is None or w in self._hooked:
+                return
+            self._hooked.add(w)
+            if isinstance(w, QAbstractButton):
+                def _on_clicked(checked: bool = False, btn: Any = w) -> None:
+                    with suppress(Exception):
+                        extra = f" checked={checked}" if btn.isCheckable() else ""
+                        session.write_line(
+                            "INFO",
+                            "ui.button",
+                            f"Clicked: {_widget_breadcrumb(btn)}{extra}",
+                        )
+
+                w.clicked.connect(_on_clicked)
+            elif isinstance(w, QMenu):
+                def _on_about_to_show(menu: Any = w) -> None:
+                    with suppress(Exception):
+                        session.write_line(
+                            "DEBUG",
+                            "ui.menu",
+                            f"Menu aboutToShow: {_menu_path(menu)}",
+                        )
+
+                def _on_menu_triggered(action: Any, menu: Any = w) -> None:
+                    with suppress(Exception):
+                        txt = str(action.text() or "").strip()
+                        chk = f" checked={action.isChecked()}" if action.isCheckable() else ""
+                        session.write_line(
+                            "INFO",
+                            "ui.menu.action",
+                            f"Triggered: {_menu_path(menu)} > {txt!r}{chk}",
+                        )
+
+                def _on_menu_hovered(action: Any, menu: Any = w) -> None:
+                    with suppress(Exception):
+                        aid = id(action)
+                        if aid == self._last_hover_id:
+                            return
+                        self._last_hover_id = aid
+                        txt = str(action.text() or "").strip()
+                        sub = " [has submenu]" if action.menu() is not None else ""
+                        session.write_line(
+                            "DEBUG",
+                            "ui.menu.hover",
+                            f"Hovered: {_menu_path(menu)} > {txt!r}{sub}",
+                        )
+
+                w.aboutToShow.connect(_on_about_to_show)
+                w.triggered.connect(_on_menu_triggered)
+                w.hovered.connect(_on_menu_hovered)
+            elif isinstance(w, QMenuBar):
+                def _on_bar_triggered(action: Any) -> None:
+                    with suppress(Exception):
+                        session.write_line(
+                            "INFO",
+                            "ui.menubar",
+                            f"Menubar triggered: {str(action.text() or '').strip()!r}",
+                        )
+
+                def _on_bar_hovered(action: Any) -> None:
+                    with suppress(Exception):
+                        aid = id(action)
+                        if aid == self._last_hover_id:
+                            return
+                        self._last_hover_id = aid
+                        session.write_line(
+                            "DEBUG",
+                            "ui.menubar.hover",
+                            f"Menubar hovered: {str(action.text() or '').strip()!r}",
+                        )
+
+                w.triggered.connect(_on_bar_triggered)
+                w.hovered.connect(_on_bar_hovered)
+            elif isinstance(w, QTabBar):
+                def _on_tab_changed(idx: int, bar: Any = w) -> None:
+                    with suppress(Exception):
+                        lbl = str(bar.tabText(idx) or "").strip() if idx >= 0 else ""
+                        session.write_line(
+                            "INFO",
+                            "ui.tab",
+                            f"Tab/Submenu selected: index={idx} label={lbl!r} "
+                            f"widget={_widget_breadcrumb(bar)}",
+                        )
+
+                w.currentChanged.connect(_on_tab_changed)
+            elif isinstance(w, QComboBox):
+                def _on_combo_activated(idx: int, box: Any = w) -> None:
+                    with suppress(Exception):
+                        txt = str(box.itemText(idx) or "").strip() if idx >= 0 else ""
+                        session.write_line(
+                            "INFO",
+                            "ui.combo",
+                            f"Combo selected: index={idx} text={txt!r} "
+                            f"widget={_widget_breadcrumb(box)}",
+                        )
+
+                w.activated.connect(_on_combo_activated)
+            elif isinstance(w, (QSpinBox, QDoubleSpinBox)):
+                def _on_spin_done(spin: Any = w) -> None:
+                    with suppress(Exception):
+                        session.write_line(
+                            "INFO",
+                            "ui.input",
+                            f"Value committed: value={spin.value()!r} "
+                            f"widget={_widget_breadcrumb(spin)}",
+                        )
+
+                w.editingFinished.connect(_on_spin_done)
+            elif isinstance(w, QAbstractSlider):
+                def _on_slider_done(slider: Any = w) -> None:
+                    with suppress(Exception):
+                        session.write_line(
+                            "INFO",
+                            "ui.slider",
+                            f"Slider changed: value={slider.value()} "
+                            f"widget={_widget_breadcrumb(slider)}",
+                        )
+
+                w.sliderReleased.connect(_on_slider_done)
+            elif isinstance(w, QAbstractItemView):
+                def _on_item_clicked(model_idx: Any, view: Any = w) -> None:
+                    with suppress(Exception):
+                        session.write_line(
+                            "INFO",
+                            "ui.item",
+                            f"Item clicked: row={model_idx.row()} col={model_idx.column()} "
+                            f"text={str(model_idx.data() or '')[:80]!r} "
+                            f"widget={_widget_breadcrumb(view)}",
+                        )
+
+                def _on_item_dbl(model_idx: Any, view: Any = w) -> None:
+                    with suppress(Exception):
+                        session.write_line(
+                            "INFO",
+                            "ui.item",
+                            f"Item doubleClicked: row={model_idx.row()} col={model_idx.column()} "
+                            f"text={str(model_idx.data() or '')[:80]!r} "
+                            f"widget={_widget_breadcrumb(view)}",
+                        )
+
+                w.clicked.connect(_on_item_clicked)
+                w.doubleClicked.connect(_on_item_dbl)
+
+        def _hook_tree(self, root: Any) -> None:
+            self._connect_widget(root)
+            find_children = getattr(root, "findChildren", None)
+            if callable(find_children):
+                target_types = (
+                    QAbstractButton,
+                    QMenu,
+                    QMenuBar,
+                    QTabBar,
+                    QComboBox,
+                    QSpinBox,
+                    QDoubleSpinBox,
+                    QAbstractSlider,
+                    QAbstractItemView,
+                )
+                for child in find_children(QObject):
+                    if isinstance(child, target_types):
+                        self._connect_widget(child)
+
+        def eventFilter(self, obj: Any, event: Any) -> bool:
+            if session.closed:
+                return False
+            with suppress(Exception):
+                etype = event.type()
+                if etype not in relevant_events:
+                    return False
+                if etype == QEvent.Type.ChildPolished:
+                    child = getattr(event, "child", lambda: None)()
+                    if child is not None:
+                        self._hook_tree(child)
+                elif etype == QEvent.Type.Show:
+                    self._hook_tree(obj)
+                    if isinstance(obj, QMenu):
+                        actions = [
+                            str(a.text() or "").strip()
+                            for a in obj.actions()
+                            if not a.isSeparator()
+                        ]
+                        session.write_line(
+                            "INFO",
+                            "ui.submenu",
+                            f"Submenu opened: path={_menu_path(obj)} actions={actions}",
+                        )
+                    elif hasattr(obj, "isWindow") and obj.isWindow():
+                        extra = ""
+                        if isinstance(obj, QMessageBox):
+                            msg_txt = str(obj.text() or "").strip().replace("\n", " ")[:120]
+                            extra = f" text={msg_txt!r}"
+                        kind = "Dialog" if isinstance(obj, QDialog) else "Window"
+                        session.write_line(
+                            "INFO",
+                            "ui.window",
+                            f"{kind} opened: {_widget_breadcrumb(obj)}{extra}",
+                        )
+                elif etype == QEvent.Type.Hide and isinstance(obj, QMenu):
+                    session.write_line(
+                        "DEBUG",
+                        "ui.submenu",
+                        f"Submenu closed: path={_menu_path(obj)}",
+                    )
+                elif etype == QEvent.Type.Close and hasattr(obj, "isWindow") and obj.isWindow():
+                    kind = "Dialog" if isinstance(obj, QDialog) else "Window"
+                    session.write_line(
+                        "INFO",
+                        "ui.window",
+                        f"{kind} closed: {_widget_breadcrumb(obj)}",
+                    )
+                elif (
+                    etype == QEvent.Type.WindowActivate
+                    and hasattr(obj, "isWindow")
+                    and obj.isWindow()
+                ):
+                    session.write_line(
+                        "DEBUG",
+                        "ui.window",
+                        f"Window activated: {_widget_breadcrumb(obj)}",
+                    )
+                elif etype == QEvent.Type.MouseButtonPress:
+                    self._hook_tree(obj)
+                    if isinstance(obj, QMenuBar):
+                        act = obj.actionAt(event.position().toPoint())
+                        if act is not None:
+                            session.write_line(
+                                "INFO",
+                                "ui.menubar",
+                                f"Menubar clicked: {str(act.text() or '').strip()!r}",
+                            )
+                elif etype == QEvent.Type.Shortcut:
+                    key_fn = getattr(event, "key", None)
+                    key_str = key_fn().toString() if callable(key_fn) else ""
+                    session.write_line(
+                        "INFO",
+                        "ui.shortcut",
+                        f"Shortcut triggered: key={key_str!r} target={_widget_breadcrumb(obj)}",
+                    )
+                elif etype == QEvent.Type.KeyPress:
+                    key = event.key()
+                    mods = event.modifiers()
+                    has_cmd_mod = bool(
+                        mods & (Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.AltModifier | Qt.KeyboardModifier.MetaModifier)
+                    )
+                    notable = key in (
+                        Qt.Key.Key_Return,
+                        Qt.Key.Key_Enter,
+                        Qt.Key.Key_Escape,
+                    )
+                    if notable or has_cmd_mod:
+                        mod_names = []
+                        if mods & Qt.KeyboardModifier.ControlModifier:
+                            mod_names.append("Ctrl")
+                        if mods & Qt.KeyboardModifier.MetaModifier:
+                            mod_names.append("Meta")
+                        if mods & Qt.KeyboardModifier.AltModifier:
+                            mod_names.append("Alt")
+                        if mods & Qt.KeyboardModifier.ShiftModifier:
+                            mod_names.append("Shift")
+                        key_name = Qt.Key(key).name
+                        combo = "+".join([*mod_names, key_name])
+                        session.write_line(
+                            "DEBUG",
+                            "ui.key",
+                            f"KeyPress: {combo} target={_widget_breadcrumb(obj)}",
+                        )
+            return False
+
+    flt = _TroubleshootQtEventFilter(app)
+    app.installEventFilter(flt)
+    for win in app.topLevelWidgets():
+        flt._hook_tree(win)
+    return flt
 
 
 def _get_session() -> TroubleshootSession | None:
@@ -970,12 +1352,15 @@ class TroubleshootSession:
         self._orig_stderr: Any = None
         self._log_handler: _TroubleshootLogHandler | None = None
         self._orig_root_level: int | None = None
+        self._orig_showwarning: Any = None
         self._patched_libs: set[str] = set()
         self._orig_cv2_vc: Any = None
         self._orig_cv2_vw: Any = None
         self._orig_mp_create: Any = None
         self._orig_sd_input: Any = None
         self._qt_handler_installed = False
+        self._qt_ui_app: Any = None
+        self._qt_ui_filter: Any = None
 
         self._fp = self.log_path.open("w", encoding="utf-8", buffering=1)
         self._heartbeat_interval_s = heartbeat_interval_s
@@ -1053,6 +1438,8 @@ class TroubleshootSession:
         handler.setFormatter(logging.Formatter("%(message)s"))
         root.addHandler(handler)
         self._log_handler = handler
+        self._orig_showwarning = warnings.showwarning
+        logging.captureWarnings(False)
         logging.captureWarnings(True)
 
         self._orig_excepthook = sys.excepthook
@@ -1358,6 +1745,25 @@ class TroubleshootSession:
 
         qt_core.qInstallMessageHandler(_qt_msg_handler)
         self.write_line("INFO", "qt.init", f"Installed Qt message handler qVersion={qt_core.qVersion()}")
+        qt_widgets: Any = sys.modules.get("PySide6.QtWidgets")
+        if qt_widgets is not None:
+            qapp_cls = getattr(qt_widgets, "QApplication", None)
+            app_inst = qapp_cls.instance() if qapp_cls is not None else None
+            if app_inst is not None:
+                self.install_qt_ui_telemetry(app_inst)
+
+    def install_qt_ui_telemetry(self, app: Any) -> None:
+        if self._closed or app is None or self._qt_ui_filter is not None:
+            return
+        with suppress(Exception):
+            flt = _create_qt_ui_filter(self, app)
+            self._qt_ui_app = app
+            self._qt_ui_filter = flt
+            self.write_line(
+                "INFO",
+                "ui.init",
+                f"Installed Qt UI event filter on {type(app).__name__}",
+            )
 
     def _start_heartbeat(self) -> None:
         if self._heartbeat_interval_s <= 0:
@@ -1428,6 +1834,10 @@ class TroubleshootSession:
             if self._orig_root_level is not None:
                 root.setLevel(self._orig_root_level)
             self._log_handler = None
+        logging.captureWarnings(False)
+        if self._orig_showwarning is not None:
+            warnings.showwarning = self._orig_showwarning
+            self._orig_showwarning = None
         cv2_mod: Any = sys.modules.get("cv2")
         if self._orig_cv2_vc is not None and cv2_mod is not None:
             cv2_mod.VideoCapture = self._orig_cv2_vc
@@ -1442,6 +1852,11 @@ class TroubleshootSession:
         sd_mod: Any = sys.modules.get("sounddevice")
         if self._orig_sd_input is not None and sd_mod is not None:
             sd_mod.InputStream = self._orig_sd_input
+        if self._qt_ui_filter is not None and self._qt_ui_app is not None:
+            with suppress(Exception):
+                self._qt_ui_app.removeEventFilter(self._qt_ui_filter)
+            self._qt_ui_filter = None
+            self._qt_ui_app = None
         if self._qt_handler_installed and "PySide6.QtCore" in sys.modules:
             with suppress(Exception):
                 sys.modules["PySide6.QtCore"].qInstallMessageHandler(None)
