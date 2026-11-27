@@ -1,0 +1,1826 @@
+"""Archive-contained analytics workspace with calibration comparison and chart export."""
+
+from __future__ import annotations
+
+import csv
+import json
+import sqlite3
+from itertools import pairwise
+from pathlib import Path
+from typing import Any
+from zipfile import BadZipFile, ZipFile
+
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QColor, QFont, QImage, QPainter
+from PySide6.QtWidgets import (
+    QComboBox,
+    QFileDialog,
+    QFrame,
+    QHBoxLayout,
+    QHeaderView,
+    QLabel,
+    QPushButton,
+    QScrollArea,
+    QTableWidget,
+    QTableWidgetItem,
+    QTabWidget,
+    QVBoxLayout,
+    QWidget,
+)
+
+from ...archive import read_analytics, read_manifest
+from ...calibration.baseline import load_calibration_file
+from ...calibration.couple import compare_couple_series
+from ...calibration.models import METRIC_DETAILS, RangeProfile, profile_from_calibration
+from ...couple.csv_export import export_couple_csv
+from ...couple.measurements import (
+    compute_torso_tilt_pearson_correlation,
+    rebuild_couple_result_with_annotations,
+)
+from ...couple.overlay import _zero_phase_ema_optional
+from ...domain import Calibration
+from ...replay import time_label
+from ..analytics.data import (
+    FRAME_METRICS,
+    ComparisonResult,
+    MetricComparison,
+    MetricData,
+    SessionData,
+    _interval_summary,
+    _segments_from_points,
+    compare_archive_with_calibration,
+    finite_number,
+    load_archive_dataset,
+)
+from ..calibration import editor as calibration_editor
+from ..components.metric_chart import MetricChart
+from ..router import Route, Router
+from ..service_bridge import (
+    ServiceBridge,
+    created_at_timestamp,
+    format_created_at,
+)
+from ..theme import COLOR_BASE, COLOR_BORDER, COLOR_TEXT_MUTED, COLOR_TEXT_PRIMARY
+
+ALL_CHART_METRICS = (*METRIC_DETAILS, *FRAME_METRICS)
+COUPLE_AXIS_METRICS: dict[str, tuple[str, str, float]] = {
+    "torso_tilt_a": ("Dancer A — Torso Axis Tilt", "deg", 0.0),
+    "torso_tilt_b": ("Dancer B — Torso Axis Tilt", "deg", 0.0),
+    "couple_midpoint_tilt": ("Couple — Midpoint Axis Tilt", "deg", 0.0),
+    "torso_separation": ("Couple — Torso Axis Separation", "deg", 0.0),
+}
+
+
+def _seconds(value: object) -> str:
+    number = finite_number(value)
+    return f"{number:.2f} s" if number is not None and number >= 0 else "Unknown"
+
+
+def _metric_title(metric: str) -> str:
+    if metric in METRIC_DETAILS:
+        body_part, label, unit = METRIC_DETAILS[metric]
+        return f"{body_part} — {label} ({unit.replace('_', ' ')})"
+    label, unit, _ = FRAME_METRICS[metric]
+    return f"{label} ({unit})"
+
+
+def _metric_unit(metric: str) -> str:
+    if metric in METRIC_DETAILS:
+        return METRIC_DETAILS[metric][2].replace("_", " ")
+    return FRAME_METRICS[metric][1]
+
+
+def _default_calibration_directory(bridge: ServiceBridge) -> Path:
+    data_dir = Path(bridge.config.data_dir)
+    return Path("calibrations") if bridge.config.data_dir == "data" else data_dir / "calibrations"
+
+
+def _find_combo_data(combo: QComboBox, target: object) -> int:
+    normalized = list(target) if isinstance(target, tuple) else target
+    for idx in range(combo.count()):
+        item = combo.itemData(idx)
+        candidate = list(item) if isinstance(item, tuple) else item
+        if candidate == normalized:
+            return idx
+    return -1
+
+
+class AnalyticsScreen(QWidget):
+    def __init__(self, bridge: ServiceBridge, router: Router, parent: QWidget | None = None):
+        super().__init__(parent)
+        self.bridge = bridge
+        self.router = router
+        self.dataset: SessionData | None = None
+        self.recordings: list[tuple[Path, int, list[float]]] = []
+        self._current_source: tuple[Path, int] | None = None
+        self._external_archives: list[Path] = []
+        self._external_calibrations: dict[str, Calibration] = {}
+        self._comparison: ComparisonResult | None = None
+        self._active_couple_result: dict[str, Any] | None = None
+        self._active_couple_run_id: str | None = None
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(24, 20, 24, 20)
+        title = QLabel("Analytics")
+        title.setProperty("class", "title")
+        layout.addWidget(title)
+        subtitle = QLabel(
+            "Select a .tpr reference or .tp practice archive to plot all posture metrics, "
+            "compare against a calibration reference profile, export charts to files, or click a "
+            "chart to seek that frame in Review."
+        )
+        subtitle.setWordWrap(True)
+        layout.addWidget(subtitle)
+
+        toolbar = QHBoxLayout()
+        toolbar.addWidget(QLabel("Mode:"))
+        self.mode_filter_combo = QComboBox()
+        self.mode_filter_combo.setObjectName("analyticsModeFilterCombo")
+        self.mode_filter_combo.addItem("All", "all")
+        self.mode_filter_combo.addItem("Single", "single")
+        self.mode_filter_combo.addItem("Couple", "couple")
+        self.mode_filter_combo.currentIndexChanged.connect(lambda _: self.refresh())
+        toolbar.addWidget(self.mode_filter_combo)
+        toolbar.addWidget(QLabel("Archive:"))
+        self.session_combo = QComboBox()
+        self.session_combo.setAccessibleName("Library archive and recording analytics")
+        self.session_combo.currentIndexChanged.connect(self._select_session)
+        toolbar.addWidget(self.session_combo, 1)
+        self.open_archive_btn = QPushButton("Open .tp / .tpr…")
+        self.open_archive_btn.clicked.connect(self._browse_archive)
+        toolbar.addWidget(self.open_archive_btn)
+        refresh_btn = QPushButton("Refresh archives")
+        refresh_btn.clicked.connect(self.refresh)
+        toolbar.addWidget(refresh_btn)
+        self.align_btn = QPushButton("Align Time Series")
+        self.align_btn.setEnabled(False)
+        self.align_btn.setToolTip(
+            "Unavailable: no compatible paired time series or calculated alignment is persisted. "
+            "Session reference deltas are not temporal alignment."
+        )
+        toolbar.addWidget(self.align_btn)
+        layout.addLayout(toolbar)
+
+        ref_toolbar = QHBoxLayout()
+        ref_toolbar.addWidget(QLabel("Calibration reference:"))
+        self.calibration_combo = QComboBox()
+        self.calibration_combo.setAccessibleName("Calibration line reference")
+        self.calibration_combo.currentIndexChanged.connect(self._apply_calibration_reference)
+        ref_toolbar.addWidget(self.calibration_combo, 1)
+        self.open_calibration_btn = QPushButton("Open .tpc…")
+        self.open_calibration_btn.clicked.connect(self._browse_calibration)
+        ref_toolbar.addWidget(self.open_calibration_btn)
+        self.edit_calibration_btn = QPushButton("Edit calibration…")
+        self.edit_calibration_btn.setToolTip(
+            "Open the calibration editor to view or edit the currently selected .tpc calibration file."
+        )
+        self.edit_calibration_btn.setEnabled(False)
+        self.edit_calibration_btn.clicked.connect(self._edit_current_calibration)
+        ref_toolbar.addWidget(self.edit_calibration_btn)
+        self.export_charts_btn = QPushButton("Export All Charts…")
+        self.export_charts_btn.setEnabled(False)
+        self.export_charts_btn.clicked.connect(lambda: self.export_all_charts())
+        ref_toolbar.addWidget(self.export_charts_btn)
+        self.export_couple_csv_btn = QPushButton("Export Couple CSV…")
+        self.export_couple_csv_btn.setObjectName("exportCoupleCsvBtn")
+        self.export_couple_csv_btn.setEnabled(False)
+        self.export_couple_csv_btn.clicked.connect(lambda: self.export_couple_csv_file())
+        ref_toolbar.addWidget(self.export_couple_csv_btn)
+        layout.addLayout(ref_toolbar)
+
+        self.state_label = QLabel()
+        self.state_label.setWordWrap(True)
+        layout.addWidget(self.state_label)
+        self.tracking_recovery_label = QLabel()
+        self.tracking_recovery_label.setWordWrap(True)
+        self.tracking_recovery_label.setTextFormat(Qt.TextFormat.RichText)
+        self.tracking_recovery_label.setOpenExternalLinks(False)
+        self.tracking_recovery_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextBrowserInteraction
+        )
+        self.tracking_recovery_label.linkActivated.connect(self._on_recovery_link)
+        self.tracking_recovery_label.setVisible(False)
+        layout.addWidget(self.tracking_recovery_label)
+        alignment_note = QLabel(
+            "Time alignment unavailable; no offset or scale has been calculated."
+        )
+        layout.addWidget(alignment_note)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        content = QWidget()
+        cards = QVBoxLayout(content)
+        self.charts: dict[str, MetricChart] = {}
+        self.coverage_labels: dict[str, QLabel] = {}
+        self.export_buttons: dict[str, QPushButton] = {}
+        for metric in ALL_CHART_METRICS:
+            card = QFrame()
+            card.setProperty("class", "card")
+            card_layout = QVBoxLayout(card)
+            header_row = QHBoxLayout()
+            label = QLabel(
+                f"{METRIC_DETAILS[metric][0]} — {METRIC_DETAILS[metric][1]} "
+                f"({METRIC_DETAILS[metric][2].replace('_', ' ')})"
+                if metric in METRIC_DETAILS
+                else f"{FRAME_METRICS[metric][0]} — measurement ({FRAME_METRICS[metric][1]})"
+            )
+            label.setStyleSheet("font-weight: 600;")
+            header_row.addWidget(label, 1)
+            export_btn = QPushButton("Export Chart…")
+            export_btn.setEnabled(False)
+            export_btn.clicked.connect(
+                lambda _checked=False, key=metric: self.export_chart(key)
+            )
+            header_row.addWidget(export_btn)
+            card_layout.addLayout(header_row)
+            coverage = QLabel()
+            coverage.setWordWrap(True)
+            card_layout.addWidget(coverage)
+            chart = MetricChart()
+            chart.seek_requested.connect(self._seek_to_recording)
+            card_layout.addWidget(chart)
+            cards.addWidget(card)
+            self.charts[metric] = chart
+            self.coverage_labels[metric] = coverage
+            self.export_buttons[metric] = export_btn
+        scroll.setWidget(content)
+        couple_view = self._build_couple_analytics_view()
+        self.analytics_mode_tabs = QTabWidget()
+        self.analytics_mode_tabs.setObjectName("analyticsModeTabs")
+        self.analytics_mode_tabs.addTab(scroll, "Posture & calibration metrics")
+        self.analytics_mode_tabs.addTab(couple_view, "Couple analysis")
+        layout.addWidget(self.analytics_mode_tabs, 1)
+        self.bridge.config_changed.connect(self._on_config_changed)
+        self.bridge.calibrations_changed.connect(self.refresh)
+        self.refresh()
+
+    def _on_config_changed(self, _cfg: object = None) -> None:
+        self.refresh()
+
+    def _clear(self, message: str) -> None:
+        self.dataset = None
+        self.recordings = []
+        self._current_source = None
+        self._comparison = None
+        self._active_couple_result = None
+        self._active_couple_run_id = None
+        if hasattr(self, "export_couple_csv_btn"):
+            self.export_couple_csv_btn.setEnabled(False)
+        if hasattr(self, "couple_panes"):
+            self._populate_couple_analysis(None)
+        self.state_label.setText(message)
+        self.tracking_recovery_label.clear()
+        self.tracking_recovery_label.setVisible(False)
+        self.export_charts_btn.setEnabled(False)
+        for metric in self.charts:
+            self.charts[metric].set_data(None)
+            self.coverage_labels[metric].setText("Coverage: Unknown · Events: Unknown")
+            self.export_buttons[metric].setEnabled(False)
+
+    def _populate_calibrations(self, preserve: object) -> None:
+        self.calibration_combo.blockSignals(True)
+        self.calibration_combo.clear()
+        self.calibration_combo.addItem("No calibration reference", None)
+        self.calibration_combo.addItem("Settings default ranges", "__defaults__")
+        seen_paths: set[Path] = set()
+        for reference in self.bridge.list_references():
+            resolved = reference.path.resolve()
+            if not resolved.is_file():
+                continue
+            seen_paths.add(resolved)
+            date_label = format_created_at(reference.created_at, reference.path)
+            suffix_tag = ".tpc" if reference.is_archive else "legacy"
+            label = (
+                f"{reference.name} ({suffix_tag} · {date_label})"
+                if date_label != "Recent"
+                else f"{reference.name} ({suffix_tag})"
+            )
+            self.calibration_combo.addItem(label, str(resolved))
+        for path_str, cal in self._external_calibrations.items():
+            resolved = Path(path_str).resolve()
+            if resolved in seen_paths or not resolved.is_file():
+                continue
+            self.calibration_combo.addItem(f"{cal.name or resolved.name} (external)", path_str)
+        index = _find_combo_data(self.calibration_combo, preserve) if preserve is not None else 0
+        self.calibration_combo.setCurrentIndex(max(0, index))
+        self.calibration_combo.blockSignals(False)
+        self._sync_edit_calibration_button()
+
+    def _sync_edit_calibration_button(self) -> None:
+        self.edit_calibration_btn.setEnabled(
+            calibration_editor.selected_tpc_calibration_path(self.calibration_combo.currentData())
+            is not None
+        )
+
+    def _edit_current_calibration(self) -> None:
+        cal_path = calibration_editor.selected_tpc_calibration_path(self.calibration_combo.currentData())
+        if cal_path is None:
+            self.bridge.status_message.emit("Select a .tpc calibration profile first.")
+            return
+        try:
+            saved = calibration_editor.open_profile_calibration_editor(
+                cal_path, self.bridge.config, self, bridge=self.bridge
+            )
+            if saved is not None:
+                resolved = saved.resolve()
+                cal = load_calibration_file(str(resolved), _default_calibration_directory(self.bridge))
+                if cal is not None:
+                    self._external_calibrations[str(resolved)] = cal
+                self._populate_calibrations(str(resolved))
+                self._apply_calibration_reference()
+                self.bridge.status_message.emit(f"Approved calibration saved: {saved.name}")
+        except (OSError, ValueError, TypeError, KeyError, RuntimeError) as error:
+            self.bridge.status_message.emit(f"Cannot edit calibration: {error}")
+
+    def refresh(self) -> None:
+        selected = self.session_combo.currentData()
+        selected_calibration = self.calibration_combo.currentData()
+        self._populate_calibrations(selected_calibration)
+
+        self.session_combo.blockSignals(True)
+        self.session_combo.clear()
+        self.session_combo.addItem("Select a Library recording or reference…", None)
+        message = (
+            "Select a Library .tp practice or .tpr reference recording to inspect metrics "
+            "and compare against a calibration."
+        )
+        try:
+            archives = [
+                archive
+                for archive in self.bridge.list_library_archives()
+                if archive["path"].suffix.lower() in (".tp", ".tpr")
+            ]
+            archives.sort(
+                key=lambda item: -created_at_timestamp(item.get("created_at", ""), item.get("path"))
+            )
+            listed_paths: set[Path] = set()
+            mode_filter = str(
+                self.mode_filter_combo.currentData()
+                if hasattr(self, "mode_filter_combo")
+                else "all"
+            )
+            for archive in archives:
+                archive_path = archive["path"].resolve()
+                listed_paths.add(archive_path)
+                manifest = read_manifest(archive_path)
+                kind_tag = " (Reference .tpr)" if archive_path.suffix.lower() == ".tpr" else ""
+                date_label = format_created_at(archive.get("created_at", ""), archive_path)
+                for index, _ in enumerate(manifest["segments"]):
+                    modes = self._segment_modes(archive_path, index)
+                    if mode_filter != "all" and mode_filter not in modes:
+                        continue
+                    mode_tag = f" [{' + '.join(m.capitalize() for m in modes)}]" if modes else ""
+                    label = f"{archive['name']}{kind_tag} · Recording {index:02d}{mode_tag}"
+                    self.session_combo.addItem(label, (archive_path, index))
+                    self.session_combo.setItemData(
+                        self.session_combo.count() - 1,
+                        f"{archive_path.name} · Created {date_label}",
+                        Qt.ItemDataRole.ToolTipRole,
+                    )
+            for ext_path in self._external_archives:
+                resolved = ext_path.resolve()
+                if resolved in listed_paths or not resolved.is_file():
+                    continue
+                manifest = read_manifest(resolved)
+                display_name = str(manifest.get("name") or resolved.stem)
+                kind_tag = " (Reference .tpr)" if resolved.suffix.lower() == ".tpr" else ""
+                for index, _ in enumerate(manifest["segments"]):
+                    modes = self._segment_modes(resolved, index)
+                    if mode_filter != "all" and mode_filter not in modes:
+                        continue
+                    mode_tag = f" [{' + '.join(m.capitalize() for m in modes)}]" if modes else ""
+                    self.session_combo.addItem(
+                        f"{display_name}{kind_tag} · Recording {index:02d}{mode_tag} (opened)",
+                        (resolved, index),
+                    )
+            if self.session_combo.count() == 1:
+                message = (
+                    "No Library practice archives (.tp) or reference (.tpr) recordings. "
+                    "Import or save a .tp or .tpr recording first."
+                )
+        except (OSError, sqlite3.Error, ValueError, BadZipFile) as exc:
+            message = f"Analytics unavailable: {exc}"
+        index = _find_combo_data(self.session_combo, selected) if selected else 0
+        resolved_index = max(0, index)
+        restored = self.session_combo.itemData(resolved_index)
+        same_selection = selected is not None and restored == selected
+        self.session_combo.setCurrentIndex(resolved_index)
+        self.session_combo.blockSignals(False)
+        self._clear(message)
+        if self.session_combo.currentData():
+            self._select_session(preserve_tab=same_selection)
+
+    def load_archive(
+        self,
+        archive_path: Path,
+        segment_index: int = 0,
+        *,
+        calibration_path: Path | None = None,
+    ) -> None:
+        """Open a specific .tp or .tpr archive (and optional calibration) in Analytics."""
+        resolved = Path(archive_path).expanduser().resolve()
+        if resolved.suffix.lower() not in (".tp", ".tpr") or not resolved.is_file():
+            self.bridge.status_message.emit(f"Archive not found or unsupported: {resolved}")
+            return
+        if resolved not in self._external_archives:
+            self._external_archives.append(resolved)
+        if calibration_path is not None:
+            self._select_calibration_path(calibration_path)
+        self.refresh()
+        target_index = _find_combo_data(self.session_combo, (resolved, segment_index))
+        if target_index >= 0:
+            self.session_combo.setCurrentIndex(target_index)
+
+    def _browse_archive(self) -> None:
+        start_dir = str(Path(self.bridge.config.data_dir))
+        chosen, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open practice (.tp) or reference (.tpr) archive",
+            start_dir,
+            "TangoPosture archives (*.tp *.tpr);;All files (*)",
+        )
+        if chosen:
+            self.load_archive(Path(chosen), 0)
+
+    def _select_calibration_path(self, cal_path: Path) -> bool:
+        resolved = Path(cal_path).expanduser().resolve()
+        cal = load_calibration_file(str(resolved), _default_calibration_directory(self.bridge))
+        if cal is None:
+            self.bridge.status_message.emit(f"Could not read calibration file: {resolved.name}")
+            return False
+        self._external_calibrations[str(resolved)] = cal
+        self._populate_calibrations(str(resolved))
+        return True
+
+    def _browse_calibration(self) -> None:
+        start_dir = str(_default_calibration_directory(self.bridge))
+        chosen, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select calibration profile (.tpc or legacy JSON)",
+            start_dir,
+            "Calibration profiles (*.tpc *.json);;All files (*)",
+        )
+        if chosen and self._select_calibration_path(Path(chosen)):
+            self._apply_calibration_reference()
+
+    def _resolve_selected_calibration(self) -> RangeProfile | Calibration | str | None:
+        selected = self.calibration_combo.currentData()
+        if selected is None or selected == "__defaults__":
+            return selected
+        if isinstance(selected, str):
+            cached = self._external_calibrations.get(selected)
+            if cached is not None:
+                return cached
+            path = Path(selected)
+            cal = load_calibration_file(str(path), _default_calibration_directory(self.bridge))
+            if cal is None:
+                raise ValueError(f"Selected calibration is unavailable: {path.name}")
+            return cal
+        return None
+
+    def _select_session(self, _combo_index: int = -1, *, preserve_tab: bool = False) -> None:
+        selected = self.session_combo.currentData()
+        self._clear("Select a Library recording or reference to inspect analytics.")
+        if not selected:
+            return
+        path, index = selected
+        try:
+            dataset = load_archive_dataset(path, index, self.bridge.config)
+        except (OSError, sqlite3.Error, ValueError, TypeError, KeyError, BadZipFile) as exc:
+            self._clear(f"No compatible dataset: {exc}")
+            return
+        self.dataset = dataset
+        self._current_source = (path, index)
+        try:
+            manifest = read_manifest(path)
+            with ZipFile(path) as archive:
+                metadata = json.loads(archive.read(manifest["segments"][index]["metadata"]))
+            if not isinstance(metadata, dict):
+                raise TypeError("Invalid archived recording metadata")
+            timestamps = metadata.get("frame_timestamps")
+            if (
+                not isinstance(timestamps, list)
+                or any(
+                    finite_number(value) is None or value < 0 for value in timestamps
+                )
+                or any(earlier >= later for earlier, later in pairwise(timestamps))
+            ):
+                raise ValueError("Invalid archived recording frame timeline")
+            self.recordings = [(path, index, timestamps)]
+        except (OSError, sqlite3.Error, ValueError, TypeError, KeyError, BadZipFile) as exc:
+            self.recordings = []
+            self.bridge.status_message.emit(f"Session video navigation unavailable: {exc}")
+        couple_res = dataset.couple_result
+        if isinstance(couple_res, dict):
+            couple_res = rebuild_couple_result_with_annotations(
+                couple_res,
+                couple_res.get("annotations") or {},
+                self.bridge.config,
+            )
+        self._active_couple_result = couple_res
+        self._active_couple_run_id = dataset.couple_run_id
+        self.export_couple_csv_btn.setEnabled(isinstance(couple_res, dict))
+        self._populate_couple_analysis(couple_res)
+        if not preserve_tab and couple_res is not None and (
+            dataset.dancer_mode == "couple" or self.mode_filter_combo.currentData() == "couple"
+        ):
+            self.analytics_mode_tabs.setCurrentIndex(1)
+        self._apply_calibration_reference()
+
+    def _apply_calibration_reference(self) -> None:
+        self._sync_edit_calibration_button()
+        dataset = self.dataset
+        source = self._current_source
+        if dataset is None or source is None:
+            return
+        path, index = source
+        cal_error = ""
+        try:
+            calibration = self._resolve_selected_calibration()
+            range_profile = (
+                profile_from_calibration(calibration) if isinstance(calibration, Calibration)
+                else calibration if isinstance(calibration, RangeProfile) else None
+            )
+            single_calibration = (
+                None if range_profile and range_profile.source.get("dancer_mode") == "couple"
+                else calibration
+            )
+            comparison = compare_archive_with_calibration(
+                path, index, dataset, self.bridge.config, single_calibration
+            )
+        except (OSError, ValueError, TypeError, KeyError, BadZipFile) as exc:
+            cal_error = str(exc)
+            comparison = compare_archive_with_calibration(
+                path, index, dataset, self.bridge.config, None
+            )
+        self._comparison = comparison
+
+        time_end = max(
+            (t for item in comparison.metrics.values() for t, _ in item.data.points),
+            default=0.0,
+        )
+        note = (
+            f"Lines break at null/unknown samples and gaps > {dataset.max_gap:g} s."
+            if dataset.max_gap is not None
+            else "Tracking gap limit unknown: samples are not connected."
+        )
+        archive_kind = "Reference (.tpr)" if path.suffix.lower() == ".tpr" else "Practice (.tp)"
+        cal_summary = (
+            f"Calibration error: {cal_error}"
+            if cal_error
+            else f"Calibration: {comparison.calibration_name}"
+        )
+        extra_note = f" {comparison.note}" if comparison.note else ""
+        self.state_label.setText(
+            f"{archive_kind} · Session {dataset.identifier} · {dataset.status} · "
+            f"Active duration: {_seconds(dataset.active_duration)} · {cal_summary}. "
+            f"{note}{extra_note}"
+        )
+        self._update_tracking_recovery_summary(path, index)
+
+        calibration_selected = (
+            self.calibration_combo.currentData() is not None and not cal_error
+        )
+        for metric in self.charts:
+            self.charts[metric].set_data(None)
+            self.export_buttons[metric].setEnabled(False)
+            self.coverage_labels[metric].setText(
+                "Unavailable: no approved / stored observations for this metric."
+            )
+
+        any_chart_enabled = False
+        for metric, comp_item in comparison.metrics.items():
+            if metric not in self.charts:
+                continue
+            data = comp_item.data
+            chart = self.charts[metric]
+            chart.set_data(
+                data,
+                time_end,
+                dataset.origin_timestamp,
+                bounds=comp_item.bounds,
+                reference_line=comp_item.reference_line,
+                states=comp_item.states,
+                unit=_metric_unit(metric),
+            )
+            enabled = chart.isEnabled()
+            self.export_buttons[metric].setEnabled(enabled)
+            any_chart_enabled = any_chart_enabled or enabled
+            self.coverage_labels[metric].setText(
+                self._format_coverage_label(metric, comp_item, calibration_selected)
+            )
+        self.export_charts_btn.setEnabled(any_chart_enabled)
+        self._populate_couple_analysis(self._active_couple_result)
+
+    def _format_coverage_label(
+        self,
+        metric: str,
+        item: MetricComparison,
+        calibration_selected: bool,
+    ) -> str:
+        data = item.data
+        ratio = finite_number(data.summary.get("valid_coverage"))
+        coverage = f"{ratio:.1%}" if ratio is not None and 0 <= ratio <= 1 else "Unknown"
+        valid = _seconds(data.summary.get("valid_duration"))
+        unknown = _seconds(data.summary.get("unknown_duration"))
+        available = sum(value is not None for _, value in data.points)
+        total = len(data.points)
+
+        if not calibration_selected:
+            if data.summary.get("source") == "observations":
+                return (
+                    f"Valid coverage: {coverage} · Valid: {valid} · Unknown: {unknown} · "
+                    f"Measured samples: {available}/{total}"
+                )
+            if metric in METRIC_DETAILS:
+                return (
+                    f"Valid coverage: {coverage} · Valid: {valid} · Unknown: {unknown} · "
+                    f"Delta samples: {available}/{total} · "
+                    f"Persisted events: {data.event_count} ({data.open_event_count} open)"
+                )
+            return (
+                f"Stored measurement samples: {available}/{total}. "
+                "Missing observations remain unknown; these are not posture scores."
+            )
+
+        parts: list[str] = []
+        if item.bounds is not None:
+            parts.append(f"Range: {item.bounds[0]:.3g} … {item.bounds[1]:.3g} {_metric_unit(metric)}")
+        elif item.calibration_label:
+            parts.append(item.calibration_label)
+        if item.reference_line is not None:
+            parts.append(f"Ref: {item.reference_line:.3g}")
+        within_ratio = finite_number(data.summary.get("within_reference_ratio"))
+        if within_ratio is not None and 0 <= within_ratio <= 1:
+            parts.append(f"Within range: {within_ratio:.1%}")
+        parts.append(f"Valid coverage: {coverage}")
+        parts.append(f"Samples: {available}/{total}")
+        parts.append(f"Events: {data.event_count} ({data.open_event_count} open)")
+        if item.note:
+            parts.append(item.note)
+        return " · ".join(parts)
+
+    def _chart_export_subtitle(self, metric: str) -> str:
+        comp = self._comparison
+        source_name = self._current_source[0].name if self._current_source else "archive"
+        parts = [f"Archive: {source_name}"]
+        if comp is not None:
+            parts.append(f"Calibration: {comp.calibration_name}")
+            item = comp.metrics.get(metric)
+            if item is not None:
+                if item.bounds is not None:
+                    parts.append(
+                        f"Range: {item.bounds[0]:.3g}..{item.bounds[1]:.3g} {_metric_unit(metric)}"
+                    )
+                if item.reference_line is not None:
+                    parts.append(f"Ref: {item.reference_line:.3g}")
+                within = finite_number(item.data.summary.get("within_reference_ratio"))
+                if within is not None:
+                    parts.append(f"Within: {within:.1%}")
+        return " · ".join(parts)
+
+    def _active_metrics(self) -> list[str]:
+        return [metric for metric in ALL_CHART_METRICS if self.charts[metric].isEnabled()]
+
+    def export_chart(self, metric: str, destination: Path | None = None) -> Path | None:
+        """Export a single metric chart to PNG, SVG, CSV, or JSON."""
+        chart = self.charts.get(metric)
+        if chart is None or not chart.isEnabled():
+            self.bridge.status_message.emit(f"Chart {metric} has no active data to export.")
+            return None
+        source_stem = self._current_source[0].stem if self._current_source else "analytics"
+        if destination is None:
+            chosen, _ = QFileDialog.getSaveFileName(
+                self,
+                f"Export {_metric_title(metric)}",
+                f"{source_stem}_{metric}.png",
+                "PNG Image (*.png);;SVG Vector (*.svg);;CSV Table (*.csv);;JSON Data (*.json)",
+            )
+            if not chosen:
+                return None
+            destination = Path(chosen)
+        destination = Path(destination)
+        title = _metric_title(metric)
+        subtitle = self._chart_export_subtitle(metric)
+        if destination.suffix.lower() == ".json":
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            item = self._comparison.metrics.get(metric) if self._comparison else None
+            payload = {
+                "metric": metric,
+                "title": title,
+                "unit": _metric_unit(metric),
+                "archive": str(self._current_source[0].name) if self._current_source else "",
+                "segment_index": self._current_source[1] if self._current_source else 0,
+                "calibration": self._comparison.calibration_name if self._comparison else "",
+                "bounds": list(chart.bounds) if chart.bounds is not None else None,
+                "reference_line": chart.reference_line,
+                "summary": item.data.summary if item is not None else {},
+                "samples": [
+                    {
+                        "timestamp_s": ts,
+                        "value": val,
+                        "state": chart.states.get(ts, "UNKNOWN" if val is None else ""),
+                    }
+                    for ts, val in (chart.data.points if chart.data else [])
+                ],
+            }
+            destination.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        else:
+            chart.export_to_file(destination, title=title, subtitle=subtitle)
+        self.bridge.status_message.emit(f"Exported {metric} chart to {destination.name}")
+        return destination
+
+    def export_all_charts(self, destination: Path | None = None) -> Path | None:
+        """Export all active metric charts to a single composite PNG/SVG or combined CSV/JSON."""
+        active = self._active_metrics()
+        if not active:
+            self.bridge.status_message.emit("No active metric charts to export.")
+            return None
+        source_stem = self._current_source[0].stem if self._current_source else "analytics"
+        if destination is None:
+            chosen, _ = QFileDialog.getSaveFileName(
+                self,
+                "Export all posture metric charts",
+                f"{source_stem}_all_metrics.png",
+                "PNG Composite Image (*.png);;SVG Vector Document (*.svg);;"
+                "CSV Combined Table (*.csv);;JSON Export (*.json)",
+            )
+            if not chosen:
+                return None
+            destination = Path(chosen)
+        destination = Path(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        suffix = destination.suffix.lower()
+        comp = self._comparison
+        header_title = (
+            f"TangoPosture Analytics — {self._current_source[0].name} "
+            f"(Recording {self._current_source[1]:02d})"
+            if self._current_source
+            else "TangoPosture Analytics"
+        )
+        header_sub = (
+            f"Calibration reference: {comp.calibration_name}"
+            + (f" · {comp.note}" if comp.note else "")
+            if comp is not None
+            else ""
+        )
+
+        if suffix in {".png", ".jpg", ".jpeg", ".bmp"}:
+            width = 960
+            header_h = 68
+            chart_h = 240
+            total_h = header_h + chart_h * len(active)
+            composite = QImage(width, total_h, QImage.Format.Format_RGB32)
+            composite.fill(QColor(COLOR_BASE))
+            painter = QPainter(composite)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.fillRect(0, 0, width, header_h, QColor(COLOR_BASE))
+            title_font = QFont(painter.font())
+            title_font.setPointSize(13)
+            title_font.setBold(True)
+            painter.setFont(title_font)
+            painter.setPen(QColor(COLOR_TEXT_PRIMARY))
+            painter.drawText(16, 28, header_title)
+            if header_sub:
+                sub_font = QFont(painter.font())
+                sub_font.setPointSize(9)
+                sub_font.setBold(False)
+                painter.setFont(sub_font)
+                painter.setPen(QColor(COLOR_TEXT_MUTED))
+                painter.drawText(16, 48, header_sub)
+            painter.setPen(QColor(COLOR_BORDER))
+            painter.drawLine(0, header_h - 1, width, header_h - 1)
+            for idx, metric in enumerate(active):
+                tile = self.charts[metric].render_to_image(
+                    width=width,
+                    height=chart_h,
+                    title=_metric_title(metric),
+                    subtitle=self._chart_export_subtitle(metric),
+                )
+                painter.drawImage(0, header_h + idx * chart_h, tile)
+            painter.end()
+            if not composite.save(str(destination)):
+                raise OSError(f"Could not save composite chart image to {destination}")
+        elif suffix == ".svg":
+            from xml.sax.saxutils import escape
+
+            width = 960
+            header_h = 64
+            chart_h = 240
+            total_h = header_h + chart_h * len(active)
+            svg_parts = [
+                '<?xml version="1.0" encoding="UTF-8"?>',
+                (
+                    f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{total_h}" '
+                    f'viewBox="0 0 {width} {total_h}">'
+                ),
+                f'<rect x="0" y="0" width="{width}" height="{total_h}" fill="{COLOR_BASE}"/>',
+                (
+                    f'<text x="16" y="28" fill="{COLOR_TEXT_PRIMARY}" font-family="sans-serif" '
+                    f'font-size="15" font-weight="bold">{escape(header_title)}</text>'
+                ),
+                (
+                    f'<text x="16" y="48" fill="{COLOR_TEXT_MUTED}" font-family="sans-serif" '
+                    f'font-size="11">{escape(header_sub)}</text>'
+                ),
+            ]
+            for idx, metric in enumerate(active):
+                svg_parts.append(
+                    self.charts[metric].svg_fragment(
+                        0.0,
+                        float(header_h + idx * chart_h),
+                        width=width,
+                        height=chart_h,
+                        title=_metric_title(metric),
+                        subtitle=self._chart_export_subtitle(metric),
+                    )
+                )
+            svg_parts.append("</svg>\n")
+            destination.write_text("\n".join(svg_parts), encoding="utf-8")
+        elif suffix == ".csv":
+            with destination.open("w", newline="", encoding="utf-8") as handle:
+                writer = csv.writer(handle)
+                writer.writerow([
+                    "metric",
+                    "title",
+                    "unit",
+                    "timestamp_s",
+                    "value",
+                    "state",
+                    "min_bound",
+                    "max_bound",
+                    "reference_line",
+                ])
+                for metric in active:
+                    chart = self.charts[metric]
+                    min_b = f"{chart.bounds[0]:.6g}" if chart.bounds is not None else ""
+                    max_b = f"{chart.bounds[1]:.6g}" if chart.bounds is not None else ""
+                    ref_v = f"{chart.reference_line:.6g}" if chart.reference_line is not None else ""
+                    m_title = _metric_title(metric)
+                    m_unit = _metric_unit(metric)
+                    for ts, val in (chart.data.points if chart.data else []):
+                        writer.writerow([
+                            metric,
+                            m_title,
+                            m_unit,
+                            f"{ts:.6f}",
+                            "" if val is None else f"{val:.6g}",
+                            chart.states.get(ts, "UNKNOWN" if val is None else ""),
+                            min_b,
+                            max_b,
+                            ref_v,
+                        ])
+        elif suffix == ".json":
+            dataset = self.dataset
+            origin = dataset.origin_timestamp if dataset is not None else 0.0
+            payload: dict[str, Any] = {
+                "archive": str(self._current_source[0].name) if self._current_source else "",
+                "segment_index": self._current_source[1] if self._current_source else 0,
+                "active_duration_s": dataset.active_duration if dataset is not None else None,
+                "calibration": comp.calibration_name if comp is not None else "",
+                "calibration_note": comp.note if comp is not None else "",
+                "events": [
+                    {
+                        "metric": ev.metric,
+                        "onset_s": ev.onset - origin,
+                        "detection_s": ev.detection - origin,
+                        "end_s": ev.end - origin if ev.end is not None else None,
+                        "peak_deviation": ev.peak_deviation,
+                        "end_reason": ev.end_reason,
+                    }
+                    for ev in (comp.events if comp is not None else [])
+                ],
+                "metrics": {},
+            }
+            for metric in active:
+                chart = self.charts[metric]
+                item = comp.metrics.get(metric) if comp is not None else None
+                payload["metrics"][metric] = {
+                    "title": _metric_title(metric),
+                    "unit": _metric_unit(metric),
+                    "bounds": list(chart.bounds) if chart.bounds is not None else None,
+                    "reference_line": chart.reference_line,
+                    "summary": item.data.summary if item is not None else {},
+                    "samples": [
+                        {
+                            "timestamp_s": ts,
+                            "value": val,
+                            "state": chart.states.get(ts, "UNKNOWN" if val is None else ""),
+                        }
+                        for ts, val in (chart.data.points if chart.data else [])
+                    ],
+                }
+            destination.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        else:
+            raise ValueError(f"Unsupported multi-chart export format: {suffix or '(none)'}")
+
+        self.bridge.status_message.emit(f"Exported {len(active)} charts to {destination.name}")
+        return destination
+
+    def _update_tracking_recovery_summary(self, path: Path, index: int) -> None:
+        try:
+            analytics = read_analytics(path, index)
+        except (OSError, ValueError, TypeError, BadZipFile):
+            analytics = None
+        if not isinstance(analytics, dict):
+            self.tracking_recovery_label.clear()
+            self.tracking_recovery_label.setVisible(False)
+            return
+        coach = analytics.get("coach_data")
+        recovery = (
+            coach.get("pose_recovery")
+            if isinstance(coach, dict) and isinstance(coach.get("pose_recovery"), dict)
+            else analytics.get("pose_recovery")
+        )
+        if not isinstance(recovery, dict):
+            self.tracking_recovery_label.clear()
+            self.tracking_recovery_label.setVisible(False)
+            return
+        raw_summary = recovery.get("summary")
+        summary: dict[str, Any] = raw_summary if isinstance(raw_summary, dict) else {}
+        detected = int(summary.get("windows_detected", len(recovery.get("windows") or [])) or 0)
+        recovered_win = int(summary.get("windows_recovered", 0) or 0)
+        unresolved = int(summary.get("windows_unresolved", 0) or 0)
+        skipped_budget = int(summary.get("windows_skipped_budget", 0) or 0)
+        recovered_frames = int(summary.get("recovered_frames", 0) or 0)
+        recovered_joints = int(summary.get("recovered_joints", 0) or 0)
+        interp_joints = int(summary.get("interpolated_joints", 0) or 0)
+        links: list[str] = []
+        for win in (recovery.get("windows") or [])[:5]:
+            if not isinstance(win, dict):
+                continue
+            gst = win.get("gap_start_time")
+            get = win.get("gap_end_time")
+            if isinstance(gst, int | float) and isinstance(get, int | float):
+                label = f"{time_label(float(gst))}–{time_label(float(get))}"
+                links.append(f'<a href="seek:{float(gst):.6f}">{label}</a>')
+        links_html = f" · Windows: {', '.join(links)}" if links else ""
+        budget_part = f", {skipped_budget} skipped by budget" if skipped_budget else ""
+        self.tracking_recovery_label.setText(
+            f"<b>Tracking recovery</b> (display only; measured coverage unchanged): "
+            f"{detected} gap window(s) ({recovered_win} recovered, {unresolved} unresolved{budget_part}) · "
+            f"{recovered_frames} frame(s), {recovered_joints} joint estimate(s) ({interp_joints} interpolated)"
+            f"{links_html}"
+        )
+        self.tracking_recovery_label.setVisible(True)
+
+    def _on_recovery_link(self, url: str) -> None:
+        if not url.startswith("seek:"):
+            return
+        try:
+            timestamp = float(url[5:])
+        except ValueError:
+            return
+        if self.recordings:
+            timestamps = self.recordings[0][2]
+            if (
+                timestamps
+                and not (timestamps[0] <= timestamp <= timestamps[-1])
+                and 0.0 <= timestamp <= (timestamps[-1] - timestamps[0])
+            ):
+                timestamp = timestamps[0] + timestamp
+        self._seek_to_recording(timestamp)
+
+    def _seek_to_recording(self, timestamp: float) -> None:
+        match = next(
+            (
+                (path, index)
+                for path, index, timestamps in self.recordings
+                if timestamps and timestamps[0] <= timestamp <= timestamps[-1]
+            ),
+            None,
+        )
+        if match is None:
+            self.bridge.status_message.emit(
+                "No archived video frame covers this chart timestamp."
+            )
+            return
+        path, index = match
+        self.router.navigate(
+            Route.REVIEW,
+            {"archive_path": path, "segment_index": index, "timestamp": timestamp},
+        )
+
+    def _segment_modes(self, path: Path, index: int) -> list[str]:
+        try:
+            analytics = read_analytics(path, index)
+        except (OSError, ValueError, TypeError, BadZipFile):
+            return []
+        if not isinstance(analytics, dict):
+            return []
+        da = analytics.get("dancer_analysis")
+        if isinstance(da, dict) and isinstance(da.get("runs"), dict):
+            modes = [m for m in ("single", "couple") if isinstance(da["runs"].get(m), dict)]
+            if modes:
+                return modes
+        return ["single"]
+
+    def _build_couple_analytics_view(self) -> QWidget:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(10)
+
+        header = QHBoxLayout()
+        self.couple_run_info_label = QLabel("Select a recording with Couple analysis to view metrics.")
+        self.couple_run_info_label.setWordWrap(True)
+        header.addWidget(self.couple_run_info_label, 1)
+        layout.addLayout(header)
+
+        self.couple_pearson_card = QFrame()
+        self.couple_pearson_card.setObjectName("couplePearsonCard")
+        self.couple_pearson_card.setProperty("class", "card")
+        pearson_layout = QVBoxLayout(self.couple_pearson_card)
+        pearson_layout.setContentsMargins(14, 12, 14, 12)
+        pearson_layout.setSpacing(4)
+        pearson_hdr = QHBoxLayout()
+        pearson_title = QLabel("Torso Axis Tilt — Pearson Correlation (Dancer A vs Dancer B)")
+        pearson_title.setStyleSheet("font-weight: 600;")
+        pearson_hdr.addWidget(pearson_title, 1)
+        self.couple_pearson_value_label = QLabel("Pearson r: Unavailable")
+        self.couple_pearson_value_label.setObjectName("couplePearsonValueLabel")
+        self.couple_pearson_value_label.setStyleSheet("font-size: 16pt; font-weight: 700;")
+        pearson_hdr.addWidget(self.couple_pearson_value_label)
+        pearson_layout.addLayout(pearson_hdr)
+        self.couple_pearson_detail_label = QLabel(
+            "Select a Couple recording to measure synchronized torso tilt correlation."
+        )
+        self.couple_pearson_detail_label.setObjectName("couplePearsonDetailLabel")
+        self.couple_pearson_detail_label.setProperty("class", "muted")
+        self.couple_pearson_detail_label.setWordWrap(True)
+        pearson_layout.addWidget(self.couple_pearson_detail_label)
+        layout.addWidget(self.couple_pearson_card)
+
+        self.couple_axis_charts: dict[str, MetricChart] = {}
+        self.couple_axis_title_labels: dict[str, QLabel] = {}
+        self.couple_axis_coverage_labels: dict[str, QLabel] = {}
+        self.couple_axis_export_buttons: dict[str, QPushButton] = {}
+        for key, (default_label, unit, _ref) in COUPLE_AXIS_METRICS.items():
+            card = QFrame()
+            card.setProperty("class", "card")
+            card_layout = QVBoxLayout(card)
+            card_header = QHBoxLayout()
+            title_lbl = QLabel(f"{default_label} ({unit})")
+            title_lbl.setStyleSheet("font-weight: 600;")
+            card_header.addWidget(title_lbl, 1)
+            export_btn = QPushButton("Export Chart…")
+            export_btn.setEnabled(False)
+            export_btn.clicked.connect(
+                lambda _checked=False, mkey=key: self.export_couple_axis_chart(mkey)
+            )
+            card_header.addWidget(export_btn)
+            card_layout.addLayout(card_header)
+
+            cov_lbl = QLabel("Coverage: Unknown")
+            cov_lbl.setWordWrap(True)
+            card_layout.addWidget(cov_lbl)
+
+            chart = MetricChart()
+            chart.setObjectName(f"coupleAxisChart_{key}")
+            chart.seek_requested.connect(self._seek_to_couple_event)
+            card_layout.addWidget(chart)
+            layout.addWidget(card)
+
+            self.couple_axis_charts[key] = chart
+            self.couple_axis_title_labels[key] = title_lbl
+            self.couple_axis_coverage_labels[key] = cov_lbl
+            self.couple_axis_export_buttons[key] = export_btn
+
+        self.couple_panes = QTabWidget()
+        self.couple_panes.setObjectName("coupleAnalyticsPanes")
+        self.couple_panes.setMinimumHeight(340)
+        self._couple_summary_tables: dict[str, QTableWidget] = {}
+        self._couple_event_tables: dict[str, QTableWidget] = {}
+
+        pane_specs = (
+            ("coordination", "Coordination", "Lead/follow start, slow, settle, contact lags & travel alignment"),
+            ("step_beat", "Step and beat timing", "Step-to-beat offsets, cadence & beat stability"),
+            ("transitions", "Transitions", "Halt/slow/reversal latency, valid coverage & planned exclusions"),
+            ("posture_axes", "Posture and axes", "Signed torso tilt, head pitch, hip separation & couple midpoint axis"),
+            ("turns_exits", "Turns and exits", "Pivot angular velocity, exit initiation/separation overlap & foot behavior"),
+        )
+        for key, title, subtitle in pane_specs:
+            pane = QWidget()
+            p_layout = QVBoxLayout(pane)
+            p_layout.setSpacing(8)
+            sub = QLabel(subtitle)
+            sub.setProperty("class", "muted")
+            p_layout.addWidget(sub)
+
+            s_table = QTableWidget(0, 4)
+            s_table.setHorizontalHeaderLabels(["Metric", "Value", "Unit", "Quality Status"])
+            s_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+            s_table.setMaximumHeight(220)
+            s_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+            p_layout.addWidget(s_table)
+
+            e_table = QTableWidget(0, 5)
+            e_table.setHorizontalHeaderLabels(["Time (s)", "Event / Item", "Subject", "Value / Timing", "Status"])
+            e_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+            e_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+            e_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+            e_table.cellClicked.connect(
+                lambda row, _col, tbl=e_table: self._on_couple_event_row_clicked(tbl, row)
+            )
+            p_layout.addWidget(e_table, 1)
+
+            self._couple_summary_tables[key] = s_table
+            self._couple_event_tables[key] = e_table
+            self.couple_panes.addTab(pane, title)
+
+        layout.addWidget(self.couple_panes, 1)
+        scroll.setWidget(panel)
+        return scroll
+
+    def _extract_couple_axis_points(
+        self, couple_result: dict[str, Any], key: str
+    ) -> list[tuple[float, float | None]]:
+        series = couple_result.get("series") or {}
+        entries = series.get(key) if isinstance(series, dict) else None
+        points: list[tuple[float, float | None]] = []
+        last_t: float | None = None
+        if isinstance(entries, list) and entries:
+            for item in entries:
+                if not isinstance(item, dict):
+                    continue
+                ts = finite_number(item.get("timestamp"))
+                if ts is None or (last_t is not None and ts <= last_t):
+                    continue
+                last_t = ts
+                points.append((ts, finite_number(item.get("value"))))
+            if points:
+                return points
+
+        overlay_keys = {
+            "torso_tilt_a": ("tilt_a_deg",),
+            "torso_tilt_b": ("tilt_b_deg",),
+            "couple_midpoint_tilt": ("couple_midpoint_tilt_deg",),
+            "torso_separation": ("torso_separation_deg",),
+        }[key]
+        overlays = couple_result.get("frame_overlays")
+        if isinstance(overlays, list) and overlays:
+            last_t = None
+            for item in overlays:
+                if not isinstance(item, dict):
+                    continue
+                ts = finite_number(item.get("timestamp"))
+                if ts is None or (last_t is not None and ts <= last_t):
+                    continue
+                last_t = ts
+                val = next(
+                    (finite_number(item.get(k)) for k in overlay_keys if finite_number(item.get(k)) is not None),
+                    None,
+                )
+                points.append((ts, val))
+            if points:
+                return points
+
+        sample_keys = {
+            "torso_tilt_a": ("torso_tilt_a_deg",),
+            "torso_tilt_b": ("torso_tilt_b_deg",),
+            "couple_midpoint_tilt": ("couple_midpoint_tilt_deg", "pair_axis_tilt_deg"),
+            "torso_separation": ("torso_separation_deg",),
+        }[key]
+        samples = couple_result.get("samples")
+        if isinstance(samples, list) and samples:
+            last_t = None
+            for item in samples:
+                if not isinstance(item, dict):
+                    continue
+                ts = finite_number(item.get("timestamp"))
+                if ts is None or (last_t is not None and ts <= last_t):
+                    continue
+                last_t = ts
+                val = next(
+                    (finite_number(item.get(k)) for k in sample_keys if finite_number(item.get(k)) is not None),
+                    None,
+                )
+                points.append((ts, val))
+        return points
+
+    def _smooth_couple_axis_points(
+        self, points: list[tuple[float, float | None]], max_gap: float
+    ) -> list[tuple[float, float | None]]:
+        if not points:
+            return []
+        cfg = self.bridge.config
+        da_cfg = cfg.dancer_analysis
+        tau_s = (
+            float(cfg.smoothing)
+            if abs(float(da_cfg.axis_smoothing_s) - 0.25) <= 1e-9
+            and abs(float(cfg.smoothing) - 0.25) > 1e-9
+            else float(da_cfg.axis_smoothing_s)
+        )
+        if tau_s > 0.0:
+            tau_s = max(tau_s, float(cfg.min_filter_time_constant))
+        bridge_gap = float(da_cfg.axis_bridge_max_gap_s)
+        timestamps = [float(t) for t, _ in points]
+        raw_vals = [v for _, v in points]
+        smoothed_vals = _zero_phase_ema_optional(
+            timestamps,
+            raw_vals,
+            tau_s=tau_s,
+            max_gap_s=bridge_gap,
+        )
+        return list(zip(timestamps, smoothed_vals, strict=True))
+
+    def _populate_couple_analysis(self, couple_result: dict[str, Any] | None) -> None:
+        for table in (*self._couple_summary_tables.values(), *self._couple_event_tables.values()):
+            table.setRowCount(0)
+        for key, (default_label, unit, _ref) in COUPLE_AXIS_METRICS.items():
+            self.couple_axis_title_labels[key].setText(f"{default_label} ({unit})")
+            self.couple_axis_charts[key].set_data(None)
+            self.couple_axis_coverage_labels[key].setText("Coverage: Unknown")
+            self.couple_axis_export_buttons[key].setEnabled(False)
+        if not isinstance(couple_result, dict):
+            self.couple_run_info_label.setText(
+                "No Couple run available on this recording."
+            )
+            self.couple_pearson_value_label.setText("Pearson r: Unavailable")
+            self.couple_pearson_detail_label.setText(
+                "Select a Couple recording to measure synchronized torso tilt correlation."
+            )
+            return
+
+        rid = str(couple_result.get("run_id") or "")
+        ann = couple_result.get("annotations") or {}
+        name_a = str(ann.get("dancer_a_name") or "Dancer A")
+        name_b = str(ann.get("dancer_b_name") or "Dancer B")
+        self.couple_axis_title_labels["torso_tilt_a"].setText(f"{name_a} — Torso Axis Tilt (deg)")
+        self.couple_axis_title_labels["torso_tilt_b"].setText(f"{name_b} — Torso Axis Tilt (deg)")
+        dec = couple_result.get("auto_decision") or {}
+        dec_txt = (
+            f"{dec.get('requested_mode', 'auto')} -> {dec.get('resolved_mode', 'couple')}"
+            if isinstance(dec, dict) and dec
+            else "couple"
+        )
+        scene = couple_result.get("post_window_scene_change") or {}
+        scene_note = ""
+        if isinstance(scene, dict) and scene.get("detected"):
+            scene_note = f" · Scene note: {scene.get('message', '')}"
+        else:
+            for diag in couple_result.get("diagnostics") or []:
+                if isinstance(diag, dict) and str(diag.get("type", "")).startswith(
+                    ("post_window", "shot_cut")
+                ):
+                    scene_note = f" · Scene note: {diag.get('message', '')}"
+                    break
+        self.couple_run_info_label.setText(
+            f"Run {rid[:12]} · {name_a} & {name_b} · Mode: {dec_txt}{scene_note}"
+        )
+
+        summaries = couple_result.get("summaries") or {}
+        if isinstance(summaries, dict) and summaries:
+            coord_sum = summaries.get("coordination") or {}
+            if isinstance(coord_sum, dict):
+                for ckey in ("start_lag_ms", "slow_lag_ms", "settle_lag_ms"):
+                    citem = coord_sum.get(ckey)
+                    if isinstance(citem, dict):
+                        self._append_summary_row(self._couple_summary_tables["coordination"], ckey, citem)
+
+            step_sum = summaries.get("step_timing") or {}
+            if isinstance(step_sum, dict):
+                for subj in ("A", "B"):
+                    st = step_sum.get(subj)
+                    if isinstance(st, dict):
+                        self._append_summary_row(
+                            self._couple_summary_tables["step_beat"],
+                            f"median_beat_offset_ms ({subj})",
+                            {
+                                "value": st.get("median_beat_offset_ms"),
+                                "unit": "ms",
+                                "status": st.get("status", "unavailable"),
+                            },
+                        )
+                        self._append_summary_row(
+                            self._couple_summary_tables["step_beat"],
+                            f"matched_contacts ({subj})",
+                            {
+                                "value": st.get("matched_count"),
+                                "unit": "count",
+                                "status": st.get("status", "unavailable"),
+                            },
+                        )
+
+            trans_sum = summaries.get("transitions") or {}
+            if isinstance(trans_sum, dict) and trans_sum:
+                tr_status = str(trans_sum.get("status") or "unavailable")
+                tr_unavail = tr_status in ("unavailable", "insufficient_evidence")
+                for tkey in (
+                    "secondary_speed_peaks",
+                    "unintended_reversals",
+                    "planned_pauses",
+                    "planned_reversals",
+                    "settling_steps",
+                ):
+                    if tkey in trans_sum:
+                        val = (
+                            None
+                            if tr_unavail and tkey in ("secondary_speed_peaks", "unintended_reversals")
+                            else trans_sum.get(tkey)
+                        )
+                        self._append_summary_row(
+                            self._couple_summary_tables["transitions"],
+                            tkey,
+                            {
+                                "value": val,
+                                "unit": "count",
+                                "status": tr_status,
+                            },
+                        )
+                if "evaluated_window_count" in trans_sum:
+                    self._append_summary_row(
+                        self._couple_summary_tables["transitions"],
+                        "evaluated_window_count",
+                        {
+                            "value": trans_sum.get("evaluated_window_count"),
+                            "unit": "windows",
+                            "status": tr_status,
+                        },
+                    )
+
+            pos_sum = summaries.get("posture") or {}
+            if isinstance(pos_sum, dict):
+                for pkey in (
+                    "torso_tilt_a",
+                    "torso_tilt_b",
+                    "couple_midpoint_tilt",
+                    "torso_separation",
+                    "head_pitch_a",
+                    "head_pitch_b",
+                ):
+                    pitem = pos_sum.get(pkey)
+                    if isinstance(pitem, dict):
+                        self._append_summary_row(
+                            self._couple_summary_tables["posture_axes"],
+                            pkey,
+                            {
+                                "value": (
+                                    pitem.get("median_deg")
+                                    if "median_deg" in pitem
+                                    else pitem.get("value")
+                                ),
+                                "unit": "deg",
+                                "status": pitem.get("status", "unavailable"),
+                            },
+                        )
+
+            turn_sum = summaries.get("turns") or {}
+            if isinstance(turn_sum, dict) and turn_sum:
+                turn_keys: list[tuple[str, str]] = [
+                    ("median_turn_duration_s", "s"),
+                    ("median_exit_minus_turn_end_ms", "ms"),
+                    ("turn_count", "count"),
+                    ("overlap_count", "count"),
+                ]
+                if int(turn_sum.get("unmatched_count") or 0) > 0:
+                    turn_keys.append(("unmatched_count", "count"))
+                for ukey, unit in turn_keys:
+                    if ukey in turn_sum:
+                        self._append_summary_row(
+                            self._couple_summary_tables["turns_exits"],
+                            ukey,
+                            {
+                                "value": turn_sum.get(ukey),
+                                "unit": unit,
+                                "status": turn_sum.get("status", "unavailable"),
+                            },
+                        )
+
+        summary = couple_result.get("summary") or {}
+        if isinstance(summary, dict) and summary:
+            pane_metric_prefixes: dict[str, tuple[str, ...]] = {
+                "coordination": ("travel_", "coord_", "lag_"),
+                "step_beat": ("step_", "beat_", "cadence"),
+                "transitions": ("transition_", "planned_"),
+                "posture_axes": ("torso_", "head_", "hip_", "pair_", "separation", "axis"),
+                "turns_exits": ("turn_", "exit_", "pivot_"),
+            }
+            assigned_keys: set[str] = set()
+            for pane_key, prefixes in pane_metric_prefixes.items():
+                tbl = self._couple_summary_tables[pane_key]
+                for metric_name, item in summary.items():
+                    if not isinstance(item, dict):
+                        continue
+                    if any(metric_name.startswith(p) or p in metric_name for p in prefixes):
+                        assigned_keys.add(metric_name)
+                        self._append_summary_row(tbl, metric_name, item)
+            for metric_name, item in summary.items():
+                if metric_name not in assigned_keys and isinstance(item, dict):
+                    self._append_summary_row(
+                        self._couple_summary_tables["coordination"], metric_name, item
+                    )
+
+        events = [ev for ev in (couple_result.get("events") or []) if isinstance(ev, dict) and not ev.get("deleted")]
+        event_pane_map = {
+            "start": "coordination",
+            "slow": "coordination",
+            "settle": "coordination",
+            "contact": "step_beat",
+            "musical_target": "step_beat",
+            "speed_cue": "transitions",
+            "turn": "turns_exits",
+            "turn_start": "turns_exits",
+            "turn_end": "turns_exits",
+            "exit": "turns_exits",
+            "embrace_opening": "turns_exits",
+        }
+        for ev in events:
+            etype = str(ev.get("event_type") or "")
+            pkey = event_pane_map.get(etype, "transitions")
+            tbl = self._couple_event_tables[pkey]
+            r = tbl.rowCount()
+            tbl.insertRow(r)
+            ts = float(ev.get("timestamp", 0.0))
+            t_item = QTableWidgetItem(f"{ts:.2f}")
+            t_item.setData(Qt.ItemDataRole.UserRole, ev)
+            meta = ev.get("metadata") or {}
+            detail = ""
+            turn_tid = ev.get("turn_id") or (meta.get("turn_id") if isinstance(meta, dict) else None)
+            if isinstance(ev.get("lag_ms"), (int, float)):
+                detail = f"lag {float(ev['lag_ms']):+.0f} ms"
+            elif isinstance(ev.get("beat_offset_ms"), (int, float)):
+                detail = f"beat {float(ev['beat_offset_ms']):+.0f} ms"
+            elif "lag_s" in meta and isinstance(meta["lag_s"], (int, float)):
+                detail = f"lag {float(meta['lag_s']) * 1000.0:+.0f} ms"
+            elif ev.get("pivot_behavior"):
+                detail = str(ev["pivot_behavior"])
+            elif ev.get("reason"):
+                detail = str(ev["reason"])
+            elif ev.get("label"):
+                detail = str(ev["label"])
+            if turn_tid:
+                detail = f"[{turn_tid}] {detail}".strip()
+            tbl.setItem(r, 0, t_item)
+            tbl.setItem(r, 1, QTableWidgetItem(etype))
+            tbl.setItem(r, 2, QTableWidgetItem(str(ev.get("subject", "pair"))))
+            tbl.setItem(r, 3, QTableWidgetItem(detail))
+            tbl.setItem(r, 4, QTableWidgetItem(str(ev.get("status", "measured"))))
+
+        # Populate transitions pane with transition coverage if present, and posture frames sample rows
+        transitions_info = couple_result.get("transitions") or []
+        if isinstance(transitions_info, list):
+            tr_tbl = self._couple_event_tables["transitions"]
+            for tr in transitions_info:
+                if not isinstance(tr, dict):
+                    continue
+                r = tr_tbl.rowCount()
+                tr_tbl.insertRow(r)
+                ts = float(tr.get("timestamp", 0.0))
+                t_item = QTableWidgetItem(f"{ts:.2f}")
+                t_item.setData(Qt.ItemDataRole.UserRole, {"timestamp": ts})
+                val = tr.get("latency_s")
+                val_txt = f"{float(val):.3f} s" if isinstance(val, (int, float)) else str(tr.get("reason") or "")
+                tr_tbl.setItem(r, 0, t_item)
+                tr_tbl.setItem(r, 1, QTableWidgetItem(str(tr.get("kind", "transition"))))
+                tr_tbl.setItem(r, 2, QTableWidgetItem("pair"))
+                tr_tbl.setItem(r, 3, QTableWidgetItem(val_txt))
+                tr_tbl.setItem(r, 4, QTableWidgetItem(str(tr.get("status", "measured"))))
+
+        samples = couple_result.get("samples") or []
+        pos_tbl = self._couple_event_tables["posture_axes"]
+        if isinstance(samples, list) and samples:
+            stride = max(1, len(samples) // 50)
+            for sample in samples[::stride]:
+                if not isinstance(sample, dict):
+                    continue
+                r = pos_tbl.rowCount()
+                pos_tbl.insertRow(r)
+                ts = float(sample.get("timestamp", 0.0))
+                t_item = QTableWidgetItem(f"{ts:.2f}")
+                t_item.setData(Qt.ItemDataRole.UserRole, {"timestamp": ts})
+                sep = sample.get("hip_separation_torso")
+                axis_t = sample.get("pair_axis_tilt_deg")
+                detail_parts = []
+                if isinstance(axis_t, (int, float)):
+                    detail_parts.append(f"axis {axis_t:+.1f}°")
+                if isinstance(sep, (int, float)):
+                    detail_parts.append(f"sep {sep:.2f}")
+                pos_tbl.setItem(r, 0, t_item)
+                pos_tbl.setItem(r, 1, QTableWidgetItem("Couple frame posture"))
+                pos_tbl.setItem(r, 2, QTableWidgetItem("pair"))
+                pos_tbl.setItem(r, 3, QTableWidgetItem(", ".join(detail_parts) or "—"))
+                pos_tbl.setItem(r, 4, QTableWidgetItem(str(sample.get("quality_status", "measured"))))
+        else:
+            series = couple_result.get("series") or {}
+            mid_series = series.get("couple_midpoint_tilt") or []
+            sep_series = series.get("torso_separation") or []
+            if isinstance(mid_series, list) and mid_series:
+                stride = max(1, len(mid_series) // 50)
+                for idx in range(0, len(mid_series), stride):
+                    mp = mid_series[idx]
+                    if not isinstance(mp, dict):
+                        continue
+                    sp = sep_series[idx] if idx < len(sep_series) and isinstance(sep_series[idx], dict) else {}
+                    r = pos_tbl.rowCount()
+                    pos_tbl.insertRow(r)
+                    ts = float(mp.get("timestamp", 0.0))
+                    t_item = QTableWidgetItem(f"{ts:.2f}")
+                    t_item.setData(Qt.ItemDataRole.UserRole, {"timestamp": ts})
+                    detail_parts = []
+                    if isinstance(mp.get("value"), (int, float)):
+                        detail_parts.append(f"axis {float(mp['value']):+.1f}°")
+                    if isinstance(sp.get("value"), (int, float)):
+                        detail_parts.append(f"sep {float(sp['value']):.1f}°")
+                    pos_tbl.setItem(r, 0, t_item)
+                    pos_tbl.setItem(r, 1, QTableWidgetItem("Couple frame posture"))
+                    pos_tbl.setItem(r, 2, QTableWidgetItem("pair"))
+                    pos_tbl.setItem(r, 3, QTableWidgetItem(", ".join(detail_parts) or "—"))
+                    pos_tbl.setItem(r, 4, QTableWidgetItem(str(mp.get("status", "unavailable"))))
+
+        extracted_axes = {
+            key: self._extract_couple_axis_points(couple_result, key)
+            for key in COUPLE_AXIS_METRICS
+        }
+        all_axis_ts = [ts for pts in extracted_axes.values() for ts, _ in pts]
+        origin_ts = min(all_axis_ts) if all_axis_ts else float(couple_result.get("clip_in") or 0.0)
+        end_ts = max(all_axis_ts) if all_axis_ts else float(couple_result.get("clip_out") or origin_ts)
+        raw_gap = (
+            self.dataset.max_gap
+            if self.dataset is not None and self.dataset.max_gap is not None
+            else self.bridge.config.dancer_analysis.max_observation_gap_s
+        )
+        max_gap = float(raw_gap) if raw_gap is not None and raw_gap > 0 else self.bridge.config.max_gap
+        smoothed_axes = {
+            key: self._smooth_couple_axis_points(
+                [(ts - origin_ts, val) for ts, val in extracted_axes[key]],
+                max_gap,
+            )
+            for key in COUPLE_AXIS_METRICS
+        }
+
+        pearson_r, pearson_n, pearson_reason = compute_torso_tilt_pearson_correlation(
+            smoothed_axes["torso_tilt_a"],
+            smoothed_axes["torso_tilt_b"],
+        )
+        pos_sum_map = summaries.get("posture") if isinstance(summaries, dict) else None
+        stored_pr = (
+            pos_sum_map.get("torso_tilt_pearson_r")
+            if isinstance(pos_sum_map, dict) and isinstance(pos_sum_map.get("torso_tilt_pearson_r"), dict)
+            else None
+        )
+        if (
+            pearson_r is None
+            and not smoothed_axes["torso_tilt_a"]
+            and not smoothed_axes["torso_tilt_b"]
+            and isinstance(stored_pr, dict)
+        ):
+            pearson_r = finite_number(stored_pr.get("value"))
+            pearson_n = int(stored_pr.get("sample_count") or 0)
+            pearson_reason = str(stored_pr.get("reason") or "")
+
+        cov_map = couple_result.get("coverage") or {}
+        pair_denom = int(
+            (stored_pr.get("coverage_denominator") if isinstance(stored_pr, dict) else None)
+            or cov_map.get("frame_count")
+            or max(len(smoothed_axes["torso_tilt_a"]), len(smoothed_axes["torso_tilt_b"]), pearson_n, 1)
+        )
+        if pearson_r is not None:
+            pr_status = (
+                str(stored_pr.get("status"))
+                if isinstance(stored_pr, dict)
+                and stored_pr.get("status") in ("measured", "estimated", "mixed", "user_confirmed")
+                else "measured"
+            )
+        elif 0 < pearson_n < 3:
+            pr_status = "insufficient_evidence"
+        else:
+            pr_status = "unavailable"
+        pr_item = {
+            "measure": "torso_tilt_pearson_r",
+            "subject": "pair",
+            "value": pearson_r,
+            "sample_count": pearson_n,
+            "eligible_count": pearson_n,
+            "coverage_denominator": pair_denom,
+            "coverage": float(cov_map.get("pair_torso_coverage", 0.0)),
+            "unit": "r",
+            "status": pr_status,
+            "status_counts": (
+                dict(stored_pr.get("status_counts") or {}) if isinstance(stored_pr, dict) else {}
+            ),
+            "reason": pearson_reason,
+        }
+        if isinstance(couple_result, dict):
+            sum_root = couple_result.setdefault("summaries", {})
+            if isinstance(sum_root, dict):
+                pos_root = sum_root.setdefault("posture", {})
+                if isinstance(pos_root, dict):
+                    pos_root["torso_tilt_pearson_r"] = pr_item
+        self._append_summary_row(self._couple_summary_tables["coordination"], "torso_tilt_pearson_r", pr_item)
+        self._append_summary_row(self._couple_summary_tables["posture_axes"], "torso_tilt_pearson_r", pr_item)
+
+        if pearson_r is not None:
+            self.couple_pearson_value_label.setText(f"Pearson r = {pearson_r:+.3f}")
+            if pearson_r >= 0.25:
+                interp = "In-phase parallel sway (Dancer A and Dancer B tend to tilt in the same direction)."
+            elif pearson_r <= -0.25:
+                interp = "Counter-balance / opposite lean (one tilts forward/right as the other leans opposite)."
+            else:
+                interp = "Weak or independent torso tilt coupling across paired frames."
+            cov_pct = (finite_number(pr_item["coverage"]) or 0.0) * 100.0
+            self.couple_pearson_detail_label.setText(
+                f"Paired samples: {pearson_n}/{pair_denom} frames · Pair torso coverage: {cov_pct:.0f}% · Status: {pr_status} · {interp}"
+            )
+        else:
+            self.couple_pearson_value_label.setText("Pearson r: Unavailable")
+            reason_txt = pearson_reason.replace("_", " ") if pearson_reason else "insufficient paired samples"
+            self.couple_pearson_detail_label.setText(
+                f"Paired samples: {pearson_n}/{pair_denom} · Status: {pr_status} · Reason: {reason_txt}"
+            )
+
+        pearson_banner = (
+            f" · Torso tilt Pearson r: {pearson_r:+.3f} (n={pearson_n})"
+            if pearson_r is not None
+            else " · Torso tilt Pearson r: Unavailable"
+        )
+        self.couple_run_info_label.setText(
+            f"Run {rid[:12]} · {name_a} & {name_b} · Mode: {dec_txt}{pearson_banner}{scene_note}"
+        )
+
+        targets = {}
+        calibration_note = ""
+        try:
+            selected = self._resolve_selected_calibration()
+            profile = profile_from_calibration(selected) if isinstance(selected, Calibration) else selected
+            if isinstance(profile, RangeProfile) and profile.source.get("dancer_mode") == "couple":
+                targets = profile.metrics
+                calibration_note = f" · Calibration: {profile.name}"
+        except (OSError, ValueError, TypeError, KeyError, BadZipFile) as error:
+            calibration_note = f" · Calibration unavailable: {error}"
+        self.couple_run_info_label.setText(self.couple_run_info_label.text() + calibration_note)
+
+        for key, (_default_label, unit, ref_val) in COUPLE_AXIS_METRICS.items():
+            rel_pts = smoothed_axes[key]
+            target = targets.get(key)
+            states: dict[float, str] = {}
+            if target is not None:
+                rel_pts, states = compare_couple_series(
+                    key, [(ts - origin_ts, value) for ts, value in extracted_axes[key]],
+                    target, self.bridge.config,
+                )
+            time_end = max(0.0, end_ts - origin_ts, rel_pts[-1][0] if rel_pts else 0.0)
+            segments = _segments_from_points(rel_pts, max_gap)
+            summary_map = _interval_summary(rel_pts, max_gap)
+            metric_data = MetricData(rel_pts, segments, summary_map, 0, 0)
+            chart = self.couple_axis_charts[key]
+            chart.set_data(
+                metric_data, time_end, origin_ts,
+                bounds=(target.lower, target.upper) if target else None,
+                reference_line=target.median if target else ref_val, states=states, unit=unit,
+            )
+            self.couple_axis_export_buttons[key].setEnabled(chart.isEnabled())
+            if target:
+                self.couple_axis_title_labels[key].setText(
+                    self.couple_axis_title_labels[key].text()
+                    + f" · Range: {target.lower:g} … {target.upper:g}°"
+                )
+
+            pearson_suffix = (
+                f" · Pearson r(A,B): {pearson_r:+.3f}"
+                if pearson_r is not None and key in ("torso_tilt_a", "torso_tilt_b", "torso_separation")
+                else ""
+            )
+            pos_item = pos_sum_map.get(key) if isinstance(pos_sum_map, dict) else None
+            med = finite_number(pos_item.get("median_deg")) if isinstance(pos_item, dict) else None
+            if med is not None and isinstance(pos_item, dict):
+                iqr = finite_number(pos_item.get("iqr_deg")) or 0.0
+                cov = finite_number(pos_item.get("coverage")) or 0.0
+                cnt = int(pos_item.get("eligible_count") or pos_item.get("sample_count") or 0)
+                denom = int(
+                    pos_item.get("coverage_denominator")
+                    or pos_item.get("total_frame_count")
+                    or cov_map.get("frame_count")
+                    or max(cnt, len(rel_pts), 1)
+                )
+                st_lbl = str(pos_item.get("status") or "measured")
+                self.couple_axis_coverage_labels[key].setText(
+                    f"Median: {med:+.1f}° · IQR: {iqr:.1f}° · Ref: {ref_val:.1f}° · "
+                    f"Coverage: {cov:.0%} ({cnt}/{denom} frames, {st_lbl}){pearson_suffix}"
+                )
+            elif segments:
+                valid_count = sum(1 for _, v in rel_pts if v is not None)
+                cov_ratio = finite_number(summary_map.get("valid_coverage"))
+                cov_txt = f"{cov_ratio:.0%}" if cov_ratio is not None else "Unknown"
+                self.couple_axis_coverage_labels[key].setText(
+                    f"Measured samples: {valid_count}/{len(rel_pts)} · "
+                    f"Coverage: {cov_txt} · Ref: {ref_val:.1f}°{pearson_suffix}"
+                )
+            else:
+                reason = (
+                    str(pos_item.get("reason") or "Unavailable (torso landmarks occluded)")
+                    if isinstance(pos_item, dict)
+                    else "Unavailable"
+                )
+                self.couple_axis_coverage_labels[key].setText(f"Unavailable: {reason}")
+
+    def _append_summary_row(self, table: QTableWidget, name: str, item: dict[str, Any]) -> None:
+        r = table.rowCount()
+        table.insertRow(r)
+        val = item.get("value")
+        val_txt = f"{val:.3f}" if isinstance(val, (int, float)) else "Unavailable"
+        table.setItem(r, 0, QTableWidgetItem(name.replace("_", " ")))
+        table.setItem(r, 1, QTableWidgetItem(val_txt))
+        table.setItem(r, 2, QTableWidgetItem(str(item.get("unit") or "")))
+        table.setItem(r, 3, QTableWidgetItem(str(item.get("status") or "unavailable")))
+
+    def _on_couple_event_row_clicked(self, table: QTableWidget, row: int) -> None:
+        item = table.item(row, 0)
+        if item is None:
+            return
+        ev = item.data(Qt.ItemDataRole.UserRole)
+        if isinstance(ev, dict) and "timestamp" in ev:
+            self._seek_to_couple_event(float(ev["timestamp"]))
+
+    def _seek_to_couple_event(self, timestamp: float) -> None:
+        source = self._current_source
+        if source is None:
+            self.bridge.status_message.emit("No Couple recording loaded to seek.")
+            return
+        path, index = source
+        payload: dict[str, Any] = {
+            "archive_path": path,
+            "segment_index": index,
+            "timestamp": float(timestamp),
+        }
+        if self._active_couple_run_id:
+            payload["run_id"] = self._active_couple_run_id
+        self.router.navigate(Route.REVIEW, payload)
+
+    def export_couple_csv_file(self, destination: Path | None = None) -> Path | None:
+        couple = self._active_couple_result
+        source = self._current_source
+        if not isinstance(couple, dict) or source is None:
+            self.bridge.status_message.emit("Load a Couple analysis recording before exporting CSV.")
+            return None
+        path, index = source
+        if destination is None:
+            default_name = f"{path.stem}_seg{index:02d}_couple.csv"
+            selected, _ = QFileDialog.getSaveFileName(
+                self,
+                "Export Couple Analysis CSV",
+                default_name,
+                "CSV files (*.csv)",
+            )
+            if not selected:
+                return None
+            destination = Path(selected)
+        csv_text = export_couple_csv(couple, path.stem, index)
+        destination.write_text(csv_text, encoding="utf-8")
+        self.bridge.status_message.emit(f"Exported Couple CSV to {destination.name}")
+        return destination
+
+    def export_couple_axis_chart(
+        self, metric: str, destination: Path | None = None
+    ) -> Path | None:
+        """Export a Couple axis chart to PNG, SVG, CSV, or JSON."""
+        if metric not in COUPLE_AXIS_METRICS:
+            raise ValueError(f"Unsupported couple axis chart metric: {metric!r}")
+        chart = self.couple_axis_charts.get(metric)
+        if chart is None or not chart.isEnabled():
+            self.bridge.status_message.emit(f"Couple axis chart {metric} has no active data to export.")
+            return None
+        title = self.couple_axis_title_labels[metric].text()
+        source_stem = self._current_source[0].stem if self._current_source else "couple_analytics"
+        if destination is None:
+            chosen, _ = QFileDialog.getSaveFileName(
+                self,
+                f"Export {title}",
+                f"{source_stem}_{metric}.png",
+                "PNG Image (*.png);;SVG Vector (*.svg);;CSV Table (*.csv);;JSON Data (*.json)",
+            )
+            if not chosen:
+                return None
+            destination = Path(chosen)
+        destination = Path(destination)
+        subtitle_parts = [
+            f"Archive: {self._current_source[0].name}" if self._current_source else "Couple analysis",
+            self.couple_axis_coverage_labels[metric].text(),
+        ]
+        subtitle = " · ".join(p for p in subtitle_parts if p)
+        if destination.suffix.lower() == ".json":
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "metric": metric,
+                "title": title,
+                "unit": COUPLE_AXIS_METRICS[metric][1],
+                "archive": str(self._current_source[0].name) if self._current_source else "",
+                "segment_index": self._current_source[1] if self._current_source else 0,
+                "run_id": self._active_couple_run_id or "",
+                "reference_line": chart.reference_line,
+                "summary": chart.data.summary if chart.data else {},
+                "samples": [
+                    {
+                        "timestamp_s": ts,
+                        "value": val,
+                    }
+                    for ts, val in (chart.data.points if chart.data else [])
+                ],
+            }
+            destination.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        else:
+            chart.export_to_file(destination, title=title, subtitle=subtitle)
+        self.bridge.status_message.emit(f"Exported {metric} chart to {destination.name}")
+        return destination

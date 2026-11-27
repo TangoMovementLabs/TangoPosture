@@ -1,0 +1,234 @@
+name: Desktop CI and release
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, windows-2022, ubuntu-24.04]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@v6
+      - name: Install Linux desktop system dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgl1 libegl1 libportaudio2 libxkbcommon0 libxkbcommon-x11-0 \
+            libdbus-1-3 libfontconfig1 libxcb-cursor0 libxcb-icccm4 \
+            libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 \
+            libxcb-shape0 libxcb-xinerama0 libxcb-xfixes0
+      - run: uv sync --frozen
+      - run: uv run --frozen ruff check src tests
+      - run: uv run --frozen mypy src
+      - env:
+          QT_QPA_PLATFORM: offscreen
+        run: uv run --frozen pytest -q
+
+  build:
+    if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            platform: macos-arm64
+          - os: windows-2022
+            platform: windows-x64
+          - os: ubuntu-24.04
+            platform: linux-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: astral-sh/setup-uv@v6
+      - name: Install Linux desktop system dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgl1 libegl1 libportaudio2 libxkbcommon0 libxkbcommon-x11-0 \
+            libdbus-1-3 libfontconfig1 libxcb-cursor0 libxcb-icccm4 \
+            libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 \
+            libxcb-shape0 libxcb-xinerama0 libxcb-xfixes0
+      - run: uv sync --frozen --group packaging
+      - name: Check release tag matches package version
+        if: github.event_name == 'release'
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          uv run --frozen --group packaging python -c 'import os, tomllib; v = tomllib.load(open("pyproject.toml", "rb"))["project"]["version"]; tag = os.environ["RELEASE_TAG"]; assert tag == "v" + v, f"Release tag {tag!r} must match package version v{v}"'
+      - name: Download and verify pose model
+        run: uv run --frozen --group packaging tango-posture models fetch --output build/model/pose_landmarker_lite.task
+      - name: Prepare manual
+        run: uv run --frozen --group packaging python -c "from pathlib import Path; import shutil; p=Path('build/desktop-resources'); p.mkdir(parents=True, exist_ok=True); shutil.copyfile('assets/docs/TANGO_POSTURE_GUIDE.md', p / 'TANGO_POSTURE_MANUAL.md')"
+      - name: Prepare desktop icons
+        run: uv run --frozen --group packaging python scripts/prepare_desktop_icons.py
+      - name: Build application
+        run: uv run --frozen --group packaging pyinstaller --noconfirm scripts/TangoPosture.spec
+      - name: Build and verify macOS disk image
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release build/dmg
+          cp -R dist/TangoPosture.app build/dmg/
+          ln -s /Applications build/dmg/Applications
+          hdiutil create -volname TangoPosture -srcfolder build/dmg -format UDZO release/TangoPosture-macOS-arm64.dmg
+          hdiutil verify release/TangoPosture-macOS-arm64.dmg
+          mkdir "$RUNNER_TEMP/tango-dmg"
+          hdiutil attach release/TangoPosture-macOS-arm64.dmg -mountpoint "$RUNNER_TEMP/tango-dmg" -nobrowse
+          detach_dmg() {
+            local attempt
+            for attempt in 1 2 3 4 5; do
+              if hdiutil detach "$RUNNER_TEMP/tango-dmg"; then
+                return 0
+              fi
+              echo "Disk image still busy; retrying cleanup in ${attempt}s" >&2
+              sleep "$attempt"
+            done
+            echo "Normal unmount failed; forcing detach of the CI smoke-test image" >&2
+            hdiutil detach -force "$RUNNER_TEMP/tango-dmg"
+          }
+          trap detach_dmg EXIT
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/tango-dmg/TangoPosture.app/Contents/MacOS/TangoPosture" --smoke-test
+      - name: Build and verify Linux archive
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release "$RUNNER_TEMP/tango-linux"
+          cp build/desktop-resources/TangoPosture.png dist/TangoPosture/TangoPosture.png
+          tar -C dist -czf release/TangoPosture-Linux-x64.tar.gz TangoPosture
+          tar -xzf release/TangoPosture-Linux-x64.tar.gz -C "$RUNNER_TEMP/tango-linux"
+          export TANGOPOSTURE_SMOKE_LOG="$RUNNER_TEMP/linux-smoke.log"
+          cd "$RUNNER_TEMP"
+          timeout 120s "$RUNNER_TEMP/tango-linux/TangoPosture/TangoPosture" --smoke-test
+          cat "$TANGOPOSTURE_SMOKE_LOG"
+          grep -Fq "Desktop smoke test passed" "$TANGOPOSTURE_SMOKE_LOG"
+      - name: Build Windows installer
+        if: runner.os == 'Windows'
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          $version = uv run --frozen --group packaging python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=$version" scripts/windows.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Install Windows application
+        if: runner.os == 'Windows'
+        timeout-minutes: 5
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force build/verification-logs | Out-Null
+          $target = Join-Path $env:RUNNER_TEMP "TangoPostureInstallerSmoke"
+          $log = Join-Path $env:GITHUB_WORKSPACE "build/verification-logs/install.log"
+          Write-Host "Installing to $target (maximum 180 seconds)"
+          $installer = Start-Process -FilePath (Resolve-Path "release/TangoPosture-Windows-x64-Setup.exe") -ArgumentList "/SP-", "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/LOG=`"$log`"", "/DIR=`"$target`"" -PassThru
+          try {
+            if (-not $installer.WaitForExit(180000)) {
+              taskkill /PID $installer.Id /T /F
+              throw "Windows installation timed out after 180 seconds"
+            }
+            if ($installer.ExitCode -ne 0) { throw "Installer failed: $($installer.ExitCode)" }
+            if (-not (Test-Path (Join-Path $target "TangoPosture.exe"))) { throw "Installed executable is missing" }
+            Write-Host "Windows installation completed"
+          } finally {
+            if (Test-Path $log) { Get-Content $log }
+          }
+      - name: Smoke-test installed Windows application
+        if: runner.os == 'Windows'
+        timeout-minutes: 3
+        shell: pwsh
+        run: |
+          $target = Join-Path $env:RUNNER_TEMP "TangoPostureInstallerSmoke"
+          $env:TANGOPOSTURE_SMOKE_LOG = Join-Path $env:GITHUB_WORKSPACE "build/verification-logs/smoke.log"
+          Write-Host "Running installed application smoke test (maximum 120 seconds)"
+          $app = Start-Process -FilePath (Join-Path $target "TangoPosture.exe") -ArgumentList "--smoke-test" -WorkingDirectory $env:RUNNER_TEMP -PassThru
+          try {
+            if (-not $app.WaitForExit(120000)) {
+              taskkill /PID $app.Id /T /F
+              throw "Installed application smoke test timed out after 120 seconds"
+            }
+            if ($app.ExitCode -ne 0) { throw "Installed application smoke test failed: $($app.ExitCode)" }
+            if (-not (Test-Path $env:TANGOPOSTURE_SMOKE_LOG)) { throw "Smoke test did not create its diagnostic log" }
+            if (-not (Select-String -Path $env:TANGOPOSTURE_SMOKE_LOG -SimpleMatch "Desktop smoke test passed")) {
+              throw "Smoke test exited without confirming successful inference"
+            }
+          } finally {
+            if (Test-Path $env:TANGOPOSTURE_SMOKE_LOG) { Get-Content $env:TANGOPOSTURE_SMOKE_LOG }
+          }
+      - name: Upload Windows verification logs
+        if: always() && runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-verification-logs
+          path: build/verification-logs/
+          if-no-files-found: warn
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.platform }}
+          path: release/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    if: github.event_name == 'release'
+    needs: [checks, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: desktop-*
+          path: release
+          merge-multiple: true
+      - name: Generate checksums and attach release assets
+        working-directory: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          sha256sum TangoPosture-macOS-arm64.dmg TangoPosture-Windows-x64-Setup.exe TangoPosture-Linux-x64.tar.gz > SHA256SUMS.txt
+          gh release upload "$RELEASE_TAG" TangoPosture-macOS-arm64.dmg TangoPosture-Windows-x64-Setup.exe TangoPosture-Linux-x64.tar.gz SHA256SUMS.txt
+
+  notify:
+    if: always()
+    needs: [checks, build, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Notify Discord of pipeline result
+        env:
+          DISCORD_CICD_WEBHOOK_URL: ${{ secrets.DISCORD_CICD_WEBHOOK_URL }}
+          JOB_CHECKS_RESULT: ${{ needs.checks.result }}
+          JOB_BUILD_RESULT: ${{ needs.build.result }}
+          JOB_PUBLISH_RESULT: ${{ needs.publish.result }}
+        run: python3 .github/scripts/notify_discord.py pipeline

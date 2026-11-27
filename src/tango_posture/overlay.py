@@ -1,0 +1,846 @@
+import math
+from collections.abc import Mapping
+from typing import Any, Literal
+
+import cv2
+
+from .domain import FrameObservation, Landmark
+from .geometry import (
+    ankle_lift_alignment,
+    calculate,
+    detect_embrace_type,
+    detect_role,
+    head_horizontal_alignment,
+    knee_bend_alignment,
+    pixel,
+    shoulder_tension_alignment,
+    torso_axis_alignment,
+)
+from .pose.constants import CONNECTIONS
+from .quality import reliable
+
+MESSAGES = {
+    "head_forward": "Head farther forward than reference",
+    "head_inclination": "Head angle differs from reference",
+    "trunk_inclination": "Trunk angle differs from reference",
+}
+TORSO_AXIS_EXTENSION = 0.25
+
+
+def screen_point(x: float, y: float, width: int, height: int, mirror: bool) -> tuple[int, int]:
+    return (
+        width - 1 - round(x * (width - 1)) if mirror else round(x * (width - 1)),
+        round(y * (height - 1)),
+    )
+
+
+def draw_torso_axis(
+    image: Any, pose: dict[str, Landmark], mirror: bool, confidence: float, *,
+    show_labels: bool = True,
+) -> None:
+    height, width = image.shape[:2]
+    axis = torso_axis_alignment(pose, width, height, confidence)
+    if axis is None:
+        return
+    angle, shoulder, hip = axis
+    sx, sy = screen_point(shoulder.x, shoulder.y, width, height, mirror)
+    hx, hy = screen_point(hip.x, hip.y, width, height, mirror)
+    dx, dy = sx - hx, sy - hy
+    length = math.hypot(dx, dy)
+    torso_color, vertical_color = (255, 140, 255), (255, 220, 0)
+
+    # Extend the fixed vertical farther so it stays visible behind an upright torso.
+    top = max(0, round(hy - 1.35 * length))
+    bottom = min(height - 1, round(hy + 0.35 * length))
+    for y in range(top, bottom + 1, 20):
+        cv2.line(image, (hx, y), (hx, min(y + 11, bottom)), vertical_color, 2, cv2.LINE_AA)
+    cv2.line(
+        image,
+        (round(hx - TORSO_AXIS_EXTENSION * dx), round(hy - TORSO_AXIS_EXTENSION * dy)),
+        (round(sx + TORSO_AXIS_EXTENSION * dx), round(sy + TORSO_AXIS_EXTENSION * dy)),
+        torso_color,
+        3,
+        cv2.LINE_AA,
+    )
+    for point in ((sx, sy), (hx, hy)):
+        cv2.circle(image, point, 5, torso_color, -1, cv2.LINE_AA)
+    # Magnitude stays the same when the display is mirrored; it is not a judgement
+    # that leaning is wrong, nor an estimate of forward/backward lean in 3D.
+    if not show_labels:
+        return
+    labels = (
+        (f"Torso axis: {abs(angle):.1f} deg", torso_color),
+        ("Vertical (level camera)", vertical_color),
+    )
+    label_y = max(24, min(hy + 24, height - 36))
+    for i, (text, color) in enumerate(labels):
+        (text_width, _), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 2)
+        x = max(8, min(hx + 16, width - text_width - 8))
+        cv2.putText(
+            image,
+            text,
+            (x, label_y + 24 * i),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.52,
+            color,
+            2,
+            cv2.LINE_AA,
+        )
+
+
+def _draw_dashed_line(
+    image: Any,
+    start: tuple[int, int],
+    end: tuple[int, int],
+    color: tuple[int, int, int],
+    thickness: int = 2,
+    dash: int = 10,
+    gap: int = 8,
+) -> None:
+    dx = end[0] - start[0]
+    dy = end[1] - start[1]
+    length = math.hypot(dx, dy)
+    if length < 1.0:
+        return
+    ux, uy = dx / length, dy / length
+    step = dash + gap
+    pos = 0.0
+    while pos < length:
+        seg_end = min(pos + dash, length)
+        p0 = (round(start[0] + ux * pos), round(start[1] + uy * pos))
+        p1 = (round(start[0] + ux * seg_end), round(start[1] + uy * seg_end))
+        cv2.line(image, p0, p1, color, thickness, cv2.LINE_AA)
+        pos += step
+
+
+def _draw_dotted_line(
+    image: Any,
+    start: tuple[int, int],
+    end: tuple[int, int],
+    color: tuple[int, int, int],
+    thickness: int = 2,
+    spacing: int = 8,
+) -> None:
+    dx = end[0] - start[0]
+    dy = end[1] - start[1]
+    length = math.hypot(dx, dy)
+    if length < 1.0:
+        return
+    ux, uy = dx / length, dy / length
+    radius = max(1, thickness)
+    pos = 0.0
+    while pos <= length:
+        pt = (round(start[0] + ux * pos), round(start[1] + uy * pos))
+        cv2.circle(image, pt, radius, color, -1, cv2.LINE_AA)
+        pos += spacing
+
+
+def edge_provenance_style(
+    a: str,
+    b: str,
+    joint_origins: Mapping[str, str] | None,
+) -> Literal["solid", "dashed", "dotted"]:
+    """Return bone line style for endpoints (`dotted` if either is interpolated, else `dashed` if backward)."""
+    if not joint_origins:
+        return "solid"
+    oa = joint_origins.get(a, "forward")
+    ob = joint_origins.get(b, "forward")
+    if oa == "interpolated" or ob == "interpolated":
+        return "dotted"
+    if oa == "backward" or ob == "backward":
+        return "dashed"
+    return "solid"
+
+
+def draw_styled_bone(
+    image: Any,
+    start: tuple[int, int],
+    end: tuple[int, int],
+    color: tuple[int, int, int],
+    thickness: int = 2,
+    style: Literal["solid", "dashed", "dotted"] = "solid",
+) -> None:
+    """Draw a skeleton bone segment in solid, dashed, or dotted provenance style."""
+    if style == "dashed":
+        _draw_dashed_line(image, start, end, color, thickness=thickness, dash=10, gap=6)
+    elif style == "dotted":
+        _draw_dotted_line(image, start, end, color, thickness=thickness, spacing=8)
+    else:
+        cv2.line(image, start, end, color, thickness, cv2.LINE_AA)
+
+
+def draw_head_alignment(
+    image: Any,
+    pose: dict[str, Landmark],
+    mirror: bool,
+    confidence: float,
+    *,
+    neutral_offset: float = 0.0,
+    show_labels: bool = True,
+) -> None:
+    """Draw ear-to-nose head alignment lines relative to horizontal."""
+    height, width = image.shape[:2]
+    reliable_pose = {k: v for k, v in pose.items() if reliable(v, confidence)}
+    head_info = head_horizontal_alignment(
+        reliable_pose, width, height, neutral_offset=neutral_offset
+    )
+    if head_info is None:
+        return
+    angle, ear, nose = head_info
+    ex, ey = screen_point(ear.x, ear.y, width, height, mirror)
+    nx, ny = screen_point(nose.x, nose.y, width, height, mirror)
+    dir_x = 1 if nx >= ex else -1
+    seg_len = max(min(65.0, width * 0.45), math.hypot(nx - ex, ny - ey))
+    hx = round(ex + dir_x * seg_len)
+    rad = math.radians(angle)
+    vx = round(ex + dir_x * seg_len * math.cos(rad))
+    vy = round(ey - seg_len * math.sin(rad))
+    ref_color, vec_color = (255, 220, 0), (0, 220, 255)
+
+    cv2.line(image, (ex, ey), (hx, ey), ref_color, 2, cv2.LINE_AA)
+    cv2.line(image, (ex, ey), (vx, vy), vec_color, 3, cv2.LINE_AA)
+    for point in ((ex, ey), (nx, ny)):
+        cv2.circle(image, point, 4, vec_color, -1, cv2.LINE_AA)
+    arc_r = min(34, max(10, round(seg_len * 0.55)))
+    base_deg = 0.0 if dir_x > 0 else 180.0
+    end_deg = base_deg - angle if dir_x > 0 else base_deg + angle
+    cv2.ellipse(
+        image,
+        (ex, ey),
+        (arc_r, arc_r),
+        0.0,
+        min(base_deg, end_deg),
+        max(base_deg, end_deg),
+        vec_color,
+        2,
+        cv2.LINE_AA,
+    )
+    if not show_labels:
+        return
+    text = f"Head alignment: {angle:+.1f} deg"
+    (text_width, text_height), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 2)
+    tx = max(8, min(min(ex, nx) - 10, width - text_width - 8))
+    ty = max(text_height + 8, min(min(ey, ny) - 14, height - 12))
+    cv2.putText(
+        image,
+        text,
+        (tx, ty),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.52,
+        vec_color,
+        2,
+        cv2.LINE_AA,
+    )
+
+
+def draw_head_posture(
+    image: Any,
+    pose: dict[str, Landmark],
+    mirror: bool,
+    confidence: float,
+    *,
+    side: str = "left",
+    facing: str = "right",
+    show_labels: bool = True,
+) -> None:
+    """Draw shoulder-to-ear head posture lines and trunk/vertical reference."""
+    height, width = image.shape[:2]
+    reliable_pose = {k: v for k, v in pose.items() if reliable(v, confidence)}
+    other_side = "right" if side == "left" else "left"
+
+    def midpoint(a: Landmark, b: Landmark) -> Landmark:
+        return Landmark((a.x + b.x) / 2, (a.y + b.y) / 2)
+
+    def pair_center(joint: str) -> Landmark | None:
+        left, right = reliable_pose.get(f"left_{joint}"), reliable_pose.get(f"right_{joint}")
+        if left is not None and right is not None:
+            return midpoint(left, right)
+        return reliable_pose.get(f"{side}_{joint}") or reliable_pose.get(f"{other_side}_{joint}")
+
+    ls, rs = reliable_pose.get("left_shoulder"), reliable_pose.get("right_shoulder")
+    le, re = reliable_pose.get("left_ear"), reliable_pose.get("right_ear")
+    shoulder = pair_center("shoulder")
+    hip = pair_center("hip")
+
+    wide_shoulders = False
+    if ls is not None and rs is not None and shoulder is not None:
+        span_px = math.hypot((ls.x - rs.x) * width, (ls.y - rs.y) * height)
+        if hip is not None:
+            torso_px = math.hypot((shoulder.x - hip.x) * width, (shoulder.y - hip.y) * height)
+            wide_shoulders = torso_px > 0 and (span_px / torso_px) > 0.25
+        else:
+            wide_shoulders = abs(ls.x - rs.x) > 0.08
+
+    ear: Landmark | None = (
+        midpoint(le, re)
+        if le is not None and re is not None and wide_shoulders
+        else reliable_pose.get(f"{side}_ear") or reliable_pose.get(f"{other_side}_ear")
+    )
+
+    if ear is None or shoulder is None:
+        return
+
+    sx, sy = screen_point(shoulder.x, shoulder.y, width, height, mirror)
+    ex, ey = screen_point(ear.x, ear.y, width, height, mirror)
+    neck_len = math.hypot(ex - sx, ey - sy)
+    if neck_len < 1.0:
+        return
+
+    ref_color, head_color = (255, 220, 0), (255, 180, 0)
+    ref_len = max(neck_len * 1.25, min(40.0, height * 0.45))
+
+    label: str | None = None
+    if hip is not None:
+        ear_px = pixel(ear, width, height)
+        sh_px = pixel(shoulder, width, height)
+        hp_px = pixel(hip, width, height)
+        if (
+            float(math.hypot(*(sh_px - hp_px))) >= 1.0
+            and float(math.hypot(*(ear_px - sh_px))) >= 1.0
+        ):
+            metrics = calculate(ear_px, sh_px, hp_px, facing)
+            hx, hy = screen_point(hip.x, hip.y, width, height, mirror)
+            tdx, tdy = sx - hx, sy - hy
+            tlen = math.hypot(tdx, tdy)
+            if tlen >= 1.0:
+                ref_end = (
+                    max(0, min(width - 1, round(sx + ref_len * tdx / tlen))),
+                    max(0, min(height - 1, round(sy + ref_len * tdy / tlen))),
+                )
+                _draw_dashed_line(image, (sx, sy), ref_end, ref_color, 2)
+            label = (
+                f"Head posture: {metrics['head_inclination']:+.1f} deg "
+                f"({metrics['head_forward'] * 100:+.1f}%)"
+            )
+
+    if label is None:
+        ref_end = (sx, max(0, round(sy - ref_len)))
+        _draw_dashed_line(image, (sx, sy), ref_end, ref_color, 2)
+        f_sign = 1.0 if facing == "right" else -1.0
+        ear_px = pixel(ear, width, height)
+        sh_px = pixel(shoulder, width, height)
+        neck_angle = math.degrees(
+            math.atan2(f_sign * (ear_px[0] - sh_px[0]), ear_px[1] - sh_px[1])
+        )
+        label = f"Head posture: {neck_angle:+.1f} deg"
+
+    cv2.line(image, (sx, sy), (ex, ey), head_color, 3, cv2.LINE_AA)
+    nose = reliable_pose.get("nose")
+    if nose is not None:
+        nx, ny = screen_point(nose.x, nose.y, width, height, mirror)
+        cv2.line(image, (ex, ey), (nx, ny), head_color, 2, cv2.LINE_AA)
+    for point in ((sx, sy), (ex, ey)):
+        cv2.circle(image, point, 5, head_color, -1, cv2.LINE_AA)
+
+    if not show_labels:
+        return
+    (text_width, text_height), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 2)
+    tx = max(8, min(ex + 12, width - text_width - 8))
+    ty = max(text_height + 8, min(ey, height - 12))
+    cv2.putText(
+        image,
+        label,
+        (tx, ty),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.52,
+        head_color,
+        2,
+        cv2.LINE_AA,
+    )
+
+
+def draw(
+    image: Any,
+    observation: FrameObservation,
+    mirror: bool,
+    lines: list[str],
+    message: str,
+    confidence: float,
+    head_down_angle: float = -15.0,
+    head_down_duration: float = 3.0,
+    head_down_elapsed: float = 0.0,
+    head_angle_smoothed: float | None = None,
+    role: str | None = None,
+    beat_state: dict[str, Any] | None = None,
+    head_neutral_offset: float = 0.0,
+    shoulder_raise_threshold: float = 10.0,
+    shoulder_tension_duration: float = 1.5,
+    shoulder_tension_elapsed: float = 0.0,
+    shoulder_neutral_clearance: float = 1.71,
+    shoulder_elev_smoothed: float | None = None,
+    embrace_type: str | None = None,
+    embrace_closed_threshold: float = 0.72,
+    closed_embrace_min_knee_bend: float = 6.0,
+    knee_straight_duration: float = 1.5,
+    knee_straight_elapsed: float = 0.0,
+    knee_bend_smoothed: float | None = None,
+    facing: str = "right",
+    side: str = "left",
+    axis_neutral_offset: float = 0.0,
+    axis_curve_entry: float = 0.06,
+    axis_curve_clear: float = 0.035,
+    axis_curve_duration: float = 1.5,
+    axis_curve_elapsed: float = 0.0,
+    axis_curve_smoothed: float | None = None,
+    axis_curve_state: str = "WITHIN_LIMIT",
+    ankle_high_lift_ratio: float = 0.06,
+    ankle_lift_smoothed: float | None = None,
+    consecutive_high_ankle_steps: int = 0,
+    max_consecutive_high_ankle_steps: int = 2,
+    slow_tango_max_bpm: float = 115.0,
+    ankle_high_alert: bool = False,
+    verbose_skeleton: bool = True,
+    show_vertical_axis: bool = True,
+    show_footer: bool = True,
+    settings_coaching: bool = True,
+    skeleton_poses: list[dict[str, Landmark]] | None = None,
+    skeleton_joint_origins: Mapping[str, str] | None = None,
+    shoulder_geometry: dict[str, float] | None = None,
+    knee_geometry: dict[str, float] | None = None,
+    show_head_alignment: bool = True,
+    show_shoulders_height: bool = True,
+    show_role_detection: bool = True,
+    show_embrace_type: bool = True,
+    show_alerts: bool = True,
+) -> Any:
+    image = cv2.flip(image, 1) if mirror else image.copy()
+    disp_w = max(960, observation.width)
+    disp_h = round(observation.height * disp_w / observation.width)
+    if (disp_w, disp_h) != (image.shape[1], image.shape[0]):
+        image = cv2.resize(image, (disp_w, disp_h), interpolation=cv2.INTER_LINEAR)
+    bad_head = show_alerts and settings_coaching and head_down_elapsed >= head_down_duration
+    bad_shoulders = show_alerts and settings_coaching and shoulder_tension_elapsed >= shoulder_tension_duration
+    bad_knees = show_alerts and settings_coaching and knee_straight_elapsed >= knee_straight_duration
+    bad_axis = show_alerts and settings_coaching and (axis_curve_state == "DEVIATION" or (
+        axis_curve_elapsed >= axis_curve_duration
+        and (axis_curve_smoothed is None or axis_curve_smoothed >= axis_curve_clear)
+    ))
+    bad_ankles = show_alerts and settings_coaching and bool(ankle_high_alert)
+    detected_role = role
+    detected_embrace = embrace_type
+    for pose in observation.poses if skeleton_poses is None else skeleton_poses:
+        if verbose_skeleton:
+            for a, b in CONNECTIONS:
+                if reliable(pose.get(a), confidence) and reliable(pose.get(b), confidence):
+                    pa, pb = pose[a], pose[b]
+                    draw_styled_bone(
+                        image,
+                        screen_point(pa.x, pa.y, disp_w, disp_h, mirror),
+                        screen_point(pb.x, pb.y, disp_w, disp_h, mirror),
+                        (80, 220, 80),
+                        2,
+                        style=edge_provenance_style(a, b, skeleton_joint_origins),
+                    )
+        for name, p in pose.items():
+            if math.isfinite(p.x) and math.isfinite(p.y) and 0 <= p.x <= 1 and 0 <= p.y <= 1:
+                origin = (
+                    skeleton_joint_origins.get(name, "forward")
+                    if skeleton_joint_origins
+                    else "forward"
+                )
+                dot_center = screen_point(p.x, p.y, disp_w, disp_h, mirror)
+                if verbose_skeleton:
+                    if not reliable(p, confidence):
+                        cv2.circle(image, dot_center, 3, (0, 180, 255), -1)
+                    elif origin in ("backward", "interpolated"):
+                        cv2.circle(image, dot_center, 4, (80, 220, 80), 1, cv2.LINE_AA)
+                    else:
+                        cv2.circle(image, dot_center, 3, (80, 220, 80), -1)
+                elif reliable(p, confidence):
+                    cv2.circle(image, dot_center, 4, (80, 220, 80), -1)
+    for pose in observation.poses:
+        if detected_role is None:
+            detected_role = detect_role(pose)
+        if settings_coaching and detected_embrace is None and detected_role in ("LEADER", "FOLLOWER"):
+            detected_embrace = detect_embrace_type(
+                pose, detected_role, closed_threshold=embrace_closed_threshold
+            )
+        head_info = head_horizontal_alignment(
+            pose, observation.width, observation.height, neutral_offset=head_neutral_offset
+        )
+        if settings_coaching and show_head_alignment and head_info is not None:
+            raw_angle, ear, nose = head_info
+            angle = head_angle_smoothed if head_angle_smoothed is not None else raw_angle
+            ex, ey = screen_point(ear.x, ear.y, disp_w, disp_h, mirror)
+            nx, ny = screen_point(nose.x, nose.y, disp_w, disp_h, mirror)
+            dir_x = 1 if nx >= ex else -1
+            seg_len = max(65.0, math.hypot(nx - ex, ny - ey))
+            hx = round(ex + dir_x * seg_len)
+            rad = math.radians(angle)
+            vx = round(ex + dir_x * seg_len * math.cos(rad))
+            vy = round(ey - seg_len * math.sin(rad))
+            vec_color = (
+                (0, 0, 255)
+                if bad_head
+                else (0, 165, 255)
+                if angle < head_down_angle
+                else (80, 220, 80)
+            )
+            # Horizontal reference line through the ear
+            cv2.line(image, (ex, ey), (hx, ey), (255, 220, 0), 2, cv2.LINE_AA)
+            # Head alignment vector (ear -> nose)
+            cv2.line(image, (ex, ey), (vx, vy), vec_color, 3 if bad_head else 2, cv2.LINE_AA)
+            base_deg = 0.0 if dir_x > 0 else 180.0
+            end_deg = base_deg - angle if dir_x > 0 else base_deg + angle
+            cv2.ellipse(
+                image,
+                (ex, ey),
+                (34, 34),
+                0.0,
+                min(base_deg, end_deg),
+                max(base_deg, end_deg),
+                vec_color,
+                2,
+                cv2.LINE_AA,
+            )
+            label = f"Head horiz: {angle:+.1f} deg"
+            if head_down_elapsed > 0:
+                label += f" ({head_down_elapsed:.1f}s)"
+            cv2.putText(
+                image,
+                label,
+                (max(8, min(ex, nx) - 10), max(24, min(ey, ny) - 14)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                vec_color,
+                2,
+                cv2.LINE_AA,
+            )
+        sh_info = shoulder_tension_alignment(
+            pose,
+            observation.width,
+            observation.height,
+            neutral_clearance=shoulder_neutral_clearance,
+            **(shoulder_geometry or {}),
+        )
+        if settings_coaching and show_shoulders_height and sh_info is not None:
+            raw_elev_pct, raw_clear, sh_ear, sh_lm = sh_info
+            elev_pct = shoulder_elev_smoothed if shoulder_elev_smoothed is not None else raw_elev_pct
+            _sex, sey = screen_point(sh_ear.x, sh_ear.y, disp_w, disp_h, mirror)
+            sx, sy = screen_point(sh_lm.x, sh_lm.y, disp_w, disp_h, mirror)
+            sh_color = (
+                (0, 0, 255)
+                if bad_shoulders
+                else (0, 165, 255)
+                if elev_pct >= shoulder_raise_threshold
+                else (80, 220, 80)
+            )
+            # Draw shoulder level indicator and downward cue when shoulders are raised
+            cv2.line(image, (sx - 28, sy), (sx + 28, sy), sh_color, 3 if bad_shoulders else 2, cv2.LINE_AA)
+            if raw_clear > 1e-3:
+                target_dy = round((sy - sey) * (shoulder_neutral_clearance / raw_clear))
+                target_sy = min(disp_h - 8, max(sey + 15, sey + target_dy))
+                cv2.line(image, (sx - 22, target_sy), (sx + 22, target_sy), (255, 220, 0), 2, cv2.LINE_AA)
+                if elev_pct >= shoulder_raise_threshold and target_sy > sy + 4:
+                    cv2.arrowedLine(
+                        image,
+                        (sx, sy),
+                        (sx, target_sy),
+                        sh_color,
+                        2,
+                        cv2.LINE_AA,
+                        tipLength=0.35,
+                    )
+            sh_label = (
+                f"LOWER SHOULDERS ({elev_pct:+.0f}%)"
+                if elev_pct >= shoulder_raise_threshold
+                else f"Shoulders: OK ({elev_pct:+.0f}%)"
+            )
+            cv2.putText(
+                image,
+                sh_label,
+                (max(8, sx - 60), min(disp_h - 12, sy + 24)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.52,
+                sh_color,
+                2,
+                cv2.LINE_AA,
+            )
+        knee_info = knee_bend_alignment(
+            pose, observation.width, observation.height, side=side, **(knee_geometry or {})
+        )
+        if settings_coaching and knee_info is not None:
+            raw_knee_bend_deg, vis_legs = knee_info
+            knee_bend_deg = (
+                knee_bend_smoothed if knee_bend_smoothed is not None else raw_knee_bend_deg
+            )
+            knees_straight = bad_knees or knee_bend_deg < closed_embrace_min_knee_bend
+            knee_color = (
+                (0, 0, 255)
+                if bad_knees
+                else (0, 165, 255)
+                if knees_straight
+                else (80, 220, 80)
+            )
+            for _hip_lm, k_lm, _ank_lm in vis_legs:
+                kx, ky = screen_point(k_lm.x, k_lm.y, disp_w, disp_h, mirror)
+                cv2.circle(
+                    image,
+                    (kx, ky),
+                    12 if knees_straight else 7,
+                    knee_color,
+                    3 if bad_knees else 2,
+                    cv2.LINE_AA,
+                )
+            if vis_legs:
+                first_k = vis_legs[0][1]
+                kx, ky = screen_point(first_k.x, first_k.y, disp_w, disp_h, mirror)
+                knee_label = (
+                    f"BEND KNEES ({knee_bend_deg:.1f} deg < {closed_embrace_min_knee_bend:.1f} deg)"
+                    if knees_straight
+                    else f"Knees: OK ({knee_bend_deg:.1f} deg)"
+                )
+                if knee_straight_elapsed > 0:
+                    knee_label += f" ({knee_straight_elapsed:.1f}s)"
+                cv2.putText(
+                    image,
+                    knee_label,
+                    (max(8, kx + 16), min(disp_h - 12, ky + 6)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.52,
+                    knee_color,
+                    2,
+                    cv2.LINE_AA,
+                )
+        if show_vertical_axis:
+            draw_torso_axis(image, pose, mirror, confidence)
+        ankle_info = ankle_lift_alignment(pose, observation.width, observation.height)
+        if settings_coaching and ankle_info is not None:
+            raw_ankle_lift, lifted_lm, grounded_lm = ankle_info
+            shown_lift = (
+                ankle_lift_smoothed if ankle_lift_smoothed is not None else raw_ankle_lift
+            )
+            high_step = bad_ankles or shown_lift >= ankle_high_lift_ratio
+            ank_color = (
+                (0, 0, 255)
+                if bad_ankles
+                else (0, 165, 255)
+                if high_step or consecutive_high_ankle_steps > 0
+                else (80, 220, 80)
+            )
+            lx, ly = screen_point(lifted_lm.x, lifted_lm.y, disp_w, disp_h, mirror)
+            gx, gy = screen_point(grounded_lm.x, grounded_lm.y, disp_w, disp_h, mirror)
+            cv2.circle(
+                image,
+                (lx, ly),
+                12 if high_step else 7,
+                ank_color,
+                3 if bad_ankles else 2,
+                cv2.LINE_AA,
+            )
+            if high_step and gy > ly + 4:
+                cv2.line(image, (lx - 18, gy), (lx + 18, gy), (255, 220, 0), 2, cv2.LINE_AA)
+                cv2.arrowedLine(
+                    image,
+                    (lx, ly),
+                    (lx, gy),
+                    ank_color,
+                    2,
+                    cv2.LINE_AA,
+                    tipLength=0.35,
+                )
+            ank_label = (
+                f"ANKLE HIGH: {shown_lift * 100.0:.1f}% "
+                f"({consecutive_high_ankle_steps}/{max_consecutive_high_ankle_steps} steps)"
+                if (high_step or consecutive_high_ankle_steps > 0)
+                else f"Feet low: OK ({shown_lift * 100.0:.1f}%)"
+            )
+            cv2.putText(
+                image,
+                ank_label,
+                (max(8, min(lx, gx) + 16), min(disp_h - 12, max(24, ly))),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.50,
+                ank_color,
+                2,
+                cv2.LINE_AA,
+            )
+    alert_y = 28
+    if show_role_detection:
+        role_text = f"Role: {detected_role or 'NONE'}"
+        role_color = (
+            (255, 220, 0)
+            if detected_role == "LEADER"
+            else (255, 140, 255)
+            if detected_role == "FOLLOWER"
+            else (200, 200, 200)
+        )
+        cv2.putText(
+            image,
+            role_text,
+            (12, disp_h - 18),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            role_color,
+            2,
+            cv2.LINE_AA,
+        )
+    if (
+        settings_coaching
+        and show_embrace_type
+        and detected_role in ("LEADER", "FOLLOWER")
+        and detected_embrace in ("CLOSED", "OPEN")
+    ):
+        embrace_label = f"Embrace: {detected_embrace} EMBRACE"
+        embrace_color = (0, 230, 255) if detected_embrace == "CLOSED" else (120, 240, 120)
+        cv2.putText(
+            image,
+            embrace_label,
+            (12, disp_h - 46 if show_role_detection else disp_h - 18),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            embrace_color,
+            2,
+            cv2.LINE_AA,
+        )
+    if not settings_coaching and message:
+        cv2.putText(
+            image, message, (12, alert_y), cv2.FONT_HERSHEY_SIMPLEX,
+            0.55, (0, 165, 255), 2, cv2.LINE_AA,
+        )
+    if bad_head:
+        cv2.putText(
+            image,
+            f"BAD HEAD ALIGNMENT ({head_down_elapsed:.1f}s > {head_down_duration:.1f}s)",
+            (12, alert_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.75,
+            (0, 0, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        alert_y += 32
+    if bad_shoulders:
+        cv2.putText(
+            image,
+            f"LOWER YOUR SHOULDERS ({shoulder_tension_elapsed:.1f}s > {shoulder_tension_duration:.1f}s)",
+            (12, alert_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.75,
+            (0, 0, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        alert_y += 32
+    if bad_knees:
+        cv2.putText(
+            image,
+            f"BEND YOUR KNEES ({knee_straight_elapsed:.1f}s > {knee_straight_duration:.1f}s)",
+            (12, alert_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.75,
+            (0, 0, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        alert_y += 32
+    if bad_axis:
+        cv2.putText(
+            image,
+            f"HIP OFFSET: PAST ANKLE-HEAD LINE ({axis_curve_elapsed:.1f}s > {axis_curve_duration:.1f}s)",
+            (12, alert_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.75,
+            (0, 0, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        alert_y += 32
+    if bad_ankles:
+        cv2.putText(
+            image,
+            f"KEEP FEET CLOSE TO FLOOR: ANKLE TOO HIGH ({consecutive_high_ankle_steps}/{max_consecutive_high_ankle_steps} STEPS, <={slow_tango_max_bpm:.0f} BPM)",
+            (12, alert_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.72,
+            (0, 0, 255),
+            2,
+            cv2.LINE_AA,
+        )
+    if beat_state is not None:
+        beat = int(beat_state.get("beat", 0))
+        phrase = int(beat_state.get("phrase", 0))
+        bpm = float(beat_state.get("bpm", 120.0))
+        playing = bool(beat_state.get("playing", True))
+        analyzing = bool(beat_state.get("analyzing", False))
+        analyzed_sec = float(beat_state.get("analyzed_seconds", 0.0))
+        target_sec = float(beat_state.get("analysis_target_seconds", 30.0))
+        phrase_locked = bool(beat_state.get("phrase_locked", False))
+        source = str(beat_state.get("source", ""))
+        box_w, gap = 24, 4
+        start_x = max(12, disp_w - 8 * (box_w + gap) - 12)
+        if not playing:
+            if source == "mic-denied":
+                header_text = f"WAITING FOR SONG TO BEGIN... | {bpm:.0f} BPM [MIC DENIED]"
+                header_color = (0, 0, 255)
+            else:
+                header_text = f"WAITING FOR SONG TO BEGIN... | {bpm:.0f} BPM"
+                header_color = (200, 200, 200)
+        elif analyzing:
+            header_text = (
+                f"UNDERSTANDING BEATS ({analyzed_sec:.0f}/{target_sec:.0f}s) | "
+                f"BEAT {beat}/8 | {bpm:.0f} BPM"
+            )
+            header_color = (80, 220, 80)
+        else:
+            lock_tag = " [LOCKED]" if phrase_locked else ""
+            header_text = f"Phrase {phrase} | BEAT {beat}/8 | {bpm:.0f} BPM{lock_tag}"
+            header_color = (80, 220, 80)
+        (tw, _), _ = cv2.getTextSize(header_text, cv2.FONT_HERSHEY_SIMPLEX, 0.52, 2)
+        text_x = max(12, disp_w - tw - 12)
+        cv2.putText(
+            image,
+            header_text,
+            (text_x, 24),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.52,
+            header_color,
+            2,
+            cv2.LINE_AA,
+        )
+        for idx in range(1, 9):
+            bx = start_x + (idx - 1) * (box_w + gap)
+            by = 32
+            active_beat = playing and (idx == beat)
+            fill_color = (80, 220, 80) if active_beat else (45, 45, 45)
+            cv2.rectangle(image, (bx, by), (bx + box_w, by + 24), fill_color, -1)
+            cv2.rectangle(image, (bx, by), (bx + box_w, by + 24), (200, 200, 200), 1)
+            cv2.putText(
+                image,
+                str(idx),
+                (bx + 6, by + 18),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                (0, 0, 0) if active_beat else (210, 210, 210),
+                2 if active_beat else 1,
+                cv2.LINE_AA,
+            )
+        if analyzing and target_sec > 0:
+            total_bar_w = 8 * (box_w + gap) - gap
+            prog_w = int(min(1.0, max(0.0, analyzed_sec / target_sec)) * total_bar_w)
+            cv2.rectangle(image, (start_x, 60), (start_x + total_bar_w, 65), (50, 50, 50), -1)
+            cv2.rectangle(image, (start_x, 60), (start_x + prog_w, 65), (80, 220, 80), -1)
+    if not show_footer:
+        return image
+    # Dedicated bottom panel keeps status readable while image fills 100% horizontally.
+    panel = cv2.copyMakeBorder(
+        image,
+        0,
+        max(220, 24 * (len(lines) + 2)),
+        0,
+        0,
+        cv2.BORDER_CONSTANT,
+    )
+    for i, line in enumerate([message, *lines]):
+        is_red = i == 0 and (bad_head or bad_shoulders or bad_knees or bad_axis or bad_ankles)
+        cv2.putText(
+            panel,
+            line,
+            (12, disp_h + 24 + 24 * i),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55 if is_red else 0.5,
+            (0, 0, 255) if is_red else (255, 255, 255),
+            2 if is_red else 1,
+            cv2.LINE_AA,
+        )
+    return panel

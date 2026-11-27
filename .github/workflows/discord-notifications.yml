@@ -1,0 +1,20 @@
+name: Discord Notifications
+
+on:
+  pull_request:
+    types: [opened, reopened, closed, ready_for_review]
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Notify Discord
+        env:
+          DISCORD_CICD_WEBHOOK_URL: ${{ secrets.DISCORD_CICD_WEBHOOK_URL }}
+        run: python3 .github/scripts/notify_discord.py "${{ github.event_name }}"

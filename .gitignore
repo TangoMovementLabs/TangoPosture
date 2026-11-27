@@ -221,3 +221,21 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# TangoPosture project
+!scripts/TangoPosture.spec
+.DS_Store
+*.task
+*.mp4
+*.mov
+videos/
+data/
+docs/licenses/
+reports/
+calibrations/
+logs/
+requirements/
+/practice/
+/references/
+release/
+
