@@ -204,6 +204,7 @@ def build_pipeline_embed(event: dict[str, Any], repo: str, actor: str) -> dict[s
         ("checks", os.environ.get("JOB_CHECKS_RESULT", "").strip().lower()),
         ("build", os.environ.get("JOB_BUILD_RESULT", "").strip().lower()),
         ("publish", os.environ.get("JOB_PUBLISH_RESULT", "").strip().lower()),
+        ("dispatch", os.environ.get("JOB_DISPATCH_RESULT", "").strip().lower()),
     ]
     active_results = [result for _, result in raw_jobs if result and result != "skipped"]
 

@@ -217,9 +217,29 @@ jobs:
           sha256sum TangoPosture-macOS-arm64.dmg TangoPosture-Windows-x64-Setup.exe TangoPosture-Linux-x64.tar.gz > SHA256SUMS.txt
           gh release upload "$RELEASE_TAG" TangoPosture-macOS-arm64.dmg TangoPosture-Windows-x64-Setup.exe TangoPosture-Linux-x64.tar.gz SHA256SUMS.txt
 
+  dispatch-downstream:
+    if: github.event_name == 'release'
+    needs: [publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dispatch release updates to websites and Documentation
+        env:
+          RELEASE_DISPATCH_TOKEN: ${{ secrets.RELEASE_DISPATCH_TOKEN }}
+          WEBSITES_DISPATCH_TOKEN: ${{ secrets.WEBSITES_DISPATCH_TOKEN }}
+          DOCS_DISPATCH_TOKEN: ${{ secrets.DOCS_DISPATCH_TOKEN }}
+          SOURCE_REPO: ${{ github.repository }}
+          RELEASE_VERSION: ${{ github.event.release.tag_name }}
+          COMMIT_SHA: ${{ github.sha }}
+          RELEASE_URL: ${{ github.event.release.html_url }}
+          RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}
+        run: python3 .github/scripts/dispatch_release.py --target all
+
   notify:
     if: always()
-    needs: [checks, build, publish]
+    needs: [checks, build, publish, dispatch-downstream]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -231,4 +251,5 @@ jobs:
           JOB_CHECKS_RESULT: ${{ needs.checks.result }}
           JOB_BUILD_RESULT: ${{ needs.build.result }}
           JOB_PUBLISH_RESULT: ${{ needs.publish.result }}
+          JOB_DISPATCH_RESULT: ${{ needs.dispatch-downstream.result }}
         run: python3 .github/scripts/notify_discord.py pipeline

@@ -1,0 +1,40 @@
+name: Dispatch Release Updates
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: "Release version tag (e.g. v0.5.3)"
+        required: true
+      target:
+        description: "Downstream repository target"
+        type: choice
+        options:
+          - all
+          - websites
+          - docs
+        default: all
+      prerelease:
+        description: "Mark release as pre-release in websites payload"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  dispatch:
+    name: Dispatch downstream release updates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Send repository_dispatch events
+        env:
+          RELEASE_DISPATCH_TOKEN: ${{ secrets.RELEASE_DISPATCH_TOKEN }}
+          WEBSITES_DISPATCH_TOKEN: ${{ secrets.WEBSITES_DISPATCH_TOKEN }}
+          DOCS_DISPATCH_TOKEN: ${{ secrets.DOCS_DISPATCH_TOKEN }}
+          SOURCE_REPO: ${{ github.repository }}
+          RELEASE_VERSION: ${{ inputs.release_version }}
+          COMMIT_SHA: ${{ github.sha }}
+          RELEASE_PRERELEASE: ${{ inputs.prerelease }}
+        run: python3 .github/scripts/dispatch_release.py --target "${{ inputs.target }}"

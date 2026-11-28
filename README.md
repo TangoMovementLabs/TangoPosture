@@ -102,6 +102,25 @@ uv build
 
 ---
 
+## Releasing & Downstream Automation
+
+Use the root [Makefile](Makefile) to validate, tag, and publish a GitHub Release:
+
+```bash
+make release-check
+make release DRY_RUN=1
+make release            # tags v<version>, pushes tag, and creates GitHub Release via gh
+```
+
+Publishing a GitHub Release automatically runs [.github/workflows/desktop-release.yml](.github/workflows/desktop-release.yml) to build and attach the macOS, Windows, and Linux installers and `SHA256SUMS.txt`, and then dispatches release events to:
+
+- **`TangoMovementLabs/websites`** (`tangoposture-release`) to update `apps/tangoposture` (`index.html`, `releases.html`, `releases.json`) and open a PR against `develop`.
+- **`TangoMovementLabs/Documentation`** (`source-release`) to regenerate documentation and open a PR against `develop`.
+
+Cross-repo dispatch requires a fine-grained PAT or GitHub App token stored in repository secret `RELEASE_DISPATCH_TOKEN` (with `contents: write` / Actions write access on `websites` and `Documentation`). You can also re-trigger downstream updates manually via `make dispatch-release` or the **Dispatch Release Updates** workflow.
+
+---
+
 ## Community & Governance
 
 - [Contributing Guide](CONTRIBUTING.md)
